@@ -23,3 +23,16 @@ jobs:
       # card, reader, or system-library build is involved.
       - uses: DeterminateSystems/nix-installer-action@main
       - run: nix develop --command cargo fmt --all --check
+
+  nix-build:
+    name: Nix build (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: nix flake check --no-update-lock-file -L
+      - run: nix build --no-update-lock-file --no-link -L

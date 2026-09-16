@@ -2,12 +2,13 @@
 # build/runtime dependency for `cargo build` in this tree.
 {
   pkgs ? import <nixpkgs> { },
+  rustToolchain ? import ./nix/rust-toolchain.nix { inherit pkgs; },
+  refineidPackage ? import ./default.nix { inherit pkgs; },
 }:
 pkgs.mkShell {
-  inputsFrom = [ (import ./default.nix { inherit pkgs; }) ];
+  inputsFrom = [ refineidPackage ];
   packages = with pkgs; [
-    clippy
-    rustfmt
+    rustToolchain
     pcsc-tools # pcsc_scan for reader debugging
     opensc # pkcs11-tool for module debugging
     nss.tools # tstclnt/certutil/modutil for the hardware cert-auth rig
