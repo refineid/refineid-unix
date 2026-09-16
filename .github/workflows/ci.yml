@@ -21,5 +21,18 @@ jobs:
       # `nix develop`; a version skew would flag formatting the
       # maintainer's rustfmt considers clean. fmt parses only, so no
       # card, reader, or system-library build is involved.
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
       - run: nix develop --command cargo fmt --all --check
+
+  nix-build:
+    name: Nix build (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - run: nix flake check --no-update-lock-file -L
+      - run: nix build --no-update-lock-file --no-link -L

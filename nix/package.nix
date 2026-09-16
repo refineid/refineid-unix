@@ -1,6 +1,6 @@
 # RefineID package: the refineid CLI, the RefineID GUI, and the
-# PKCS#11 module, built from this source tree with the Rust that
-# nixpkgs ships.
+# PKCS#11 module, built from this source tree with the pinned Rust
+# toolchain supplied through craneLib by both entry points.
 #
 # Built with crane so the dependency graph compiles as its own
 # derivation: editing RefineID source rebuilds only the workspace

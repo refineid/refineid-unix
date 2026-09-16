@@ -3,6 +3,11 @@
 Everything below builds RefineID from this source tree. Nix fetches
 every build dependency (Rust toolchain, pcsc-lite, fontconfig, GUI
 libraries) by itself; nothing needs to be installed by hand first.
+The Rust version and components come from `rust-toolchain.toml`,
+packaged by the locked `rust-overlay` input.
+Both dependency and application builds use this compiler, even when
+the system's nixpkgs provides an older Rust. `nix develop` and
+`nix-shell` use the same toolchain, including Clippy and rustfmt.
 
 Building needs a few gigabytes of memory free; on a small machine or
 VM, add swap before building -- see Troubleshooting. Only the first
@@ -57,8 +62,8 @@ sudo NIX_CONFIG="tarball-ttl = 0" nixos-rebuild switch
 `tarball-ttl = 0` makes Nix fetch the current revision; without it a
 rebuild reuses a revision fetched within the last hour. Only the
 RefineID crates recompile on an update -- the dependency build is
-reused from the local Nix store until Cargo.lock or the pinned
-nixpkgs changes, and `nix.settings.keep-outputs = true` keeps it
+reused from the local Nix store until Cargo.lock, the toolchain, or
+the pinned nixpkgs changes, and `nix.settings.keep-outputs = true` keeps it
 there across garbage collection.
 
 The sections below unpack the same install for existing
@@ -293,6 +298,24 @@ Security Devices should list `RefineID` with your reader under it,
 and a card-login site will prompt for the certificate and PIN 1.
 
 ## Troubleshooting
+
+- **Dependency build says a crate requires a newer `rustc`.**
+  Update the RefineID source input to include the pinned-toolchain
+  configuration. Installing Rust with rustup or in
+  `environment.systemPackages` does not change a Nix derivation's
+  compiler. For a flake-based system, update its RefineID input and
+  rebuild (replace `myhost` with your configuration name):
+
+  ```sh
+  cd /etc/nixos
+  sudo nix flake update refineid
+  sudo nixos-rebuild switch --flake /etc/nixos#myhost
+  ```
+
+  For the classic configuration above, use the update command in
+  the Updating section. A toolchain change rebuilds dependencies
+  once; later source-only updates reuse them. Do not lower crate
+  `rust-version` requirements or use `--ignore-rust-version`.
 
 - **Build fails with `rustc was terminated by a deadly signal`.**
   The machine ran out of memory during the final optimisation step,
