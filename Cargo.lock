@@ -4663,7 +4663,7 @@ source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df
 
 [[package]]
 name = "refineid-client"
-version = "26.9.12"
+version = "26.9.24"
 dependencies = [
  "hex",
  "hickory-resolver",
@@ -4704,7 +4704,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui"
-version = "26.9.12"
+version = "26.9.24"
 dependencies = [
  "arboard",
  "image",
@@ -4719,7 +4719,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-core"
-version = "26.9.12"
+version = "26.9.24"
 dependencies = [
  "aes",
  "cbc",
@@ -4745,7 +4745,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-pcsc"
-version = "26.9.12"
+version = "26.9.24"
 dependencies = [
  "pcsc",
  "refineid-lib-core",
@@ -4753,7 +4753,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-tls"
-version = "26.9.12"
+version = "26.9.24"
 dependencies = [
  "refineid-lib-core",
  "rustls",
@@ -4823,7 +4823,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-unix-pkcs11"
-version = "26.9.12"
+version = "26.9.24"
 dependencies = [
  "libc",
  "refineid-lib-core",
