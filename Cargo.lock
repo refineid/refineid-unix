@@ -4270,21 +4270,21 @@ dependencies = [
 
 [[package]]
 name = "refineid-apdu"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "zeroize",
 ]
 
 [[package]]
 name = "refineid-atr"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 
 [[package]]
 name = "refineid-auth"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "hmac",
  "refineid-apdu",
@@ -4294,8 +4294,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-ber"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 
 [[package]]
 name = "refineid-client"
@@ -4316,8 +4316,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-cms"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "const-oid",
  "crypto-bigint",
@@ -4331,8 +4331,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-digest"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "sha1",
  "sha2",
@@ -4398,8 +4398,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-pcsc"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "pcsc",
  "refineid-apdu",
@@ -4408,8 +4408,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-pin-cache"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "getrandom 0.4.3",
  "refineid-auth",
@@ -4420,8 +4420,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs11"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -4440,8 +4440,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs15"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "refineid-apdu",
  "refineid-ber",
@@ -4450,8 +4450,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-sign"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "refineid-apdu",
  "zeroize",
@@ -4468,8 +4468,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-x509"
-version = "26.9.12"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#0b6036df1949d396116f47d7450327befa53f287"
+version = "26.9.27"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#1b4c787f91f496d8dcb4a475177f56d88d4dddb4"
 dependencies = [
  "refineid-ber",
 ]
@@ -5376,7 +5376,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
