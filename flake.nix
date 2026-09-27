@@ -67,7 +67,9 @@
             cargo --version
             cargo clippy --version
             cargo fmt --version
-            test "$(rustc --version | cut -d ' ' -f 2)" = ${pkgs.lib.escapeShellArg version}
+            if [ ${pkgs.lib.escapeShellArg version} != "stable" ]; then
+              test "$(rustc --version | cut -d ' ' -f 2)" = ${pkgs.lib.escapeShellArg version}
+            fi
             touch "$out"
           '';
       });
