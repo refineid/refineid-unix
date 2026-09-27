@@ -22,11 +22,11 @@ refineid-lib-core.workspace = true
 # Presence monitor: SCardGetStatusChange-driven card insert/remove
 # wake-ups instead of timed polling.
 refineid-lib-pcsc.workspace = true
-slint = { version = "1.17", default-features = false, features = ["accessibility", "backend-winit", "compat-1-2", "renderer-software"] }
+slint = { version = "1.18", default-features = false, features = ["accessibility", "backend-winit", "compat-1-2", "renderer-software"] }
 arboard = "3.6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-pdfluent-jpeg2000 = { version = "0.3", default-features = false, features = ["image", "std"] }
+pdfluent-jpeg2000 = { version = "0.4", default-features = false, features = ["image", "std"] }
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 
 [build-dependencies]
-slint-build = "1.17"
+slint-build = "1.18"
