@@ -132,11 +132,11 @@ impl FltkDriver {
         let window = Window::default().with_size(920, 700).with_label("RefineID");
 
         // Top bar: Card Reader selector, Refresh, Status
-        let mut card_choice = Choice::new(110, 15, 340, 30, "Card Reader:");
+        let mut card_choice = Choice::new(110, 15, 500, 30, "Card Reader:");
         card_choice.set_align(Align::Left);
 
-        let mut refresh_btn = Button::new(460, 15, 90, 30, "Refresh");
-        let mut card_status_badge = Frame::new(560, 15, 345, 30, "No Card Detected");
+        let mut refresh_btn = Button::new(620, 15, 85, 30, "Refresh");
+        let mut card_status_badge = Frame::new(715, 15, 190, 30, "No Card Detected");
         card_status_badge.set_frame(FrameType::EngravedBox);
 
         // Main Tabs
@@ -953,7 +953,9 @@ impl UiDriver for FltkDriver {
         // Top bar: Card selector
         widgets.card_choice.clear();
         for card in &state.cards {
-            widgets.card_choice.add_choice(&card.label());
+            widgets
+                .card_choice
+                .add_choice(&escape_fltk_menu_text(&card.label()));
         }
         if let Some(idx) = state.selected_card {
             widgets.card_choice.set_value(idx as i32);
@@ -1175,5 +1177,37 @@ impl UiDriver for FltkDriver {
 
         controller.stop();
         Ok(())
+    }
+}
+
+/// Escapes special menu characters in FLTK choice items (`/`, `&`, `_`).
+fn escape_fltk_menu_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '/' => out.push_str("\\/"),
+            '&' => out.push_str("&&"),
+            '_' => out.push_str("\\_"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_fltk_menu_text() {
+        assert_eq!(
+            escape_fltk_menu_text("KOISTINEN PETRI / Alcor Reader / CardOS"),
+            "KOISTINEN PETRI \\/ Alcor Reader \\/ CardOS"
+        );
+        assert_eq!(
+            escape_fltk_menu_text("R&D / Test_Case"),
+            "R&&D \\/ Test\\_Case"
+        );
+        assert_eq!(escape_fltk_menu_text("Clean Name"), "Clean Name");
     }
 }
