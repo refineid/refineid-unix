@@ -57,6 +57,8 @@ struct FltkWidgets {
     window: Window,
     card_choice: Choice,
     card_status_badge: Frame,
+    holder_name_frame: Frame,
+    holder_sub_frame: Frame,
     serial_frame: Frame,
     pin1_status_frame: Frame,
     pin2_status_frame: Frame,
@@ -110,6 +112,8 @@ impl FltkDriver {
     /// Create a new FLTK driver and its state notification callback.
     pub fn create() -> (Self, StateChangeCallback) {
         let app = app::App::default().with_scheme(Scheme::Gtk);
+        app::set_background_color(245, 246, 248);
+        app::set_foreground_color(33, 37, 41);
         let (state_tx, state_rx) = app::channel::<UiState>();
 
         let on_state_change = Box::new(move |state: &UiState| {
@@ -129,279 +133,397 @@ impl FltkDriver {
 
     /// Build all UI controls and attach callbacks dispatching to `controller`.
     fn init_ui(&mut self, controller: &Arc<RefineIdController>) {
-        let window = Window::default().with_size(920, 700).with_label("RefineID");
+        let window = Window::default().with_size(920, 680).with_label("RefineID");
 
-        // Top bar: Card Reader selector, Refresh, Status
-        let mut card_choice = Choice::new(110, 15, 500, 30, "Card Reader:");
+        // Top bar: Card selector, Refresh, Status Badge
+        let mut card_choice = Choice::new(70, 15, 520, 32, "Card:");
         card_choice.set_align(Align::Left);
 
-        let mut refresh_btn = Button::new(620, 15, 85, 30, "Refresh");
-        let mut card_status_badge = Frame::new(715, 15, 190, 30, "No Card Detected");
-        card_status_badge.set_frame(FrameType::EngravedBox);
+        let mut refresh_btn = Button::new(605, 15, 80, 32, "Refresh");
+        let mut card_status_badge = Frame::new(695, 15, 205, 32, "No Card Detected");
+        card_status_badge.set_frame(FrameType::RFlatBox);
+        card_status_badge.set_label_font(Font::HelveticaBold);
+        card_status_badge.set_label_size(12);
 
         // Main Tabs
-        let tabs = Tabs::new(15, 55, 890, 600, "");
+        let tabs = Tabs::new(20, 58, 880, 580, "");
 
         // ---------------------------------------------------------------------
         // TAB 1: Card & PIN Management
         // ---------------------------------------------------------------------
-        let pin_tab = Group::new(15, 85, 890, 565, "Card & PIN\t");
+        let pin_tab = Group::new(20, 88, 880, 550, "Card & PIN   ");
 
-        let mut info_box = Group::new(25, 95, 870, 75, "");
-        info_box.set_frame(FrameType::EngravedBox);
+        // Hero Card: Cardholder profile and PIN retries
+        let mut hero_card = Group::new(35, 98, 850, 96, "");
+        hero_card.set_frame(FrameType::RFlatBox);
+        hero_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut serial_frame = Frame::new(35, 105, 400, 25, "Card Serial: N/A");
+        let mut holder_name_frame = Frame::new(50, 108, 430, 28, "No Card Detected");
+        holder_name_frame.set_label_font(Font::HelveticaBold);
+        holder_name_frame.set_label_size(18);
+        holder_name_frame.set_align(Align::Left | Align::Inside);
+
+        let mut holder_sub_frame =
+            Frame::new(50, 138, 430, 20, "Insert your smart card into the reader");
+        holder_sub_frame.set_label_size(12);
+        holder_sub_frame.set_label_color(Color::from_rgb(108, 117, 125));
+        holder_sub_frame.set_align(Align::Left | Align::Inside);
+
+        let mut serial_frame = Frame::new(50, 160, 430, 18, "");
+        serial_frame.set_label_size(11);
+        serial_frame.set_label_color(Color::from_rgb(140, 145, 150));
         serial_frame.set_align(Align::Left | Align::Inside);
 
-        let mut puk_status_frame = Frame::new(450, 105, 430, 25, "PUK: Unknown");
-        puk_status_frame.set_align(Align::Left | Align::Inside);
-
-        let mut pin1_status_frame = Frame::new(35, 135, 400, 25, "PIN1 (Authentication): Unknown");
+        let mut pin1_status_frame =
+            Frame::new(490, 108, 380, 24, "Authentication PIN (PIN 1): Unknown");
+        pin1_status_frame.set_label_size(12);
         pin1_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut pin2_status_frame = Frame::new(450, 135, 430, 25, "PIN2 (Signing): Unknown");
+        let mut pin2_status_frame = Frame::new(490, 134, 380, 24, "Signing PIN (PIN 2): Unknown");
+        pin2_status_frame.set_label_size(12);
         pin2_status_frame.set_align(Align::Left | Align::Inside);
-        info_box.end();
+
+        let mut puk_status_frame = Frame::new(490, 160, 380, 24, "PUK Code: Unknown");
+        puk_status_frame.set_label_size(12);
+        puk_status_frame.set_align(Align::Left | Align::Inside);
+        hero_card.end();
 
         // Subtabs for PIN operations
-        let pin_subtabs = Tabs::new(25, 180, 870, 465, "");
+        let pin_subtabs = Tabs::new(35, 204, 850, 420, "");
 
-        // Subtab 1: Change PIN1
-        let tab_change_pin1 = Group::new(25, 210, 870, 435, "Change PIN1 (Auth)\t");
-        let mut p1_note = Frame::new(
-            40,
-            220,
-            840,
-            25,
-            "PIN1 is used for identity verification and service logins (4 to 12 digits).",
-        );
-        p1_note.set_align(Align::Left | Align::Inside);
+        // Subtab 1: Change PIN 1
+        let mut tab_change_pin1 = Group::new(35, 234, 850, 390, "Change PIN 1   ");
+        tab_change_pin1.set_frame(FrameType::RFlatBox);
+        tab_change_pin1.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut cur_p1_in = SecretInput::new(250, 255, 250, 30, "Current PIN1:");
-        cur_p1_in.set_align(Align::Left);
-        let mut new_p1_in = SecretInput::new(250, 295, 250, 30, "New PIN1 (4-12 digits):");
-        new_p1_in.set_align(Align::Left);
-        let mut conf_p1_in = SecretInput::new(250, 335, 250, 30, "Confirm New PIN1:");
-        conf_p1_in.set_align(Align::Left);
+        let mut l1 = Frame::new(120, 265, 150, 32, "Current PIN 1:");
+        l1.set_align(Align::Right | Align::Inside);
+        let cur_p1_in = SecretInput::new(285, 265, 260, 32, "");
 
-        let mut change_pin1_btn = Button::new(250, 380, 180, 35, "Change PIN1");
+        let mut l2 = Frame::new(120, 310, 150, 32, "New PIN 1:");
+        l2.set_align(Align::Right | Align::Inside);
+        let new_p1_in = SecretInput::new(285, 310, 260, 32, "");
+
+        let mut l3 = Frame::new(120, 355, 150, 32, "Confirm PIN 1:");
+        l3.set_align(Align::Right | Align::Inside);
+        let conf_p1_in = SecretInput::new(285, 355, 260, 32, "");
+
+        let mut change_pin1_btn = Button::new(285, 405, 180, 36, "Change PIN 1");
+        change_pin1_btn.set_color(Color::from_rgb(0, 122, 255));
+        change_pin1_btn.set_label_color(Color::from_rgb(255, 255, 255));
+        change_pin1_btn.set_label_font(Font::HelveticaBold);
         tab_change_pin1.end();
 
-        // Subtab 2: Change PIN2
-        let tab_change_pin2 = Group::new(25, 210, 870, 435, "Change PIN2 (Signing)\t");
-        let mut p2_note = Frame::new(
-            40,
-            220,
-            840,
-            25,
-            "PIN2 is used for legally binding digital signatures (6 to 12 digits).",
-        );
-        p2_note.set_align(Align::Left | Align::Inside);
+        // Subtab 2: Change PIN 2
+        let mut tab_change_pin2 = Group::new(35, 234, 850, 390, "Change PIN 2   ");
+        tab_change_pin2.set_frame(FrameType::RFlatBox);
+        tab_change_pin2.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut cur_p2_in = SecretInput::new(250, 255, 250, 30, "Current PIN2:");
-        cur_p2_in.set_align(Align::Left);
-        let mut new_p2_in = SecretInput::new(250, 295, 250, 30, "New PIN2 (6-12 digits):");
-        new_p2_in.set_align(Align::Left);
-        let mut conf_p2_in = SecretInput::new(250, 335, 250, 30, "Confirm New PIN2:");
-        conf_p2_in.set_align(Align::Left);
+        let mut l1_p2 = Frame::new(120, 265, 150, 32, "Current PIN 2:");
+        l1_p2.set_align(Align::Right | Align::Inside);
+        let cur_p2_in = SecretInput::new(285, 265, 260, 32, "");
 
-        let mut change_pin2_btn = Button::new(250, 380, 180, 35, "Change PIN2");
+        let mut l2_p2 = Frame::new(120, 310, 150, 32, "New PIN 2:");
+        l2_p2.set_align(Align::Right | Align::Inside);
+        let new_p2_in = SecretInput::new(285, 310, 260, 32, "");
+
+        let mut l3_p2 = Frame::new(120, 355, 150, 32, "Confirm PIN 2:");
+        l3_p2.set_align(Align::Right | Align::Inside);
+        let conf_p2_in = SecretInput::new(285, 355, 260, 32, "");
+
+        let mut change_pin2_btn = Button::new(285, 405, 180, 36, "Change PIN 2");
+        change_pin2_btn.set_color(Color::from_rgb(0, 122, 255));
+        change_pin2_btn.set_label_color(Color::from_rgb(255, 255, 255));
+        change_pin2_btn.set_label_font(Font::HelveticaBold);
         tab_change_pin2.end();
 
-        // Subtab 3: Reactivate PIN (PUK)
-        let tab_reactivate = Group::new(25, 210, 870, 435, "Reactivate PIN (PUK)\t");
-        let mut react_note = Frame::new(
-            40,
-            220,
-            840,
-            25,
-            "If PIN1 or PIN2 is blocked, enter your PUK code to set a new PIN.",
-        );
-        react_note.set_align(Align::Left | Align::Inside);
+        // Subtab 3: Unblock PIN
+        let mut tab_reactivate = Group::new(35, 234, 850, 390, "Unblock PIN   ");
+        tab_reactivate.set_frame(FrameType::RFlatBox);
+        tab_reactivate.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut react_slot_choice = Choice::new(250, 255, 250, 30, "PIN to Reactivate:");
-        react_slot_choice.set_align(Align::Left);
-        react_slot_choice.add_choice("PIN1 (Authentication)|PIN2 (Signing)");
+        let mut l_slot = Frame::new(120, 260, 150, 32, "PIN to Unblock:");
+        l_slot.set_align(Align::Right | Align::Inside);
+        let mut react_slot_choice = Choice::new(285, 260, 260, 32, "");
+        react_slot_choice.add_choice("PIN 1 (Authentication)|PIN 2 (Signing)");
         react_slot_choice.set_value(0);
 
-        let mut puk_in = SecretInput::new(250, 295, 250, 30, "PUK Code (8 digits):");
-        puk_in.set_align(Align::Left);
-        let mut react_new_pin = SecretInput::new(250, 335, 250, 30, "New PIN:");
-        react_new_pin.set_align(Align::Left);
-        let mut react_conf_pin = SecretInput::new(250, 375, 250, 30, "Confirm New PIN:");
-        react_conf_pin.set_align(Align::Left);
+        let mut l_puk = Frame::new(120, 300, 150, 32, "PUK Code:");
+        l_puk.set_align(Align::Right | Align::Inside);
+        let puk_in = SecretInput::new(285, 300, 260, 32, "");
 
-        let mut reactivate_btn = Button::new(250, 420, 180, 35, "Reactivate PIN");
+        let mut l_rnew = Frame::new(120, 340, 150, 32, "New PIN:");
+        l_rnew.set_align(Align::Right | Align::Inside);
+        let react_new_pin = SecretInput::new(285, 340, 260, 32, "");
+
+        let mut l_rconf = Frame::new(120, 380, 150, 32, "Confirm New PIN:");
+        l_rconf.set_align(Align::Right | Align::Inside);
+        let react_conf_pin = SecretInput::new(285, 380, 260, 32, "");
+
+        let mut reactivate_btn = Button::new(285, 428, 180, 36, "Unblock PIN");
+        reactivate_btn.set_color(Color::from_rgb(0, 122, 255));
+        reactivate_btn.set_label_color(Color::from_rgb(255, 255, 255));
+        reactivate_btn.set_label_font(Font::HelveticaBold);
         tab_reactivate.end();
 
-        // Subtab 4: First-Time Card Activation
-        let tab_activate = Group::new(25, 210, 870, 435, "Activate New Card\t");
-        let mut act_note = Frame::new(
-            40,
-            220,
-            840,
-            25,
-            "Enter the factory activation code received with your card to set initial PINs.",
-        );
-        act_note.set_align(Align::Left | Align::Inside);
+        // Subtab 4: First-Time Setup
+        let mut tab_activate = Group::new(35, 234, 850, 390, "First-Time Setup   ");
+        tab_activate.set_frame(FrameType::RFlatBox);
+        tab_activate.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut act_code_in = SecretInput::new(260, 255, 250, 30, "Activation Code:");
-        act_code_in.set_align(Align::Left);
-        let mut act_p1_in = SecretInput::new(260, 295, 250, 30, "New PIN1 (4-12 digits):");
-        act_p1_in.set_align(Align::Left);
-        let mut act_p1_conf = SecretInput::new(260, 335, 250, 30, "Confirm PIN1:");
-        act_p1_conf.set_align(Align::Left);
-        let mut act_p2_in = SecretInput::new(260, 375, 250, 30, "New PIN2 (6-12 digits):");
-        act_p2_in.set_align(Align::Left);
-        let mut act_p2_conf = SecretInput::new(260, 415, 250, 30, "Confirm PIN2:");
-        act_p2_conf.set_align(Align::Left);
+        let mut l_acode = Frame::new(120, 250, 150, 30, "Activation Code:");
+        l_acode.set_align(Align::Right | Align::Inside);
+        let act_code_in = SecretInput::new(285, 250, 260, 30, "");
 
-        let mut activate_btn = Button::new(260, 460, 180, 35, "Activate Card");
+        let mut l_ap1 = Frame::new(120, 290, 150, 30, "New PIN 1:");
+        l_ap1.set_align(Align::Right | Align::Inside);
+        let act_p1_in = SecretInput::new(285, 290, 260, 30, "");
+
+        let mut l_ap1c = Frame::new(120, 330, 150, 30, "Confirm PIN 1:");
+        l_ap1c.set_align(Align::Right | Align::Inside);
+        let act_p1_conf = SecretInput::new(285, 330, 260, 30, "");
+
+        let mut l_ap2 = Frame::new(120, 370, 150, 30, "New PIN 2:");
+        l_ap2.set_align(Align::Right | Align::Inside);
+        let act_p2_in = SecretInput::new(285, 370, 260, 30, "");
+
+        let mut l_ap2c = Frame::new(120, 410, 150, 30, "Confirm PIN 2:");
+        l_ap2c.set_align(Align::Right | Align::Inside);
+        let act_p2_conf = SecretInput::new(285, 410, 260, 30, "");
+
+        let mut activate_btn = Button::new(285, 455, 180, 36, "Activate Card");
+        activate_btn.set_color(Color::from_rgb(0, 122, 255));
+        activate_btn.set_label_color(Color::from_rgb(255, 255, 255));
+        activate_btn.set_label_font(Font::HelveticaBold);
         tab_activate.end();
 
         pin_subtabs.end();
         pin_tab.end();
 
         // ---------------------------------------------------------------------
-        // TAB 2: Identity & PACE (Portrait & Signature)
+        // TAB 2: Identity (Portrait & Signature)
         // ---------------------------------------------------------------------
-        let pace_tab = Group::new(15, 85, 890, 565, "Identity & PACE\t");
+        let pace_tab = Group::new(20, 88, 880, 550, "Identity   ");
 
-        let mut pace_bar = Group::new(25, 95, 870, 45, "");
-        pace_bar.set_frame(FrameType::EngravedBox);
-        let mut can_label = Frame::new(35, 102, 180, 30, "Card Access Number (CAN):");
+        // CAN Bar
+        let mut can_bar = Group::new(35, 98, 850, 44, "");
+        can_bar.set_frame(FrameType::RFlatBox);
+        can_bar.set_color(Color::from_rgb(255, 255, 255));
+
+        let mut can_label = Frame::new(50, 105, 210, 30, "Card Access Number (CAN):");
         can_label.set_align(Align::Left | Align::Inside);
-        let mut can_input = Input::new(220, 102, 100, 30, "");
+        let mut can_input = Input::new(265, 105, 90, 30, "");
         can_input.set_maximum_size(6);
-        let mut read_images_btn = Button::new(330, 102, 160, 30, "Read Card Data");
-        let mut can_hint = Frame::new(
-            505,
-            102,
-            380,
-            30,
-            "6 digits printed on the front of your card.",
-        );
+
+        let mut read_images_btn = Button::new(370, 105, 140, 30, "Load Photos");
+        read_images_btn.set_color(Color::from_rgb(0, 122, 255));
+        read_images_btn.set_label_color(Color::from_rgb(255, 255, 255));
+        read_images_btn.set_label_font(Font::HelveticaBold);
+
+        let mut can_hint = Frame::new(525, 105, 340, 30, "6 digits on front of card");
+        can_hint.set_label_size(12);
+        can_hint.set_label_color(Color::from_rgb(108, 117, 125));
         can_hint.set_align(Align::Left | Align::Inside);
-        pace_bar.end();
+        can_bar.end();
 
-        // Portrait frame
-        let mut p_title = Frame::new(50, 150, 350, 25, "Official Portrait (ICAO eMRTD DG2)");
-        p_title.set_align(Align::Center | Align::Inside);
-        let mut portrait_frame = Frame::new(75, 180, 300, 390, "No image loaded");
-        portrait_frame.set_frame(FrameType::EngravedBox);
-        let copy_portrait_btn = Button::new(100, 580, 120, 30, "Copy Image");
-        let save_portrait_btn = Button::new(230, 580, 120, 30, "Save As...");
+        // Photo Card
+        let mut photo_card = Group::new(35, 152, 370, 470, "");
+        photo_card.set_frame(FrameType::RFlatBox);
+        photo_card.set_color(Color::from_rgb(255, 255, 255));
 
-        // Signature frame
-        let mut s_title = Frame::new(500, 150, 350, 25, "Cardholder Signature (DG7)");
-        s_title.set_align(Align::Center | Align::Inside);
-        let mut signature_frame = Frame::new(500, 180, 350, 180, "No signature loaded");
-        signature_frame.set_frame(FrameType::EngravedBox);
-        let copy_sig_btn = Button::new(530, 375, 140, 30, "Copy Signature");
-        let save_sig_btn = Button::new(685, 375, 140, 30, "Save As...");
+        let mut p_title = Frame::new(50, 160, 340, 24, "Official Photo");
+        p_title.set_label_font(Font::HelveticaBold);
+        p_title.set_label_size(14);
+        p_title.set_align(Align::Left | Align::Inside);
 
-        let mut pace_info = Frame::new(
-            500,
-            425,
-            350,
-            185,
-            "Protected by PACE (Password Authenticated\nConnection Establishment) with EAC1.\n\nBiometric portrait and signature data are read\nsecurely using PACE-ECDH key agreement.",
+        let mut portrait_frame = Frame::new(60, 192, 320, 370, "No image loaded");
+        portrait_frame.set_frame(FrameType::ThinDownBox);
+
+        let copy_portrait_btn = Button::new(85, 575, 120, 32, "Copy Photo");
+        let save_portrait_btn = Button::new(225, 575, 120, 32, "Save As...");
+        photo_card.end();
+
+        // Signature Card
+        let mut sig_card = Group::new(420, 152, 465, 265, "");
+        sig_card.set_frame(FrameType::RFlatBox);
+        sig_card.set_color(Color::from_rgb(255, 255, 255));
+
+        let mut s_title = Frame::new(435, 160, 435, 24, "Cardholder Signature");
+        s_title.set_label_font(Font::HelveticaBold);
+        s_title.set_label_size(14);
+        s_title.set_align(Align::Left | Align::Inside);
+
+        let mut signature_frame = Frame::new(435, 192, 435, 165, "No signature loaded");
+        signature_frame.set_frame(FrameType::ThinDownBox);
+
+        let copy_sig_btn = Button::new(490, 372, 140, 32, "Copy Signature");
+        let save_sig_btn = Button::new(650, 372, 140, 32, "Save As...");
+        sig_card.end();
+
+        // Security Privacy Card
+        let mut sec_card = Group::new(420, 430, 465, 192, "");
+        sec_card.set_frame(FrameType::RFlatBox);
+        sec_card.set_color(Color::from_rgb(255, 255, 255));
+
+        let mut sec_title = Frame::new(435, 442, 435, 24, "Security & Privacy");
+        sec_title.set_label_font(Font::HelveticaBold);
+        sec_title.set_label_size(14);
+        sec_title.set_align(Align::Left | Align::Inside);
+
+        let mut sec_text = Frame::new(
+            435,
+            475,
+            435,
+            60,
+            "Biometric data is read directly from your smart card using\nPACE-ECDH encryption. Photos are never stored remotely.",
         );
-        pace_info.set_frame(FrameType::EngravedBox);
-        pace_info.set_align(Align::Center | Align::Inside);
+        sec_text.set_label_size(12);
+        sec_text.set_label_color(Color::from_rgb(108, 117, 125));
+        sec_text.set_align(Align::Left | Align::Inside);
+        sec_card.end();
 
         pace_tab.end();
 
         // ---------------------------------------------------------------------
         // TAB 3: Sign Documents
         // ---------------------------------------------------------------------
-        let sign_tab = Group::new(15, 85, 890, 565, "Sign Documents\t");
+        let sign_tab = Group::new(20, 88, 880, 550, "Sign   ");
 
-        let mut queue_label = Frame::new(35, 95, 200, 25, "Queued Documents:");
+        // Document Queue Card
+        let mut doc_card = Group::new(35, 98, 495, 525, "");
+        doc_card.set_frame(FrameType::RFlatBox);
+        doc_card.set_color(Color::from_rgb(255, 255, 255));
+
+        let mut queue_label = Frame::new(50, 108, 465, 24, "Documents to Sign");
+        queue_label.set_label_font(Font::HelveticaBold);
+        queue_label.set_label_size(14);
         queue_label.set_align(Align::Left | Align::Inside);
 
-        let doc_browser = HoldBrowser::new(35, 120, 520, 280, "");
-        let mut add_doc_btn = Button::new(35, 410, 150, 30, "Add Files...");
-        let mut remove_doc_btn = Button::new(195, 410, 150, 30, "Remove Selected");
-        let mut clear_docs_btn = Button::new(355, 410, 120, 30, "Clear List");
+        let doc_browser = HoldBrowser::new(50, 138, 465, 335, "");
 
-        let mut sign_settings = Group::new(575, 100, 320, 440, "");
-        sign_settings.set_frame(FrameType::EngravedBox);
+        let mut add_doc_btn = Button::new(50, 485, 130, 32, "Add Files...");
+        let mut remove_doc_btn = Button::new(190, 485, 140, 32, "Remove Selected");
+        let mut clear_docs_btn = Button::new(340, 485, 100, 32, "Clear List");
 
-        let mut fmt_label = Frame::new(590, 110, 200, 25, "Signature Format:");
+        let mut sign_result_frame = Frame::new(50, 530, 465, 80, "");
+        sign_result_frame.set_frame(FrameType::ThinDownBox);
+        sign_result_frame.set_align(Align::Left | Align::Inside);
+        doc_card.end();
+
+        // Signing Options Card
+        let mut sign_settings = Group::new(545, 98, 340, 525, "");
+        sign_settings.set_frame(FrameType::RFlatBox);
+        sign_settings.set_color(Color::from_rgb(255, 255, 255));
+
+        let mut opt_title = Frame::new(560, 108, 310, 24, "Signature Options");
+        opt_title.set_label_font(Font::HelveticaBold);
+        opt_title.set_label_size(14);
+        opt_title.set_align(Align::Left | Align::Inside);
+
+        let mut fmt_label = Frame::new(560, 145, 310, 20, "Format:");
         fmt_label.set_align(Align::Left | Align::Inside);
 
-        let mut format_pades = RadioRoundButton::new(590, 135, 280, 25, "PAdES (Embedded in PDF)");
+        let mut format_pades = RadioRoundButton::new(560, 170, 290, 25, "PDF Document (PAdES)");
         format_pades.set_value(true);
-        let format_asice =
-            RadioRoundButton::new(590, 165, 280, 25, "ASiC-E (Associated Container)");
+        let format_asice = RadioRoundButton::new(560, 200, 290, 25, "BDOC Container (ASiC-E)");
 
-        let mut tsa_label = Frame::new(590, 205, 200, 25, "Timestamp Authority:");
+        let mut tsa_label = Frame::new(560, 240, 310, 20, "Timestamp Authority:");
         tsa_label.set_align(Align::Left | Align::Inside);
-        let mut tsa_check = CheckButton::new(590, 230, 280, 25, "Include Qualified Timestamp");
+        let mut tsa_check = CheckButton::new(560, 265, 290, 25, "Include Qualified Timestamp");
         tsa_check.set_value(true);
-        let mut tsa_url_input = Input::new(590, 260, 290, 28, "");
+        let mut tsa_url_input = Input::new(560, 295, 310, 28, "");
         tsa_url_input.set_value("https://timestamp.sectigo.com/qualified");
 
-        let mut p2_label = Frame::new(590, 305, 200, 25, "PIN2 (Signing PIN):");
+        let mut p2_label = Frame::new(560, 345, 310, 20, "Signing PIN (PIN 2):");
         p2_label.set_align(Align::Left | Align::Inside);
-        let sign_pin2_input = SecretInput::new(590, 330, 290, 30, "");
+        let sign_pin2_input = SecretInput::new(560, 370, 310, 32, "");
 
-        let mut sign_btn = Button::new(590, 375, 290, 40, "Sign Documents");
-
-        let mut sign_result_frame = Frame::new(35, 460, 520, 80, "");
-        sign_result_frame.set_frame(FrameType::EngravedBox);
-        sign_result_frame.set_align(Align::Left | Align::Inside);
-
+        let mut sign_btn = Button::new(560, 425, 310, 42, "Sign Documents");
+        sign_btn.set_color(Color::from_rgb(0, 122, 255));
+        sign_btn.set_label_color(Color::from_rgb(255, 255, 255));
+        sign_btn.set_label_font(Font::HelveticaBold);
+        sign_btn.set_label_size(14);
         sign_settings.end();
+
         sign_tab.end();
 
         // ---------------------------------------------------------------------
-        // TAB 4: Phone Pairing (RAPP / CPace PAKE)
+        // TAB 4: Mobile Reader (RAPP / CPace PAKE)
         // ---------------------------------------------------------------------
-        let rapp_tab = Group::new(15, 85, 890, 565, "Phone Pairing (RAPP)\t");
+        let rapp_tab = Group::new(20, 88, 880, 550, "Mobile Reader   ");
 
-        let mut rapp_desc = Frame::new(
-            40,
-            95,
-            830,
-            40,
-            "Pair your smartphone running RefineID Authenticator using secure CPace PAKE (RFC 9383).\nAllows authorized mobile apps to perform signatures and logins using this smart card.",
+        // Header Description Card
+        let mut desc_card = Group::new(35, 98, 850, 65, "");
+        desc_card.set_frame(FrameType::RFlatBox);
+        desc_card.set_color(Color::from_rgb(255, 255, 255));
+
+        let mut r_title = Frame::new(50, 106, 820, 24, "Use this card on your mobile phone");
+        r_title.set_label_font(Font::HelveticaBold);
+        r_title.set_label_size(15);
+        r_title.set_align(Align::Left | Align::Inside);
+
+        let mut r_sub = Frame::new(
+            50,
+            132,
+            820,
+            20,
+            "Open RefineID Authenticator on your phone to sign and log in securely.",
         );
-        rapp_desc.set_align(Align::Left | Align::Inside);
+        r_sub.set_label_size(12);
+        r_sub.set_label_color(Color::from_rgb(108, 117, 125));
+        r_sub.set_align(Align::Left | Align::Inside);
+        desc_card.end();
 
-        let mut start_pair_btn = Button::new(60, 150, 180, 35, "Start New Pairing");
-        let mut cancel_pair_btn = Button::new(260, 150, 140, 35, "Cancel");
+        // Controls Card
+        let mut ctrl_card = Group::new(35, 175, 385, 445, "");
+        ctrl_card.set_frame(FrameType::RFlatBox);
+        ctrl_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut pcode_lbl = Frame::new(60, 205, 340, 25, "Pairing Verification Code:");
+        let mut start_pair_btn = Button::new(55, 195, 170, 36, "Start Pairing");
+        start_pair_btn.set_color(Color::from_rgb(0, 122, 255));
+        start_pair_btn.set_label_color(Color::from_rgb(255, 255, 255));
+        start_pair_btn.set_label_font(Font::HelveticaBold);
+
+        let mut cancel_pair_btn = Button::new(240, 195, 110, 36, "Cancel");
+
+        let mut pcode_lbl = Frame::new(55, 250, 340, 22, "Verification Code:");
+        pcode_lbl.set_label_font(Font::HelveticaBold);
         pcode_lbl.set_align(Align::Left | Align::Inside);
 
-        let mut pair_code_frame = Frame::new(60, 235, 340, 65, "---   ---");
-        pair_code_frame.set_frame(FrameType::EngravedBox);
+        let mut pair_code_frame = Frame::new(55, 280, 345, 65, "---   ---");
+        pair_code_frame.set_frame(FrameType::ThinDownBox);
         pair_code_frame.set_label_font(Font::CourierBold);
         pair_code_frame.set_label_size(28);
 
-        let mut pair_status_frame = Frame::new(60, 320, 340, 50, "Status: Idle");
-        pair_status_frame.set_frame(FrameType::EngravedBox);
+        let mut pair_status_frame = Frame::new(55, 365, 345, 45, "Status: Idle");
+        pair_status_frame.set_frame(FrameType::ThinDownBox);
         pair_status_frame.set_align(Align::Center | Align::Inside);
+        ctrl_card.end();
+
+        // QR Code Card
+        let mut qr_card = Group::new(435, 175, 450, 445, "");
+        qr_card.set_frame(FrameType::RFlatBox);
+        qr_card.set_color(Color::from_rgb(255, 255, 255));
 
         let mut qr_frame = Frame::new(
-            450,
-            150,
-            380,
-            380,
+            465,
+            200,
+            390,
+            390,
             "QR Code will appear when pairing starts",
         );
-        qr_frame.set_frame(FrameType::EngravedBox);
+        qr_frame.set_frame(FrameType::ThinDownBox);
         qr_frame.set_align(Align::Center | Align::Inside);
+        qr_card.end();
 
         rapp_tab.end();
         tabs.end();
 
         // Bottom status bar
-        let mut status_frame = Frame::new(15, 665, 890, 25, "Initializing RefineID...");
-        status_frame.set_frame(FrameType::EngravedBox);
+        let mut status_frame = Frame::new(20, 642, 880, 24, "Initializing RefineID...");
         status_frame.set_align(Align::Left | Align::Inside);
+        status_frame.set_label_size(12);
+        status_frame.set_label_color(Color::from_rgb(108, 117, 125));
 
         window.end();
 
@@ -713,6 +835,8 @@ impl FltkDriver {
             window,
             card_choice,
             card_status_badge,
+            holder_name_frame,
+            holder_sub_frame,
             serial_frame,
             pin1_status_frame,
             pin2_status_frame,
@@ -961,44 +1085,73 @@ impl UiDriver for FltkDriver {
             widgets.card_choice.set_value(idx as i32);
         }
 
-        // Top bar: Card presence badge
+        // Top bar: Card presence badge & Hero Card
         if state.cards.is_empty() {
-            widgets.card_status_badge.set_label("No Card Detected");
+            widgets.card_status_badge.set_label("○ No Card");
+            widgets
+                .card_status_badge
+                .set_color(Color::from_rgb(238, 240, 242));
             widgets
                 .card_status_badge
                 .set_label_color(Color::from_rgb(120, 120, 120));
+
+            widgets.holder_name_frame.set_label("No Card Detected");
+            widgets
+                .holder_sub_frame
+                .set_label("Insert your smart card into the reader");
+            widgets.serial_frame.set_label("");
         } else if state.busy {
-            widgets.card_status_badge.set_label("Processing...");
+            widgets.card_status_badge.set_label("◌ Reading...");
             widgets
                 .card_status_badge
-                .set_label_color(Color::from_rgb(200, 150, 0));
+                .set_color(Color::from_rgb(254, 247, 224));
+            widgets
+                .card_status_badge
+                .set_label_color(Color::from_rgb(180, 100, 0));
+
+            if let Some(card) = state.selected_card.and_then(|i| state.cards.get(i)) {
+                widgets.holder_name_frame.set_label(&card.display_name());
+                widgets
+                    .holder_sub_frame
+                    .set_label("Finnish Identity Card (FINEID)");
+            }
         } else {
-            widgets.card_status_badge.set_label("Card Ready");
+            widgets.card_status_badge.set_label("● Card Ready");
             widgets
                 .card_status_badge
-                .set_label_color(Color::from_rgb(0, 150, 0));
+                .set_color(Color::from_rgb(230, 244, 234));
+            widgets
+                .card_status_badge
+                .set_label_color(Color::from_rgb(46, 125, 50));
+
+            if let Some(card) = state.selected_card.and_then(|i| state.cards.get(i)) {
+                widgets.holder_name_frame.set_label(&card.display_name());
+                widgets
+                    .holder_sub_frame
+                    .set_label("Finnish Identity Card (FINEID)");
+                widgets.serial_frame.set_label(&format!(
+                    "Card ID: {}",
+                    state.card_serial.as_deref().unwrap_or("—")
+                ));
+            }
         }
+        widgets.card_status_badge.redraw();
 
-        // Tab 1: Card & PIN Status
-        widgets.serial_frame.set_label(&format!(
-            "Card Serial: {}",
-            state.card_serial.as_deref().unwrap_or("N/A")
-        ));
-
+        // Tab 1: PIN Status
         let p1_text = match state.pin1_status {
             Some(PinStatus::Remaining(retries)) => {
                 let count = retries.get();
                 if retries.is_exhausted() {
-                    "PIN1 (Authentication): BLOCKED".to_string()
+                    "Authentication PIN (PIN 1):  BLOCKED".to_string()
                 } else {
-                    format!("PIN1 (Authentication): Valid ({count} retries left)")
+                    format!("Authentication PIN (PIN 1):  Ready ({count} tries left)")
                 }
             }
-            Some(PinStatus::Verified) => "PIN1 (Authentication): Verified".to_string(),
-            Some(PinStatus::Locked) => "PIN1 (Authentication): BLOCKED".to_string(),
-            Some(PinStatus::NoInfo) => "PIN1 (Authentication): No retry info".to_string(),
-            Some(PinStatus::Other(sw)) => format!("PIN1 (Authentication): Status 0x{sw:04X}"),
-            None => "PIN1 (Authentication): Not Inspected".to_string(),
+            Some(PinStatus::Verified) => "Authentication PIN (PIN 1):  Verified".to_string(),
+            Some(PinStatus::Locked) => "Authentication PIN (PIN 1):  BLOCKED".to_string(),
+            Some(PinStatus::NoInfo) => "Authentication PIN (PIN 1):  No retry info".to_string(),
+            Some(PinStatus::Other(sw)) => format!("Authentication PIN (PIN 1):  Status 0x{sw:04X}"),
+            None => "Authentication PIN (PIN 1):  Not Inspected".to_string(),
         };
         widgets.pin1_status_frame.set_label(&p1_text);
 
@@ -1006,16 +1159,16 @@ impl UiDriver for FltkDriver {
             Some(PinStatus::Remaining(retries)) => {
                 let count = retries.get();
                 if retries.is_exhausted() {
-                    "PIN2 (Signing): BLOCKED".to_string()
+                    "Signing PIN (PIN 2):         BLOCKED".to_string()
                 } else {
-                    format!("PIN2 (Signing): Valid ({count} retries left)")
+                    format!("Signing PIN (PIN 2):         Ready ({count} tries left)")
                 }
             }
-            Some(PinStatus::Verified) => "PIN2 (Signing): Verified".to_string(),
-            Some(PinStatus::Locked) => "PIN2 (Signing): BLOCKED".to_string(),
-            Some(PinStatus::NoInfo) => "PIN2 (Signing): No retry info".to_string(),
-            Some(PinStatus::Other(sw)) => format!("PIN2 (Signing): Status 0x{sw:04X}"),
-            None => "PIN2 (Signing): Not Inspected".to_string(),
+            Some(PinStatus::Verified) => "Signing PIN (PIN 2):         Verified".to_string(),
+            Some(PinStatus::Locked) => "Signing PIN (PIN 2):         BLOCKED".to_string(),
+            Some(PinStatus::NoInfo) => "Signing PIN (PIN 2):         No retry info".to_string(),
+            Some(PinStatus::Other(sw)) => format!("Signing PIN (PIN 2):         Status 0x{sw:04X}"),
+            None => "Signing PIN (PIN 2):         Not Inspected".to_string(),
         };
         widgets.pin2_status_frame.set_label(&p2_text);
 
@@ -1023,16 +1176,16 @@ impl UiDriver for FltkDriver {
             Some(PukStatus::Remaining(retries)) => {
                 let count = retries.get();
                 if retries.is_exhausted() {
-                    "PUK: BLOCKED".to_string()
+                    "PUK Code:                    BLOCKED".to_string()
                 } else {
-                    format!("PUK: Valid ({count} retries left)")
+                    format!("PUK Code:                    Ready ({count} tries left)")
                 }
             }
-            Some(PukStatus::Locked) => "PUK: BLOCKED".to_string(),
-            Some(PukStatus::Invalidated) => "PUK: Invalidated".to_string(),
-            Some(PukStatus::NoInfo) => "PUK: No retry info".to_string(),
-            Some(PukStatus::Other(sw)) => format!("PUK: Status 0x{sw:04X}"),
-            None => "PUK: Unknown".to_string(),
+            Some(PukStatus::Locked) => "PUK Code:                    BLOCKED".to_string(),
+            Some(PukStatus::Invalidated) => "PUK Code:                    Invalidated".to_string(),
+            Some(PukStatus::NoInfo) => "PUK Code:                    No retry info".to_string(),
+            Some(PukStatus::Other(sw)) => format!("PUK Code:                    Status 0x{sw:04X}"),
+            None => "PUK Code:                    Unknown".to_string(),
         };
         widgets.puk_status_frame.set_label(&puk_text);
 
@@ -1070,7 +1223,7 @@ impl UiDriver for FltkDriver {
                 .expect("current portrait write lock") = state.portrait.clone();
 
             if let Some(ref buf) = state.portrait {
-                if let Some(img) = create_fitted_image(buf, 290, 380) {
+                if let Some(img) = create_fitted_image(buf, 310, 360) {
                     widgets.portrait_frame.set_label("");
                     widgets.portrait_frame.set_image(Some(img));
                 }
@@ -1093,7 +1246,7 @@ impl UiDriver for FltkDriver {
                 .expect("current signature write lock") = state.signature.clone();
 
             if let Some(ref buf) = state.signature {
-                if let Some(img) = create_fitted_image(buf, 340, 170) {
+                if let Some(img) = create_fitted_image(buf, 420, 150) {
                     widgets.signature_frame.set_label("");
                     widgets.signature_frame.set_image(Some(img));
                 }

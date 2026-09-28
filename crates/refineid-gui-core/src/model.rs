@@ -42,23 +42,34 @@ impl ManagedCard {
         self.report.identity.person_string()
     }
 
+    /// Clean cardholder display name (e.g. "Petri Koistinen").
+    pub fn display_name(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(ref f) = self.report.identity.first_name {
+            parts.push(f.as_str());
+        }
+        for g in self.report.identity.iter_given_names().skip(1) {
+            parts.push(g);
+        }
+        if let Some(ref s) = self.report.identity.surname {
+            parts.push(s.as_str());
+        }
+        if parts.is_empty() {
+            self.person_name()
+        } else {
+            parts.join(" ")
+        }
+    }
+
     /// Display label for card selector tabs / dropdowns.
     pub fn label(&self) -> String {
-        let model = self
-            .activation_context
-            .as_ref()
-            .map(|ctx| {
-                format!(
-                    " / {} {} v{}",
-                    ctx.model.vendor(),
-                    ctx.model.vendor_product(),
-                    ctx.model.vendor_product_version()
-                )
-            })
-            .unwrap_or_default();
-
         let reader_short = condense_reader_name(&self.report.reader);
-        format!("{} / {reader_short}{model}", self.person_name())
+        let name = self.person_name();
+        if name.is_empty() {
+            reader_short
+        } else {
+            format!("{name} ({reader_short})")
+        }
     }
 
     /// Card key for cache lookup.
