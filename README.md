@@ -18,9 +18,9 @@ things:
 - **`librefineid_pkcs11.so`** -- PKCS#11 v2.40 module (read-only,
   sign-only) for Firefox/NSS card login, and for OpenSSL / GnuTLS /
   OpenSSH through p11-kit.
-- **`refineid-gui`** -- desktop GUI (Slint): PIN activation, PIN
+- **`refineid-gui`** -- desktop GUI: PIN activation, PIN
   change, PUK unblock, viewing the card's portrait and signature
-  images, and PDF document signing.
+  images, and PDF document signing. (See [GUI Architecture](doc/gui-architecture.md)).
 
 Project stage: beta. The CLI, the PKCS#11 Firefox/NSS card login, and
 the reproducible NixOS install are proven against real FINEID
