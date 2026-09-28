@@ -1,6 +1,6 @@
 [package]
-name = "refineid-gui"
-description = "RefineID desktop application: PIN management, portrait/signature, and document signing"
+name = "refineid-gui-fltk"
+description = "FLTK presentation driver for RefineID"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,5 +13,9 @@ workspace = true
 
 [dependencies]
 refineid-gui-core = { path = "../refineid-gui-core", version = "26" }
-refineid-gui-fltk = { path = "../refineid-gui-fltk", version = "26" }
+refineid-client = { path = "../refineid-client", version = "26" }
 refineid-lib-core.workspace = true
+fltk.workspace = true
+zeroize.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+arboard = "3"

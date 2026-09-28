@@ -1,0 +1,23 @@
+[package]
+name = "refineid-gui-core"
+description = "Headless UI controller and presentation driver interface for RefineID"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+refineid-client = { path = "../refineid-client", version = "26" }
+refineid-lib-core.workspace = true
+refineid-lib-pcsc.workspace = true
+refineid-rapp.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+pdfluent-jpeg2000 = { version = "0.4", default-features = false, features = ["image", "std"] }
+qrcodegen.workspace = true
+zeroize.workspace = true
+hex.workspace = true
