@@ -10,6 +10,7 @@
   lib,
   craneLib,
   pkg-config,
+  cmake,
   # GTK apps abort without the GSettings machinery in their
   # environment (the file chooser reads org.gtk.Settings.FileChooser).
   wrapGAppsHook3,
@@ -19,14 +20,12 @@
   # GTK 3 backs the file-chooser dialog (rfd gtk3 backend); linked at
   # build time.
   gtk3,
-  # Windowing stack for the Slint (winit) GUI. The software renderer
-  # needs no GL. dlopened at runtime, so on the rpath.
+  pango,
+  cairo,
+  # Windowing stack and libraries for the GUI.
   libxkbcommon,
   wayland,
-  libx11,
-  libxcursor,
-  libxi,
-  libxrandr,
+  xorg,
 }:
 
 let
@@ -57,8 +56,10 @@ let
     # and recompiles cached dependencies for nothing.
     nativeBuildInputs = [
       pkg-config
+      cmake
       wrapGAppsHook3
     ];
+    dontUseCmakeConfigure = true;
     # Only the GUI needs the GTK wrap; leave the CLI and the PKCS#11
     # module unwrapped (wrapGApp runs in postFixup).
     dontWrapGApps = true;
@@ -66,7 +67,20 @@ let
       pcsclite
       fontconfig
       gtk3
+      pango
+      cairo
       gsettings-desktop-schemas
+      xorg.libX11
+      xorg.libXext
+      xorg.libXinerama
+      xorg.libXcursor
+      xorg.libXrender
+      xorg.libXfixes
+      xorg.libXft
+      xorg.libXi
+      xorg.libXrandr
+      libxkbcommon
+      wayland
     ];
   };
 
@@ -88,10 +102,18 @@ craneLib.buildPackage (
     runtimeLibs = lib.makeLibraryPath [
       libxkbcommon
       wayland
-      libx11
-      libxcursor
-      libxi
-      libxrandr
+      xorg.libX11
+      xorg.libXext
+      xorg.libXinerama
+      xorg.libXcursor
+      xorg.libXrender
+      xorg.libXfixes
+      xorg.libXft
+      xorg.libXi
+      xorg.libXrandr
+      pango
+      cairo
+      fontconfig
     ];
 
     postFixup = ''
