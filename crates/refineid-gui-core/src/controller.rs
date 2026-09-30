@@ -781,10 +781,18 @@ fn generate_random_pairing_code() -> u32 {
     val % 1_000_000
 }
 
+/// Route-probe target used only for local source-address selection.
+///
+/// `UdpSocket::connect` on a UDP socket sends no packets; it only makes the OS
+/// report the source address it would use toward this destination. The
+/// TEST-NET-1 documentation address (RFC 5737) is intentionally unroutable to
+/// any real host, so the probe can never contact a third party.
+const ROUTE_PROBE_ADDR: &str = "192.0.2.1:80";
+
 fn detect_local_ips() -> Vec<IpAddr> {
     let mut ips = Vec::new();
     if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
-        && socket.connect("8.8.8.8:80").is_ok()
+        && socket.connect(ROUTE_PROBE_ADDR).is_ok()
         && let Ok(addr) = socket.local_addr()
     {
         ips.push(addr.ip());
@@ -922,4 +930,26 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>) -> Vec<ManagedCard> {
     }
 
     cards
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ROUTE_PROBE_ADDR, detect_local_ips};
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn route_probe_targets_unroutable_documentation_address() {
+        let host = ROUTE_PROBE_ADDR.rsplit_once(':').expect("probe has port").0;
+        let ip: Ipv4Addr = host.parse().expect("probe host is IPv4");
+        assert_eq!(
+            ip.octets()[0..3],
+            [192, 0, 2],
+            "probe must stay in TEST-NET-1 (RFC 5737)"
+        );
+    }
+
+    #[test]
+    fn detect_local_ips_never_returns_empty() {
+        assert!(!detect_local_ips().is_empty());
+    }
 }

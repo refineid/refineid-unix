@@ -1,22 +1,54 @@
-# Debian packaging material
+# Debian & Ubuntu packaging material
 
-What a Debian package of this repository has to do beyond copying
-files. These are the parts that were learned by getting them wrong:
-a card tool on Linux fails in the daemon, the policy store and the
-loader, not in its own code.
+This directory contains the system integration assets packaged into binary
+Debian (`.deb`) packages for Debian and Ubuntu systems.
 
-There is **no `cargo-deb` metadata yet**, so nothing here builds a
-`.deb` on its own. These are the pieces a package must carry when one
-is built.
+## Packages
 
-| File | What it is for |
-| --- | --- |
-| `50-refineid-pcscd.rules` | polkit rule letting an active local-session user reach `pcscd` without a prompt. Remote inactive sessions still authenticate. Without it, every card operation raises a polkit dialog or fails outright. |
-| `policies.json` | Firefox enterprise policy registering `librefineid_pkcs11.so` as a security device, so the browser finds the card without the holder adding a module by hand. |
-| `postinst` | Reloads polkit so the rule applies without a session restart, enables `pcscd.socket`, and runs `ldconfig` so the cdylib's transitive libraries resolve when Firefox `dlopen`s it. |
-| `prerm`, `postrm` | Debian Policy 6.5 argument handling, and `ldconfig` again on removal. |
+Binary `.deb` packages are produced automatically by `script/package-deb.sh`
+(or `make package-deb`):
 
-`policies.json` names `/usr/lib/librefineid_pkcs11.so`; the crate that
-builds it is [`refineid-pkcs11`](../../crates/refineid-pkcs11/), whose
-cdylib is `librefineid_pkcs11.so`. A package that installs it anywhere
-else has to change that path here too.
+1. **`refineid-pkcs11`** (`Multi-Arch: same`):
+   - Multiarch shared library `/usr/lib/${DEB_HOST_MULTIARCH}/librefineid_pkcs11.so`
+   - PKCS#11 module symlink `/usr/lib/${DEB_HOST_MULTIARCH}/pkcs11/librefineid_pkcs11.so`
+   - Compatibility symlink `/usr/lib/librefineid_pkcs11.so`
+   - System p11-kit module `/usr/share/p11-kit/modules/refineid.module`
+   - Polkit access rule `/usr/share/polkit-1/rules.d/50-refineid-pcscd.rules`
+   - Firefox enterprise policy `/etc/firefox/policies/policies.json`
+   - Maintainer scripts (`postinst`, `postrm`, `prerm`) managing `ldconfig`, polkit reload, and `pcscd.socket` activation.
+2. **`refineid-cli`** (`Multi-Arch: foreign`):
+   - Command-line tool `/usr/bin/refineid`
+3. **`refineid-gui`**:
+   - Desktop application `/usr/bin/refineid-gui`
+   - Freedesktop launcher `/usr/share/applications/refineid.desktop`
+   - Scalable icon `/usr/share/icons/hicolor/scalable/apps/refineid.svg`
+   - Maintainer scripts triggering `update-desktop-database` and `gtk-update-icon-cache`
+4. **`refineid`** (`Architecture: all` metapackage):
+   - Metapackage pulling in CLI, PKCS#11, and GUI, with `Recommends: pcscd, libccid, pcsc-tools`.
+
+## Debian / Ubuntu Policy Compliance
+
+| Component | Policy Rule | Location in Package |
+| --- | --- | --- |
+| Shared library | Multiarch (§9.1.1) | `/usr/lib/${DEB_HOST_MULTIARCH}/librefineid_pkcs11.so` |
+| PKCS#11 module | Default module path | `/usr/lib/${DEB_HOST_MULTIARCH}/pkcs11/librefineid_pkcs11.so` |
+| p11-kit registration | Distro modules in `/usr/share` | `/usr/share/p11-kit/modules/refineid.module` |
+| Polkit rule | Distro rules in `/usr/share` | `/usr/share/polkit-1/rules.d/50-refineid-pcscd.rules` |
+| Firefox policy | Conffile in `/etc` | `/etc/firefox/policies/policies.json` |
+| Desktop & icon | Freedesktop / XDG specs | `/usr/share/applications/refineid.desktop`, `/usr/share/icons/...` |
+| Package copyright | DEP-5 format (§12.3) | `/usr/share/doc/<pkg>/copyright` |
+| Shared library dependencies | Dynamic resolution | Generated via `dpkg-shlibdeps` |
+
+## Building & Installing
+
+Build packages:
+```sh
+make package-deb
+# or: script/package-deb.sh
+```
+
+Build and install via package manager:
+```sh
+make install-deb
+# or: script/package-deb.sh --install
+```
