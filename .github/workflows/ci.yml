@@ -1,41 +1,14 @@
 name: ci
 
-on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'doc/**'
-      - 'INSTALL'
-      - 'LICENSE'
-      - '.gitignore'
-  pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'doc/**'
-      - 'INSTALL'
-      - 'LICENSE'
-      - '.gitignore'
+'on':
+  workflow_dispatch:
+  schedule:
+    - cron: '0 5 * * 1'
 
 permissions:
   contents: read
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Run the check through the flake dev shell so CI's rustfmt is
-      # byte-identical to the pinned toolchain a developer gets from
-      # `nix develop`; a version skew would flag formatting the
-      # maintainer's rustfmt considers clean. fmt parses only, so no
-      # card, reader, or system-library build is involved.
-      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
-      - run: nix develop --command cargo fmt --all --check
-
   nix-build:
     name: Nix build (${{ matrix.runner }})
     strategy:

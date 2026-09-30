@@ -47,6 +47,20 @@ See [INSTALL](INSTALL) for full installation and uninstallation instructions.
   cargo build --release --workspace
   ```
 
+## Development checks
+
+Install the repository's mandatory Git hooks once per clone:
+
+```sh
+script/install-githook.sh
+```
+
+The pre-commit hook checks formatting and the workspace; the pre-push hook
+runs the complete build, test, Clippy, and rustdoc floor. Keep the hooks
+enabled for every commit and push. GitHub's Nix workflow is an optional
+manual run plus a weekly build for both x86_64 and arm64; it complements the
+native local gates without repeating them on every push and pull request.
+
 ### Managing build cache
 
 During development, Cargo build artifacts and `rustc` incremental compilation caches can grow significantly.

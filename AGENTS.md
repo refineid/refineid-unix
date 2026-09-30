@@ -16,6 +16,12 @@
 - No Magic Codes - define everything.   
 - Commit often when compiles and lint is clean.
 - Push when feature is ready.
+- Native Git hooks are mandatory. Install them with
+  `script/install-githook.sh`; keep `core.hooksPath=script/githook` active and
+  never bypass or disable the hooks. Pre-commit checks formatting and the
+  workspace; pre-push runs the complete local build, test, Clippy, and rustdoc
+  floor. GitHub Nix builds are available manually and run weekly for both
+  x86_64 and arm64 coverage; they do not replace local hooks.
 - Verify from specifications, don't wild guess.
   `doc/references.md` indexes which one governs what.
   Cite what a source proves, and say what it does not.
