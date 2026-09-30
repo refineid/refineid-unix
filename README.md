@@ -47,6 +47,18 @@ See [INSTALL](INSTALL) for full installation and uninstallation instructions.
   cargo build --release --workspace
   ```
 
+### Managing build cache
+
+During development, Cargo build artifacts and `rustc` incremental compilation caches can grow significantly.
+
+```sh
+# Sweep unused build artifacts older than 14 days
+cargo sweep -t 14
+
+# Clean incremental compilation cache if disk space is needed
+find target -type d -name "incremental" -prune -exec rm -rf {} +
+```
+
 ## Workspace layout
 
 | Crate | Purpose |
