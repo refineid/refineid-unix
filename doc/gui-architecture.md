@@ -168,18 +168,34 @@ pub trait UiDriver: Send + 'static {
 - `pin_status: BTreeMap<PinManageSlot, PinStatus>` (retry counters, blocked flags)
 - `portrait: Option<Arc<DocumentImage>>` and `signature: Option<Arc<DocumentImage>>`
 - `signing_queue: Vec<PathBuf>`
-- `rapp_pairing: Option<RappPairingState>` (PAKE state, QR matrix, 6-digit PIN code)
+- `remote_reader_enabled: bool` (default: `false` — local PC/SC smart card reader only)
+- `rapp_pairing: Option<RappPairingState>` (PAKE state, 6-character Crockford Base32 code)
 - `busy_message: Option<String>`
 - `status_banner: Option<StatusBanner>`
 
 #### Intent Emitted by Driver (`UserIntent`)
 - `SelectCard(usize)`
+- `ToggleRemoteReader(bool)` (explicit opt-in to discover announced phone readers)
 - `ChangePin { slot: PinManageSlot, old_pin: PinBytes, new_pin: PinBytes }`
 - `ReactivatePin { puk: PukBytes, new_pin1: PinBytes, new_pin2: PinBytes }`
 - `LoadPortrait { can: PinBytes }`
 - `QueueDocuments(Vec<PathBuf>)` and `ClearDocuments`
 - `ExecuteSign { pin2: PinBytes, format: SignFormat, timestamp_config: TimestampConfig }`
 - `StartRappPairing` and `CancelRappPairing`
+
+### 4.3 Workstation UX Hygiene Contract
+
+In accordance with [RAPP Transport and Discovery Hierarchy Specification](../../refineid-core/docs/protocols/rapp-transport-and-discovery-hierarchy.md):
+1. **Local Card Reader Default**: Out of the box, `remote_reader_enabled` is strictly `false`. The controller interfaces exclusively with local smart cards via `pcscd`. No background radio polling, mDNS queries, or network sockets are active.
+2. **Explicit User Opt-In**: The GUI provides a clean toggle:
+   ```text
+   [ ] Enable Remote Phone Reader
+       Allow discovering and using your phone as a wireless card reader.
+   ```
+3. **Outbound Discovery Activation**:
+   * Enabling the toggle activates Tier 2 (BlueZ BLE scanning) and/or Tier 3 (Avahi/`systemd-resolved` mDNS browsing) to detect phones advertising `_refineid-stream._tcp.local.`.
+   * Disabling the toggle immediately shuts down discovery scanners, closes any idle outbound sockets, and purges transient device cache.
+4. **Zero Open Ports on Unix**: The desktop application operates exclusively as an outbound client. It binds zero network listening sockets and requires zero `iptables`, `nftables`, `firewalld`, or `pf` firewall rules.
 
 ---
 
