@@ -27,11 +27,13 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use refineid_lib_core::crypto::digest::Sha384;
-use refineid_lib_core::rapp::{
-    CardOperation, CardOperationResult, PairRecord, execute_operation_with_pair,
-};
 use refineid_lib_core::sign::cades::ecdsa_signature_to_cms;
 use refineid_lib_core::text::{Scheme, Uri};
+use refineid_rapp_core::ids::PairId;
+use refineid_rapp_core::operations::{
+    CardKeyProfile, CardOperation, CardOperationResult, SignatureAlgorithm as CardAlgorithm,
+};
+use refineid_rapp_core::remote::RemoteReader;
 
 use rustls::client::ResolvesClientCert;
 use rustls::pki_types::CertificateDer;
@@ -41,10 +43,13 @@ use rustls::{SignatureAlgorithm, SignatureScheme};
 
 use crate::simple_https::HttpsError;
 
+/// How long the signer browses for the paired phone.
+const REMOTE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Client certificate resolver backed by a paired RAPP remote card reader.
 #[derive(Debug)]
 pub struct RappClientCertResolver {
-    pair: PairRecord,
+    pair: PairId,
     cert_der: Vec<u8>,
     origin: String,
 }
@@ -52,7 +57,7 @@ pub struct RappClientCertResolver {
 impl RappClientCertResolver {
     /// Create a resolver for the given active pair, authentication certificate, and origin.
     #[must_use]
-    pub fn new(pair: PairRecord, cert_der: Vec<u8>, origin: String) -> Self {
+    pub fn new(pair: PairId, cert_der: Vec<u8>, origin: String) -> Self {
         Self {
             pair,
             cert_der,
@@ -69,7 +74,7 @@ impl ResolvesClientCert for RappClientCertResolver {
     ) -> Option<Arc<CertifiedKey>> {
         let cert = CertificateDer::from(self.cert_der.clone());
         let key = Arc::new(RappSigningKey {
-            pair: self.pair.clone(),
+            pair: self.pair,
             origin: self.origin.clone(),
         });
         Some(Arc::new(CertifiedKey::new(vec![cert], key)))
@@ -82,7 +87,7 @@ impl ResolvesClientCert for RappClientCertResolver {
 
 #[derive(Debug)]
 struct RappSigningKey {
-    pair: PairRecord,
+    pair: PairId,
     origin: String,
 }
 
@@ -91,7 +96,7 @@ impl SigningKey for RappSigningKey {
         for s in offered {
             if *s == SignatureScheme::ECDSA_NISTP384_SHA384 {
                 return Some(Box::new(RappSigner {
-                    pair: self.pair.clone(),
+                    pair: self.pair,
                     origin: self.origin.clone(),
                     scheme: *s,
                 }));
@@ -107,7 +112,7 @@ impl SigningKey for RappSigningKey {
 
 #[derive(Debug)]
 struct RappSigner {
-    pair: PairRecord,
+    pair: PairId,
     origin: String,
     scheme: SignatureScheme,
 }
@@ -117,14 +122,17 @@ impl Signer for RappSigner {
         let digest = Sha384::of(message);
         let op = CardOperation::BrowserAuthenticate {
             origin: self.origin.clone(),
-            key_profile: "ecdsa_p384".into(),
-            algorithm: "ecdsa_sha384".into(),
+            key_profile: CardKeyProfile::EcdsaP384,
+            algorithm: CardAlgorithm::EcdsaSha384,
             digest: digest.as_bytes().to_vec(),
         };
-        let res = execute_operation_with_pair(&self.pair, &op)
-            .map_err(|e| rustls::Error::General(format!("RAPP operation failed: {e:?}")))?;
+        let mut reader = RemoteReader::open_local()
+            .map_err(|e| rustls::Error::General(format!("RAPP reader: {e}")))?;
+        let res = reader
+            .execute(Some(self.pair), &op, REMOTE_DISCOVERY_TIMEOUT)
+            .map_err(|e| rustls::Error::General(format!("RAPP operation failed: {e}")))?;
         match res {
-            CardOperationResult::Signature { signature_bytes } => {
+            CardOperationResult::Signature(signature_bytes) => {
                 let der = ecdsa_signature_to_cms(&signature_bytes)
                     .ok_or_else(|| rustls::Error::General("DER conversion failed".into()))?;
                 Ok(der)
@@ -144,7 +152,7 @@ impl Signer for RappSigner {
 /// Returns [`HttpsError`] on network, TLS handshake, or RAPP signing errors.
 pub fn get_with_rapp_client_auth(
     url: &Uri,
-    pair: &PairRecord,
+    pair: PairId,
     cert_der: &[u8],
 ) -> Result<String, HttpsError> {
     if url.scheme() != Scheme::Https {
@@ -170,11 +178,7 @@ pub fn get_with_rapp_client_auth(
     let versions: &[&rustls::SupportedProtocolVersion] =
         &[&rustls::version::TLS13, &rustls::version::TLS12];
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let resolver = Arc::new(RappClientCertResolver::new(
-        pair.clone(),
-        cert_der.to_vec(),
-        origin,
-    ));
+    let resolver = Arc::new(RappClientCertResolver::new(pair, cert_der.to_vec(), origin));
 
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)

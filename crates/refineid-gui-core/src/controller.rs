@@ -15,14 +15,12 @@
 //! Headless controller: smart-card monitoring, PIN operations, and ceremony execution.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use qrcodegen::{QrCode, QrCodeEcc};
 use refineid_client::card_check::CardCheckReport;
 use refineid_client::card_pin::{
     ActivateOptions, ChangePinOptions, PinManageSlot, UnblockPinOptions,
@@ -34,10 +32,8 @@ use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
 use refineid_lib_core::pkcs15::CardGeneration;
-use refineid_lib_core::rapp::{
-    CardOperation, PairOfferContext, PairingOffer, RappDeviceVault, TRANSPORT_STREAM,
-    TransportCandidate, pair_requester_over_stream,
-};
+use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
+use refineid_rapp_core::remote::{RemoteError, RemoteReader};
 
 use crate::error::GuiCoreError;
 use crate::image::{RgbaImageBuffer, decode_document_image};
@@ -146,7 +142,7 @@ impl RefineIdController {
             UserIntent::SetSignFormat(format) => self.set_sign_format(format),
             UserIntent::SetTimestampConfig(config) => self.set_timestamp_config(config),
             UserIntent::SignDocuments { pin2 } => self.sign_documents(pin2),
-            UserIntent::StartPairing => self.start_pairing(),
+            UserIntent::StartPairing { code } => self.start_pairing(&code),
             UserIntent::CancelPairing => self.cancel_pairing(),
         }
     }
@@ -648,75 +644,50 @@ impl RefineIdController {
         });
     }
 
-    fn start_pairing(self: &Arc<Self>) {
-        let code = generate_random_pairing_code();
-        let code_str = format!("{code:06}");
-        let d = code_str.as_bytes();
-        let formatted_code = format!(
-            "{} {} {}   {} {} {}",
-            char::from(d[0]),
-            char::from(d[1]),
-            char::from(d[2]),
-            char::from(d[3]),
-            char::from(d[4]),
-            char::from(d[5]),
-        );
-
-        let qr_payload = format!("refineid://pair?code={code:06}");
-        let qr_modules = QrCode::encode_text(&qr_payload, QrCodeEcc::Medium)
-            .ok()
-            .map(|qr| {
-                let size = qr.size() as usize;
-                let mut matrix = vec![vec![false; size]; size];
-                for (y, row) in matrix.iter_mut().enumerate().take(size) {
-                    for (x, cell) in row.iter_mut().enumerate().take(size) {
-                        *cell = qr.get_module(x as i32, y as i32);
-                    }
-                }
-                matrix
+    /// Pairs with the phone showing `code` (RAPP v26.10.1: the phone shows
+    /// the code and this workstation types it).
+    fn start_pairing(self: &Arc<Self>, code: &str) {
+        let Some(normalized) = normalize_pairing_code(code) else {
+            self.update_state(|s| {
+                s.status_message = "That is not the code your phone shows.".into();
             });
-
+            return;
+        };
         self.update_state(|s| {
             s.pairing = Some(RappPairingState {
-                code: formatted_code,
-                status: "Listening on port 52424 for phone connection...".into(),
-                qr_modules,
+                code: format_pairing_code(&normalized),
+                status: "Looking for your phone on the local network...".into(),
+                qr_modules: None,
             });
         });
 
         let controller = Arc::clone(self);
         thread::spawn(move || {
-            let port = 52424;
-            let local_ips = detect_local_ips();
-            let endpoints: Vec<String> =
-                local_ips.iter().map(|ip| format!("{ip}:{port}")).collect();
-
-            let candidate = TransportCandidate::new_stream("stream-0", &endpoints);
-            let offer = PairingOffer::generate_numeric(code, vec![candidate.clone()]);
-            let offer_ctx = PairOfferContext {
-                offer,
-                selected_transport: TRANSPORT_STREAM.into(),
-                selected_candidate_id: "stream-0".into(),
-                transport_parameters: candidate.parameters,
-            };
-
-            let listener = match TcpListener::bind(("0.0.0.0", port)) {
-                Ok(l) => l,
+            let mut reader = match RemoteReader::open_local() {
+                Ok(reader) => reader,
                 Err(e) => {
                     controller.update_state(|s| {
                         s.pairing = None;
-                        s.status_message = format!("Pairing listener error: {e}");
+                        s.status_message = format!("Pairing store error: {e}");
                     });
                     return;
                 }
             };
-
-            let (mut stream, _peer) = match listener.accept() {
-                Ok(conn) => conn,
+            let pair = match reader.pair_with_code(&normalized, PAIRING_DISCOVERY_TIMEOUT) {
+                Ok(pair) => pair,
+                Err(RemoteError::Pairing(
+                    refineid_rapp_core::engine::PairingError::CodeMismatch,
+                )) => {
+                    controller.update_state(|s| {
+                        s.pairing = None;
+                        s.status_message = "The code does not match the one on your phone.".into();
+                    });
+                    return;
+                }
                 Err(e) => {
                     controller.update_state(|s| {
                         s.pairing = None;
-                        s.status_message = format!("Pairing connection error: {e}");
+                        s.status_message = format!("Pairing failed: {e}");
                     });
                     return;
                 }
@@ -724,39 +695,10 @@ impl RefineIdController {
 
             controller.update_state(|s| {
                 if let Some(p) = &mut s.pairing {
-                    p.status = "Connected! Running CPace PAKE handshake...".into();
+                    p.status = "Paired. Reading the authentication certificate...".into();
                 }
             });
-
-            let mut pair_record = match pair_requester_over_stream(
-                &mut stream,
-                &offer_ctx,
-                "RefineID Unix",
-                "Unix",
-            ) {
-                Ok(rec) => rec,
-                Err(e) => {
-                    controller.update_state(|s| {
-                        s.pairing = None;
-                        s.status_message = format!("Pairing handshake failed: {e}");
-                    });
-                    return;
-                }
-            };
-
-            // Read auth certificate to store in the pair record
-            let cert_op = CardOperation::ReadCertificate {
-                kind: "authentication".into(),
-            };
-            if let Ok(refineid_lib_core::rapp::CardOperationResult::Certificate {
-                der_bytes, ..
-            }) = refineid_lib_core::rapp::execute_operation_with_pair(&pair_record, &cert_op)
-            {
-                pair_record.cached_auth_cert = Some(der_bytes);
-            }
-
-            let vault = RappDeviceVault::new_default();
-            let _ = vault.save_pair(&pair_record);
+            let _ = reader.refresh_auth_cert(pair.pair_id, PAIRING_DISCOVERY_TIMEOUT);
 
             controller.update_state(|s| {
                 s.pairing = None;
@@ -774,34 +716,8 @@ impl RefineIdController {
     }
 }
 
-fn generate_random_pairing_code() -> u32 {
-    let mut bytes = [0u8; 4];
-    refineid_lib_core::rng::fill(&mut bytes).expect("CSPRNG");
-    let val = u32::from_ne_bytes(bytes);
-    val % 1_000_000
-}
-
-/// Route-probe target used only for local source-address selection.
-///
-/// `UdpSocket::connect` on a UDP socket sends no packets; it only makes the OS
-/// report the source address it would use toward this destination. The
-/// TEST-NET-1 documentation address (RFC 5737) is intentionally unroutable to
-/// any real host, so the probe can never contact a third party.
-const ROUTE_PROBE_ADDR: &str = "192.0.2.1:80";
-
-fn detect_local_ips() -> Vec<IpAddr> {
-    let mut ips = Vec::new();
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0")
-        && socket.connect(ROUTE_PROBE_ADDR).is_ok()
-        && let Ok(addr) = socket.local_addr()
-    {
-        ips.push(addr.ip());
-    }
-    if ips.is_empty() {
-        ips.push(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    }
-    ips
-}
+/// How long pairing browses for the phone showing the code.
+const PAIRING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn validate_gui_pin(pin: &PinBytes, label: &str, minimum_length: usize) -> Result<(), String> {
     let bytes = pin.as_bytes();
@@ -863,15 +779,14 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>) -> Vec<ManagedCard> {
         }
     }
 
-    // Include active paired mobile devices from RappDeviceVault
-    let vault = RappDeviceVault::new_default();
-    if let Ok(pairs) = vault.active_pairs() {
-        for pair in pairs {
-            if let Some(cached_der) = pair.cached_auth_cert
+    // Include paired phones whose authentication certificate is cached.
+    if let Ok(reader) = RemoteReader::open_local() {
+        for pair in reader.pairs().into_iter().filter(|pair| !pair.revoked) {
+            if let Some(cached_der) = pair.auth_cert
                 && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(cached_der)
             {
                 let view = owned_cert.view();
-                let dev_name = pair.display_name.unwrap_or_else(|| "Mobile Device".into());
+                let dev_name = pair.peer_display_name;
                 let reader = format!("Mobile: {dev_name}");
                 let serial = owned_cert.serial().to_string();
                 let token_info = refineid_lib_core::pkcs15::TokenInfo {
@@ -930,26 +845,4 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>) -> Vec<ManagedCard> {
     }
 
     cards
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ROUTE_PROBE_ADDR, detect_local_ips};
-    use std::net::Ipv4Addr;
-
-    #[test]
-    fn route_probe_targets_unroutable_documentation_address() {
-        let host = ROUTE_PROBE_ADDR.rsplit_once(':').expect("probe has port").0;
-        let ip: Ipv4Addr = host.parse().expect("probe host is IPv4");
-        assert_eq!(
-            ip.octets()[0..3],
-            [192, 0, 2],
-            "probe must stay in TEST-NET-1 (RFC 5737)"
-        );
-    }
-
-    #[test]
-    fn detect_local_ips_never_returns_empty() {
-        assert!(!detect_local_ips().is_empty());
-    }
 }

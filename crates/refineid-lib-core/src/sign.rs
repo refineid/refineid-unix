@@ -1073,7 +1073,7 @@ mod tests {
     /// Scripted transport that asserts each APDU matches an
     /// expected sequence and returns canned responses.
     struct Scripted {
-        steps: alloc::collections::VecDeque<(Vec<u8>, ResponseApdu)>,
+        steps: std::collections::VecDeque<(Vec<u8>, ResponseApdu)>,
     }
     impl Scripted {
         fn new(steps: Vec<(Vec<u8>, ResponseApdu)>) -> Self {

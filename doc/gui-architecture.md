@@ -1,7 +1,7 @@
 # GUI Architecture & Modernization: Modular Driver Framework
 
 - **Document Version**: `26.9.28.1`
-- **Protocol Wire Version**: `26.9.28`
+- **Protocol Wire Version**: `26.10.1`
 - **Status**: Approved Architecture & Implementation Plan
 - **Date**: 2026-09-28
 - **Applies To**: `RefineID-Unix` (Linux, NetBSD, FreeBSD, OpenBSD)
@@ -82,7 +82,7 @@ RefineID maintains a unified core repository (`refineid-core`) providing authori
 Under this modernization:
 1. **Elimination of In-Tree Duplication**: Deprecate `crates/refineid-lib-core` in `refineid-unix` in favor of consuming canonical modular crates from `refineid-core`:
    - `refineid-auth`
-   - `refineid-rapp` (CPace PAKE per RFC 9383 over Ristretto255 / Curve25519, SHA-512 Noise suites, wire format v26.9.28)
+   - `refineid-rapp` (CPace KC2 over Ristretto255, `Noise_XXpsk3` pairing and `Noise_KK` sessions with SHA-512, wire format v26.10.1), driven by the in-workspace `crates/refineid-rapp-core` requester
    - `refineid-sign` (PAdES, CAdES, ASiC-E)
    - `refineid-emrtd` (ICAO Doc 9303 LDS1 portrait and signature parsing)
    - `refineid-pcsc` and `refineid-pkcs11`
@@ -116,7 +116,7 @@ Drawing directly from HCI User Interface Management System (UIMS) literature (Ha
 │   • Background PC/SC SCardGetStatusChange listener thread   │
 │   • Weak PIN validation & policy constraints (4-12 digits)  │
 │   • Secret zeroization (ZeroizeOnDrop)                      │
-│   • RAPP CPace pairing controller (wire v26.9.28)           │
+│   • RAPP CPace pairing controller (wire v26.10.1)           │
 │   • Async signing dispatch queue                            │
 └───────────────┬─────────────────────────────▲───────────────┘
                 │                             │
@@ -203,8 +203,8 @@ In accordance with [RAPP Transport and Discovery Hierarchy Specification](../../
 
 ### Phase 1: Unify with Core & Bring in RAPP with CPace PAKE
 - Update `Cargo.toml` to depend on modular `refineid-core` components (`refineid-rapp`, `refineid-sign`, `refineid-emrtd`, `refineid-pcsc`).
-- Deprecate in-tree `crates/refineid-lib-core/src/rapp` in favor of `refineid-rapp`.
-- Standardize on CPace PAKE (RFC 9383), `Noise_XXpsk3_25519_ChaChaPoly_SHA512`, `Noise_KK_25519_ChaChaPoly_SHA512`, and wire protocol v26.9.28.
+- Replace in-tree `crates/refineid-lib-core/src/rapp` with `refineid-rapp` through `crates/refineid-rapp-core` (done).
+- Standardize on CPace KC2, `Noise_XXpsk3_25519_ChaChaPoly_SHA512`, `Noise_KK_25519_ChaChaPoly_SHA512`, and wire protocol v26.10.1: the phone shows the pairing code and the workstation types it.
 - Verify interoperability tests pass against canonical vectors.
 
 ### Phase 2: Design `refineid-gui-core` (Headless Dialogue Layer)

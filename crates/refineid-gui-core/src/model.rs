@@ -188,7 +188,7 @@ impl Default for TimestampConfig {
 /// Active RAPP phone pairing state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RappPairingState {
-    /// Numeric pairing code (formatted as "123 456").
+    /// The typed pairing code, in two-character clusters ("7K X4 M9").
     pub code: String,
     /// Human-readable status line.
     pub status: String,
@@ -339,8 +339,11 @@ pub enum UserIntent {
         /// Qualified signature PIN2 bytes.
         pin2: PinBytes,
     },
-    /// Start RAPP phone pairing.
-    StartPairing,
+    /// Pair with the phone showing this code.
+    StartPairing {
+        /// The code as the user typed it.
+        code: String,
+    },
     /// Cancel active RAPP pairing.
     CancelPairing,
 }

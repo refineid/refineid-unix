@@ -132,32 +132,42 @@ impl CardArgs {
     }
 
     fn try_remote_card_check() -> Option<std::process::ExitCode> {
-        let vault = refineid_lib_core::rapp::RappDeviceVault::new_default();
-        let pair = vault.selected_pair().ok()??;
-        Some(Self::run_remote_card_check_with_pair(&pair))
+        let mut reader = refineid_rapp_core::remote::RemoteReader::open_local().ok()?;
+        let pair = reader.selected()?;
+        Some(Self::run_remote_card_check_with_pair(&mut reader, &pair))
     }
 
     fn run_remote_card_check() -> std::process::ExitCode {
-        let vault = refineid_lib_core::rapp::RappDeviceVault::new_default();
-        let Ok(Some(pair)) = vault.selected_pair() else {
+        let Ok(mut reader) = refineid_rapp_core::remote::RemoteReader::open_local() else {
+            eprintln!("cannot open the paired-phone store.");
+            return std::process::ExitCode::FAILURE;
+        };
+        let Some(pair) = reader.selected() else {
             eprintln!("no paired remote device found. Run `refineid pair` first.");
             return std::process::ExitCode::FAILURE;
         };
-        Self::run_remote_card_check_with_pair(&pair)
+        Self::run_remote_card_check_with_pair(&mut reader, &pair)
     }
 
     fn run_remote_card_check_with_pair(
-        pair: &refineid_lib_core::rapp::PairRecord,
+        reader: &mut refineid_rapp_core::remote::RemoteReader,
+        pair: &refineid_rapp_core::remote::PairSummary,
     ) -> std::process::ExitCode {
-        use refineid_lib_core::rapp::{
-            CardOperation, CardOperationResult, execute_operation_with_pair,
-        };
-        let dev_name = pair.display_name.as_deref().unwrap_or("Remote Device");
-        let platform = pair.platform.as_deref().unwrap_or("Mobile");
+        use refineid_rapp_core::operations::{CardOperation, CardOperationResult};
+        let dev_name = &pair.peer_display_name;
+        let platform = &pair.peer_platform;
         println!("Connecting to paired remote reader: {dev_name} ({platform})...");
 
-        let identity_res = execute_operation_with_pair(pair, &CardOperation::ReadIdentity);
-        let inspect_res = execute_operation_with_pair(pair, &CardOperation::InspectCard);
+        let identity_res = reader.execute(
+            Some(pair.pair_id),
+            &CardOperation::ReadIdentity,
+            super::card_pair::DISCOVERY_TIMEOUT,
+        );
+        let inspect_res = reader.execute(
+            Some(pair.pair_id),
+            &CardOperation::InspectCard,
+            super::card_pair::DISCOVERY_TIMEOUT,
+        );
 
         println!(
             "================================================================================"
@@ -166,18 +176,16 @@ impl CardArgs {
         println!(
             "================================================================================"
         );
-        println!(
-            "  Pair ID:      {}",
-            refineid_lib_core::hex::Hex::encode(&pair.pair_id)
-        );
+        println!("  Pair ID:      {}", pair.pair_id_hex());
 
         match identity_res {
-            Ok(CardOperationResult::Identity {
-                display_name,
-                person_id,
-            }) => {
-                println!("  Card Holder:  {display_name}");
-                println!("  Personal ID:  {person_id}");
+            Ok(CardOperationResult::Identity(identity)) => {
+                println!("  Card Holder:  {}", identity.holder_name);
+                println!("  Card ID:      {}", identity.card_id);
+                println!(
+                    "  Valid:        {} to {}",
+                    identity.issuance_date, identity.expiration_date
+                );
             }
             Ok(_) => {}
             Err(e) => {

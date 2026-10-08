@@ -69,8 +69,6 @@
     reason = "library-facade pattern: crate root re-exports the public API surface of submodules so external consumers don't depend on the internal module layout"
 )]
 
-extern crate alloc;
-
 pub mod aa;
 pub mod apdu;
 pub mod atr;
@@ -103,7 +101,6 @@ pub mod pin;
 pub mod pin_cache;
 pub mod pin_retry_risk;
 pub mod pkcs15;
-pub mod rapp;
 pub mod revocation;
 pub mod rng;
 pub mod secure_messaging;

@@ -608,21 +608,19 @@ mod tests {
     #[cfg(feature = "tls-rustls")]
     fn test_live_card_refineid_fi_login() {
         use crate::client_auth::get_with_rapp_client_auth;
-        use refineid_lib_core::rapp::RappDeviceVault;
         use refineid_lib_core::text::Uri;
+        use refineid_rapp_core::remote::RemoteReader;
 
-        let vault = RappDeviceVault::new_default();
-        let pairs = vault.active_pairs().expect("active pairs");
-        assert!(!pairs.is_empty(), "Need at least 1 active pair");
-        let pair = &pairs[0];
-
+        let reader = RemoteReader::open_local().expect("paired-phone store");
+        let pair = reader.selected().expect("Need at least 1 active pair");
         let cert_der = pair
-            .cached_auth_cert
+            .auth_cert
             .as_ref()
             .expect("cached authentication certificate on pair record");
 
         let url = Uri::parse("https://card.refineid.fi/".to_owned()).expect("valid URL");
-        let response = get_with_rapp_client_auth(&url, pair, cert_der).expect("successful login");
+        let response =
+            get_with_rapp_client_auth(&url, pair.pair_id, cert_der).expect("successful login");
 
         println!("=== Response from https://card.refineid.fi ===");
         println!("{response}");
