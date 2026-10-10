@@ -7,7 +7,9 @@
 //!
 //! The store lives beside, not inside, the directory earlier releases used:
 //! those records belong to an older protocol revision and cannot open a
-//! v26.10.1 session, so they are left untouched rather than misread.
+//! v26.10.9 session, so they are left untouched rather than misread. A
+//! record file of an earlier encoding revision in this directory is skipped
+//! the same way, and its pairing is made again.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -208,8 +210,6 @@ mod tests {
             signature_cert: None,
             root_ca: None,
             intermediate_ca: None,
-            candidate_id: Some("stream-1".into()),
-            transport_profile: Some(refineid_rapp::STREAM_PROFILE.into()),
         }
     }
 

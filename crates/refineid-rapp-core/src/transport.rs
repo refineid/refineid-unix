@@ -23,9 +23,6 @@ pub use refineid_rapp::{BinaryFrame, FrameError};
 /// The experimental local byte-stream transport profile name.
 pub const STREAM_PROFILE: &str = refineid_rapp::STREAM_PROFILE;
 
-/// The in-memory loopback transport profile name, for tests only.
-pub const MEMORY_PROFILE: &str = "fi.refineid.memory.v1";
-
 /// Bytes in the frame length prefix of the byte-stream framing.
 const LENGTH_PREFIX_BYTES: usize = 2;
 
@@ -135,8 +132,10 @@ impl FrameTransport for MemoryTransport {
         }
     }
 
+    /// The in-process stand-in for a stream connection binds the stream
+    /// profile: v26.10.9 binds only registered transport profiles.
     fn profile(&self) -> &str {
-        MEMORY_PROFILE
+        STREAM_PROFILE
     }
 
     fn candidate_id(&self) -> &str {

@@ -1,4 +1,4 @@
-//! The requester engine: the workstation side of RAPP v26.10.1.
+//! The requester engine: the workstation side of RAPP v26.10.9.
 //!
 //! The engine drives pairing, sessions, and operations using the canonical
 //! protocol boundaries from `refineid_rapp`.
@@ -22,7 +22,7 @@ use refineid_rapp::{
     EndpointRole, EstablishedEndpoint, ExplicitUserIntent, LivenessMessage, OperationReference,
     OperationRequest, OperationState, PairingHandshake, PingChallenge, ProfileName,
     ProtocolErrorMessage, ReceiveOutcome, ResultError, SessionCloseMessage, SessionHandshake,
-    SessionState, TypedMessage, generate_pair_key_material,
+    SessionState, TransportProfile, TypedMessage, generate_pair_key_material,
 };
 
 /// Local labels sent inside `pairing.hello`. Labels, not identities.
@@ -76,6 +76,9 @@ pub enum PairingError {
     Store(StoreError),
     /// The channel failed after authentication.
     Channel,
+    /// A post-PAKE phase outlived its section 3.3 deadline; nothing is
+    /// recorded.
+    DeadlineExpired,
 }
 
 impl core::fmt::Display for PairingError {
@@ -91,6 +94,7 @@ impl core::fmt::Display for PairingError {
             Self::ProtocolViolation => f.write_str("protocol violation"),
             Self::DeniedLocally => f.write_str("pairing denied locally"),
             Self::AbortedByPeer => f.write_str("pairing aborted by peer"),
+            Self::DeadlineExpired => f.write_str("pairing step outlived its deadline"),
             Self::GrantsMismatch => f.write_str("grants mismatch"),
             Self::GrantsNotSubset => f.write_str("grants not a valid subset"),
             Self::Store(e) => write!(f, "store error: {e:?}"),
@@ -281,20 +285,23 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
     }
 
     /// Pairs with the custodian showing `code`, as the requester (RAPP
-    /// v26.10.1 sections 3 and 6).
+    /// v26.10.9 sections 3, 4.2 and 6).
     ///
-    /// Both peers derive the offer from the code. The requester sends `Y_A`,
-    /// verifies the custodian's `Y_B || T_B`, answers with `T_A`, and hands
-    /// the `CPace` key to `Noise_XXpsk3`; the pairing hello and confirmation
-    /// follow inside that channel. The transport is already past its routing
-    /// preamble. `confirm` sees the custodian's introduction and returns the
-    /// profiles to grant, or `None` to refuse.
+    /// The transport is already past its `"pairing"` routing preamble. The
+    /// custodian's first frame is its offer (section 4.2); the requester
+    /// binds the offer's entry for the connection's transport profile, sends
+    /// `Y_A`, verifies the custodian's `Y_B || T_B`, answers with `T_A`, and
+    /// hands the `CPace` key to `Noise_XXpsk3`; the pairing hello and
+    /// confirmation follow inside that channel. `confirm` sees the
+    /// custodian's introduction and returns the profiles to grant, or `None`
+    /// to refuse.
     ///
     /// # Errors
     /// [`PairingError::InvalidCode`] for input that is not a pairing code,
+    /// [`PairingError::Offer`] for a bootstrap that is not a usable offer,
     /// [`PairingError::CodeMismatch`] when the custodian's confirmation tag
     /// does not verify (a mistyped code), and the other [`PairingError`]
-    /// variants on handshake, transport, or grant failures.
+    /// variants on handshake, deadline, transport, or grant failures.
     pub fn pair_with_code<Transport: FrameTransport>(
         &mut self,
         code: &str,
@@ -304,14 +311,21 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         let normalized = crate::offer::normalize_pairing_code(code)
             .map(Zeroizing::new)
             .ok_or(PairingError::InvalidCode)?;
+        let profile = TransportProfile::parse(transport.profile())
+            .ok_or(PairingError::Offer(OfferError::InvalidTransport))?;
+        let bootstrap = transport.receive_frame().map_err(PairingError::Transport)?;
         let offer =
-            crate::offer::code_offer(&normalized, transport.profile(), transport.candidate_id())
-                .map_err(|_| PairingError::InvalidCode)?;
+            crate::offer::offer_from_bootstrap(&bootstrap, profile).map_err(PairingError::Offer)?;
+        let candidate_id = offer
+            .entry(profile)
+            .map(|entry| entry.candidate_id.clone())
+            .ok_or(PairingError::Offer(OfferError::TransportNotOffered))?;
         let offer_hash = offer
             .offer_hash()
             .map_err(|_| PairingError::HandshakeFailed)?;
-        let context = refineid_rapp::standard_pairing_context_v2(&offer_hash)
-            .map_err(|_| PairingError::HandshakeFailed)?;
+        let context =
+            refineid_rapp::standard_pairing_context_v2(&offer_hash, profile.name(), &candidate_id)
+                .map_err(|_| PairingError::HandshakeFailed)?;
         let mut entropy = Zeroizing::new([0u8; 64]);
         getrandom::fill(entropy.as_mut()).map_err(|_| PairingError::KeyGeneration)?;
         let (initiator, step_one) =
@@ -339,9 +353,18 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         transport
             .send_frame(step_three.as_bytes())
             .map_err(PairingError::Transport)?;
+        let handshake_deadline = PhaseDeadline::after(refineid_rapp::POST_PAKE_HANDSHAKE_MS);
 
         let requested: Vec<String> = offer.profiles.clone();
-        self.complete_pairing(offer, &pairing_secret, &requested, transport, confirm)
+        self.complete_pairing(
+            offer,
+            &candidate_id,
+            &pairing_secret,
+            &requested,
+            transport,
+            handshake_deadline,
+            confirm,
+        )
     }
 
     /// Runs `Noise_XXpsk3` under the `CPace` key, then the pairing hello and
@@ -350,12 +373,18 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         clippy::too_many_lines,
         reason = "pairing handshake walks 7 sequential wire messages"
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the pairing continuation carries the bound offer, its entry, the CPace key, and its deadline"
+    )]
     fn complete_pairing<Transport: FrameTransport>(
         &mut self,
         offer: PairingOffer,
+        candidate_id: &str,
         pairing_secret: &refineid_rapp::PairingSecret,
         requested_profiles: &[String],
         mut transport: Transport,
+        handshake_deadline: PhaseDeadline,
         confirm: impl FnOnce(&PeerIntroduction, &[String]) -> Option<Vec<String>>,
     ) -> Result<PairId, PairingError> {
         let offer_profiles = offer.profiles.clone();
@@ -363,7 +392,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         let mut handshake = match PairingHandshake::begin(
             EndpointRole::Requester,
             offer,
-            transport.candidate_id(),
+            candidate_id,
             local_keys,
             pairing_secret,
         ) {
@@ -407,6 +436,8 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         if !handshake.is_complete() {
             return Err(PairingError::HandshakeFailed);
         }
+        handshake_deadline.check()?;
+        let confirmation_deadline = PhaseDeadline::after(refineid_rapp::POST_PAKE_CONFIRMATION_MS);
 
         let mut confirmation = handshake
             .into_confirmation()
@@ -426,6 +457,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
 
         // Receive Proxy Hello
         let peer_hello_bytes = transport.receive_frame().map_err(PairingError::Transport)?;
+        confirmation_deadline.check()?;
         let peer_hello_frame =
             BinaryFrame::reconstruct(peer_hello_bytes).map_err(|_| PairingError::Channel)?;
         let now_ms = current_time_ms();
@@ -476,6 +508,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
 
         // Receive peer confirmation
         let peer_confirm_bytes = transport.receive_frame().map_err(PairingError::Transport)?;
+        confirmation_deadline.check()?;
         let peer_confirm_frame =
             BinaryFrame::reconstruct(peer_confirm_bytes).map_err(|_| PairingError::Channel)?;
         confirmation
@@ -491,6 +524,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             .map_err(|_| PairingError::Channel)?;
         let local_record =
             PairingRecord::from_core_pair_record(&pair_record, intro.display_name, intro.platform);
+        confirmation_deadline.check()?;
         self.store
             .insert(local_record)
             .map_err(PairingError::Store)?;
@@ -523,8 +557,10 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         let core_record = record
             .to_core_pair_record()
             .map_err(|_| SessionError::EngineFault)?;
+        let profile =
+            TransportProfile::parse(transport.profile()).ok_or(SessionError::EngineFault)?;
         let mut handshake =
-            SessionHandshake::begin_requester(&core_record, ExplicitUserIntent::record())
+            SessionHandshake::begin_requester(&core_record, profile, ExplicitUserIntent::record())
                 .map_err(|_| SessionError::EngineFault)?;
 
         // Message 1 (Requester -> Proxy)
@@ -782,7 +818,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             return Ok(outcome);
         }
 
-        // RAPP v26.10.1 section 8.2 executes directly: once a consequential
+        // RAPP v26.10.9 section 8.2 executes directly: once a consequential
         // request is sent the custodian may act on it after consent, so an
         // unanswered one is in flight and ends ambiguous, never cancelled.
         let mut state = if consequential {
@@ -1109,6 +1145,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             }
             CloseReason::Normal
             | CloseReason::Complete
+            | CloseReason::CardUnavailable
             | CloseReason::UserDisconnect
             | CloseReason::Policy
             | CloseReason::Shutdown => {}
@@ -1202,9 +1239,41 @@ fn finish_close<Transport: FrameTransport>(session: &mut Session<Transport>, end
     clippy::cast_possible_truncation,
     reason = "milliseconds since Unix epoch fits safely in u64"
 )]
+/// A monotonic deadline for one post-PAKE pairing phase (section 3.3).
+#[derive(Clone, Copy, Debug)]
+struct PhaseDeadline(std::time::Instant);
+
+impl PhaseDeadline {
+    fn after(window_ms: u64) -> Self {
+        Self(std::time::Instant::now() + std::time::Duration::from_millis(window_ms))
+    }
+
+    fn check(self) -> Result<(), PairingError> {
+        if std::time::Instant::now() > self.0 {
+            Err(PairingError::DeadlineExpired)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 fn current_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod phase_deadline_tests {
+    use super::{PairingError, PhaseDeadline};
+
+    #[test]
+    fn a_phase_past_its_window_fails_closed() {
+        let open = PhaseDeadline::after(refineid_rapp::POST_PAKE_HANDSHAKE_MS);
+        assert_eq!(open.check(), Ok(()));
+        let elapsed =
+            PhaseDeadline(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert_eq!(elapsed.check(), Err(PairingError::DeadlineExpired));
+    }
 }

@@ -644,7 +644,7 @@ impl RefineIdController {
         });
     }
 
-    /// Pairs with the phone showing `code` (RAPP v26.10.1: the phone shows
+    /// Pairs with the phone showing `code` (RAPP v26.10.9: the phone shows
     /// the code and this workstation types it).
     fn start_pairing(self: &Arc<Self>, code: &str) {
         let Some(normalized) = normalize_pairing_code(code) else {

@@ -14,10 +14,13 @@ use crate::engine::{
 };
 use crate::file_store::FilePairingStore;
 use crate::ids::PairId;
+use crate::ids::RendezvousToken;
 use crate::message::CloseReason;
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
 use crate::store::{MemoryJournal, PairingDisposition, PairingStore, StoreError};
-use crate::stream::{DiscoveryMode, STREAM_CANDIDATE_ID, StreamRendezvous, browse, dial};
+use crate::stream::{
+    DiscoveryMode, HintMatch, STREAM_CANDIDATE_ID, StreamRendezvous, StreamService, browse, dial,
+};
 
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
@@ -29,6 +32,26 @@ const PAIRING_RECEIVE_DEADLINE: Duration = Duration::from_secs(60);
 const OPERATION_RECEIVE_DEADLINE: Duration = Duration::from_secs(120);
 /// The lifetime each request asks for (section 8.2.1).
 const OPERATION_LIFETIME_MS: u64 = 120_000;
+
+/// The session custodians worth dialing for `token`, best first: those whose
+/// rotating hint names the pairing, then those publishing no hints. A
+/// custodian whose hints all name other pairings is never dialed, so the
+/// token is presented only where it can be served.
+fn sessions_for(token: &RendezvousToken, services: Vec<StreamService>) -> Vec<StreamService> {
+    let unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (mut named, mut unhinted) = (Vec::new(), Vec::new());
+    for service in services {
+        match service.hint_match(token, unix_seconds) {
+            HintMatch::Named => named.push(service),
+            HintMatch::Unhinted => unhinted.push(service),
+            HintMatch::Other => {}
+        }
+    }
+    named.extend(unhinted);
+    named
+}
 
 /// Why a remote reader call ended without its answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,7 +289,7 @@ impl RemoteReader {
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
-            for service in browse(DiscoveryMode::Session, BROWSE_ROUND) {
+            for service in sessions_for(&token, browse(DiscoveryMode::Session, BROWSE_ROUND)) {
                 let Ok(transport) = dial(
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
@@ -326,5 +349,54 @@ impl RemoteReader {
             })
             .map_err(RemoteError::Store)?;
         Ok(der)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{RendezvousToken, StreamService, sessions_for};
+
+    fn service(instance: &str, hints: Option<String>) -> StreamService {
+        let mut attributes = BTreeMap::from([
+            ("v".to_owned(), "1".to_owned()),
+            ("mode".to_owned(), "session".to_owned()),
+        ]);
+        if let Some(hints) = hints {
+            attributes.insert("hints".to_owned(), hints);
+        }
+        StreamService {
+            instance: instance.to_owned(),
+            endpoints: vec!["192.0.2.10:47110".to_owned()],
+            attributes,
+        }
+    }
+
+    #[test]
+    fn named_custodians_come_first_and_foreign_ones_are_never_dialed() {
+        let token = RendezvousToken::from_array([0x42; 16]);
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs())
+            / refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS;
+        let hex = |bytes: [u8; refineid_rapp::DISCOVERY_HINT_SIZE]| -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        };
+        let mine = hex(refineid_rapp::discovery_hint(&token, epoch));
+        let theirs = hex(refineid_rapp::discovery_hint(
+            &RendezvousToken::from_array([0x24; 16]),
+            epoch,
+        ));
+        let ordered = sessions_for(
+            &token,
+            vec![
+                service("refineid-unhinted", None),
+                service("refineid-foreign", Some(theirs)),
+                service("refineid-mine", Some(mine)),
+            ],
+        );
+        let names: Vec<&str> = ordered.iter().map(|svc| svc.instance.as_str()).collect();
+        assert_eq!(names, ["refineid-mine", "refineid-unhinted"]);
     }
 }

@@ -22,11 +22,9 @@ use crate::store::{PairingDisposition, PairingRecord};
 /// Format tag identifying a `RefineID` pairing-record blob.
 const PAIRING_BLOB_MAGIC: &[u8] = b"RAPP-pair-record";
 
-/// Supported encoding revisions.
-const PAIRING_BLOB_VERSION_1: u8 = 1;
-const PAIRING_BLOB_VERSION_2: u8 = 2;
-const PAIRING_BLOB_VERSION_3: u8 = 3;
-const PAIRING_BLOB_VERSION: u8 = 4;
+/// The one encoding revision this build reads and writes. Records of earlier
+/// revisions belong to earlier protocol versions and are re-paired.
+const PAIRING_BLOB_VERSION: u8 = 5;
 
 /// Format tag identifying a whole stored pairing set.
 const PAIRING_SET_MAGIC: &[u8] = b"RAPP-pair-set";
@@ -119,11 +117,6 @@ pub fn encode_pairing_record(record: &PairingRecord) -> Zeroizing<Vec<u8>> {
     put_optional_bytes(&mut out, record.signature_cert.as_deref());
     put_optional_bytes(&mut out, record.root_ca.as_deref());
     put_optional_bytes(&mut out, record.intermediate_ca.as_deref());
-    put_optional_bytes(&mut out, record.candidate_id.as_deref().map(str::as_bytes));
-    put_optional_bytes(
-        &mut out,
-        record.transport_profile.as_deref().map(str::as_bytes),
-    );
     out
 }
 
@@ -139,11 +132,7 @@ pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecE
         return Err(PairingCodecError::BadMagic);
     }
     let version = reader.take_u8()?;
-    if version != PAIRING_BLOB_VERSION_1
-        && version != PAIRING_BLOB_VERSION_2
-        && version != PAIRING_BLOB_VERSION_3
-        && version != PAIRING_BLOB_VERSION
-    {
+    if version != PAIRING_BLOB_VERSION {
         return Err(PairingCodecError::UnsupportedVersion { found: version });
     }
 
@@ -164,43 +153,10 @@ pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecE
     }
     let peer_display_name = reader.take_text()?;
     let peer_platform = reader.take_text()?;
-    let (auth_cert, signature_cert) = if version >= 2 {
-        (
-            reader.take_optional_bytes()?.map(<[u8]>::to_vec),
-            reader.take_optional_bytes()?.map(<[u8]>::to_vec),
-        )
-    } else {
-        (None, None)
-    };
-    let (root_ca, intermediate_ca) = if version >= 3 {
-        (
-            reader.take_optional_bytes()?.map(<[u8]>::to_vec),
-            reader.take_optional_bytes()?.map(<[u8]>::to_vec),
-        )
-    } else {
-        (None, None)
-    };
-    let (candidate_id, transport_profile) = if version >= PAIRING_BLOB_VERSION {
-        let cid = match reader.take_optional_bytes()? {
-            Some(bytes) => Some(
-                core::str::from_utf8(bytes)
-                    .map_err(|_| PairingCodecError::InvalidText)?
-                    .to_owned(),
-            ),
-            None => None,
-        };
-        let tprof = match reader.take_optional_bytes()? {
-            Some(bytes) => Some(
-                core::str::from_utf8(bytes)
-                    .map_err(|_| PairingCodecError::InvalidText)?
-                    .to_owned(),
-            ),
-            None => None,
-        };
-        (cid, tprof)
-    } else {
-        (None, None)
-    };
+    let auth_cert = reader.take_optional_bytes()?.map(<[u8]>::to_vec);
+    let signature_cert = reader.take_optional_bytes()?.map(<[u8]>::to_vec);
+    let root_ca = reader.take_optional_bytes()?.map(<[u8]>::to_vec);
+    let intermediate_ca = reader.take_optional_bytes()?.map(<[u8]>::to_vec);
 
     reader.finish()?;
 
@@ -221,8 +177,6 @@ pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecE
         signature_cert,
         root_ca,
         intermediate_ca,
-        candidate_id,
-        transport_profile,
     })
 }
 
@@ -436,8 +390,6 @@ mod tests {
             signature_cert: Some(vec![0x30, 0x82, 0x02, 0x00]),
             root_ca: Some(vec![0x30, 0x82, 0x03, 0x00]),
             intermediate_ca: Some(vec![0x30, 0x82, 0x04, 0x00]),
-            candidate_id: Some("stream-1".into()),
-            transport_profile: Some("stream.v1".into()),
         }
     }
 
@@ -464,8 +416,6 @@ mod tests {
         assert_eq!(left.signature_cert, right.signature_cert);
         assert_eq!(left.root_ca, right.root_ca);
         assert_eq!(left.intermediate_ca, right.intermediate_ca);
-        assert_eq!(left.candidate_id, right.candidate_id);
-        assert_eq!(left.transport_profile, right.transport_profile);
     }
 
     #[test]
@@ -554,66 +504,14 @@ mod tests {
     }
 
     #[test]
-    fn decodes_version_1_blob_without_certificates() {
-        // Construct a valid version 1 record blob
-        let mut v1_blob = Vec::new();
-        v1_blob.extend_from_slice(PAIRING_BLOB_MAGIC);
-        v1_blob.push(1); // Version 1
-        let rec = sample();
-        v1_blob.extend_from_slice(rec.pair_id.as_bytes());
-        v1_blob.extend_from_slice(rec.rendezvous_token.as_bytes());
-        v1_blob.extend_from_slice(&rec.grants_hash);
-        v1_blob.push(0); // Paired
-        v1_blob.push(0); // peer_initiated = false
-        v1_blob.extend_from_slice(&rec.candidate_failures.to_be_bytes());
-        super::put_bytes(&mut v1_blob, &rec.local_private);
-        super::put_bytes(&mut v1_blob, &rec.local_public);
-        super::put_bytes(&mut v1_blob, &rec.peer_public);
-        super::put_length(&mut v1_blob, rec.granted_profiles.len());
-        for profile in &rec.granted_profiles {
-            super::put_bytes(&mut v1_blob, profile.as_bytes());
+    fn earlier_revisions_are_refused() {
+        let mut blob = encode_pairing_record(&sample()).to_vec();
+        for earlier in 1..PAIRING_BLOB_VERSION {
+            blob[PAIRING_BLOB_MAGIC.len()] = earlier;
+            assert!(matches!(
+                decode_pairing_record(&blob),
+                Err(PairingCodecError::UnsupportedVersion { found }) if found == earlier
+            ));
         }
-        super::put_bytes(&mut v1_blob, rec.peer_display_name.as_bytes());
-        super::put_bytes(&mut v1_blob, rec.peer_platform.as_bytes());
-
-        let decoded = decode_pairing_record(&v1_blob).unwrap();
-        assert_eq!(decoded.pair_id, rec.pair_id);
-        assert_eq!(decoded.auth_cert, None);
-        assert_eq!(decoded.signature_cert, None);
-        assert_eq!(decoded.root_ca, None);
-        assert_eq!(decoded.intermediate_ca, None);
-    }
-
-    #[test]
-    fn decodes_version_2_blob_without_root_ca() {
-        // Construct a valid version 2 record blob
-        let mut v2_blob = Vec::new();
-        v2_blob.extend_from_slice(PAIRING_BLOB_MAGIC);
-        v2_blob.push(2); // Version 2
-        let rec = sample();
-        v2_blob.extend_from_slice(rec.pair_id.as_bytes());
-        v2_blob.extend_from_slice(rec.rendezvous_token.as_bytes());
-        v2_blob.extend_from_slice(&rec.grants_hash);
-        v2_blob.push(0); // Paired
-        v2_blob.push(0); // peer_initiated = false
-        v2_blob.extend_from_slice(&rec.candidate_failures.to_be_bytes());
-        super::put_bytes(&mut v2_blob, &rec.local_private);
-        super::put_bytes(&mut v2_blob, &rec.local_public);
-        super::put_bytes(&mut v2_blob, &rec.peer_public);
-        super::put_length(&mut v2_blob, rec.granted_profiles.len());
-        for profile in &rec.granted_profiles {
-            super::put_bytes(&mut v2_blob, profile.as_bytes());
-        }
-        super::put_bytes(&mut v2_blob, rec.peer_display_name.as_bytes());
-        super::put_bytes(&mut v2_blob, rec.peer_platform.as_bytes());
-        super::put_optional_bytes(&mut v2_blob, rec.auth_cert.as_deref());
-        super::put_optional_bytes(&mut v2_blob, rec.signature_cert.as_deref());
-
-        let decoded = decode_pairing_record(&v2_blob).unwrap();
-        assert_eq!(decoded.pair_id, rec.pair_id);
-        assert_eq!(decoded.auth_cert, rec.auth_cert);
-        assert_eq!(decoded.signature_cert, rec.signature_cert);
-        assert_eq!(decoded.root_ca, None);
-        assert_eq!(decoded.intermediate_ca, None);
     }
 }

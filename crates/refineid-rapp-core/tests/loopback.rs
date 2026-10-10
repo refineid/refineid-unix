@@ -25,8 +25,9 @@ use refineid_rapp::{
     BinaryFrame, CardInspection, CardKeyProfile as KeyProfile, CardOperation, CardOperationResult,
     CloseReason, CpaceKc2Responder, EndpointRole, EstablishedEndpoint, OperationReference,
     OperationResultMessage, PairId, PairRecord, PairStore, PairStoreError, PairTombstone,
-    PairingHandshake, ProxyFailure, ReceiveOutcome, SessionCloseMessage, SessionHandshake,
-    SignatureAlgorithm, TypedMessage, generate_pair_key_material, standard_pairing_context_v2,
+    PairingHandshake, PairingOffer, ProxyFailure, ReceiveOutcome, SessionCloseMessage,
+    SessionHandshake, SignatureAlgorithm, TransportProfile, TypedMessage,
+    generate_pair_key_material, standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
     OperationOutcome, PairingError, Requester, RequesterConfig, SessionError,
@@ -36,7 +37,7 @@ use refineid_rapp_core::profiles::{PROFILE_AUTHENTICATION, PROFILE_CARD_STATUS};
 use refineid_rapp_core::store::{
     MemoryJournal, MemoryPairingStore, OperationJournal, PairingDisposition, PairingStore,
 };
-use refineid_rapp_core::transport::{FrameTransport, MEMORY_PROFILE, MemoryTransport};
+use refineid_rapp_core::transport::{FrameTransport, MemoryTransport};
 
 /// A generous deadline for scripted exchanges.
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -48,6 +49,31 @@ const TEST_MONOTONIC_TIMESTAMP_MS: u64 = 1_000_000;
 const SHOWN_CODE: &str = "7KX4M9";
 /// Fixed custodian scalar entropy for the scripted exchange.
 const CUSTODIAN_ENTROPY: [u8; 64] = [0x24; 64];
+
+/// The custodian's random stream offer and its bootstrap bytes (section
+/// 4.2), and the CPace context it binds.
+fn custodian_offer() -> (PairingOffer, Vec<u8>, Vec<u8>) {
+    let mut offer_id = [0_u8; refineid_rapp::OFFER_ID_SIZE];
+    getrandom::fill(&mut offer_id).unwrap();
+    let offer = PairingOffer::create(
+        refineid_rapp::OfferId::from_array(offer_id),
+        vec![
+            PROFILE_CARD_STATUS.to_owned(),
+            PROFILE_AUTHENTICATION.to_owned(),
+            refineid_rapp_core::profiles::PROFILE_DOCUMENT_SIGNING.to_owned(),
+        ],
+        &[TransportProfile::Stream],
+    )
+    .unwrap();
+    let bytes = offer.to_cbor().unwrap();
+    let context = standard_pairing_context_v2(
+        &offer.offer_hash().unwrap(),
+        TransportProfile::Stream.name(),
+        TransportProfile::Stream.candidate_id(),
+    )
+    .unwrap();
+    (offer, bytes, context)
+}
 
 /// The requester engine type under test.
 type TestRequester = Requester<MemoryPairingStore, MemoryJournal>;
@@ -97,10 +123,9 @@ impl PairStore for MockProxyStore {
 /// hello and confirmation exchange.
 fn proxy_pair<T: FrameTransport>(mut transport: T, shown_code: &str) -> PairRecord {
     let now_ms = TEST_MONOTONIC_TIMESTAMP_MS;
-    let candidate = transport.candidate_id().to_owned();
-    let offer =
-        refineid_rapp_core::offer::code_offer(shown_code, transport.profile(), &candidate).unwrap();
-    let context = standard_pairing_context_v2(&offer.offer_hash().unwrap()).unwrap();
+    let candidate = TransportProfile::Stream.candidate_id();
+    let (offer, bootstrap, context) = custodian_offer();
+    transport.send_frame(&bootstrap).unwrap();
 
     let step_one = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
     let (step_two, waiting) = CpaceKc2Responder::process_step1_frame(
@@ -117,7 +142,7 @@ fn proxy_pair<T: FrameTransport>(mut transport: T, shown_code: &str) -> PairReco
 
     let local_keys = generate_pair_key_material().unwrap();
     let mut handshake =
-        PairingHandshake::begin(EndpointRole::Proxy, offer, &candidate, local_keys, &secret)
+        PairingHandshake::begin(EndpointRole::Proxy, offer, candidate, local_keys, &secret)
             .unwrap();
 
     let m1 = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
@@ -177,7 +202,8 @@ fn proxy_accept_session<T: FrameTransport>(
     mut transport: T,
 ) -> ProxySession<T> {
     let now_ms = TEST_MONOTONIC_TIMESTAMP_MS;
-    let mut handshake = SessionHandshake::begin_proxy(pair_record).unwrap();
+    let mut handshake =
+        SessionHandshake::begin_proxy(pair_record, TransportProfile::Stream).unwrap();
 
     // Message 1 (Requester -> Proxy)
     let m1_bytes = transport.receive_frame().unwrap();
@@ -244,9 +270,8 @@ fn a_mistyped_code_fails_at_the_custodian_tag_and_stores_nothing() {
     let mut requester = test_requester();
     let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || {
-        let offer =
-            refineid_rapp_core::offer::code_offer(SHOWN_CODE, MEMORY_PROFILE, CANDIDATE).unwrap();
-        let context = standard_pairing_context_v2(&offer.offer_hash().unwrap()).unwrap();
+        let (offer, bootstrap, context) = custodian_offer();
+        proxy_transport.send_frame(&bootstrap).unwrap();
         let step_one = BinaryFrame::reconstruct(proxy_transport.receive_frame().unwrap()).unwrap();
         let (step_two, _waiting) = CpaceKc2Responder::process_step1_frame(
             SHOWN_CODE,
@@ -265,6 +290,38 @@ fn a_mistyped_code_fails_at_the_custodian_tag_and_stores_nothing() {
     });
     proxy.join().unwrap();
     assert_eq!(outcome, Err(PairingError::CodeMismatch));
+    assert!(requester.store().pair_ids().is_empty());
+}
+
+#[test]
+fn an_offer_without_the_connection_transport_is_refused_before_cpace() {
+    let mut requester = test_requester();
+    let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut offer_id = [0_u8; refineid_rapp::OFFER_ID_SIZE];
+        getrandom::fill(&mut offer_id).unwrap();
+        let ble_only = PairingOffer::create(
+            refineid_rapp::OfferId::from_array(offer_id),
+            vec![PROFILE_AUTHENTICATION.to_owned()],
+            &[TransportProfile::Ble],
+        )
+        .unwrap();
+        proxy_transport
+            .send_frame(&ble_only.to_cbor().unwrap())
+            .unwrap();
+        // The requester refuses the offer and never sends Y_A.
+        assert!(proxy_transport.receive_frame().is_err());
+    });
+    let outcome = requester.pair_with_code(SHOWN_CODE, requester_transport, |_, _| {
+        panic!("a refused offer must never reach confirmation")
+    });
+    proxy.join().unwrap();
+    assert_eq!(
+        outcome,
+        Err(PairingError::Offer(
+            refineid_rapp::PairingOfferError::TransportNotOffered
+        ))
+    );
     assert!(requester.store().pair_ids().is_empty());
 }
 
