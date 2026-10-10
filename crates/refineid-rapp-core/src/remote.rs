@@ -10,7 +10,8 @@
 use std::time::{Duration, Instant};
 
 use crate::engine::{
-    AdmissionError, OperationOutcome, PairingError, Requester, RequesterConfig, SessionError,
+    AdmissionError, OperationOutcome, PairingError, Reconciliation, Requester, RequesterConfig,
+    SessionError,
 };
 use crate::file_journal::FileOperationJournal;
 use crate::file_store::FilePairingStore;
@@ -239,8 +240,9 @@ impl RemoteReader {
     /// that ended ambiguous (section 8.3), one session per operation, and
     /// annotates the journal with each answer. Nothing is ever retried.
     ///
-    /// Returns each reconciled operation with the state the phone reported,
-    /// `None` when the phone does not know it.
+    /// Returns each reconciled operation with what the phone reported and
+    /// any result it re-delivered; a re-delivered completed result is
+    /// acknowledged.
     ///
     /// # Errors
     /// [`RemoteError`] when the pairing is unknown or no phone opens a
@@ -249,7 +251,7 @@ impl RemoteReader {
         &mut self,
         pair_id: PairId,
         discovery_timeout: Duration,
-    ) -> Result<Vec<(OperationId, Option<String>)>, RemoteError> {
+    ) -> Result<Vec<(OperationId, Reconciliation)>, RemoteError> {
         let record = self
             .requester
             .store()
@@ -284,8 +286,6 @@ impl RemoteReader {
                         .requester
                         .reconcile_status(&mut session, operation_id)
                         .map_err(RemoteError::Session);
-                    // The phone re-delivers a retained result after its
-                    // report; closing here leaves it unread.
                     self.requester
                         .disconnect(&mut session, CloseReason::Complete);
                     break 'search;

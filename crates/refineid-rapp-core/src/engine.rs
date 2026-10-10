@@ -189,6 +189,34 @@ impl core::fmt::Display for AdmissionError {
 
 impl core::error::Error for AdmissionError {}
 
+/// What one section 8.3 status request learned about an earlier operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reconciliation {
+    /// The custodian's reported state, `None` when it does not know the
+    /// operation.
+    pub reported_state: Option<OperationState>,
+    /// Whether the custodian reports the operation acknowledged and retired.
+    pub retired: bool,
+    /// The result the custodian re-delivered after its report, if any.
+    pub result: Option<ReconciledResult>,
+}
+
+/// A result the custodian re-delivered during reconciliation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconciledResult {
+    /// A completed result, journaled and acknowledged on the session. The
+    /// response stays as the wire carries it: the journal keeps no request
+    /// parameters to type it by.
+    Completed(refineid_rapp::ResultResponse),
+    /// A terminal failure, journaled; nothing is acknowledged.
+    Failed {
+        /// The reported status.
+        status: ResultStatus,
+        /// The registered error name, if one was given.
+        error: Option<String>,
+    },
+}
+
 /// How a finished operation ended, with the session consequence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationOutcome {
@@ -1024,7 +1052,15 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         }
     }
 
-    /// Queries the proxy journal for an earlier operation.
+    /// Queries the custodian's journal for an earlier operation (section
+    /// 8.3) and settles whatever it re-delivers.
+    ///
+    /// A custodian that retains a terminal result sends it right after its
+    /// status report. A live completed result is journaled, acknowledged
+    /// with `operation.result_ack`, and returned; a failure is journaled
+    /// with its terminal state, and a blocked credential revokes the
+    /// pairing as it does during [`Self::execute`]. Nothing is retried. The
+    /// session stays usable unless the pairing was revoked.
     ///
     /// # Errors
     /// Returns [`SessionError`] on closed session, peer close,
@@ -1033,20 +1069,125 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         &mut self,
         session: &mut Session<Transport>,
         operation_id: OperationId,
-    ) -> Result<Option<String>, SessionError> {
+    ) -> Result<Reconciliation, SessionError> {
         if session.state != SessionState::Healthy || session.end.is_some() {
             return Err(SessionError::EngineFault);
         }
-        let req_msg = TypedMessage::OperationStatusRequest(operation_id);
+        self.send_on(session, &TypedMessage::OperationStatusRequest(operation_id))?;
+        let report = loop {
+            match self.receive_on(session)? {
+                TypedMessage::OperationStatus(report) if report.operation_id == operation_id => {
+                    break report;
+                }
+                TypedMessage::OperationStatus(_) => {}
+                _ => {
+                    self.handle_violation(session);
+                    return Err(SessionError::EngineFault);
+                }
+            }
+        };
+        if let (true, Some(hash), Ok(entry)) = (
+            report.known,
+            report.request_hash,
+            self.journal.get(operation_id),
+        ) && *hash.as_bytes() != entry.request_hash
+        {
+            self.handle_violation(session);
+            return Err(SessionError::EngineFault);
+        }
+        let reported_state = report.known.then_some(report.state).flatten();
+        self.annotate(
+            operation_id,
+            reported_state.map(|state| format!("{state:?}")),
+        );
+        let mut reconciliation = Reconciliation {
+            reported_state,
+            retired: report.retired,
+            result: None,
+        };
+        let redelivers = report.known
+            && !report.retired
+            && reported_state.is_some_and(OperationState::is_terminal);
+        if !redelivers {
+            return Ok(reconciliation);
+        }
+        let TypedMessage::OperationResult(result) = self.receive_on(session)? else {
+            self.handle_violation(session);
+            return Err(SessionError::EngineFault);
+        };
+        if result.operation_id != operation_id {
+            self.handle_violation(session);
+            return Err(SessionError::EngineFault);
+        }
+        if Some(result.request_hash) != report.request_hash || !result.is_consistent() {
+            self.handle_violation(session);
+            return Err(SessionError::EngineFault);
+        }
+        reconciliation.result = Some(match (result.status, result.retired, result.response) {
+            (ResultStatus::Completed, false, Some(response)) => {
+                self.journal_state(operation_id, OperationState::Completed, true);
+                self.send_on(
+                    session,
+                    &TypedMessage::OperationResultAck(OperationReference {
+                        operation_id,
+                        request_hash: result.request_hash,
+                    }),
+                )?;
+                ReconciledResult::Completed(response)
+            }
+            (status, _, _) => {
+                let state = match status {
+                    ResultStatus::Completed => OperationState::Completed,
+                    ResultStatus::Rejected => OperationState::Rejected,
+                    ResultStatus::Cancelled => OperationState::Cancelled,
+                    ResultStatus::CredentialRejected => OperationState::CredentialRejected,
+                    ResultStatus::Ambiguous => OperationState::Ambiguous,
+                };
+                self.journal_state(operation_id, state, true);
+                if status == ResultStatus::CredentialRejected {
+                    self.revoke_pairing(session.pair_id, false);
+                    self.await_close_after_credential_rejection(session);
+                }
+                ReconciledResult::Failed {
+                    status,
+                    error: result.error.map(|error| error.as_str().to_owned()),
+                }
+            }
+        });
+        Ok(reconciliation)
+    }
+
+    /// Records the custodian's reported state on the journal entry.
+    fn annotate(&mut self, operation_id: OperationId, annotation: Option<String>) {
+        if let Ok(entry) = self.journal.get(operation_id) {
+            let mut updated = entry.clone();
+            updated.reconciled_proxy_state = annotation;
+            let _ = self.journal.record(updated);
+        }
+    }
+
+    /// Seals and sends one message on the session.
+    fn send_on<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+        message: &TypedMessage,
+    ) -> Result<(), SessionError> {
         let frame = session
             .endpoint
-            .send(&req_msg)
+            .send(message)
             .map_err(|_| SessionError::Transport(TransportError::Failed))?;
         session
             .transport
             .send_frame(frame.as_bytes())
-            .map_err(SessionError::Transport)?;
+            .map_err(SessionError::Transport)
+    }
 
+    /// Receives the next operation-layer message, answering liveness pings
+    /// and ending the session on a close, a failure, or a revocation.
+    fn receive_on<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+    ) -> Result<TypedMessage, SessionError> {
         loop {
             let recv_bytes = session.transport.receive_frame().map_err(|e| {
                 finish_close(session, SessionEnd::TransportLoss);
@@ -1059,22 +1200,6 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             let now_ms = current_time_ms();
             let mut adapter = CorePairStoreAdapter::new(&mut self.store);
             match session.endpoint.receive(&mut adapter, &frame, now_ms) {
-                Ok(ReceiveOutcome::Message(TypedMessage::OperationStatus(report))) => {
-                    if report.operation_id != operation_id {
-                        continue;
-                    }
-                    let annotation = if report.known {
-                        report.state.map(|s| format!("{s:?}"))
-                    } else {
-                        None
-                    };
-                    if let Ok(entry) = self.journal.get(operation_id) {
-                        let mut updated = entry.clone();
-                        updated.reconciled_proxy_state.clone_from(&annotation);
-                        let _ = self.journal.record(updated);
-                    }
-                    return Ok(annotation);
-                }
                 Ok(ReceiveOutcome::Message(TypedMessage::LivenessPing(incoming_ping))) => {
                     let reply_pong = TypedMessage::LivenessPong(LivenessMessage {
                         challenge: incoming_ping.challenge,
@@ -1092,10 +1217,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                     finish_close(session, SessionEnd::PeerClose(close_msg.reason));
                     return Err(SessionError::ClosedByPeer(close_msg.reason));
                 }
-                Ok(ReceiveOutcome::Message(_)) => {
-                    self.handle_violation(session);
-                    return Err(SessionError::EngineFault);
-                }
+                Ok(ReceiveOutcome::Message(message)) => return Ok(message),
                 Ok(ReceiveOutcome::SessionClosed(_) | ReceiveOutcome::PairRevoked { .. }) => {
                     finish_close(session, SessionEnd::Violation);
                     return Err(SessionError::EngineFault);

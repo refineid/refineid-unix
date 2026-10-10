@@ -30,7 +30,7 @@ use refineid_rapp::{
     generate_pair_key_material, standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
-    OperationOutcome, PairingError, Requester, RequesterConfig, SessionError,
+    OperationOutcome, PairingError, ReconciledResult, Requester, RequesterConfig, SessionError,
 };
 use refineid_rapp_core::file_journal::FileOperationJournal;
 use refineid_rapp_core::operations::SignatureAlgorithmExt as _;
@@ -601,13 +601,27 @@ fn an_unanswered_signature_survives_restart_and_reconciles_by_status() {
             request_hash: Some(reference.request_hash),
             retired: false,
         }));
+        // Section 8.3: the retained terminal result follows the report.
+        session.send(&TypedMessage::OperationResult(
+            OperationResultMessage::failure(reference, ProxyFailure::CardCompletionAmbiguous),
+        ));
     });
     let mut session = requester.connect(pair_id, requester_transport).unwrap();
     let answer = requester
         .reconcile_status(&mut session, request.operation_id)
         .unwrap();
     proxy.join().unwrap();
-    assert!(answer.is_some());
+    assert_eq!(
+        answer.reported_state,
+        Some(refineid_rapp::OperationState::Ambiguous)
+    );
+    assert!(matches!(
+        answer.result,
+        Some(ReconciledResult::Failed {
+            status: refineid_rapp::ResultStatus::Ambiguous,
+            ..
+        })
+    ));
     assert!(requester.journal().unreconciled(pair_id).is_empty());
     let reopened = FileOperationJournal::open(&directory).unwrap();
     assert!(reopened.unreconciled(pair_id).is_empty());
@@ -619,6 +633,87 @@ fn an_unanswered_signature_survives_restart_and_reconciles_by_status() {
             .is_some()
     );
     std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn a_redelivered_completed_result_is_acknowledged_and_the_session_continues() {
+    let mut requester = test_requester();
+    let granted = vec![PROFILE_AUTHENTICATION.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationRequest(request) = session.receive() else {
+            panic!("expected an operation request");
+        };
+        drop(session);
+        (request, proxy_pairing)
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let outcome = requester
+        .execute(&mut session, &authentication_operation(), 30_000)
+        .unwrap();
+    let (request, proxy_pairing) = proxy.join().unwrap();
+    assert_eq!(outcome, OperationOutcome::Ambiguous);
+
+    let reference = OperationReference {
+        operation_id: request.operation_id,
+        request_hash: request.request_hash().unwrap(),
+    };
+    let signature = CardOperationResult::Signature(vec![0x5c; 384]);
+    let delivered = OperationResultMessage::completed(reference, &signature);
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationStatusRequest(asked) = session.receive() else {
+            panic!("expected a status request");
+        };
+        session.send(&TypedMessage::OperationStatus(StatusReport {
+            operation_id: asked,
+            known: true,
+            state: Some(refineid_rapp::OperationState::Completed),
+            request_hash: Some(reference.request_hash),
+            retired: false,
+        }));
+        session.send(&TypedMessage::OperationResult(delivered));
+        let TypedMessage::OperationResultAck(acknowledged) = session.receive() else {
+            panic!("a re-delivered completed result must be acknowledged");
+        };
+        assert_eq!(acknowledged, reference);
+        // The session stays usable after reconciliation.
+        let TypedMessage::OperationStatusRequest(again) = session.receive() else {
+            panic!("expected a second status request");
+        };
+        session.send(&TypedMessage::OperationStatus(StatusReport {
+            operation_id: again,
+            known: true,
+            state: Some(refineid_rapp::OperationState::Completed),
+            request_hash: Some(reference.request_hash),
+            retired: true,
+        }));
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let answer = requester
+        .reconcile_status(&mut session, request.operation_id)
+        .unwrap();
+    let Some(ReconciledResult::Completed(response)) = answer.result else {
+        panic!("expected the completed result, got {answer:?}");
+    };
+    assert_eq!(
+        response.typed_for(&authentication_operation()).unwrap(),
+        signature
+    );
+    assert_eq!(
+        requester.journal().get(request.operation_id).unwrap().state,
+        refineid_rapp::OperationState::Completed
+    );
+    let retired = requester
+        .reconcile_status(&mut session, request.operation_id)
+        .unwrap();
+    proxy.join().unwrap();
+    assert!(retired.retired);
+    assert_eq!(retired.result, None);
 }
 
 #[test]
