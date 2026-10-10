@@ -3,12 +3,15 @@
 //!
 //! This is the surface the CLI, the GUI, and the TLS client use. Pairing
 //! browses for a custodian in `mode=pairing`; every operation browses for
-//! custodians in `mode=session`, dials each, and presents the pair's
-//! rendezvous token only inside the routing preamble. A custodian that does
-//! not hold the pairing closes the connection, and the next one is tried.
+//! custodians in `mode=session`, dials each, and opens with a routing value
+//! that is fresh per dial and keyed by the pairing's static agreement. A
+//! custodian that does not hold the pairing closes the connection, and the
+//! next one is tried. A custodian that announced its withdrawal for the
+//! pairing ends the search until it serves again.
 
 use std::time::{Duration, Instant};
 
+use crate::engine::SessionEnd;
 use crate::engine::{
     AdmissionError, OperationOutcome, PairingError, Reconciliation, Requester, RequesterConfig,
     SessionError,
@@ -17,13 +20,15 @@ use crate::file_journal::FileOperationJournal;
 use crate::file_store::FilePairingStore;
 use crate::ids::OperationId;
 use crate::ids::PairId;
-use crate::ids::RendezvousToken;
 use crate::message::CloseReason;
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
+use crate::store::PairingRecord;
 use crate::store::{PairingDisposition, PairingStore, StoreError};
 use crate::stream::{
-    DiscoveryMode, HintMatch, STREAM_CANDIDATE_ID, StreamRendezvous, StreamService, browse, dial,
+    DiscoveryMode, HintMatch, RoutingPreamble, STREAM_CANDIDATE_ID, StreamService, browse,
+    browse_stream_services, dial,
 };
+use refineid_rapp::{DiscoveryKey, RoutingKey, TransportProfile, WithdrawalKey};
 
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
@@ -36,24 +41,83 @@ const OPERATION_RECEIVE_DEADLINE: Duration = Duration::from_secs(120);
 /// The lifetime each request asks for (section 8.2.1).
 const OPERATION_LIFETIME_MS: u64 = 120_000;
 
-/// The session custodians worth dialing for `token`, best first: those whose
-/// rotating hint names the pairing, then those publishing no hints. A
-/// custodian whose hints all name other pairings is never dialed, so the
-/// token is presented only where it can be served.
-fn sessions_for(token: &RendezvousToken, services: Vec<StreamService>) -> Vec<StreamService> {
-    let unix_seconds = std::time::SystemTime::now()
+/// The keys one stored pairing uses to find and reach its custodian.
+struct PairingKeys {
+    discovery: DiscoveryKey,
+    routing: RoutingKey,
+    withdrawal: WithdrawalKey,
+}
+
+impl PairingKeys {
+    fn derive(record: &PairingRecord) -> Result<Self, RemoteError> {
+        let core = record
+            .to_core_pair_record()
+            .map_err(|_| RemoteError::NotPaired)?;
+        Ok(Self {
+            discovery: DiscoveryKey::derive(&core).map_err(|_| RemoteError::NotPaired)?,
+            routing: RoutingKey::derive(&core).map_err(|_| RemoteError::NotPaired)?,
+            withdrawal: WithdrawalKey::derive(&core).map_err(|_| RemoteError::NotPaired)?,
+        })
+    }
+
+    /// A session preamble with a fresh routing value.
+    fn session_preamble(&self) -> Result<RoutingPreamble, RemoteError> {
+        self.routing
+            .route(TransportProfile::Stream, |nonce| {
+                getrandom::fill(nonce).map_err(|_| refineid_rapp::RandomUnavailable)
+            })
+            .map(RoutingPreamble::Session)
+            .map_err(|_| RemoteError::RandomUnavailable)
+    }
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// The session custodians worth dialing for the pairing keyed by `keys`,
+/// best first: those whose rotating hint names the pairing, then those
+/// publishing no hints. A custodian whose hints all name other pairings is
+/// never dialed.
+///
+/// # Errors
+/// [`RemoteError::Withdrawn`] when a custodian announced its withdrawal for
+/// the pairing and none names it in a session record: the pairing is not
+/// dialed again until its custodian serves in `mode=session`.
+fn sessions_for(
+    keys: &PairingKeys,
+    services: Vec<StreamService>,
+) -> Result<Vec<StreamService>, RemoteError> {
+    let now = unix_seconds();
+    let withdrawn = services
+        .iter()
+        .any(|service| service.withdraws(&keys.withdrawal, now));
     let (mut named, mut unhinted) = (Vec::new(), Vec::new());
     for service in services {
-        match service.hint_match(token, unix_seconds) {
+        if !service.advertises(DiscoveryMode::Session) {
+            continue;
+        }
+        match service.hint_match(&keys.discovery, now) {
             HintMatch::Named => named.push(service),
             HintMatch::Unhinted => unhinted.push(service),
             HintMatch::Other => {}
         }
     }
+    if withdrawn && named.is_empty() {
+        return Err(RemoteError::Withdrawn);
+    }
     named.extend(unhinted);
-    named
+    Ok(named)
+}
+
+/// Whether the peer ended `end` by announcing its withdrawal.
+const fn withdrawn_by(end: Option<SessionEnd>) -> bool {
+    matches!(
+        end,
+        Some(SessionEnd::PeerClose(CloseReason::ServiceWithdrawn))
+    )
 }
 
 /// Why a remote reader call ended without its answer.
@@ -65,6 +129,10 @@ pub enum RemoteError {
     NotPaired,
     /// No custodian advertised the needed mode before the deadline.
     NotFound,
+    /// The phone announced that it stopped serving the pairing.
+    Withdrawn,
+    /// The system random source failed.
+    RandomUnavailable,
     /// Pairing failed.
     Pairing(PairingError),
     /// No custodian opened a session for the pairing.
@@ -85,6 +153,8 @@ impl core::fmt::Display for RemoteError {
             Self::Store(error) => write!(f, "pairing store: {error:?}"),
             Self::NotPaired => f.write_str("no paired phone"),
             Self::NotFound => f.write_str("no phone found on the local network"),
+            Self::Withdrawn => f.write_str("the phone turned remote card access off"),
+            Self::RandomUnavailable => f.write_str("the system random source failed"),
             Self::Pairing(error) => write!(f, "pairing: {error}"),
             Self::Session(error) => write!(f, "session: {error}"),
             Self::Admission(error) => write!(f, "operation: {error}"),
@@ -260,23 +330,26 @@ impl RemoteReader {
         if record.disposition != PairingDisposition::Paired {
             return Err(RemoteError::NotPaired);
         }
-        let token = record.rendezvous_token;
+        let keys = PairingKeys::derive(record)?;
         let mut answers = Vec::new();
         for operation_id in self.unreconciled(pair_id) {
             let deadline = Instant::now() + discovery_timeout;
             let mut answer = Err(RemoteError::NotFound);
             'search: while Instant::now() < deadline {
-                for service in sessions_for(&token, browse(DiscoveryMode::Session, BROWSE_ROUND)) {
+                for service in sessions_for(&keys, browse_stream_services(BROWSE_ROUND))? {
                     let Ok(transport) = dial(
                         &service.endpoints,
                         STREAM_CANDIDATE_ID,
                         OPERATION_RECEIVE_DEADLINE,
-                        &StreamRendezvous::Session(token),
+                        &keys.session_preamble()?,
                     ) else {
                         continue;
                     };
                     let mut session = match self.requester.connect(pair_id, transport) {
                         Ok(session) => session,
+                        Err(SessionError::ClosedByPeer(CloseReason::ServiceWithdrawn)) => {
+                            return Err(RemoteError::Withdrawn);
+                        }
                         Err(error) => {
                             answer = Err(RemoteError::Session(error));
                             continue;
@@ -322,7 +395,7 @@ impl RemoteReader {
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
                     PAIRING_RECEIVE_DEADLINE,
-                    &StreamRendezvous::Pairing,
+                    &RoutingPreamble::Pairing,
                 ) else {
                     continue;
                 };
@@ -374,21 +447,24 @@ impl RemoteReader {
         if record.disposition != PairingDisposition::Paired {
             return Err(RemoteError::NotPaired);
         }
-        let token = record.rendezvous_token;
+        let keys = PairingKeys::derive(record)?;
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
-            for service in sessions_for(&token, browse(DiscoveryMode::Session, BROWSE_ROUND)) {
+            for service in sessions_for(&keys, browse_stream_services(BROWSE_ROUND))? {
                 let Ok(transport) = dial(
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
                     OPERATION_RECEIVE_DEADLINE,
-                    &StreamRendezvous::Session(token),
+                    &keys.session_preamble()?,
                 ) else {
                     continue;
                 };
                 let mut session = match self.requester.connect(pair_id, transport) {
                     Ok(session) => session,
+                    Err(SessionError::ClosedByPeer(CloseReason::ServiceWithdrawn)) => {
+                        return Err(RemoteError::Withdrawn);
+                    }
                     Err(error) => {
                         last = RemoteError::Session(error);
                         continue;
@@ -398,10 +474,14 @@ impl RemoteReader {
                     .requester
                     .execute(&mut session, operation, OPERATION_LIFETIME_MS)
                     .map_err(RemoteError::Admission);
+                let withdrawn = withdrawn_by(
+                    Requester::<FilePairingStore, FileOperationJournal>::session_end(&session),
+                );
                 self.requester
                     .disconnect(&mut session, CloseReason::Complete);
                 return match outcome? {
                     OperationOutcome::Completed(result) => Ok(result),
+                    _ if withdrawn => Err(RemoteError::Withdrawn),
                     other => Err(RemoteError::Outcome(Box::new(other))),
                 };
             }
@@ -442,50 +522,142 @@ impl RemoteReader {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixtures are constructed to be infallible"
+)]
 mod tests {
-    use std::collections::BTreeMap;
+    use refineid_rapp::{
+        AnnouncementCandidate, DiscoveryKey, InstanceName, PairId, RoutingKey, WithdrawalKey,
+        WithdrawnRecord, discovery_epoch, withdrawal_counter,
+    };
 
-    use super::{RendezvousToken, StreamService, sessions_for};
+    use super::{PairingKeys, RemoteError, StreamService, sessions_for, unix_seconds};
 
-    fn service(instance: &str, hints: Option<String>) -> StreamService {
-        let mut attributes = BTreeMap::from([
-            ("v".to_owned(), "1".to_owned()),
-            ("mode".to_owned(), "session".to_owned()),
-        ]);
-        if let Some(hints) = hints {
-            attributes.insert("hints".to_owned(), hints);
+    const PAIR_ID: [u8; 16] = [0x22; 16];
+    const PEER_PUBLIC: [u8; 32] = [0x44; 32];
+    const MINE: [u8; 32] = [0x11; 32];
+    const THEIRS: [u8; 32] = [0x33; 32];
+
+    fn keys(local: [u8; 32]) -> PairingKeys {
+        let pair_id = PairId::from_array(PAIR_ID);
+        PairingKeys {
+            discovery: DiscoveryKey::from_parts(pair_id, &local, &PEER_PUBLIC).unwrap(),
+            routing: RoutingKey::from_parts(pair_id, &local, &PEER_PUBLIC).unwrap(),
+            withdrawal: WithdrawalKey::from_parts(pair_id, &local, &PEER_PUBLIC).unwrap(),
         }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn service(instance: &str, txt: &[(&str, String)]) -> StreamService {
         StreamService {
             instance: instance.to_owned(),
             endpoints: vec!["192.0.2.10:47110".to_owned()],
-            attributes,
+            txt: txt
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect(),
         }
+    }
+
+    fn session(instance: &str, hints: Option<String>) -> StreamService {
+        let mut txt = vec![("v", "1".to_owned()), ("mode", "session".to_owned())];
+        if let Some(hints) = hints {
+            txt.push(("hints", hints));
+        }
+        service(instance, &txt)
+    }
+
+    fn withdrawn(instance: &str, key: &WithdrawalKey) -> StreamService {
+        let name = InstanceName::new(instance).unwrap();
+        let candidate = AnnouncementCandidate {
+            hint: key.hint(&name, withdrawal_counter(unix_seconds())),
+            last_used_ms: 1,
+        };
+        let record = WithdrawnRecord::assemble(&[candidate], |bytes| {
+            getrandom::fill(bytes).map_err(|_| refineid_rapp::WithdrawalError::RandomUnavailable)
+        })
+        .unwrap();
+        service(instance, &record.txt_entries())
+    }
+
+    fn names(services: &[StreamService]) -> Vec<&str> {
+        services.iter().map(|svc| svc.instance.as_str()).collect()
     }
 
     #[test]
     fn named_custodians_come_first_and_foreign_ones_are_never_dialed() {
-        let token = RendezvousToken::from_array([0x42; 16]);
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs())
-            / refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS;
-        let hex = |bytes: [u8; refineid_rapp::DISCOVERY_HINT_SIZE]| -> String {
-            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-        };
-        let mine = hex(refineid_rapp::discovery_hint(&token, epoch));
-        let theirs = hex(refineid_rapp::discovery_hint(
-            &RendezvousToken::from_array([0x24; 16]),
-            epoch,
-        ));
+        let mine = keys(MINE);
+        let epoch = discovery_epoch(unix_seconds());
         let ordered = sessions_for(
-            &token,
+            &mine,
             vec![
-                service("refineid-unhinted", None),
-                service("refineid-foreign", Some(theirs)),
-                service("refineid-mine", Some(mine)),
+                session("refineid-unhinted", None),
+                session(
+                    "refineid-foreign",
+                    Some(hex(&keys(THEIRS).discovery.hint(epoch))),
+                ),
+                session("refineid-mine", Some(hex(&mine.discovery.hint(epoch)))),
             ],
+        )
+        .unwrap();
+        assert_eq!(names(&ordered), ["refineid-mine", "refineid-unhinted"]);
+    }
+
+    #[test]
+    fn a_withdrawal_for_the_pairing_ends_the_search() {
+        let mine = keys(MINE);
+        assert_eq!(
+            sessions_for(
+                &mine,
+                vec![
+                    withdrawn("refineid-gone", &mine.withdrawal),
+                    session("refineid-unhinted", None),
+                ],
+            )
+            .map(|found| names(&found).len()),
+            Err(RemoteError::Withdrawn)
         );
-        let names: Vec<&str> = ordered.iter().map(|svc| svc.instance.as_str()).collect();
-        assert_eq!(names, ["refineid-mine", "refineid-unhinted"]);
+    }
+
+    #[test]
+    fn a_session_record_naming_the_pairing_outranks_its_withdrawal() {
+        let mine = keys(MINE);
+        let epoch = discovery_epoch(unix_seconds());
+        let found = sessions_for(
+            &mine,
+            vec![
+                withdrawn("refineid-old", &mine.withdrawal),
+                session("refineid-new", Some(hex(&mine.discovery.hint(epoch)))),
+            ],
+        )
+        .unwrap();
+        assert_eq!(names(&found), ["refineid-new"]);
+    }
+
+    #[test]
+    fn another_pairings_withdrawal_is_ignored() {
+        let mine = keys(MINE);
+        let found = sessions_for(
+            &mine,
+            vec![
+                withdrawn("refineid-other", &keys(THEIRS).withdrawal),
+                session("refineid-unhinted", None),
+            ],
+        )
+        .unwrap();
+        assert_eq!(names(&found), ["refineid-unhinted"]);
+    }
+
+    #[test]
+    fn every_session_preamble_is_fresh() {
+        let mine = keys(MINE);
+        assert_ne!(
+            mine.session_preamble().unwrap(),
+            mine.session_preamble().unwrap()
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! The requester operation journal as owner-only files.
 //!
-//! RAPP v26.10.9 section 8.3 reconciles an interrupted operation after the
+//! RAPP v26.10.10 section 8.3 reconciles an interrupted operation after the
 //! requester reconnects, by `operation.status_request` with the operation's
 //! identifier. That needs the identifier and request hash to outlive the
 //! process, so each operation is one file, written atomically before the

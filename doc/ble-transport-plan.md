@@ -64,14 +64,16 @@ ble-parameters = {
 }
 ```
 
-### 2.5 Rendezvous Preamble
+### 2.5 Routing Preamble
 Immediately upon L2CAP channel connection, before the Noise handshake:
 
 ```cddl
-ble-rendezvous = [
+ble-routing-preamble = [
   "RAPP-ble-v1",
   tstr,                             ; "pairing" or "session"
-  bstr                              ; empty (for pairing) or rendezvous_token (for session)
+  bstr                              ; empty (for pairing), or for a session a fresh
+                                    ; 16-byte nonce || 16-byte routing tag keyed by
+                                    ; the pairing's static agreement (RAPP v26.10.10 §2.2.1)
 ]
 ```
 
