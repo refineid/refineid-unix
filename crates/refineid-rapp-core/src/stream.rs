@@ -70,6 +70,74 @@ impl StreamService {
         self.attributes.get(VERSION_KEY).map(String::as_str) == Some(SUPPORTED_TXT_VERSION)
             && self.attributes.get(MODE_KEY).map(String::as_str) == Some(mode.txt_value())
     }
+
+    /// The rotating discovery hints the record publishes (hierarchy
+    /// section 4.3), or `None` when it publishes no `hints` attribute.
+    /// Entries that are not 16 lowercase hex digits are ignored.
+    #[must_use]
+    pub fn hints(&self) -> Option<Vec<[u8; refineid_rapp::DISCOVERY_HINT_SIZE]>> {
+        let value = self.attributes.get(HINTS_KEY)?;
+        Some(
+            value
+                .split(',')
+                .take(MAX_PUBLISHED_HINTS)
+                .filter_map(decode_hint)
+                .collect(),
+        )
+    }
+
+    /// How this record relates to the pairing whose token is `token` at
+    /// `unix_seconds`: a published hint names it within one epoch either
+    /// way, the record publishes no hints, or its hints name other pairings.
+    #[must_use]
+    pub fn hint_match(&self, token: &RendezvousToken, unix_seconds: u64) -> HintMatch {
+        let Some(hints) = self.hints() else {
+            return HintMatch::Unhinted;
+        };
+        let epoch = unix_seconds / refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS;
+        let named = [epoch.saturating_sub(1), epoch, epoch.saturating_add(1)]
+            .into_iter()
+            .map(|candidate| refineid_rapp::discovery_hint(token, candidate))
+            .any(|hint| hints.contains(&hint));
+        if named {
+            HintMatch::Named
+        } else {
+            HintMatch::Other
+        }
+    }
+}
+
+/// How a session record's hints relate to one stored pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintMatch {
+    /// A hint names the pairing; dial this custodian first.
+    Named,
+    /// The record publishes no hints; it may serve the pairing.
+    Unhinted,
+    /// Every hint names another pairing; do not dial.
+    Other,
+}
+
+/// TXT key carrying the rotating discovery hints.
+const HINTS_KEY: &str = "hints";
+/// Hints a custodian publishes at most (hierarchy section 4.3).
+const MAX_PUBLISHED_HINTS: usize = 4;
+/// Hex digits in one published hint.
+const HINT_HEX_DIGITS: usize = 2 * refineid_rapp::DISCOVERY_HINT_SIZE;
+
+fn decode_hint(text: &str) -> Option<[u8; refineid_rapp::DISCOVERY_HINT_SIZE]> {
+    if text.len() != HINT_HEX_DIGITS
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let mut hint = [0_u8; refineid_rapp::DISCOVERY_HINT_SIZE];
+    for (index, byte) in hint.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).ok()?;
+    }
+    Some(hint)
 }
 
 /// One accepted, preamble-classified stream connection.
@@ -481,11 +549,6 @@ pub enum StreamError {
     Oversized,
     /// Purpose string is not registered; the connection closes unanswered.
     UnknownPurpose,
-    /// Candidate carried no endpoint or more than `refineid_rapp::MAX_STREAM_ENDPOINTS`.
-    EndpointCount,
-    /// An endpoint literal was empty or exceeded
-    /// `refineid_rapp::MAX_STREAM_ENDPOINT_BYTES`.
-    EndpointLength,
     /// The listener address could not be bound or reported.
     Bind,
     /// A connection could not be accepted or wrapped.
@@ -502,8 +565,6 @@ impl From<refineid_rapp::StreamError> for StreamError {
             refineid_rapp::StreamError::Malformed => Self::Malformed,
             refineid_rapp::StreamError::Oversized => Self::Oversized,
             refineid_rapp::StreamError::UnknownPurpose => Self::UnknownPurpose,
-            refineid_rapp::StreamError::EndpointCount => Self::EndpointCount,
-            refineid_rapp::StreamError::EndpointLength => Self::EndpointLength,
         }
     }
 }
@@ -514,8 +575,6 @@ impl core::fmt::Display for StreamError {
             Self::Malformed => write!(f, "malformed stream profile data"),
             Self::Oversized => write!(f, "oversized stream rendezvous frame"),
             Self::UnknownPurpose => write!(f, "unknown stream rendezvous purpose"),
-            Self::EndpointCount => write!(f, "invalid stream endpoint count"),
-            Self::EndpointLength => write!(f, "invalid stream endpoint length"),
             Self::Bind => write!(f, "failed to bind stream listener"),
             Self::Accept => write!(f, "failed to accept stream connection"),
             Self::Preamble(e) => write!(f, "failed to move preamble frame: {e}"),
@@ -539,11 +598,12 @@ impl core::error::Error for StreamError {
     reason = "test fixtures are constructed to be infallible"
 )]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use super::{
-        DiscoveryMode, MdnsRecords, StreamAccept, StreamError, StreamListener, StreamRendezvous,
-        dial, parse_mdns_response,
+        DiscoveryMode, HintMatch, MdnsRecords, StreamAccept, StreamError, StreamListener,
+        StreamRendezvous, StreamService, dial, parse_mdns_response,
     };
     use crate::ids::RendezvousToken;
     use crate::transport::FrameTransport;
@@ -731,5 +791,58 @@ mod tests {
             ),
             Err(StreamError::Unreachable)
         ));
+    }
+
+    fn session_service(hints: Option<String>) -> StreamService {
+        let mut attributes = BTreeMap::from([
+            ("v".to_owned(), "1".to_owned()),
+            ("mode".to_owned(), "session".to_owned()),
+        ]);
+        if let Some(hints) = hints {
+            attributes.insert("hints".to_owned(), hints);
+        }
+        StreamService {
+            instance: "refineid-0b9e44d1".to_owned(),
+            endpoints: vec!["192.0.2.10:47110".to_owned()],
+            attributes,
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn a_hint_names_its_pairing_within_one_epoch_either_way() {
+        let token = token();
+        let epoch_seconds = refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS;
+        let now = 1_000 * epoch_seconds + 7;
+        let previous = refineid_rapp::discovery_hint(&token, 999);
+        let other = refineid_rapp::discovery_hint(&RendezvousToken::from_array([0x24; 16]), 1_000);
+        let service = session_service(Some(format!("{},{}", hex(&other), hex(&previous))));
+        assert_eq!(service.hint_match(&token, now), HintMatch::Named);
+        assert_eq!(
+            service.hint_match(&token, now + 3 * epoch_seconds),
+            HintMatch::Other
+        );
+        assert_eq!(
+            session_service(None).hint_match(&token, now),
+            HintMatch::Unhinted
+        );
+    }
+
+    #[test]
+    fn malformed_hint_entries_are_ignored() {
+        let token = token();
+        let current = refineid_rapp::discovery_hint(&token, 1_000);
+        let upper = hex(&current).to_ascii_uppercase();
+        let service = session_service(Some(format!("{upper},zz,{}", hex(&current))));
+        assert_eq!(service.hints().map(|hints| hints.len()), Some(1));
+        let only_bad = session_service(Some(format!("{upper},short")));
+        assert_eq!(only_bad.hints().map(|hints| hints.len()), Some(0));
+        assert_eq!(
+            only_bad.hint_match(&token, 1_000 * refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS),
+            HintMatch::Other
+        );
     }
 }

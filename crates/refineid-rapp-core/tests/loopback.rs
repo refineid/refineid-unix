@@ -25,18 +25,20 @@ use refineid_rapp::{
     BinaryFrame, CardInspection, CardKeyProfile as KeyProfile, CardOperation, CardOperationResult,
     CloseReason, CpaceKc2Responder, EndpointRole, EstablishedEndpoint, OperationReference,
     OperationResultMessage, PairId, PairRecord, PairStore, PairStoreError, PairTombstone,
-    PairingHandshake, ProxyFailure, ReceiveOutcome, SessionCloseMessage, SessionHandshake,
-    SignatureAlgorithm, TypedMessage, generate_pair_key_material, standard_pairing_context_v2,
+    PairingHandshake, PairingOffer, ProxyFailure, ReceiveOutcome, SessionCloseMessage,
+    SessionHandshake, SignatureAlgorithm, StatusReport, TransportProfile, TypedMessage,
+    generate_pair_key_material, standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
-    OperationOutcome, PairingError, Requester, RequesterConfig, SessionError,
+    OperationOutcome, PairingError, ReconciledResult, Requester, RequesterConfig, SessionError,
 };
+use refineid_rapp_core::file_journal::FileOperationJournal;
 use refineid_rapp_core::operations::SignatureAlgorithmExt as _;
 use refineid_rapp_core::profiles::{PROFILE_AUTHENTICATION, PROFILE_CARD_STATUS};
 use refineid_rapp_core::store::{
     MemoryJournal, MemoryPairingStore, OperationJournal, PairingDisposition, PairingStore,
 };
-use refineid_rapp_core::transport::{FrameTransport, MEMORY_PROFILE, MemoryTransport};
+use refineid_rapp_core::transport::{FrameTransport, MemoryTransport};
 
 /// A generous deadline for scripted exchanges.
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -48,6 +50,31 @@ const TEST_MONOTONIC_TIMESTAMP_MS: u64 = 1_000_000;
 const SHOWN_CODE: &str = "7KX4M9";
 /// Fixed custodian scalar entropy for the scripted exchange.
 const CUSTODIAN_ENTROPY: [u8; 64] = [0x24; 64];
+
+/// The custodian's random stream offer and its bootstrap bytes (section
+/// 4.2), and the CPace context it binds.
+fn custodian_offer() -> (PairingOffer, Vec<u8>, Vec<u8>) {
+    let mut offer_id = [0_u8; refineid_rapp::OFFER_ID_SIZE];
+    getrandom::fill(&mut offer_id).unwrap();
+    let offer = PairingOffer::create(
+        refineid_rapp::OfferId::from_array(offer_id),
+        vec![
+            PROFILE_CARD_STATUS.to_owned(),
+            PROFILE_AUTHENTICATION.to_owned(),
+            refineid_rapp_core::profiles::PROFILE_DOCUMENT_SIGNING.to_owned(),
+        ],
+        &[TransportProfile::Stream],
+    )
+    .unwrap();
+    let bytes = offer.to_cbor().unwrap();
+    let context = standard_pairing_context_v2(
+        &offer.offer_hash().unwrap(),
+        TransportProfile::Stream.name(),
+        TransportProfile::Stream.candidate_id(),
+    )
+    .unwrap();
+    (offer, bytes, context)
+}
 
 /// The requester engine type under test.
 type TestRequester = Requester<MemoryPairingStore, MemoryJournal>;
@@ -97,10 +124,9 @@ impl PairStore for MockProxyStore {
 /// hello and confirmation exchange.
 fn proxy_pair<T: FrameTransport>(mut transport: T, shown_code: &str) -> PairRecord {
     let now_ms = TEST_MONOTONIC_TIMESTAMP_MS;
-    let candidate = transport.candidate_id().to_owned();
-    let offer =
-        refineid_rapp_core::offer::code_offer(shown_code, transport.profile(), &candidate).unwrap();
-    let context = standard_pairing_context_v2(&offer.offer_hash().unwrap()).unwrap();
+    let candidate = TransportProfile::Stream.candidate_id();
+    let (offer, bootstrap, context) = custodian_offer();
+    transport.send_frame(&bootstrap).unwrap();
 
     let step_one = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
     let (step_two, waiting) = CpaceKc2Responder::process_step1_frame(
@@ -117,7 +143,7 @@ fn proxy_pair<T: FrameTransport>(mut transport: T, shown_code: &str) -> PairReco
 
     let local_keys = generate_pair_key_material().unwrap();
     let mut handshake =
-        PairingHandshake::begin(EndpointRole::Proxy, offer, &candidate, local_keys, &secret)
+        PairingHandshake::begin(EndpointRole::Proxy, offer, candidate, local_keys, &secret)
             .unwrap();
 
     let m1 = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
@@ -177,7 +203,8 @@ fn proxy_accept_session<T: FrameTransport>(
     mut transport: T,
 ) -> ProxySession<T> {
     let now_ms = TEST_MONOTONIC_TIMESTAMP_MS;
-    let mut handshake = SessionHandshake::begin_proxy(pair_record).unwrap();
+    let mut handshake =
+        SessionHandshake::begin_proxy(pair_record, TransportProfile::Stream).unwrap();
 
     // Message 1 (Requester -> Proxy)
     let m1_bytes = transport.receive_frame().unwrap();
@@ -209,7 +236,10 @@ fn proxy_accept_session<T: FrameTransport>(
 }
 
 /// Pairs a fresh requester with a custodian thread and returns both halves.
-fn paired(requester: &mut TestRequester, granted: &[String]) -> (PairId, PairRecord) {
+fn paired<J: OperationJournal>(
+    requester: &mut Requester<MemoryPairingStore, J>,
+    granted: &[String],
+) -> (PairId, PairRecord) {
     let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || proxy_pair(proxy_transport, SHOWN_CODE));
     let pair_id = requester
@@ -244,9 +274,8 @@ fn a_mistyped_code_fails_at_the_custodian_tag_and_stores_nothing() {
     let mut requester = test_requester();
     let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || {
-        let offer =
-            refineid_rapp_core::offer::code_offer(SHOWN_CODE, MEMORY_PROFILE, CANDIDATE).unwrap();
-        let context = standard_pairing_context_v2(&offer.offer_hash().unwrap()).unwrap();
+        let (offer, bootstrap, context) = custodian_offer();
+        proxy_transport.send_frame(&bootstrap).unwrap();
         let step_one = BinaryFrame::reconstruct(proxy_transport.receive_frame().unwrap()).unwrap();
         let (step_two, _waiting) = CpaceKc2Responder::process_step1_frame(
             SHOWN_CODE,
@@ -265,6 +294,38 @@ fn a_mistyped_code_fails_at_the_custodian_tag_and_stores_nothing() {
     });
     proxy.join().unwrap();
     assert_eq!(outcome, Err(PairingError::CodeMismatch));
+    assert!(requester.store().pair_ids().is_empty());
+}
+
+#[test]
+fn an_offer_without_the_connection_transport_is_refused_before_cpace() {
+    let mut requester = test_requester();
+    let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut offer_id = [0_u8; refineid_rapp::OFFER_ID_SIZE];
+        getrandom::fill(&mut offer_id).unwrap();
+        let ble_only = PairingOffer::create(
+            refineid_rapp::OfferId::from_array(offer_id),
+            vec![PROFILE_AUTHENTICATION.to_owned()],
+            &[TransportProfile::Ble],
+        )
+        .unwrap();
+        proxy_transport
+            .send_frame(&ble_only.to_cbor().unwrap())
+            .unwrap();
+        // The requester refuses the offer and never sends Y_A.
+        assert!(proxy_transport.receive_frame().is_err());
+    });
+    let outcome = requester.pair_with_code(SHOWN_CODE, requester_transport, |_, _| {
+        panic!("a refused offer must never reach confirmation")
+    });
+    proxy.join().unwrap();
+    assert_eq!(
+        outcome,
+        Err(PairingError::Offer(
+            refineid_rapp::PairingOfferError::TransportNotOffered
+        ))
+    );
     assert!(requester.store().pair_ids().is_empty());
 }
 
@@ -468,6 +529,191 @@ fn unanswered_consequential_close_classifies_as_ambiguous() {
     // The journal remembers the prohibition on automatic retry (INV-06).
     let open = requester.journal().open_entries();
     assert!(open.is_empty());
+}
+
+#[test]
+fn an_unanswered_signature_survives_restart_and_reconciles_by_status() {
+    let directory = std::env::temp_dir().join(format!(
+        "refineid-loopback-journal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config = || RequesterConfig {
+        display_name: "Workstation".into(),
+        platform: "Linux".into(),
+    };
+    let mut requester = Requester::new(
+        config(),
+        MemoryPairingStore::new(),
+        FileOperationJournal::open(&directory).unwrap(),
+    );
+    let granted = vec![PROFILE_AUTHENTICATION.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationRequest(request) = session.receive() else {
+            panic!("expected an operation request");
+        };
+        // The transport dies with the request delivered and unanswered.
+        drop(session);
+        (request, proxy_pairing)
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let outcome = requester
+        .execute(&mut session, &authentication_operation(), 30_000)
+        .unwrap();
+    let (request, proxy_pairing) = proxy.join().unwrap();
+    assert_eq!(outcome, OperationOutcome::Ambiguous);
+    let store = std::mem::take(requester.store_mut());
+    drop(requester);
+
+    // A new process finds the operation ambiguous and unreconciled.
+    let mut requester = Requester::new(
+        config(),
+        store,
+        FileOperationJournal::open(&directory).unwrap(),
+    );
+    let pending = requester.journal().unreconciled(pair_id);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].operation_id, request.operation_id);
+    assert!(pending[0].retry_prohibited);
+
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let reference = OperationReference {
+        operation_id: request.operation_id,
+        request_hash: request.request_hash().unwrap(),
+    };
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationStatusRequest(asked) = session.receive() else {
+            panic!("expected a status request");
+        };
+        assert_eq!(asked, reference.operation_id);
+        session.send(&TypedMessage::OperationStatus(StatusReport {
+            operation_id: asked,
+            known: true,
+            state: Some(refineid_rapp::OperationState::Ambiguous),
+            request_hash: Some(reference.request_hash),
+            retired: false,
+        }));
+        // Section 8.3: the retained terminal result follows the report.
+        session.send(&TypedMessage::OperationResult(
+            OperationResultMessage::failure(reference, ProxyFailure::CardCompletionAmbiguous),
+        ));
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let answer = requester
+        .reconcile_status(&mut session, request.operation_id)
+        .unwrap();
+    proxy.join().unwrap();
+    assert_eq!(
+        answer.reported_state,
+        Some(refineid_rapp::OperationState::Ambiguous)
+    );
+    assert!(matches!(
+        answer.result,
+        Some(ReconciledResult::Failed {
+            status: refineid_rapp::ResultStatus::Ambiguous,
+            ..
+        })
+    ));
+    assert!(requester.journal().unreconciled(pair_id).is_empty());
+    let reopened = FileOperationJournal::open(&directory).unwrap();
+    assert!(reopened.unreconciled(pair_id).is_empty());
+    assert!(
+        reopened
+            .get(request.operation_id)
+            .unwrap()
+            .reconciled_proxy_state
+            .is_some()
+    );
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn a_redelivered_completed_result_is_acknowledged_and_the_session_continues() {
+    let mut requester = test_requester();
+    let granted = vec![PROFILE_AUTHENTICATION.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationRequest(request) = session.receive() else {
+            panic!("expected an operation request");
+        };
+        drop(session);
+        (request, proxy_pairing)
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let outcome = requester
+        .execute(&mut session, &authentication_operation(), 30_000)
+        .unwrap();
+    let (request, proxy_pairing) = proxy.join().unwrap();
+    assert_eq!(outcome, OperationOutcome::Ambiguous);
+
+    let reference = OperationReference {
+        operation_id: request.operation_id,
+        request_hash: request.request_hash().unwrap(),
+    };
+    let signature = CardOperationResult::Signature(vec![0x5c; 384]);
+    let delivered = OperationResultMessage::completed(reference, &signature);
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationStatusRequest(asked) = session.receive() else {
+            panic!("expected a status request");
+        };
+        session.send(&TypedMessage::OperationStatus(StatusReport {
+            operation_id: asked,
+            known: true,
+            state: Some(refineid_rapp::OperationState::Completed),
+            request_hash: Some(reference.request_hash),
+            retired: false,
+        }));
+        session.send(&TypedMessage::OperationResult(delivered));
+        let TypedMessage::OperationResultAck(acknowledged) = session.receive() else {
+            panic!("a re-delivered completed result must be acknowledged");
+        };
+        assert_eq!(acknowledged, reference);
+        // The session stays usable after reconciliation.
+        let TypedMessage::OperationStatusRequest(again) = session.receive() else {
+            panic!("expected a second status request");
+        };
+        session.send(&TypedMessage::OperationStatus(StatusReport {
+            operation_id: again,
+            known: true,
+            state: Some(refineid_rapp::OperationState::Completed),
+            request_hash: Some(reference.request_hash),
+            retired: true,
+        }));
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let answer = requester
+        .reconcile_status(&mut session, request.operation_id)
+        .unwrap();
+    let Some(ReconciledResult::Completed(response)) = answer.result else {
+        panic!("expected the completed result, got {answer:?}");
+    };
+    assert_eq!(
+        response.typed_for(&authentication_operation()).unwrap(),
+        signature
+    );
+    assert_eq!(
+        requester.journal().get(request.operation_id).unwrap().state,
+        refineid_rapp::OperationState::Completed
+    );
+    let retired = requester
+        .reconcile_status(&mut session, request.operation_id)
+        .unwrap();
+    proxy.join().unwrap();
+    assert!(retired.retired);
+    assert_eq!(retired.result, None);
 }
 
 #[test]

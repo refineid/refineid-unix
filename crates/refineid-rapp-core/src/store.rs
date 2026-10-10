@@ -3,7 +3,7 @@
 //! A pairing record is the atomic result of pairing: pair keys, `pair_id`,
 //! the rendezvous token, granted profiles, `grants_hash`, labels, and the
 //! fail-stop marker. The journal records each operation from the moment its
-//! request is written (RAPP v26.10.1 section 8): an unanswered consequential
+//! request is written (RAPP v26.10.9 section 8): an unanswered consequential
 //! request is in flight and ends ambiguous, and terminal states are
 //! permanent.
 //!
@@ -64,10 +64,6 @@ pub struct PairingRecord {
     pub root_ca: Option<Vec<u8>>,
     /// Cached DER bytes of the intermediate CA certificate, if populated.
     pub intermediate_ca: Option<Vec<u8>>,
-    /// Candidate identifier used by this pairing.
-    pub candidate_id: Option<String>,
-    /// Transport profile used by this pairing.
-    pub transport_profile: Option<String>,
 }
 
 impl core::fmt::Debug for PairingRecord {
@@ -84,8 +80,6 @@ impl core::fmt::Debug for PairingRecord {
 pub const DEFAULT_PEER_DISPLAY_NAME: &str = "Peer";
 /// Default platform when peer platform is unspecified.
 pub const DEFAULT_PEER_PLATFORM: &str = "Unknown";
-/// Default candidate identifier for single-channel stream transport.
-pub const DEFAULT_STREAM_CANDIDATE_ID: &str = "stream-1";
 
 impl PairingRecord {
     /// Convert to canonical core [`refineid_rapp::PairRecord`].
@@ -129,17 +123,6 @@ impl PairingRecord {
             peer_public,
             grants_hash,
             profiles,
-            refineid_rapp::PairTransportBinding {
-                profile: self
-                    .transport_profile
-                    .clone()
-                    .unwrap_or_else(|| refineid_rapp::STREAM_PROFILE.to_owned()),
-                candidate_id: self
-                    .candidate_id
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_STREAM_CANDIDATE_ID.to_owned()),
-                parameters: std::collections::BTreeMap::new(),
-            },
             0,
         )
     }
@@ -172,8 +155,6 @@ impl PairingRecord {
             signature_cert: None,
             root_ca: None,
             intermediate_ca: None,
-            candidate_id: Some(core.transport().candidate_id.clone()),
-            transport_profile: Some(core.transport().profile.clone()),
         }
     }
 }
@@ -259,6 +240,9 @@ pub enum StoreError {
     Unknown,
     /// The backing store refused the write.
     WriteRefused,
+    /// The secret store refused to hold a pair private key; nothing was
+    /// written.
+    SecretsUnavailable,
 }
 
 /// Durable storage for pairing records.
@@ -472,8 +456,6 @@ mod tests {
             signature_cert: None,
             root_ca: None,
             intermediate_ca: None,
-            candidate_id: None,
-            transport_profile: None,
         }
     }
 

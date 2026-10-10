@@ -10,14 +10,20 @@
 use std::time::{Duration, Instant};
 
 use crate::engine::{
-    AdmissionError, OperationOutcome, PairingError, Requester, RequesterConfig, SessionError,
+    AdmissionError, OperationOutcome, PairingError, Reconciliation, Requester, RequesterConfig,
+    SessionError,
 };
+use crate::file_journal::FileOperationJournal;
 use crate::file_store::FilePairingStore;
+use crate::ids::OperationId;
 use crate::ids::PairId;
+use crate::ids::RendezvousToken;
 use crate::message::CloseReason;
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
-use crate::store::{MemoryJournal, PairingDisposition, PairingStore, StoreError};
-use crate::stream::{DiscoveryMode, STREAM_CANDIDATE_ID, StreamRendezvous, browse, dial};
+use crate::store::{PairingDisposition, PairingStore, StoreError};
+use crate::stream::{
+    DiscoveryMode, HintMatch, STREAM_CANDIDATE_ID, StreamRendezvous, StreamService, browse, dial,
+};
 
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
@@ -29,6 +35,26 @@ const PAIRING_RECEIVE_DEADLINE: Duration = Duration::from_secs(60);
 const OPERATION_RECEIVE_DEADLINE: Duration = Duration::from_secs(120);
 /// The lifetime each request asks for (section 8.2.1).
 const OPERATION_LIFETIME_MS: u64 = 120_000;
+
+/// The session custodians worth dialing for `token`, best first: those whose
+/// rotating hint names the pairing, then those publishing no hints. A
+/// custodian whose hints all name other pairings is never dialed, so the
+/// token is presented only where it can be served.
+fn sessions_for(token: &RendezvousToken, services: Vec<StreamService>) -> Vec<StreamService> {
+    let unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (mut named, mut unhinted) = (Vec::new(), Vec::new());
+    for service in services {
+        match service.hint_match(token, unix_seconds) {
+            HintMatch::Named => named.push(service),
+            HintMatch::Unhinted => unhinted.push(service),
+            HintMatch::Other => {}
+        }
+    }
+    named.extend(unhinted);
+    named
+}
 
 /// Why a remote reader call ended without its answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +78,10 @@ pub enum RemoteError {
 impl core::fmt::Display for RemoteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Store(StoreError::SecretsUnavailable) => f.write_str(
+                "the desktop secret store is unavailable: install secret-tool (libsecret) and \
+                 unlock the keyring",
+            ),
             Self::Store(error) => write!(f, "pairing store: {error:?}"),
             Self::NotPaired => f.write_str("no paired phone"),
             Self::NotFound => f.write_str("no phone found on the local network"),
@@ -97,7 +127,7 @@ impl PairSummary {
 /// The workstation's remote reader over its durable pairing store.
 #[derive(Debug)]
 pub struct RemoteReader {
-    requester: Requester<FilePairingStore, MemoryJournal>,
+    requester: Requester<FilePairingStore, FileOperationJournal>,
 }
 
 /// The platform label this workstation introduces itself with.
@@ -130,12 +160,18 @@ impl RemoteReader {
     /// [`RemoteError::Store`] when the store cannot be opened.
     pub fn open(display_name: &str, platform: &str) -> Result<Self, RemoteError> {
         let store = FilePairingStore::open_default().map_err(RemoteError::Store)?;
-        Ok(Self::with_store(display_name, platform, store))
+        let journal = FileOperationJournal::open_default().map_err(RemoteError::Store)?;
+        Ok(Self::with_stores(display_name, platform, store, journal))
     }
 
-    /// Uses `store` for pairings.
+    /// Uses `store` for pairings and `journal` for operations.
     #[must_use]
-    pub fn with_store(display_name: &str, platform: &str, store: FilePairingStore) -> Self {
+    pub fn with_stores(
+        display_name: &str,
+        platform: &str,
+        store: FilePairingStore,
+        journal: FileOperationJournal,
+    ) -> Self {
         Self {
             requester: Requester::new(
                 RequesterConfig {
@@ -143,7 +179,7 @@ impl RemoteReader {
                     platform: platform.to_owned(),
                 },
                 store,
-                MemoryJournal::new(),
+                journal,
             ),
         }
     }
@@ -181,7 +217,83 @@ impl RemoteReader {
         self.requester
             .store_mut()
             .remove(pair_id)
+            .map_err(RemoteError::Store)?;
+        self.requester
+            .journal_mut()
+            .forget_pair(pair_id)
             .map_err(RemoteError::Store)
+    }
+
+    /// Operations of `pair_id` that ended ambiguous and await section 8.3
+    /// reconciliation, oldest first.
+    #[must_use]
+    pub fn unreconciled(&self, pair_id: PairId) -> Vec<OperationId> {
+        self.requester
+            .journal()
+            .unreconciled(pair_id)
+            .into_iter()
+            .map(|entry| entry.operation_id)
+            .collect()
+    }
+
+    /// Asks the phone holding `pair_id` for the state of each operation
+    /// that ended ambiguous (section 8.3), one session per operation, and
+    /// annotates the journal with each answer. Nothing is ever retried.
+    ///
+    /// Returns each reconciled operation with what the phone reported and
+    /// any result it re-delivered; a re-delivered completed result is
+    /// acknowledged.
+    ///
+    /// # Errors
+    /// [`RemoteError`] when the pairing is unknown or no phone opens a
+    /// session for it before `discovery_timeout`.
+    pub fn reconcile(
+        &mut self,
+        pair_id: PairId,
+        discovery_timeout: Duration,
+    ) -> Result<Vec<(OperationId, Reconciliation)>, RemoteError> {
+        let record = self
+            .requester
+            .store()
+            .get(pair_id)
+            .map_err(|_| RemoteError::NotPaired)?;
+        if record.disposition != PairingDisposition::Paired {
+            return Err(RemoteError::NotPaired);
+        }
+        let token = record.rendezvous_token;
+        let mut answers = Vec::new();
+        for operation_id in self.unreconciled(pair_id) {
+            let deadline = Instant::now() + discovery_timeout;
+            let mut answer = Err(RemoteError::NotFound);
+            'search: while Instant::now() < deadline {
+                for service in sessions_for(&token, browse(DiscoveryMode::Session, BROWSE_ROUND)) {
+                    let Ok(transport) = dial(
+                        &service.endpoints,
+                        STREAM_CANDIDATE_ID,
+                        OPERATION_RECEIVE_DEADLINE,
+                        &StreamRendezvous::Session(token),
+                    ) else {
+                        continue;
+                    };
+                    let mut session = match self.requester.connect(pair_id, transport) {
+                        Ok(session) => session,
+                        Err(error) => {
+                            answer = Err(RemoteError::Session(error));
+                            continue;
+                        }
+                    };
+                    answer = self
+                        .requester
+                        .reconcile_status(&mut session, operation_id)
+                        .map_err(RemoteError::Session);
+                    self.requester
+                        .disconnect(&mut session, CloseReason::Complete);
+                    break 'search;
+                }
+            }
+            answers.push((operation_id, answer?));
+        }
+        Ok(answers)
     }
 
     /// Pairs with the phone showing `code`, browsing for it until
@@ -266,7 +378,7 @@ impl RemoteReader {
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
-            for service in browse(DiscoveryMode::Session, BROWSE_ROUND) {
+            for service in sessions_for(&token, browse(DiscoveryMode::Session, BROWSE_ROUND)) {
                 let Ok(transport) = dial(
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
@@ -326,5 +438,54 @@ impl RemoteReader {
             })
             .map_err(RemoteError::Store)?;
         Ok(der)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{RendezvousToken, StreamService, sessions_for};
+
+    fn service(instance: &str, hints: Option<String>) -> StreamService {
+        let mut attributes = BTreeMap::from([
+            ("v".to_owned(), "1".to_owned()),
+            ("mode".to_owned(), "session".to_owned()),
+        ]);
+        if let Some(hints) = hints {
+            attributes.insert("hints".to_owned(), hints);
+        }
+        StreamService {
+            instance: instance.to_owned(),
+            endpoints: vec!["192.0.2.10:47110".to_owned()],
+            attributes,
+        }
+    }
+
+    #[test]
+    fn named_custodians_come_first_and_foreign_ones_are_never_dialed() {
+        let token = RendezvousToken::from_array([0x42; 16]);
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs())
+            / refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS;
+        let hex = |bytes: [u8; refineid_rapp::DISCOVERY_HINT_SIZE]| -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        };
+        let mine = hex(refineid_rapp::discovery_hint(&token, epoch));
+        let theirs = hex(refineid_rapp::discovery_hint(
+            &RendezvousToken::from_array([0x24; 16]),
+            epoch,
+        ));
+        let ordered = sessions_for(
+            &token,
+            vec![
+                service("refineid-unhinted", None),
+                service("refineid-foreign", Some(theirs)),
+                service("refineid-mine", Some(mine)),
+            ],
+        );
+        let names: Vec<&str> = ordered.iter().map(|svc| svc.instance.as_str()).collect();
+        assert_eq!(names, ["refineid-mine", "refineid-unhinted"]);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "refineid-rapp-core"
-description = "Remote Authorization Proxy Protocol (RAPP) v26.10.1 requester for Unix workstations, built on refineid-rapp."
+description = "Remote Authorization Proxy Protocol (RAPP) v26.10.9 requester for Unix workstations, built on refineid-rapp."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
