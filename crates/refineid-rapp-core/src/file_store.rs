@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 use crate::ids::PairId;
-use crate::key_vault::{KeyVault, PAIR_PRIVATE_KEY_SIZE, SecretServiceVault};
+use crate::key_vault::{KeyVault, KeyVaultError, PAIR_PRIVATE_KEY_SIZE, SecretServiceVault};
 use crate::persistence::{decode_pairing_record, encode_pairing_record};
 use crate::store::{PairingDisposition, PairingRecord, PairingStore, StoreError};
 
@@ -34,9 +34,10 @@ const FILE_MODE: u32 = 0o600;
 /// [`KeyVault`].
 ///
 /// A file holds only non-secret pair metadata. The private key goes to the
-/// vault before the file is written, and is read back when the store opens;
-/// a pairing whose key the vault cannot produce is loaded without one and
-/// cannot open sessions until it is made again.
+/// vault before the file is written, and is read back when the store opens.
+/// An unreachable vault fails the open; a pairing whose key the vault does
+/// not hold is loaded without one and cannot open sessions until it is made
+/// again.
 #[derive(Debug)]
 pub struct FilePairingStore {
     directory: PathBuf,
@@ -65,7 +66,8 @@ impl FilePairingStore {
     ///
     /// # Errors
     /// [`StoreError::WriteRefused`] when the directory cannot be created or
-    /// read.
+    /// read, and [`StoreError::SecretsUnavailable`] when the vault cannot be
+    /// reached to read a stored key or take one over from a file.
     pub fn open(directory: &Path, vault: Box<dyn KeyVault + Send>) -> Result<Self, StoreError> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -87,8 +89,12 @@ impl FilePairingStore {
             };
             if record.disposition == PairingDisposition::Paired {
                 if record.local_private.is_empty() {
-                    if let Ok(key) = vault.load(record.pair_id) {
-                        record.local_private = Zeroizing::new(key.to_vec());
+                    match vault.load(record.pair_id) {
+                        Ok(key) => record.local_private = Zeroizing::new(key.to_vec()),
+                        Err(KeyVaultError::Unavailable) => {
+                            return Err(StoreError::SecretsUnavailable);
+                        }
+                        Err(KeyVaultError::Missing | KeyVaultError::Malformed) => {}
                     }
                 } else if let Ok(key) =
                     <[u8; PAIR_PRIVATE_KEY_SIZE]>::try_from(record.local_private.as_slice())
@@ -120,7 +126,10 @@ impl FilePairingStore {
     /// # Errors
     /// As [`Self::open`].
     pub fn open_default() -> Result<Self, StoreError> {
-        Self::open(&Self::default_directory(), Box::new(SecretServiceVault))
+        Self::open(
+            &Self::default_directory(),
+            Box::new(SecretServiceVault::default()),
+        )
     }
 
     /// Keeps the vault in step with `record`'s key, then writes its file.
@@ -316,6 +325,21 @@ mod tests {
             FilePairingStore::open(&directory, Box::new(MemoryKeyVault::unavailable())).unwrap();
         assert_eq!(store.insert(record(4)), Err(StoreError::SecretsUnavailable));
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_unreachable_vault_fails_the_open_instead_of_losing_keys() {
+        let directory = scratch();
+        {
+            let mut store = FilePairingStore::open(&directory, Box::new(vault())).unwrap();
+            store.insert(record(8)).unwrap();
+        }
+        assert_eq!(
+            FilePairingStore::open(&directory, Box::new(MemoryKeyVault::unavailable()))
+                .unwrap_err(),
+            StoreError::SecretsUnavailable
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

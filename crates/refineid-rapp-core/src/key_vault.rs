@@ -93,14 +93,54 @@ impl<Vault: KeyVault + ?Sized> KeyVault for std::sync::Arc<Vault> {
 }
 
 /// The freedesktop Secret Service, through `secret-tool`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SecretServiceVault;
+#[derive(Clone, Debug, Default)]
+pub struct SecretServiceVault {
+    /// A session bus to use instead of the process's own; tests point it at
+    /// an address with no listener to reach the unavailable path.
+    session_bus: Option<String>,
+}
 
 impl SecretServiceVault {
-    fn command(pair_id: PairId) -> (Command, String) {
+    #[cfg(test)]
+    fn on_session_bus(address: &str) -> Self {
+        Self {
+            session_bus: Some(address.to_owned()),
+        }
+    }
+
+    fn command(&self, pair_id: PairId) -> (Command, String) {
         let mut command = Command::new(SECRET_TOOL);
         command.stderr(Stdio::null());
+        if let Some(address) = &self.session_bus {
+            command.env("DBUS_SESSION_BUS_ADDRESS", address);
+        }
         (command, hex(pair_id.as_bytes()))
+    }
+
+    /// Whether the Secret Service answers and holds no item for `pair`.
+    ///
+    /// `secret-tool lookup` exits non-zero both when nothing matches and
+    /// when the service is unreachable, and its error text is localized.
+    /// `search` exits zero whenever the service answered, so an empty
+    /// successful search separates "no item" from "no service".
+    fn holds_no_item(&self, pair_id: PairId) -> bool {
+        let (mut command, pair) = self.command(pair_id);
+        let Ok(output) = command
+            .args([
+                "search",
+                "--all",
+                APPLICATION_ATTRIBUTE,
+                APPLICATION,
+                PAIR_ATTRIBUTE,
+                &pair,
+            ])
+            .stdin(Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        let listing = Zeroizing::new(output.stdout);
+        output.status.success() && listing.is_empty()
     }
 }
 
@@ -110,7 +150,7 @@ impl KeyVault for SecretServiceVault {
         pair_id: PairId,
         key: &[u8; PAIR_PRIVATE_KEY_SIZE],
     ) -> Result<(), KeyVaultError> {
-        let (mut command, pair) = Self::command(pair_id);
+        let (mut command, pair) = self.command(pair_id);
         let mut child = command
             .args([
                 "store",
@@ -148,7 +188,7 @@ impl KeyVault for SecretServiceVault {
         &self,
         pair_id: PairId,
     ) -> Result<Zeroizing<[u8; PAIR_PRIVATE_KEY_SIZE]>, KeyVaultError> {
-        let (mut command, pair) = Self::command(pair_id);
+        let (mut command, pair) = self.command(pair_id);
         let mut child = command
             .args([
                 "lookup",
@@ -174,9 +214,7 @@ impl KeyVault for SecretServiceVault {
         let status = child.wait().map_err(|_| KeyVaultError::Unavailable)?;
         read?;
         if !status.success() {
-            // secret-tool exits non-zero both when nothing matches and when
-            // the service is unreachable; an empty answer is the former.
-            return Err(if output.is_empty() {
+            return Err(if output.is_empty() && self.holds_no_item(pair_id) {
                 KeyVaultError::Missing
             } else {
                 KeyVaultError::Unavailable
@@ -186,7 +224,7 @@ impl KeyVault for SecretServiceVault {
     }
 
     fn remove(&self, pair_id: PairId) -> Result<(), KeyVaultError> {
-        let (mut command, pair) = Self::command(pair_id);
+        let (mut command, pair) = self.command(pair_id);
         let status = command
             .args([
                 "clear",
@@ -350,7 +388,7 @@ mod tests {
     #[test]
     #[ignore = "needs secret-tool and an unlocked Secret Service keyring"]
     fn the_secret_service_round_trips_a_key() {
-        let vault = super::SecretServiceVault;
+        let vault = super::SecretServiceVault::default();
         let mut pair = [0_u8; 16];
         getrandom::fill(&mut pair).unwrap();
         let pair = PairId::from_array(pair);
@@ -366,5 +404,22 @@ mod tests {
         vault.remove(pair).unwrap();
         assert_eq!(vault.load(pair).unwrap_err(), KeyVaultError::Missing);
         vault.remove(pair).unwrap();
+    }
+
+    /// Runs against the real `secret-tool` with a session bus that has no
+    /// listener: every call reports the store unavailable, never a missing
+    /// key.
+    #[test]
+    #[ignore = "needs secret-tool"]
+    fn an_unreachable_secret_service_is_unavailable_not_missing() {
+        let vault =
+            super::SecretServiceVault::on_session_bus("unix:path=/nonexistent/refineid-test-bus");
+        let pair = PairId::from_array([0x7e; 16]);
+        assert_eq!(vault.load(pair).unwrap_err(), KeyVaultError::Unavailable);
+        assert_eq!(
+            vault.store(pair, &[1; 32]).unwrap_err(),
+            KeyVaultError::Unavailable
+        );
+        assert_eq!(vault.remove(pair).unwrap_err(), KeyVaultError::Unavailable);
     }
 }
