@@ -6,10 +6,10 @@
 //! private key; nothing here prints or logs it.
 //!
 //! The store lives beside, not inside, the directory earlier releases used:
-//! those records belong to an older protocol revision and cannot open a
-//! v26.10.9 session, so they are left untouched rather than misread. A
-//! record file of an earlier encoding revision in this directory is skipped
-//! the same way, and its pairing is made again.
+//! those records belong to an older protocol revision and are left
+//! untouched rather than misread. A record file of an earlier encoding
+//! revision in this directory belongs to an earlier protocol version: it
+//! is removed together with its key, and its pairing is made again.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 
 use crate::ids::PairId;
 use crate::key_vault::{KeyVault, KeyVaultError, PAIR_PRIVATE_KEY_SIZE, SecretServiceVault};
-use crate::persistence::{decode_pairing_record, encode_pairing_record};
+use crate::persistence::{decode_pairing_record, encode_pairing_record, superseded_pair_id};
 use crate::store::{PairingDisposition, PairingRecord, PairingStore, StoreError};
 
 /// File extension of one stored pairing.
@@ -61,13 +61,14 @@ impl FilePairingStore {
     }
 
     /// Opens (creating if needed) the store in `directory` and loads every
-    /// readable record. A file that does not decode is skipped, never
+    /// readable record. A record of an earlier encoding revision is removed
+    /// with its key; any other file that does not decode is skipped, never
     /// rewritten.
     ///
     /// # Errors
     /// [`StoreError::WriteRefused`] when the directory cannot be created or
     /// read, and [`StoreError::SecretsUnavailable`] when the vault cannot be
-    /// reached to read a stored key or take one over from a file.
+    /// reached to read or remove a stored key.
     pub fn open(directory: &Path, vault: Box<dyn KeyVault + Send>) -> Result<Self, StoreError> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -85,26 +86,23 @@ impl FilePairingStore {
                 continue;
             };
             let Ok(mut record) = decode_pairing_record(&bytes) else {
-                continue;
-            };
-            if record.disposition == PairingDisposition::Paired {
-                if record.local_private.is_empty() {
-                    match vault.load(record.pair_id) {
-                        Ok(key) => record.local_private = Zeroizing::new(key.to_vec()),
-                        Err(KeyVaultError::Unavailable) => {
-                            return Err(StoreError::SecretsUnavailable);
-                        }
-                        Err(KeyVaultError::Missing | KeyVaultError::Malformed) => {}
-                    }
-                } else if let Ok(key) =
-                    <[u8; PAIR_PRIVATE_KEY_SIZE]>::try_from(record.local_private.as_slice())
-                {
-                    // A file still carrying its key moves the key to the
-                    // vault and is rewritten without it.
-                    if vault.store(record.pair_id, &key).is_err() {
+                if let Some(pair_id) = superseded_pair_id(&bytes) {
+                    // A pairing from an earlier protocol version: its
+                    // holder pairs again, so the record and key go.
+                    if matches!(vault.remove(pair_id), Err(KeyVaultError::Unavailable)) {
                         return Err(StoreError::SecretsUnavailable);
                     }
-                    write_record(directory, &record)?;
+                    let _ = fs::remove_file(&path);
+                }
+                continue;
+            };
+            if record.disposition == PairingDisposition::Paired && record.local_private.is_empty() {
+                match vault.load(record.pair_id) {
+                    Ok(key) => record.local_private = Zeroizing::new(key.to_vec()),
+                    Err(KeyVaultError::Unavailable) => {
+                        return Err(StoreError::SecretsUnavailable);
+                    }
+                    Err(KeyVaultError::Missing | KeyVaultError::Malformed) => {}
                 }
             }
             let modified = entry
@@ -250,14 +248,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::FilePairingStore;
-    use crate::ids::{PairId, RendezvousToken};
+    use crate::ids::PairId;
     use crate::key_vault::{KeyVault as _, KeyVaultError, MemoryKeyVault};
     use crate::store::{PairingDisposition, PairingRecord, PairingStore, StoreError};
 
     fn record(byte: u8) -> PairingRecord {
         PairingRecord {
             pair_id: PairId::from_array([byte; 16]),
-            rendezvous_token: RendezvousToken::from_array([byte ^ 0xFF; 16]),
             local_private: zeroize::Zeroizing::new(vec![0x11; 32]),
             local_public: vec![0x22; 32],
             peer_public: vec![0x33; 32],
@@ -381,6 +378,26 @@ mod tests {
             keys.load(PairId::from_array([7; 16])).unwrap_err(),
             KeyVaultError::Missing
         );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn records_of_an_earlier_revision_are_dropped_with_their_key() {
+        let directory = scratch();
+        let keys = vault();
+        drop(FilePairingStore::open(&directory, Box::new(keys.clone())).unwrap());
+        let pair_id = PairId::from_array([9; 16]);
+        keys.store(pair_id, &[0x11; 32]).unwrap();
+        let mut blob = b"RAPP-pair-record".to_vec();
+        blob.push(5);
+        blob.extend_from_slice(pair_id.as_bytes());
+        blob.extend_from_slice(&[0x55; 40]);
+        let path = directory.join("earlier.pair");
+        std::fs::write(&path, &blob).unwrap();
+        let store = FilePairingStore::open(&directory, Box::new(keys.clone())).unwrap();
+        assert!(store.pair_ids().is_empty());
+        assert!(!path.exists());
+        assert_eq!(keys.load(pair_id).unwrap_err(), KeyVaultError::Missing);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

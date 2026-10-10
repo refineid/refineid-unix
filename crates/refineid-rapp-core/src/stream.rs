@@ -4,20 +4,25 @@
 //! The custodian (the phone) listens on an ephemeral TCP port and advertises
 //! `_refineid-stream._tcp.local.` under a fresh random instance name, with a
 //! TXT record naming its mode: `mode=pairing` during a pairing ceremony,
-//! `mode=session` while it serves stored pairings. The requester browses by
+//! `mode=session` while it serves stored pairings, and briefly
+//! `mode=withdrawn` when its holder stops serving. The requester browses by
 //! those attributes, dials, and opens every connection with one plaintext
-//! routing preamble. The session preamble carries the pair's rendezvous token
-//! point to point; nothing derived from the token is ever published or
-//! looked up by name. An anomaly closes the connection without touching
+//! routing preamble. A session preamble carries a fresh routing value keyed
+//! by the pairing's static agreement, so no stable pairing identifier
+//! crosses the wire. An anomaly closes the connection without touching
 //! stored state (specification section 10.1, class 1).
 
 use std::collections::BTreeMap;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::ids::RendezvousToken;
+use refineid_rapp::{
+    DiscoveryKey, DiscoveryRecord, InstanceName, PreambleError, SessionRouting, TransportProfile,
+    WithdrawalKey, WithdrawnRecord, discovery_epoch, withdrawal_counter,
+};
+
 use crate::transport::{FrameTransport, TcpFrameTransport, TransportError};
-pub use refineid_rapp::{MAX_STREAM_RENDEZVOUS_FRAME, STREAM_PROFILE, StreamRendezvous};
+pub use refineid_rapp::{MAX_ROUTING_PREAMBLE_FRAME, RoutingPreamble, STREAM_PROFILE};
 
 /// The DNS-SD service type of the stream tier.
 pub const STREAM_SERVICE_TYPE: &str = "_refineid-stream._tcp.local";
@@ -31,6 +36,8 @@ const MODE_KEY: &str = "mode";
 const VERSION_KEY: &str = "v";
 /// The one TXT format version this requester understands.
 const SUPPORTED_TXT_VERSION: &str = "1";
+/// The `mode` value of a pairing ceremony.
+const MODE_PAIRING: &str = "pairing";
 
 /// The custodian discovery modes of hierarchy section 4.3.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,71 +46,83 @@ pub enum DiscoveryMode {
     Pairing,
     /// The custodian serves sessions for stored pairings.
     Session,
+    /// The custodian announced that it stopped serving.
+    Withdrawn,
 }
 
-impl DiscoveryMode {
-    /// The TXT `mode` value.
-    #[must_use]
-    pub const fn txt_value(self) -> &'static str {
-        match self {
-            Self::Pairing => "pairing",
-            Self::Session => "session",
-        }
-    }
-}
-
-/// One advertised custodian: its instance, endpoints, and TXT attributes.
+/// One advertised custodian: its instance, endpoints, and TXT entries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamService {
-    /// The advertised instance name (random; carries no identity).
+    /// The advertised instance portion of the service name (random; carries
+    /// no identity).
     pub instance: String,
     /// `ip:port` endpoints that answered for this instance.
     pub endpoints: Vec<String>,
-    /// The TXT attributes, keys lowercased.
-    pub attributes: BTreeMap<String, String>,
+    /// The TXT `key=value` entries as published, in order.
+    pub txt: Vec<(String, String)>,
 }
 
 impl StreamService {
-    /// Whether the TXT record names format version 1 and `mode`.
+    fn entries(&self) -> Vec<(&str, &str)> {
+        self.txt
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
+    }
+
+    /// The value of `key`, compared case-insensitively (RFC 6763 section
+    /// 6.4); `None` when it is absent or repeated.
+    fn value(&self, key: &str) -> Option<&str> {
+        let mut found = self
+            .txt
+            .iter()
+            .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(key));
+        let (_, value) = found.next()?;
+        found.next().is_none().then_some(value.as_str())
+    }
+
+    /// Whether the TXT record is a well-formed record of `mode`.
     #[must_use]
     pub fn advertises(&self, mode: DiscoveryMode) -> bool {
-        self.attributes.get(VERSION_KEY).map(String::as_str) == Some(SUPPORTED_TXT_VERSION)
-            && self.attributes.get(MODE_KEY).map(String::as_str) == Some(mode.txt_value())
+        match mode {
+            DiscoveryMode::Pairing => {
+                self.value(VERSION_KEY) == Some(SUPPORTED_TXT_VERSION)
+                    && self.value(MODE_KEY) == Some(MODE_PAIRING)
+            }
+            DiscoveryMode::Session => DiscoveryRecord::parse(&self.entries()).is_ok(),
+            DiscoveryMode::Withdrawn => WithdrawnRecord::parse(&self.entries()).is_ok(),
+        }
     }
 
-    /// The rotating discovery hints the record publishes (hierarchy
-    /// section 4.3), or `None` when it publishes no `hints` attribute.
-    /// Entries that are not 16 lowercase hex digits are ignored.
-    #[must_use]
-    pub fn hints(&self) -> Option<Vec<[u8; refineid_rapp::DISCOVERY_HINT_SIZE]>> {
-        let value = self.attributes.get(HINTS_KEY)?;
-        Some(
-            value
-                .split(',')
-                .take(MAX_PUBLISHED_HINTS)
-                .filter_map(decode_hint)
-                .collect(),
-        )
-    }
-
-    /// How this record relates to the pairing whose token is `token` at
+    /// How this session record relates to the pairing keyed by `key` at
     /// `unix_seconds`: a published hint names it within one epoch either
-    /// way, the record publishes no hints, or its hints name other pairings.
+    /// way, the record publishes no hints, or its hints name other pairings
+    /// or the record is not a well-formed session record.
     #[must_use]
-    pub fn hint_match(&self, token: &RendezvousToken, unix_seconds: u64) -> HintMatch {
-        let Some(hints) = self.hints() else {
-            return HintMatch::Unhinted;
+    pub fn hint_match(&self, key: &DiscoveryKey, unix_seconds: u64) -> HintMatch {
+        let Ok(record) = DiscoveryRecord::parse(&self.entries()) else {
+            return HintMatch::Other;
         };
-        let epoch = unix_seconds / refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS;
-        let named = [epoch.saturating_sub(1), epoch, epoch.saturating_add(1)]
-            .into_iter()
-            .map(|candidate| refineid_rapp::discovery_hint(token, candidate))
-            .any(|hint| hints.contains(&hint));
-        if named {
+        if record.hints().is_empty() {
+            HintMatch::Unhinted
+        } else if key.matches_record(&record, discovery_epoch(unix_seconds)) {
             HintMatch::Named
         } else {
             HintMatch::Other
         }
+    }
+
+    /// Whether this is a withdrawn record that announces the pairing keyed
+    /// by `key` at `unix_seconds` on this instance.
+    #[must_use]
+    pub fn withdraws(&self, key: &WithdrawalKey, unix_seconds: u64) -> bool {
+        let (Ok(record), Ok(instance)) = (
+            WithdrawnRecord::parse(&self.entries()),
+            InstanceName::new(&self.instance),
+        ) else {
+            return false;
+        };
+        key.matches(&record, &instance, withdrawal_counter(unix_seconds))
     }
 }
 
@@ -118,28 +137,6 @@ pub enum HintMatch {
     Other,
 }
 
-/// TXT key carrying the rotating discovery hints.
-const HINTS_KEY: &str = "hints";
-/// Hints a custodian publishes at most (hierarchy section 4.3).
-const MAX_PUBLISHED_HINTS: usize = 4;
-/// Hex digits in one published hint.
-const HINT_HEX_DIGITS: usize = 2 * refineid_rapp::DISCOVERY_HINT_SIZE;
-
-fn decode_hint(text: &str) -> Option<[u8; refineid_rapp::DISCOVERY_HINT_SIZE]> {
-    if text.len() != HINT_HEX_DIGITS
-        || !text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
-    }
-    let mut hint = [0_u8; refineid_rapp::DISCOVERY_HINT_SIZE];
-    for (index, byte) in hint.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).ok()?;
-    }
-    Some(hint)
-}
-
 /// One accepted, preamble-classified stream connection.
 #[derive(Debug)]
 pub enum StreamAccept {
@@ -147,9 +144,9 @@ pub enum StreamAccept {
     Pairing(TcpFrameTransport),
     /// The dialing proxy asked for a fresh session with a stored pairing.
     Session {
-        /// The pair-specific token from the preamble. The caller looks it
-        /// up among non-revoked pairings and closes on no match.
-        rendezvous_token: RendezvousToken,
+        /// The routing value from the preamble. The caller routes it among
+        /// non-revoked pairings and closes on no match.
+        routing: SessionRouting,
         /// The connection, positioned after the preamble.
         transport: TcpFrameTransport,
     },
@@ -246,12 +243,9 @@ impl StreamListener {
             TcpFrameTransport::new(socket, &self.candidate_id, self.receive_deadline)
                 .map_err(|_| StreamError::Accept)?;
         let preamble = transport.receive_frame().map_err(StreamError::Preamble)?;
-        match StreamRendezvous::decode(&preamble)? {
-            StreamRendezvous::Pairing => Ok(StreamAccept::Pairing(transport)),
-            StreamRendezvous::Session(rendezvous_token) => Ok(StreamAccept::Session {
-                rendezvous_token,
-                transport,
-            }),
+        match RoutingPreamble::decode(TransportProfile::Stream, &preamble)? {
+            RoutingPreamble::Pairing => Ok(StreamAccept::Pairing(transport)),
+            RoutingPreamble::Session(routing) => Ok(StreamAccept::Session { routing, transport }),
         }
     }
 }
@@ -267,9 +261,9 @@ pub fn dial(
     endpoints: &[String],
     candidate_id: &str,
     receive_deadline: Duration,
-    rendezvous: &StreamRendezvous,
+    preamble: &RoutingPreamble,
 ) -> Result<TcpFrameTransport, StreamError> {
-    let preamble = rendezvous.encode()?;
+    let preamble = preamble.encode(TransportProfile::Stream)?;
     for endpoint in endpoints {
         let Ok(mut addresses) = endpoint.as_str().to_socket_addrs() else {
             continue;
@@ -357,7 +351,7 @@ const MDNS_POLL: Duration = Duration::from_millis(250);
 struct MdnsRecords {
     instances: Vec<String>,
     services: BTreeMap<String, (u16, String, Option<std::net::Ipv4Addr>)>,
-    texts: BTreeMap<String, BTreeMap<String, String>>,
+    texts: BTreeMap<String, Vec<(String, String)>>,
     addresses: BTreeMap<String, std::net::Ipv4Addr>,
 }
 
@@ -387,7 +381,7 @@ impl MdnsRecords {
             found.push(StreamService {
                 instance: label,
                 endpoints,
-                attributes: self.texts.get(&instance).cloned().unwrap_or_default(),
+                txt: self.texts.get(&instance).cloned().unwrap_or_default(),
             });
         }
         found
@@ -460,9 +454,12 @@ fn parse_mdns_response(
     }
 }
 
-/// Reads TXT rdata: length-prefixed `key=value` strings (RFC 6763 section 6).
-fn parse_txt(rdata: &[u8]) -> BTreeMap<String, String> {
-    let mut attributes = BTreeMap::new();
+/// Reads TXT rdata: length-prefixed `key=value` strings (RFC 6763 section
+/// 6), kept in order and as published. Keys compare case-insensitively
+/// where they are read, and a repeated key makes the record malformed
+/// there; neither is decided here.
+fn parse_txt(rdata: &[u8]) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
     let mut offset = 0;
     while offset < rdata.len() {
         let length = usize::from(rdata[offset]);
@@ -473,17 +470,15 @@ fn parse_txt(rdata: &[u8]) -> BTreeMap<String, String> {
         if let Ok(text) = core::str::from_utf8(entry)
             && let Some((key, value)) = text.split_once('=')
         {
-            attributes
-                .entry(key.to_ascii_lowercase())
-                .or_insert_with(|| value.to_owned());
+            entries.push((key.to_owned(), value.to_owned()));
         }
         offset = end;
     }
-    attributes
+    entries
 }
 
 /// Browses `_refineid-stream._tcp.local.` for `timeout` and returns every
-/// advertised custodian, with the TXT attributes it published.
+/// advertised custodian, with the TXT entries it published.
 ///
 /// The query asks for unicast answers from an ephemeral port (RFC 6762
 /// section 5.4), so it works beside a system mDNS responder.
@@ -543,9 +538,9 @@ pub fn browse(mode: DiscoveryMode, timeout: Duration) -> Vec<StreamService> {
 /// Rejected stream-profile bytes, parameters, or connection steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamError {
-    /// Structure, domain, type, or token length was not as specified.
+    /// Structure, domain, type, or routing length was not as specified.
     Malformed,
-    /// Preamble frame exceeded [`MAX_STREAM_RENDEZVOUS_FRAME`].
+    /// Preamble frame exceeded [`MAX_ROUTING_PREAMBLE_FRAME`].
     Oversized,
     /// Purpose string is not registered; the connection closes unanswered.
     UnknownPurpose,
@@ -559,12 +554,12 @@ pub enum StreamError {
     Unreachable,
 }
 
-impl From<refineid_rapp::StreamError> for StreamError {
-    fn from(err: refineid_rapp::StreamError) -> Self {
+impl From<PreambleError> for StreamError {
+    fn from(err: PreambleError) -> Self {
         match err {
-            refineid_rapp::StreamError::Malformed => Self::Malformed,
-            refineid_rapp::StreamError::Oversized => Self::Oversized,
-            refineid_rapp::StreamError::UnknownPurpose => Self::UnknownPurpose,
+            PreambleError::Malformed => Self::Malformed,
+            PreambleError::Oversized => Self::Oversized,
+            PreambleError::UnknownPurpose => Self::UnknownPurpose,
         }
     }
 }
@@ -573,8 +568,8 @@ impl core::fmt::Display for StreamError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Malformed => write!(f, "malformed stream profile data"),
-            Self::Oversized => write!(f, "oversized stream rendezvous frame"),
-            Self::UnknownPurpose => write!(f, "unknown stream rendezvous purpose"),
+            Self::Oversized => write!(f, "oversized routing preamble frame"),
+            Self::UnknownPurpose => write!(f, "unknown routing preamble purpose"),
             Self::Bind => write!(f, "failed to bind stream listener"),
             Self::Accept => write!(f, "failed to accept stream connection"),
             Self::Preamble(e) => write!(f, "failed to move preamble frame: {e}"),
@@ -598,21 +593,44 @@ impl core::error::Error for StreamError {
     reason = "test fixtures are constructed to be infallible"
 )]
 mod tests {
-    use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use super::{
-        DiscoveryMode, HintMatch, MdnsRecords, StreamAccept, StreamError, StreamListener,
-        StreamRendezvous, StreamService, dial, parse_mdns_response,
+    use refineid_rapp::{
+        DiscoveryKey, InstanceName, PairId, RoutingKey, TransportProfile, WithdrawalKey,
+        WithdrawnRecord, discovery_epoch, withdrawal_counter,
     };
-    use crate::ids::RendezvousToken;
+
+    use super::{
+        DiscoveryMode, HintMatch, MdnsRecords, RoutingPreamble, StreamAccept, StreamError,
+        StreamListener, StreamService, dial, parse_mdns_response,
+    };
     use crate::transport::FrameTransport;
 
     const DEADLINE: Duration = Duration::from_secs(2);
     const CANDIDATE: &str = "stream-test";
+    const INSTANCE: &str = "refineid-0b9e44d1";
+    const LOCAL_PRIVATE: [u8; 32] = [0x11; 32];
+    const OTHER_PRIVATE: [u8; 32] = [0x33; 32];
+    const PAIR_ID: [u8; 16] = [0x22; 16];
 
-    fn token() -> RendezvousToken {
-        RendezvousToken::from_array([0x5A; 16])
+    const PEER_PUBLIC: [u8; 32] = [0x44; 32];
+
+    fn discovery_key(local: [u8; 32]) -> DiscoveryKey {
+        DiscoveryKey::from_parts(PairId::from_array(PAIR_ID), &local, &PEER_PUBLIC).unwrap()
+    }
+
+    fn withdrawal_key(local: [u8; 32]) -> WithdrawalKey {
+        WithdrawalKey::from_parts(PairId::from_array(PAIR_ID), &local, &PEER_PUBLIC).unwrap()
+    }
+
+    fn routing() -> refineid_rapp::SessionRouting {
+        RoutingKey::from_parts(PairId::from_array(PAIR_ID), &LOCAL_PRIVATE, &PEER_PUBLIC)
+            .unwrap()
+            .route(TransportProfile::Stream, |nonce| {
+                nonce.fill(0x5A);
+                Ok(())
+            })
+            .unwrap()
     }
 
     fn name(labels: &[&str]) -> Vec<u8> {
@@ -704,20 +722,22 @@ mod tests {
 
     #[test]
     fn preambles_round_trip_and_reject_foreign_purposes() {
-        let pairing = StreamRendezvous::Pairing.encode().unwrap();
+        let profile = TransportProfile::Stream;
+        let pairing = RoutingPreamble::Pairing.encode(profile).unwrap();
         assert_eq!(
-            StreamRendezvous::decode(&pairing).unwrap(),
-            StreamRendezvous::Pairing
+            RoutingPreamble::decode(profile, &pairing).unwrap(),
+            RoutingPreamble::Pairing
         );
-        let session = StreamRendezvous::Session(token()).encode().unwrap();
+        let session = RoutingPreamble::Session(routing()).encode(profile).unwrap();
         assert_eq!(
-            StreamRendezvous::decode(&session).unwrap(),
-            StreamRendezvous::Session(token())
+            RoutingPreamble::decode(profile, &session).unwrap(),
+            RoutingPreamble::Session(routing())
         );
-        let oversized = vec![0u8; super::MAX_STREAM_RENDEZVOUS_FRAME + 1];
+        assert!(RoutingPreamble::decode(TransportProfile::Ble, &session).is_err());
+        let oversized = vec![0u8; super::MAX_ROUTING_PREAMBLE_FRAME + 1];
         assert_eq!(
-            StreamRendezvous::decode(&oversized),
-            Err(refineid_rapp::StreamError::Oversized)
+            RoutingPreamble::decode(profile, &oversized),
+            Err(refineid_rapp::PreambleError::Oversized)
         );
     }
 
@@ -733,7 +753,7 @@ mod tests {
                 &dial_endpoints,
                 CANDIDATE,
                 DEADLINE,
-                &StreamRendezvous::Pairing,
+                &RoutingPreamble::Pairing,
             )
             .unwrap()
         });
@@ -746,19 +766,19 @@ mod tests {
                 &endpoints,
                 CANDIDATE,
                 DEADLINE,
-                &StreamRendezvous::Session(RendezvousToken::from_array([0x5A; 16])),
+                &RoutingPreamble::Session(routing()),
             )
             .unwrap();
             transport.send_frame(&[0x01, 0x02]).unwrap();
         });
         let StreamAccept::Session {
-            rendezvous_token,
+            routing: received,
             mut transport,
         } = listener.accept().unwrap()
         else {
             panic!("expected a session accept");
         };
-        assert_eq!(rendezvous_token, token());
+        assert_eq!(received, routing());
         assert_eq!(transport.receive_frame().unwrap(), vec![0x01, 0x02]);
         dialer.join().unwrap();
     }
@@ -787,24 +807,20 @@ mod tests {
                 &[format!("127.0.0.1:{port}")],
                 CANDIDATE,
                 DEADLINE,
-                &StreamRendezvous::Pairing
+                &RoutingPreamble::Pairing
             ),
             Err(StreamError::Unreachable)
         ));
     }
 
-    fn session_service(hints: Option<String>) -> StreamService {
-        let mut attributes = BTreeMap::from([
-            ("v".to_owned(), "1".to_owned()),
-            ("mode".to_owned(), "session".to_owned()),
-        ]);
-        if let Some(hints) = hints {
-            attributes.insert("hints".to_owned(), hints);
-        }
+    fn service(txt: &[(&str, String)]) -> StreamService {
         StreamService {
-            instance: "refineid-0b9e44d1".to_owned(),
+            instance: INSTANCE.to_owned(),
             endpoints: vec!["192.0.2.10:47110".to_owned()],
-            attributes,
+            txt: txt
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect(),
         }
     }
 
@@ -812,37 +828,80 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    fn session_service(hints: Option<String>) -> StreamService {
+        let mut txt = vec![("v", "1".to_owned()), ("mode", "session".to_owned())];
+        if let Some(hints) = hints {
+            txt.push(("hints", hints));
+        }
+        service(&txt)
+    }
+
     #[test]
     fn a_hint_names_its_pairing_within_one_epoch_either_way() {
-        let token = token();
+        let key = discovery_key(LOCAL_PRIVATE);
         let epoch_seconds = refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS;
         let now = 1_000 * epoch_seconds + 7;
-        let previous = refineid_rapp::discovery_hint(&token, 999);
-        let other = refineid_rapp::discovery_hint(&RendezvousToken::from_array([0x24; 16]), 1_000);
-        let service = session_service(Some(format!("{},{}", hex(&other), hex(&previous))));
-        assert_eq!(service.hint_match(&token, now), HintMatch::Named);
+        let previous = key.hint(discovery_epoch(now) - 1);
+        let other = discovery_key(OTHER_PRIVATE).hint(discovery_epoch(now));
+        let named = session_service(Some(format!("{},{}", hex(&other), hex(&previous))));
+        assert_eq!(named.hint_match(&key, now), HintMatch::Named);
         assert_eq!(
-            service.hint_match(&token, now + 3 * epoch_seconds),
+            named.hint_match(&key, now + 3 * epoch_seconds),
             HintMatch::Other
         );
         assert_eq!(
-            session_service(None).hint_match(&token, now),
+            session_service(None).hint_match(&key, now),
             HintMatch::Unhinted
         );
     }
 
     #[test]
-    fn malformed_hint_entries_are_ignored() {
-        let token = token();
-        let current = refineid_rapp::discovery_hint(&token, 1_000);
-        let upper = hex(&current).to_ascii_uppercase();
-        let service = session_service(Some(format!("{upper},zz,{}", hex(&current))));
-        assert_eq!(service.hints().map(|hints| hints.len()), Some(1));
-        let only_bad = session_service(Some(format!("{upper},short")));
-        assert_eq!(only_bad.hints().map(|hints| hints.len()), Some(0));
-        assert_eq!(
-            only_bad.hint_match(&token, 1_000 * refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS),
-            HintMatch::Other
-        );
+    fn keys_compare_case_insensitively_and_values_exactly() {
+        let key = discovery_key(LOCAL_PRIVATE);
+        let now = 1_000 * refineid_rapp::DISCOVERY_HINT_EPOCH_SECONDS;
+        let hint = hex(&key.hint(discovery_epoch(now)));
+        let mixed = service(&[
+            ("V", "1".to_owned()),
+            ("Mode", "session".to_owned()),
+            ("HINTS", hint.clone()),
+        ]);
+        assert!(mixed.advertises(DiscoveryMode::Session));
+        assert_eq!(mixed.hint_match(&key, now), HintMatch::Named);
+        let upper = session_service(Some(hint.to_ascii_uppercase()));
+        assert!(!upper.advertises(DiscoveryMode::Session));
+        assert_eq!(upper.hint_match(&key, now), HintMatch::Other);
+        let repeated = service(&[
+            ("v", "1".to_owned()),
+            ("mode", "session".to_owned()),
+            ("MODE", "session".to_owned()),
+        ]);
+        assert!(!repeated.advertises(DiscoveryMode::Session));
+    }
+
+    #[test]
+    fn a_withdrawn_record_names_its_pairing_on_its_instance_only() {
+        let key = withdrawal_key(LOCAL_PRIVATE);
+        let now = 1_700_000_000;
+        let instance = InstanceName::new(INSTANCE).unwrap();
+        let candidate = refineid_rapp::AnnouncementCandidate {
+            hint: key.hint(&instance, withdrawal_counter(now)),
+            last_used_ms: 1,
+        };
+        let record = WithdrawnRecord::assemble(&[candidate], |bytes| {
+            bytes.fill(0x7E);
+            Ok(())
+        })
+        .unwrap();
+        let withdrawn = service(&record.txt_entries());
+        assert!(withdrawn.advertises(DiscoveryMode::Withdrawn));
+        assert!(withdrawn.withdraws(&key, now));
+        assert!(!withdrawn.withdraws(&withdrawal_key(OTHER_PRIVATE), now));
+        assert!(!withdrawn.withdraws(&key, now + 3 * refineid_rapp::WITHDRAWAL_COUNTER_SECONDS));
+        let moved = StreamService {
+            instance: "refineid-ffffffff".to_owned(),
+            ..withdrawn
+        };
+        assert!(!moved.withdraws(&key, now));
+        assert!(!session_service(None).withdraws(&key, now));
     }
 }

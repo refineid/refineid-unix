@@ -30,47 +30,24 @@ use super::verb::VerbTag;
 /// How long pairing and operations browse for the phone.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Arguments for `refineid pair`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PairArgs {
-    /// The code the phone shows; asked for on standard input when absent.
-    pub code: Option<String>,
-}
+/// Arguments for `refineid pair`. The code is read from the prompt only,
+/// never from the command line, where other local accounts could read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairArgs;
 
 impl PairArgs {
-    /// Parse arguments for `refineid pair [CODE]` or `refineid pair --code CODE`.
+    /// Parse arguments for `refineid pair`, which takes none.
     ///
     /// # Errors
-    /// Returns [`ArgParseError`] on a malformed code or unexpected arguments.
+    /// Returns [`ArgParseError`] on any argument.
     pub fn parse(argv: RemainingArgv) -> Result<Self, ArgParseError> {
-        let mut code = None;
-        let tokens = argv.into_vec();
-        let mut iter = tokens.iter();
-        while let Some(arg) = iter.next() {
-            let value = match arg.as_str() {
-                "--code" | "-c" => iter.next().ok_or(ArgParseError::MissingValue {
-                    cmd: VerbTag::CardPair,
-                    flag: "--code",
-                })?,
-                other if !other.starts_with('-') && code.is_none() => arg,
-                other => {
-                    return Err(ArgParseError::Unexpected {
-                        cmd: VerbTag::CardPair,
-                        got: other.to_owned(),
-                    });
-                }
-            };
-            if normalize_pairing_code(value).is_none() {
-                return Err(ArgParseError::BadValue {
-                    cmd: VerbTag::CardPair,
-                    flag: "--code",
-                    value: value.clone(),
-                    reason: "must be the six characters your phone shows".into(),
-                });
-            }
-            code = Some(value.clone());
+        match argv.into_vec().first() {
+            None => Ok(Self),
+            Some(got) => Err(ArgParseError::Unexpected {
+                cmd: VerbTag::CardPair,
+                got: got.clone(),
+            }),
         }
-        Ok(Self { code })
     }
 
     /// Pair with the phone that shows the code.
@@ -84,15 +61,9 @@ impl PairArgs {
         println!("  2. Start pairing; the phone shows a six-character code");
         println!("  3. Type that code here");
         println!();
-        let code = match self.code {
-            Some(code) => code,
-            None => match prompt_code() {
-                Some(code) => code,
-                None => {
-                    eprintln!("Error: that is not a pairing code.");
-                    return ExitCode::FAILURE;
-                }
-            },
+        let Some(code) = prompt_code() else {
+            eprintln!("Error: that is not a pairing code.");
+            return ExitCode::FAILURE;
         };
         let Some(normalized) = normalize_pairing_code(&code) else {
             eprintln!("Error: that is not a pairing code.");
