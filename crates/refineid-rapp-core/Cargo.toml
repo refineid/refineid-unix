@@ -1,0 +1,18 @@
+[package]
+name = "refineid-rapp-core"
+description = "Remote Authorization Proxy Protocol (RAPP) v26.10.1 requester for Unix workstations, built on refineid-rapp."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+refineid-rapp.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+zeroize.workspace = true

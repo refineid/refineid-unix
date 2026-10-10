@@ -20,7 +20,7 @@ use std::sync::Arc;
 use fltk::app::{self, Receiver, Scheme};
 use fltk::browser::HoldBrowser;
 use fltk::button::{Button, CheckButton, RadioRoundButton};
-use fltk::dialog::{FileDialogType, NativeFileChooser, alert, message};
+use fltk::dialog::{FileDialogType, NativeFileChooser, alert, input_default, message};
 use fltk::enums::{Align, Color, ColorDepth, Font, FrameType};
 use fltk::frame::Frame;
 use fltk::group::{Group, Tabs};
@@ -490,7 +490,7 @@ impl FltkDriver {
         pcode_lbl.set_label_font(Font::HelveticaBold);
         pcode_lbl.set_align(Align::Left | Align::Inside);
 
-        let mut pair_code_frame = Frame::new(55, 280, 345, 65, "---   ---");
+        let mut pair_code_frame = Frame::new(55, 280, 345, 65, "-- -- --");
         pair_code_frame.set_frame(FrameType::ThinDownBox);
         pair_code_frame.set_label_font(Font::CourierBold);
         pair_code_frame.set_label_size(28);
@@ -510,7 +510,7 @@ impl FltkDriver {
             200,
             390,
             390,
-            "QR Code will appear when pairing starts",
+            "Start pairing on your phone, then type the code it shows.",
         );
         qr_frame.set_frame(FrameType::ThinDownBox);
         qr_frame.set_align(Align::Center | Align::Inside);
@@ -821,7 +821,9 @@ impl FltkDriver {
         {
             let c = Arc::clone(controller);
             start_pair_btn.set_callback(move |_| {
-                c.handle_intent(UserIntent::StartPairing);
+                if let Some(code) = input_default("Type the code your phone shows:", "") {
+                    c.handle_intent(UserIntent::StartPairing { code });
+                }
             });
         }
         {
@@ -1300,12 +1302,12 @@ impl UiDriver for FltkDriver {
             set_active(&mut widgets.start_pair_btn, false);
             set_active(&mut widgets.cancel_pair_btn, true);
         } else {
-            widgets.pair_code_frame.set_label("---   ---");
+            widgets.pair_code_frame.set_label("-- -- --");
             widgets.pair_status_frame.set_label("Status: Idle");
             widgets.qr_frame.set_image(None::<RgbImage>);
             widgets
                 .qr_frame
-                .set_label("QR Code will appear when pairing starts");
+                .set_label("Start pairing on your phone, then type the code it shows.");
             set_active(&mut widgets.start_pair_btn, true);
             set_active(&mut widgets.cancel_pair_btn, false);
         }

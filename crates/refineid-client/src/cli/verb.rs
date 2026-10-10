@@ -619,8 +619,18 @@ mod tests {
 
     #[test]
     fn pair_and_auth_subcommands() -> TestResult {
-        let sub = parse_argv(&argv(&["refineid", "pair", "--port", "9999"]))?;
+        let sub = parse_argv(&argv(&["refineid", "pair", "7K X4 M9"]))?;
         check(&sub.tag(), &VerbTag::CardPair, "pair tag")?;
+        let sub = parse_argv(&argv(&["refineid", "pair", "--code", "7kx4m9"]))?;
+        check(&sub.tag(), &VerbTag::CardPair, "pair --code tag")?;
+        let sub = parse_argv(&argv(&["refineid", "pair"]))?;
+        check(&sub.tag(), &VerbTag::CardPair, "pair prompts for the code")?;
+        if parse_argv(&argv(&["refineid", "pair", "--port", "9999"])).is_ok() {
+            return Err("pair no longer listens on a port".into());
+        }
+        if parse_argv(&argv(&["refineid", "pair", "7KX4MU"])).is_ok() {
+            return Err("a non-code is refused".into());
+        }
         let sub = parse_argv(&argv(&["refineid", "pairs"]))?;
         check(&sub.tag(), &VerbTag::CardPairs, "pairs tag")?;
         let sub = parse_argv(&argv(&[

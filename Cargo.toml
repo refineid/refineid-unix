@@ -9,6 +9,7 @@ members = [
     "crates/refineid-lib-pcsc",
     "crates/refineid-lib-tls",
     "crates/refineid-pkcs11",
+    "crates/refineid-rapp-core",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ refineid-lib-pcsc = { path = "crates/refineid-lib-pcsc", version = "26" }
 refineid-lib-tls = { path = "crates/refineid-lib-tls", version = "26" }
 refineid-gui-core = { path = "crates/refineid-gui-core", version = "26" }
 refineid-gui-fltk = { path = "crates/refineid-gui-fltk", version = "26" }
+refineid-rapp-core = { path = "crates/refineid-rapp-core", version = "26" }
 
 refineid-auth = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-rapp = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
@@ -50,9 +52,6 @@ sha2 = "0.11"
 hmac = "0.13"
 hex = "0.4"
 ring = { version = "0.17", default-features = false, features = ["alloc", "std"] }
-x25519-dalek = { version = "3", default-features = false, features = ["static_secrets"] }
-chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
-qrcodegen = "1.8"
 # Property-based testing (dev-only): falsification harness for the
 # Uri parser -- idempotence and total no-panic over generated inputs.
 proptest = "1"
