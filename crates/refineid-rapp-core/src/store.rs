@@ -240,6 +240,9 @@ pub enum StoreError {
     Unknown,
     /// The backing store refused the write.
     WriteRefused,
+    /// The secret store refused to hold a pair private key; nothing was
+    /// written.
+    SecretsUnavailable,
 }
 
 /// Durable storage for pairing records.

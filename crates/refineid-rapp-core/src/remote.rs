@@ -77,6 +77,10 @@ pub enum RemoteError {
 impl core::fmt::Display for RemoteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Store(StoreError::SecretsUnavailable) => f.write_str(
+                "the desktop secret store is unavailable: install secret-tool (libsecret) and \
+                 unlock the keyring",
+            ),
             Self::Store(error) => write!(f, "pairing store: {error:?}"),
             Self::NotPaired => f.write_str("no paired phone"),
             Self::NotFound => f.write_str("no phone found on the local network"),
