@@ -30,7 +30,8 @@ use refineid_rapp::{
     generate_pair_key_material, standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
-    OperationOutcome, PairingError, ReconciledResult, Requester, RequesterConfig, SessionError,
+    OperationOutcome, PairingError, ReconciledResult, Requester, RequesterConfig, SessionEnd,
+    SessionError,
 };
 use refineid_rapp_core::file_journal::FileOperationJournal;
 use refineid_rapp_core::operations::SignatureAlgorithmExt as _;
@@ -498,6 +499,34 @@ fn credential_rejection_revokes_the_pairing() {
         requester.connect(pair_id, requester_transport),
         Err(SessionError::NotPaired(PairingDisposition::Revoked))
     ));
+}
+
+#[test]
+fn a_withdrawn_session_keeps_the_pairing_and_reports_the_reason() {
+    let mut requester = test_requester();
+    let granted = vec![PROFILE_AUTHENTICATION.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationRequest(_) = session.receive() else {
+            panic!("expected an operation request");
+        };
+        session.send(&TypedMessage::SessionClose(SessionCloseMessage {
+            reason: CloseReason::ServiceWithdrawn,
+            last_received_sequence: 1,
+        }));
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let outcome = requester.execute(&mut session, &authentication_operation(), 30_000);
+    proxy.join().unwrap();
+    assert!(!matches!(outcome, Ok(OperationOutcome::Completed(_))));
+    assert_eq!(
+        TestRequester::session_end(&session),
+        Some(SessionEnd::PeerClose(CloseReason::ServiceWithdrawn))
+    );
+    let record = requester.store().get(pair_id).unwrap();
+    assert_eq!(record.disposition, PairingDisposition::Paired);
 }
 
 #[test]

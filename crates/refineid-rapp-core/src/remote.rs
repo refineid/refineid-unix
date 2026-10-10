@@ -6,8 +6,10 @@
 //! custodians in `mode=session`, dials each, and opens with a routing value
 //! that is fresh per dial and keyed by the pairing's static agreement. A
 //! custodian that does not hold the pairing closes the connection, and the
-//! next one is tried. A custodian that announced its withdrawal for the
-//! pairing ends the search until it serves again.
+//! next one is tried. A withdrawn record announcing the pairing, or a session
+//! close carrying `service_withdrawn`, ends the search at once; the
+//! withdrawn instance is never dialed, and the pairing is dialed again only
+//! when a session record on another instance names it.
 
 use std::time::{Duration, Instant};
 
@@ -80,23 +82,25 @@ fn unix_seconds() -> u64 {
 /// The session custodians worth dialing for the pairing keyed by `keys`,
 /// best first: those whose rotating hint names the pairing, then those
 /// publishing no hints. A custodian whose hints all name other pairings is
-/// never dialed.
+/// never dialed, and neither is an instance that announced its withdrawal
+/// for the pairing.
 ///
 /// # Errors
 /// [`RemoteError::Withdrawn`] when a custodian announced its withdrawal for
-/// the pairing and none names it in a session record: the pairing is not
-/// dialed again until its custodian serves in `mode=session`.
+/// the pairing and no session record on another instance names it.
 fn sessions_for(
     keys: &PairingKeys,
     services: Vec<StreamService>,
 ) -> Result<Vec<StreamService>, RemoteError> {
     let now = unix_seconds();
-    let withdrawn = services
+    let withdrawn: Vec<String> = services
         .iter()
-        .any(|service| service.withdraws(&keys.withdrawal, now));
+        .filter(|service| service.withdraws(&keys.withdrawal, now))
+        .map(|service| service.instance.clone())
+        .collect();
     let (mut named, mut unhinted) = (Vec::new(), Vec::new());
     for service in services {
-        if !service.advertises(DiscoveryMode::Session) {
+        if !service.advertises(DiscoveryMode::Session) || withdrawn.contains(&service.instance) {
             continue;
         }
         match service.hint_match(&keys.discovery, now) {
@@ -105,11 +109,26 @@ fn sessions_for(
             HintMatch::Other => {}
         }
     }
-    if withdrawn && named.is_empty() {
+    if !withdrawn.is_empty() && named.is_empty() {
         return Err(RemoteError::Withdrawn);
     }
     named.extend(unhinted);
     Ok(named)
+}
+
+/// The answer of one operation whose session ended with `withdrawn` telling
+/// whether the peer announced its withdrawal. A delivered result stands; any
+/// other ending of a withdrawn session reports the withdrawal.
+fn operation_result(
+    outcome: Result<OperationOutcome, AdmissionError>,
+    withdrawn: bool,
+) -> Result<CardOperationResult, RemoteError> {
+    match outcome {
+        Ok(OperationOutcome::Completed(result)) => Ok(result),
+        _ if withdrawn => Err(RemoteError::Withdrawn),
+        Ok(other) => Err(RemoteError::Outcome(Box::new(other))),
+        Err(error) => Err(RemoteError::Admission(error)),
+    }
 }
 
 /// Whether the peer ended `end` by announcing its withdrawal.
@@ -359,8 +378,14 @@ impl RemoteReader {
                         .requester
                         .reconcile_status(&mut session, operation_id)
                         .map_err(RemoteError::Session);
+                    let withdrawn = withdrawn_by(
+                        Requester::<FilePairingStore, FileOperationJournal>::session_end(&session),
+                    );
                     self.requester
                         .disconnect(&mut session, CloseReason::Complete);
+                    if withdrawn && answer.is_err() {
+                        return Err(RemoteError::Withdrawn);
+                    }
                     break 'search;
                 }
             }
@@ -470,20 +495,15 @@ impl RemoteReader {
                         continue;
                     }
                 };
-                let outcome = self
-                    .requester
-                    .execute(&mut session, operation, OPERATION_LIFETIME_MS)
-                    .map_err(RemoteError::Admission);
+                let outcome =
+                    self.requester
+                        .execute(&mut session, operation, OPERATION_LIFETIME_MS);
                 let withdrawn = withdrawn_by(
                     Requester::<FilePairingStore, FileOperationJournal>::session_end(&session),
                 );
                 self.requester
                     .disconnect(&mut session, CloseReason::Complete);
-                return match outcome? {
-                    OperationOutcome::Completed(result) => Ok(result),
-                    _ if withdrawn => Err(RemoteError::Withdrawn),
-                    other => Err(RemoteError::Outcome(Box::new(other))),
-                };
+                return operation_result(outcome, withdrawn);
             }
         }
         Err(last)
@@ -532,7 +552,10 @@ mod tests {
         WithdrawnRecord, discovery_epoch, withdrawal_counter,
     };
 
-    use super::{PairingKeys, RemoteError, StreamService, sessions_for, unix_seconds};
+    use super::{
+        AdmissionError, CardOperationResult, OperationOutcome, PairingKeys, RemoteError,
+        StreamService, operation_result, sessions_for, unix_seconds,
+    };
 
     const PAIR_ID: [u8; 16] = [0x22; 16];
     const PEER_PUBLIC: [u8; 32] = [0x44; 32];
@@ -650,6 +673,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(names(&found), ["refineid-unhinted"]);
+    }
+
+    #[test]
+    fn a_session_record_on_the_withdrawn_instance_is_never_dialed() {
+        let mine = keys(MINE);
+        let epoch = discovery_epoch(unix_seconds());
+        let stale = session("refineid-gone", Some(hex(&mine.discovery.hint(epoch))));
+        assert_eq!(
+            sessions_for(
+                &mine,
+                vec![withdrawn("refineid-gone", &mine.withdrawal), stale]
+            )
+            .map(|found| found.len()),
+            Err(RemoteError::Withdrawn)
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_session_reports_the_withdrawal_unless_a_result_arrived() {
+        let certificate = CardOperationResult::Certificate(vec![0x30, 0x00]);
+        assert_eq!(
+            operation_result(Ok(OperationOutcome::Completed(certificate.clone())), true),
+            Ok(certificate)
+        );
+        assert_eq!(
+            operation_result(Ok(OperationOutcome::Cancelled), true),
+            Err(RemoteError::Withdrawn)
+        );
+        assert_eq!(
+            operation_result(Err(AdmissionError::SessionNotHealthy), true),
+            Err(RemoteError::Withdrawn)
+        );
+        assert_eq!(
+            operation_result(Ok(OperationOutcome::Cancelled), false),
+            Err(RemoteError::Outcome(Box::new(OperationOutcome::Cancelled)))
+        );
     }
 
     #[test]
