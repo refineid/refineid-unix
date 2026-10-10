@@ -9,6 +9,7 @@
 //! by `refineid_rapp`.
 
 pub mod engine;
+pub mod file_journal;
 pub mod file_store;
 pub mod ids;
 pub mod message;

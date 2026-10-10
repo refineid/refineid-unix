@@ -26,12 +26,13 @@ use refineid_rapp::{
     CloseReason, CpaceKc2Responder, EndpointRole, EstablishedEndpoint, OperationReference,
     OperationResultMessage, PairId, PairRecord, PairStore, PairStoreError, PairTombstone,
     PairingHandshake, PairingOffer, ProxyFailure, ReceiveOutcome, SessionCloseMessage,
-    SessionHandshake, SignatureAlgorithm, TransportProfile, TypedMessage,
+    SessionHandshake, SignatureAlgorithm, StatusReport, TransportProfile, TypedMessage,
     generate_pair_key_material, standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
     OperationOutcome, PairingError, Requester, RequesterConfig, SessionError,
 };
+use refineid_rapp_core::file_journal::FileOperationJournal;
 use refineid_rapp_core::operations::SignatureAlgorithmExt as _;
 use refineid_rapp_core::profiles::{PROFILE_AUTHENTICATION, PROFILE_CARD_STATUS};
 use refineid_rapp_core::store::{
@@ -235,7 +236,10 @@ fn proxy_accept_session<T: FrameTransport>(
 }
 
 /// Pairs a fresh requester with a custodian thread and returns both halves.
-fn paired(requester: &mut TestRequester, granted: &[String]) -> (PairId, PairRecord) {
+fn paired<J: OperationJournal>(
+    requester: &mut Requester<MemoryPairingStore, J>,
+    granted: &[String],
+) -> (PairId, PairRecord) {
     let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || proxy_pair(proxy_transport, SHOWN_CODE));
     let pair_id = requester
@@ -525,6 +529,96 @@ fn unanswered_consequential_close_classifies_as_ambiguous() {
     // The journal remembers the prohibition on automatic retry (INV-06).
     let open = requester.journal().open_entries();
     assert!(open.is_empty());
+}
+
+#[test]
+fn an_unanswered_signature_survives_restart_and_reconciles_by_status() {
+    let directory = std::env::temp_dir().join(format!(
+        "refineid-loopback-journal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config = || RequesterConfig {
+        display_name: "Workstation".into(),
+        platform: "Linux".into(),
+    };
+    let mut requester = Requester::new(
+        config(),
+        MemoryPairingStore::new(),
+        FileOperationJournal::open(&directory).unwrap(),
+    );
+    let granted = vec![PROFILE_AUTHENTICATION.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationRequest(request) = session.receive() else {
+            panic!("expected an operation request");
+        };
+        // The transport dies with the request delivered and unanswered.
+        drop(session);
+        (request, proxy_pairing)
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let outcome = requester
+        .execute(&mut session, &authentication_operation(), 30_000)
+        .unwrap();
+    let (request, proxy_pairing) = proxy.join().unwrap();
+    assert_eq!(outcome, OperationOutcome::Ambiguous);
+    let store = std::mem::take(requester.store_mut());
+    drop(requester);
+
+    // A new process finds the operation ambiguous and unreconciled.
+    let mut requester = Requester::new(
+        config(),
+        store,
+        FileOperationJournal::open(&directory).unwrap(),
+    );
+    let pending = requester.journal().unreconciled(pair_id);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].operation_id, request.operation_id);
+    assert!(pending[0].retry_prohibited);
+
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let reference = OperationReference {
+        operation_id: request.operation_id,
+        request_hash: request.request_hash().unwrap(),
+    };
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationStatusRequest(asked) = session.receive() else {
+            panic!("expected a status request");
+        };
+        assert_eq!(asked, reference.operation_id);
+        session.send(&TypedMessage::OperationStatus(StatusReport {
+            operation_id: asked,
+            known: true,
+            state: Some(refineid_rapp::OperationState::Ambiguous),
+            request_hash: Some(reference.request_hash),
+            retired: false,
+        }));
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let answer = requester
+        .reconcile_status(&mut session, request.operation_id)
+        .unwrap();
+    proxy.join().unwrap();
+    assert!(answer.is_some());
+    assert!(requester.journal().unreconciled(pair_id).is_empty());
+    let reopened = FileOperationJournal::open(&directory).unwrap();
+    assert!(reopened.unreconciled(pair_id).is_empty());
+    assert!(
+        reopened
+            .get(request.operation_id)
+            .unwrap()
+            .reconciled_proxy_state
+            .is_some()
+    );
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]

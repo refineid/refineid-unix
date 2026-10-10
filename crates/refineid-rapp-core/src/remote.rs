@@ -12,12 +12,14 @@ use std::time::{Duration, Instant};
 use crate::engine::{
     AdmissionError, OperationOutcome, PairingError, Requester, RequesterConfig, SessionError,
 };
+use crate::file_journal::FileOperationJournal;
 use crate::file_store::FilePairingStore;
+use crate::ids::OperationId;
 use crate::ids::PairId;
 use crate::ids::RendezvousToken;
 use crate::message::CloseReason;
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
-use crate::store::{MemoryJournal, PairingDisposition, PairingStore, StoreError};
+use crate::store::{PairingDisposition, PairingStore, StoreError};
 use crate::stream::{
     DiscoveryMode, HintMatch, STREAM_CANDIDATE_ID, StreamRendezvous, StreamService, browse, dial,
 };
@@ -120,7 +122,7 @@ impl PairSummary {
 /// The workstation's remote reader over its durable pairing store.
 #[derive(Debug)]
 pub struct RemoteReader {
-    requester: Requester<FilePairingStore, MemoryJournal>,
+    requester: Requester<FilePairingStore, FileOperationJournal>,
 }
 
 /// The platform label this workstation introduces itself with.
@@ -153,12 +155,18 @@ impl RemoteReader {
     /// [`RemoteError::Store`] when the store cannot be opened.
     pub fn open(display_name: &str, platform: &str) -> Result<Self, RemoteError> {
         let store = FilePairingStore::open_default().map_err(RemoteError::Store)?;
-        Ok(Self::with_store(display_name, platform, store))
+        let journal = FileOperationJournal::open_default().map_err(RemoteError::Store)?;
+        Ok(Self::with_stores(display_name, platform, store, journal))
     }
 
-    /// Uses `store` for pairings.
+    /// Uses `store` for pairings and `journal` for operations.
     #[must_use]
-    pub fn with_store(display_name: &str, platform: &str, store: FilePairingStore) -> Self {
+    pub fn with_stores(
+        display_name: &str,
+        platform: &str,
+        store: FilePairingStore,
+        journal: FileOperationJournal,
+    ) -> Self {
         Self {
             requester: Requester::new(
                 RequesterConfig {
@@ -166,7 +174,7 @@ impl RemoteReader {
                     platform: platform.to_owned(),
                 },
                 store,
-                MemoryJournal::new(),
+                journal,
             ),
         }
     }
@@ -204,7 +212,84 @@ impl RemoteReader {
         self.requester
             .store_mut()
             .remove(pair_id)
+            .map_err(RemoteError::Store)?;
+        self.requester
+            .journal_mut()
+            .forget_pair(pair_id)
             .map_err(RemoteError::Store)
+    }
+
+    /// Operations of `pair_id` that ended ambiguous and await section 8.3
+    /// reconciliation, oldest first.
+    #[must_use]
+    pub fn unreconciled(&self, pair_id: PairId) -> Vec<OperationId> {
+        self.requester
+            .journal()
+            .unreconciled(pair_id)
+            .into_iter()
+            .map(|entry| entry.operation_id)
+            .collect()
+    }
+
+    /// Asks the phone holding `pair_id` for the state of each operation
+    /// that ended ambiguous (section 8.3), one session per operation, and
+    /// annotates the journal with each answer. Nothing is ever retried.
+    ///
+    /// Returns each reconciled operation with the state the phone reported,
+    /// `None` when the phone does not know it.
+    ///
+    /// # Errors
+    /// [`RemoteError`] when the pairing is unknown or no phone opens a
+    /// session for it before `discovery_timeout`.
+    pub fn reconcile(
+        &mut self,
+        pair_id: PairId,
+        discovery_timeout: Duration,
+    ) -> Result<Vec<(OperationId, Option<String>)>, RemoteError> {
+        let record = self
+            .requester
+            .store()
+            .get(pair_id)
+            .map_err(|_| RemoteError::NotPaired)?;
+        if record.disposition != PairingDisposition::Paired {
+            return Err(RemoteError::NotPaired);
+        }
+        let token = record.rendezvous_token;
+        let mut answers = Vec::new();
+        for operation_id in self.unreconciled(pair_id) {
+            let deadline = Instant::now() + discovery_timeout;
+            let mut answer = Err(RemoteError::NotFound);
+            'search: while Instant::now() < deadline {
+                for service in sessions_for(&token, browse(DiscoveryMode::Session, BROWSE_ROUND)) {
+                    let Ok(transport) = dial(
+                        &service.endpoints,
+                        STREAM_CANDIDATE_ID,
+                        OPERATION_RECEIVE_DEADLINE,
+                        &StreamRendezvous::Session(token),
+                    ) else {
+                        continue;
+                    };
+                    let mut session = match self.requester.connect(pair_id, transport) {
+                        Ok(session) => session,
+                        Err(error) => {
+                            answer = Err(RemoteError::Session(error));
+                            continue;
+                        }
+                    };
+                    answer = self
+                        .requester
+                        .reconcile_status(&mut session, operation_id)
+                        .map_err(RemoteError::Session);
+                    // The phone re-delivers a retained result after its
+                    // report; closing here leaves it unread.
+                    self.requester
+                        .disconnect(&mut session, CloseReason::Complete);
+                    break 'search;
+                }
+            }
+            answers.push((operation_id, answer?));
+        }
+        Ok(answers)
     }
 
     /// Pairs with the phone showing `code`, browsing for it until

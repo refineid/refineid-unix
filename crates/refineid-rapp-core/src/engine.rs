@@ -284,6 +284,11 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         &self.journal
     }
 
+    /// Mutable access to the operation journal.
+    pub const fn journal_mut(&mut self) -> &mut Journal {
+        &mut self.journal
+    }
+
     /// Pairs with the custodian showing `code`, as the requester (RAPP
     /// v26.10.9 sections 3, 4.2 and 6).
     ///
