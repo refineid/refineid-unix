@@ -22,7 +22,7 @@ use fltk::browser::HoldBrowser;
 use fltk::button::{Button, CheckButton, RadioRoundButton};
 use fltk::dialog::{FileDialogType, NativeFileChooser, alert, choice2_default};
 use fltk::draw;
-use fltk::enums::{Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType};
+use fltk::enums::{Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType, Key};
 use fltk::frame::Frame;
 use fltk::group::{Group, Tabs};
 use fltk::image::RgbImage;
@@ -85,7 +85,6 @@ struct FltkWidgets {
     sign_btn: Button,
     sign_result_frame: Frame,
     pair_code_input: Input,
-    pair_code_boxes: Frame,
     /// Whether the last rendered state had a pairing ceremony running.
     pairing_running: bool,
     pair_status_frame: Frame,
@@ -426,29 +425,26 @@ impl FltkDriver {
 
         let mut code_label = Frame::new(50, 110, 170, 32, "Code on the phone:");
         code_label.set_align(Align::Left | Align::Inside);
-        // The input reads the keyboard and pastes; the frame over it draws
-        // the boxes and passes every event through.
+        // The input reads the keyboard and pastes and draws itself as the
+        // boxes; its cursor stays at the end, so the next character always
+        // lands in the box after the last one.
         let mut pair_code_input = Input::new(225, 108, code_boxes_width(), CODE_BOX_SIZE, "");
         pair_code_input.set_frame(FrameType::NoBox);
-        pair_code_input.set_color(CARD_BACKGROUND);
-        pair_code_input.set_text_color(CARD_BACKGROUND);
-        pair_code_input.set_cursor_color(CARD_BACKGROUND);
-        pair_code_input.set_selection_color(CARD_BACKGROUND);
         pair_code_input.set_trigger(CallbackTrigger::Changed);
-        let mut pair_code_boxes = Frame::new(225, 108, code_boxes_width(), CODE_BOX_SIZE, "");
-        {
-            let input = pair_code_input.clone();
-            pair_code_boxes.draw(move |frame| draw_code_boxes(frame, &input));
-        }
-        {
-            let mut boxes = pair_code_boxes.clone();
-            pair_code_input.handle(move |_, event| {
-                if matches!(event, Event::Focus | Event::Unfocus) {
-                    boxes.redraw();
-                }
+        pair_code_input.draw(|input| draw_code_boxes(input));
+        pair_code_input.handle(|input, event| match event {
+            Event::Focus | Event::Unfocus => {
+                input.redraw();
                 false
-            });
-        }
+            }
+            Event::Push => {
+                let _ = input.take_focus();
+                true
+            }
+            Event::Drag | Event::Released => true,
+            Event::KeyDown => CURSOR_KEYS.contains(&app::event_key()),
+            _ => false,
+        });
 
         let mut pair_status_frame = Frame::new(50, 155, 820, 36, "");
         pair_status_frame.set_align(Align::Left | Align::Inside);
@@ -774,14 +770,13 @@ impl FltkDriver {
         }
         {
             let c = Arc::clone(controller);
-            let mut boxes = pair_code_boxes.clone();
             pair_code_input.set_callback(move |input| {
                 let kept = kept_code(&input.value());
                 if kept != input.value() {
                     input.set_value(&kept);
-                    let _ = input.set_position(kept.len().try_into().unwrap_or(i32::MAX));
                 }
-                boxes.redraw();
+                let _ = input.set_position(kept.len().try_into().unwrap_or(i32::MAX));
+                input.redraw();
                 if kept.len() == PAIRING_CODE_LENGTH {
                     c.handle_intent(UserIntent::StartPairing { code: kept });
                 }
@@ -835,7 +830,6 @@ impl FltkDriver {
             sign_btn,
             sign_result_frame,
             pair_code_input,
-            pair_code_boxes,
             pairing_running: false,
             pair_status_frame,
             phone_browser,
@@ -1191,14 +1185,15 @@ impl UiDriver for FltkDriver {
             widgets.pair_status_frame.set_label(&pairing.status);
             set_active(&mut widgets.pair_code_input, false);
         } else {
-            if widgets.pairing_running {
-                widgets.pair_code_input.set_value("");
-            }
             widgets.pair_status_frame.set_label("");
             set_active(&mut widgets.pair_code_input, true);
+            if widgets.pairing_running {
+                widgets.pair_code_input.set_value("");
+                let _ = widgets.pair_code_input.take_focus();
+            }
         }
         widgets.pairing_running = state.pairing.is_some();
-        widgets.pair_code_boxes.redraw();
+        widgets.pair_code_input.redraw();
 
         let lines: Vec<String> = state
             .phones
@@ -1255,8 +1250,17 @@ const CODE_BOX_SPACING: i32 = 6;
 const CODE_GROUP_GAP: i32 = 14;
 /// The characters of one cluster, as the phone shows the code.
 const CODE_GROUP_SIZE: usize = 2;
-/// The background of the cards and of the input under the boxes.
+/// The background of the cards, drawn behind the boxes.
 const CARD_BACKGROUND: Color = Color::from_rgb(255, 255, 255);
+/// The keys that would move the input's cursor off the end.
+const CURSOR_KEYS: [Key; 6] = [
+    Key::Left,
+    Key::Right,
+    Key::Up,
+    Key::Down,
+    Key::Home,
+    Key::End,
+];
 
 /// The width of the row of boxes.
 fn code_boxes_width() -> i32 {
@@ -1282,12 +1286,13 @@ fn kept_code(typed: &str) -> String {
         .collect()
 }
 
-/// Draws the code in `input` as one box per character; the box the next
+/// Draws `input` as one box per code character; the box the next
 /// character lands in carries the accent while the input has focus.
-fn draw_code_boxes(frame: &Frame, input: &Input) {
+fn draw_code_boxes(input: &Input) {
     let code: Vec<char> = input.value().chars().collect();
     let active = input.active();
     let focused = input.has_focus();
+    draw::draw_rect_fill(input.x(), input.y(), input.w(), input.h(), CARD_BACKGROUND);
     let text_color = if active {
         Color::from_rgb(20, 20, 20)
     } else {
@@ -1295,9 +1300,8 @@ fn draw_code_boxes(frame: &Frame, input: &Input) {
     };
     draw::set_font(Font::CourierBold, 20);
     for index in 0..PAIRING_CODE_LENGTH {
-        let x = frame.x() + code_box_offset(index);
-        let y = frame.y();
-        draw::draw_rect_fill(x, y, CODE_BOX_SIZE, CODE_BOX_SIZE, CARD_BACKGROUND);
+        let x = input.x() + code_box_offset(index);
+        let y = input.y();
         let border = if focused && active && index == code.len() {
             Color::from_rgb(0, 122, 255)
         } else {
