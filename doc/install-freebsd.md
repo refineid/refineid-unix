@@ -133,10 +133,13 @@ change.
 In Firefox the module appears under "RefineID" in Settings > Privacy &
 Security > Security Devices, with the reader as one slot and the paired
 phone (section 7) as another, "RefineID Remote" with the phone's name.
-A card in the reader shows the token "Basic (PIN 1)"; a card lying on
-the paired phone shows "Phone (PIN 1)" while the module holds a session
-to the phone. A card-login site asks for the certificate; PIN 1 is
-asked by the browser for the reader's card and by the phone for the
+A card in the reader shows the token "Basic (PIN 1)"; the paired phone
+shows "Phone (PIN 1)" while the module holds a session to it and the
+phone reports its card. The phone's certificate comes from the pairing
+record, read from the card once and cached, so the phone does nothing
+for the slot but answer the session's pings; it is asked for one
+thing, the signature. A card-login site asks for the certificate; PIN 1
+is asked by the browser for the reader's card and by the phone for the
 phone's card. Without a card nothing is offered and nothing is asked.
 One program on the computer holds the phone session at a time: while a
 browser holds it, `refineid card` and the desktop application report

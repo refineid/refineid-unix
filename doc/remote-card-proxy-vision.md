@@ -112,7 +112,7 @@ Once paired, routine authentication requires zero re-pairing:
    * `librefineid_pkcs11.so` reads the pairing record the desktop application or the CLI keeps, without sweeping it, and raises one slot, "RefineID Remote" with the phone's name, for the one phone paired with this computer.
    * A thread inside the module holds the session: it dials while the record is usable, and keeps the session while the phone reports a card. The pairing's lock file keeps the module, the desktop application and the CLI from two sessions under one static key; the loser reports the phone as in use.
 2. **The token is the card on the phone**:
-   * On each session the module reads the authentication certificate from the card, so the token "Phone (PIN 1)" is present exactly while the phone can serve, and the identity offered is the card lying on the phone now (RAPP v26.10.18 section 8.4).
+   * The token "Phone (PIN 1)" carries the authentication certificate the pairing record caches, read from the card once when no program has cached it yet; it is present exactly while the session reports a card (RAPP v26.10.18 section 8.4). The phone does nothing for the slot but answer pings, and a card other than the cached one fails at the signature, where PACE runs against the stored access number.
    * NSS reads `CKA_VALUE`, `CKA_ISSUER`, `CKA_SUBJECT` and the CA certificates from the module's memory; enumeration never dials.
    * `C_Login` reads no PIN: the token declares a protected authentication path, and succeeds only while the token is present.
 3. **Sign request dispatch**:
