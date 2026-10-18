@@ -308,22 +308,27 @@ pub const fn local_platform() -> &'static str {
 }
 
 /// This computer's host name without its domain, as the phone lists it:
-/// what `hostname` prints, or `RefineID` when it prints nothing.
+/// what `uname -n` prints, or `RefineID` when the system has no name of
+/// its own.
 #[must_use]
 pub fn local_host_name() -> String {
-    let printed = std::process::Command::new("hostname")
+    let printed = std::process::Command::new("uname")
+        .arg("-n")
         .output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default();
     let short = printed.trim().split('.').next().unwrap_or("").trim();
-    if short.is_empty() {
+    if short.is_empty() || UNSET_HOST_NAMES.contains(&short) {
         "RefineID".to_owned()
     } else {
         short.to_owned()
     }
 }
+
+/// The names a system reports before it has been given one.
+const UNSET_HOST_NAMES: [&str; 2] = ["localhost", "(none)"];
 
 impl RemoteReader {
     /// Opens the per-user pairing store, introducing this workstation by

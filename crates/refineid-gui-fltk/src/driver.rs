@@ -22,9 +22,7 @@ use fltk::browser::HoldBrowser;
 use fltk::button::{Button, CheckButton, RadioRoundButton};
 use fltk::dialog::{FileDialogType, NativeFileChooser, alert, choice2_default};
 use fltk::draw;
-use fltk::enums::{
-    Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType, Key, Shortcut,
-};
+use fltk::enums::{Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType, Key};
 use fltk::frame::Frame;
 use fltk::group::{Group, Tabs};
 use fltk::image::RgbImage;
@@ -444,7 +442,7 @@ impl FltkDriver {
                 true
             }
             Event::Drag | Event::Released => true,
-            Event::KeyDown => !key_reaches_the_code(),
+            Event::KeyDown => CURSOR_KEYS.contains(&app::event_key()),
             _ => false,
         });
 
@@ -1254,36 +1252,18 @@ const CODE_GROUP_GAP: i32 = 14;
 const CODE_GROUP_SIZE: usize = 2;
 /// The background of the cards, drawn behind the boxes.
 const CARD_BACKGROUND: Color = Color::from_rgb(255, 255, 255);
-/// The keys the code input takes besides typed text: deletion, focus
-/// and dismissal.
-const EDITING_KEYS: [Key; 6] = [
-    Key::BackSpace,
-    Key::Delete,
-    Key::Tab,
-    Key::Enter,
-    Key::KPEnter,
-    Key::Escape,
+/// The keys that would move the input's cursor off the end; every other
+/// key reaches the input, and a change puts the cursor back at the end.
+const CURSOR_KEYS: [Key; 8] = [
+    Key::Left,
+    Key::Right,
+    Key::Up,
+    Key::Down,
+    Key::Home,
+    Key::End,
+    Key::PageUp,
+    Key::PageDown,
 ];
-
-/// Whether the key event under way reaches the code input: an editing
-/// key, a paste shortcut, or typed text without a command modifier. Every
-/// other key is swallowed, so nothing moves the cursor off the end or
-/// edits the code behind the boxes.
-fn key_reaches_the_code() -> bool {
-    let key = app::event_key();
-    let state = app::event_state();
-    if EDITING_KEYS.contains(&key) {
-        return true;
-    }
-    if key == Key::Insert && state.contains(Shortcut::Shift) {
-        return true;
-    }
-    if state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Meta) {
-        return !state.contains(Shortcut::Alt)
-            && key.to_char().map(|c| c.to_ascii_lowercase()) == Some('v');
-    }
-    !state.contains(Shortcut::Alt) && !app::event_text().is_empty()
-}
 
 /// The width of the row of boxes.
 fn code_boxes_width() -> i32 {
