@@ -14,8 +14,9 @@
 # permissions and limitations under the License.
 
 # Stamp the project version across the tree. The canonical version is
-# CalVer YY.M.D.HHMM, where HHMM is the UTC time of day of the stamp
-# (hour*10 + minute/10, 0..235). Updates:
+# CalVer YY.M.D.HHMM, where HHMM is the UTC time of day of the stamp as one
+# integer (905 at 09:05), the spelling every platform's version field takes
+# (hour * 100 + minute, 0..2359). Updates:
 #   VERSION                 canonical four-component string
 #   .cargo/config.toml      REFINEID_VERSION (compiled into binaries)
 #   Cargo.toml              workspace three-component SemVer projection
@@ -27,7 +28,7 @@ cd "$(dirname "$0")/.."
 
 read -r year month day hour minute < <(date -u '+%y %-m %-d %H %M')
 today="$year.$month.$day"
-time_of_day="$hour$minute"
+time_of_day=$((10#$hour * 100 + 10#$minute))
 project_version="$today.$time_of_day"
 old=$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml | head -n 1)
 [ -n "$old" ] || { echo "version-stamp: no workspace version" >&2; exit 1; }
