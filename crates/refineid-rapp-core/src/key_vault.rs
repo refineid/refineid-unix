@@ -69,6 +69,9 @@ pub trait KeyVault: core::fmt::Debug {
     /// # Errors
     /// [`KeyVaultError::Unavailable`] when the store refuses the request.
     fn remove(&self, pair_id: PairId) -> Result<(), KeyVaultError>;
+
+    /// Whether the vault answers, so a key stored now would be kept.
+    fn reachable(&self) -> bool;
 }
 
 impl<Vault: KeyVault + ?Sized> KeyVault for std::sync::Arc<Vault> {
@@ -89,6 +92,10 @@ impl<Vault: KeyVault + ?Sized> KeyVault for std::sync::Arc<Vault> {
 
     fn remove(&self, pair_id: PairId) -> Result<(), KeyVaultError> {
         (**self).remove(pair_id)
+    }
+
+    fn reachable(&self) -> bool {
+        (**self).reachable()
     }
 }
 
@@ -141,6 +148,17 @@ impl SecretServiceVault {
         };
         let listing = Zeroizing::new(output.stdout);
         output.status.success() && listing.is_empty()
+    }
+
+    /// Whether the Secret Service answers a search at all.
+    fn answers(&self) -> bool {
+        let (mut command, _) = self.command(PairId::from_array([0; 16]));
+        command
+            .args(["search", "--all", APPLICATION_ATTRIBUTE, APPLICATION])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }
 
@@ -247,6 +265,10 @@ impl KeyVault for SecretServiceVault {
             _ => Err(KeyVaultError::Unavailable),
         }
     }
+
+    fn reachable(&self) -> bool {
+        self.answers()
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -338,6 +360,10 @@ impl KeyVault for MemoryKeyVault {
         self.keys()?.retain(|(stored, _)| *stored != pair_id);
         Ok(())
     }
+
+    fn reachable(&self) -> bool {
+        !self.unavailable
+    }
 }
 
 #[cfg(test)]
@@ -421,5 +447,6 @@ mod tests {
             KeyVaultError::Unavailable
         );
         assert_eq!(vault.remove(pair).unwrap_err(), KeyVaultError::Unavailable);
+        assert!(!vault.reachable());
     }
 }

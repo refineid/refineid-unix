@@ -472,8 +472,10 @@ impl RemoteReader {
     ///
     /// # Errors
     /// [`RemoteError::Pairing`] for a malformed or mistyped code and other
-    /// pairing failures, and [`RemoteError::NotFound`] when no phone in a
-    /// pairing ceremony answered.
+    /// pairing failures, [`RemoteError::Store`] when the key vault does not
+    /// answer (checked before the phone's code is spent), and
+    /// [`RemoteError::NotFound`] when no phone in a pairing ceremony
+    /// answered.
     pub fn pair_with_code(
         &mut self,
         code: &str,
@@ -481,6 +483,9 @@ impl RemoteReader {
     ) -> Result<PairSummary, RemoteError> {
         if crate::offer::normalize_pairing_code(code).is_none() {
             return Err(RemoteError::Pairing(PairingError::InvalidCode));
+        }
+        if !self.requester.store().vault_reachable() {
+            return Err(RemoteError::Store(StoreError::SecretsUnavailable));
         }
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
