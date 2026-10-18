@@ -36,7 +36,8 @@ pair_wait_seconds=120
 read_wait_seconds=90
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+offer_pid=
+trap 'kill "${offer_pid:-}" 2>/dev/null; rm -rf "$work"' EXIT
 
 say() { printf '%s %s\n' "$(date -u '+%H:%M:%S')" "$*"; }
 
@@ -47,6 +48,7 @@ phone_offer() {
     xcrun devicectl device process launch --device "$udid" --console \
         --terminate-existing "$bundle" --offer-remote-reader \
         < /dev/null > "$work/offer.log" 2>&1 &
+    offer_pid=$!
     waited=0
     while [ "$waited" -lt "$code_wait_seconds" ]; do
         tr -d '\r' < "$work/offer.log" | grep -o 'offer-remote-reader: offer [0-9A-Z]\{6\}' \
@@ -71,13 +73,24 @@ host_sh() {
     ssh -o BatchMode=yes "$host" sh -s
 }
 
+# Opens the host's window on the Phone tab and types the code; fails
+# when the old window does not go or the new one does not come.
 host_type_code() {
     host_sh <<EOS
-pkill -x refineid-gui >/dev/null 2>&1 || true
-sleep 1
-cd "\$HOME" && DISPLAY=$display nohup refineid-gui --pair > /dev/null 2>&1 &
 export DISPLAY=$display
-window=\$(xdotool search --sync --onlyvisible --name RefineID | head -n 1)
+pkill -x refineid-gui >/dev/null 2>&1 || true
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    xdotool search --onlyvisible --name RefineID >/dev/null 2>&1 || break
+    sleep 1
+done
+cd "\$HOME" && nohup refineid-gui --pair > /dev/null 2>&1 &
+window=
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    window=\$(xdotool search --onlyvisible --name RefineID 2>/dev/null | head -n 1)
+    [ -n "\$window" ] && break
+    sleep 1
+done
+[ -n "\$window" ] || { echo "no RefineID window on $display" >&2; exit 1; }
 xdotool windowactivate --sync "\$window"
 sleep 1
 xdotool type --delay 120 "$1"
@@ -90,30 +103,34 @@ refineid pairs 2>/dev/null
 EOS
 }
 
-# The pairing identifiers the host lists.
+# The pairing identifiers in a listing.
 pair_ids() {
-    host_pairs | sed -n 's/^      Pair ID: *//p'
+    sed -n 's/^      Pair ID: *//p'
 }
 
-# The listing's entry, name line and certificate line joined, of `pair_id`.
+# The listing's entry of `pair_id` as one line: its name line and its
+# certificate line.
 entry_of() {
-    host_pairs | awk -v id="$1" '
+    awk -v id="$1" '
         /^  \[/ { name = $0; next }
         /Pair ID:/ { found = ($NF == id); next }
         found && /Cert cache:/ { print name " " $0; exit }'
 }
 
-# Waits until a pairing not in `known` exists whose entry matches `pattern`,
-# and prints its identifier.
+# Waits until a pairing not in `known` exists whose entry matches
+# `wanted` and not `unwanted`, and prints its identifier.
 wait_for() {
     known=$1
-    pattern=$2
-    seconds=$3
+    wanted=$2
+    unwanted=$3
+    seconds=$4
     waited=0
     while [ "$waited" -lt "$seconds" ]; do
-        for id in $(pair_ids); do
+        host_pairs > "$work/listing"
+        for id in $(pair_ids < "$work/listing"); do
             case " $known " in *" $id "*) continue ;; esac
-            if entry_of "$id" | grep -q "$pattern"; then
+            if entry_of "$id" < "$work/listing" | grep -q "$wanted" \
+                && ! entry_of "$id" < "$work/listing" | grep -q "$unwanted"; then
                 printf '%s\n' "$id"
                 return 0
             fi
@@ -124,7 +141,7 @@ wait_for() {
     return 1
 }
 
-known=$(pair_ids | tr '\n' ' ')
+known=$(host_pairs | pair_ids | tr '\n' ' ')
 say "asking the phone for a code"
 phone_offer
 code=$(cat "$work/code")
@@ -132,7 +149,7 @@ say "code shown; typing it into the host's boxes"
 host_type_code "$code"
 
 say "waiting for the pairing on the host"
-if ! new_id=$(wait_for "$known" '^  \[[0-9]*\] [^ ]* ([A-Za-z]*) ' "$pair_wait_seconds"); then
+if ! new_id=$(wait_for "$known" '^  \[[0-9]*\] ' ' -- ' "$pair_wait_seconds"); then
     say "FAIL: no usable pairing within ${pair_wait_seconds} s"
     host_pairs
     exit 1
@@ -141,7 +158,7 @@ say "paired as $new_id; the phone serves again"
 phone_serve
 
 say "waiting for the certificate read through the phone"
-if ! wait_for "$known" '^  \[[0-9]*\] [^ ]* ([A-Za-z]*) .*Cert cache: Cached' "$read_wait_seconds" > /dev/null; then
+if ! wait_for "$known" 'Cert cache: Cached' ' -- ' "$read_wait_seconds" > /dev/null; then
     say "FAIL: the certificate was not read within ${read_wait_seconds} s"
     host_pairs
     exit 1
