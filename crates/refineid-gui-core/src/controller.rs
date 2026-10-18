@@ -21,12 +21,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use refineid_client::card_check::CardCheckReport;
+use refineid_client::card_check::{CardCheckError, CardCheckReport};
 use refineid_client::card_pin::{
     ActivateOptions, ChangePinOptions, PinManageSlot, UnblockPinOptions,
 };
 use refineid_lib_core::auth::{ChangePinOutcome, PinStatus, UnblockOutcome};
-use refineid_lib_core::backend::ReaderFilter;
+use refineid_lib_core::backend::{ReaderFilter, ReaderPickError};
 use refineid_lib_core::identity::render_token_serial;
 use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
@@ -283,9 +283,15 @@ impl RefineIdController {
         let controller = Arc::clone(self);
         let include_phones = self.has_usable_phone();
         thread::spawn(move || {
-            let result = refineid_client::card_manager::inspect_cards(None)
-                .map(|reports| deduplicate_cards(reports, include_phones))
-                .map_err(|e| e.to_string());
+            // No reader, or none with a card, is an empty list, not an error.
+            let result = match refineid_client::card_manager::inspect_cards(None) {
+                Ok(reports) => Ok(reports),
+                Err(CardCheckError::ReaderPick(
+                    ReaderPickError::NoReaders | ReaderPickError::NoCardPresent,
+                )) => Ok(Vec::new()),
+                Err(error) => Err(error.to_string()),
+            }
+            .map(|reports| deduplicate_cards(reports, include_phones));
 
             controller
                 .inspection_in_flight
