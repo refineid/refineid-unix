@@ -154,7 +154,7 @@ impl PairsArgs {
             println!("No phone paired.");
             return ExitCode::SUCCESS;
         };
-        println!("Phone: {} ({})", pair.peer_display_name, pair.peer_platform);
+        println!("Phone: {} - {}", pair.peer_display_name, pair.peer_platform);
         println!("  Pair ID:    {}", pair.pair_id_hex());
         println!("  Profiles:   {}", pair.granted_profiles.join(", "));
         println!(
