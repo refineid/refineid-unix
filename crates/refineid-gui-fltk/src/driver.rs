@@ -166,15 +166,15 @@ impl FltkDriver {
         holder_name_frame.set_label_size(18);
         holder_name_frame.set_align(Align::Left | Align::Inside);
 
-        let mut pin1_status_frame = Frame::new(490, 108, 380, 24, PIN1_LABEL);
+        let mut pin1_status_frame = Frame::new(490, 108, 380, 24, "");
         pin1_status_frame.set_label_size(12);
         pin1_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut pin2_status_frame = Frame::new(490, 134, 380, 24, PIN2_LABEL);
+        let mut pin2_status_frame = Frame::new(490, 134, 380, 24, "");
         pin2_status_frame.set_label_size(12);
         pin2_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut puk_status_frame = Frame::new(490, 160, 380, 24, PUK_LABEL);
+        let mut puk_status_frame = Frame::new(490, 160, 380, 24, "");
         puk_status_frame.set_label_size(12);
         puk_status_frame.set_align(Align::Left | Align::Inside);
         hero_card.end();
@@ -1230,16 +1230,16 @@ const PAIRING_CODE_INPUT_SIZE: i32 = 8;
 /// The index of the "Forget" button in the forget confirmation.
 const FORGET_CHOICE: i32 = 1;
 
-/// A PIN status line with the factory-value flag the card reported.
-const PIN1_LABEL: &str = "Authentication PIN (PIN 1)";
-const PIN2_LABEL: &str = "Signing PIN (PIN 2)";
+/// The credential labels of the status lines.
+const PIN1_LABEL: &str = "PIN 1";
+const PIN2_LABEL: &str = "PIN 2";
 const PUK_LABEL: &str = "PUK";
 
-/// A credential line: the label alone while the value is in its normal
-/// state, otherwise the label and the value.
+/// A credential line: nothing while the value is in its normal state,
+/// otherwise the label and the value.
 fn credential_line(label: &str, value: String) -> String {
     if value.is_empty() {
-        label.to_owned()
+        String::new()
     } else {
         format!("{label}: {value}")
     }
@@ -1346,7 +1346,7 @@ mod tests {
         let none = PinRetries::from_nibble(0).expect("retry nibble");
         assert_eq!(
             credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(full)))),
-            "PIN 1"
+            ""
         );
         assert_eq!(
             credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(spent)))),
@@ -1358,9 +1358,9 @@ mod tests {
         );
         assert_eq!(
             credential_line("PIN 1", pin_value(Some(PinStatus::Verified))),
-            "PIN 1"
+            ""
         );
-        assert_eq!(credential_line("PUK", puk_value(None)), "PUK");
+        assert_eq!(credential_line("PUK", puk_value(None)), "");
         assert_eq!(
             credential_line("PUK", puk_value(Some(PukStatus::Locked))),
             "PUK: blocked"

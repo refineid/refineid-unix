@@ -421,6 +421,9 @@ fn pubkey_one(
     let printed_serial = token_full.as_ref().and_then(derive_printed_serial);
     let given_names = cert.subject.given_names();
     let mut identity = CredentialIdentity::new();
+    if let Some(cn) = subject_cn.clone() {
+        identity = identity.with_common_name(cn);
+    }
     if let Some(s) = cert.subject.surname() {
         identity = identity.with_surname(s);
     }

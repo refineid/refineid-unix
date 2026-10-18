@@ -44,23 +44,15 @@ impl ManagedCard {
         self.report.identity.person_string()
     }
 
-    /// Clean cardholder display name (e.g. "Petri Koistinen").
+    /// The cardholder line: the certificate subject's common name as
+    /// the card carries it, or the person string when the certificate
+    /// was not read.
     pub fn display_name(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(ref f) = self.report.identity.first_name {
-            parts.push(f.as_str());
-        }
-        for g in self.report.identity.iter_given_names().skip(1) {
-            parts.push(g);
-        }
-        if let Some(ref s) = self.report.identity.surname {
-            parts.push(s.as_str());
-        }
-        if parts.is_empty() {
-            self.person_name()
-        } else {
-            parts.join(" ")
-        }
+        self.report
+            .identity
+            .common_name
+            .as_ref()
+            .map_or_else(|| self.person_name(), |cn| cn.as_str().to_owned())
     }
 
     /// Display label for card selector tabs / dropdowns.

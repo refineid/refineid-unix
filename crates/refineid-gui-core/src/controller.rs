@@ -889,6 +889,7 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
 
                 let mut identity = refineid_lib_core::identity::CredentialIdentity::new();
                 if let Some(cn) = view.subject.common_name() {
+                    identity = identity.with_common_name(cn.clone());
                     let name_str = cn.as_str();
                     if let Some((first, last)) = name_str.split_once(' ') {
                         if let Ok(fn_val) =
