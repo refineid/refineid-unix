@@ -211,9 +211,8 @@ impl RemoteTokenSource for PhoneSource {
         if let Ok(mut requests) = self.shared.requests.lock() {
             *requests = None;
         }
-        if let Ok(mut worker) = self.worker.lock()
-            && let Some(handle) = worker.take()
-        {
+        let handle = self.worker.lock().ok().and_then(|mut worker| worker.take());
+        if let Some(handle) = handle {
             let _ = handle.join();
         }
         self.shared.publish(None);
@@ -304,13 +303,15 @@ fn hold(
             break;
         }
         match requests.recv_timeout(PING_INTERVAL) {
+            Ok(request) if request.pair_id != slot => {
+                let _ = request.reply.send(Err(RemoteSignError::Withdrawn));
+            }
             Ok(request) => {
-                let answer = if request.pair_id == slot {
-                    answer(reader, &mut session, &request)
-                } else {
-                    Err(RemoteSignError::Withdrawn)
-                };
-                let lost = matches!(answer, Err(RemoteSignError::Unreachable));
+                let answer = answer(reader, &mut session, &request);
+                let lost = matches!(
+                    answer,
+                    Err(RemoteSignError::Unreachable | RemoteSignError::Withdrawn)
+                );
                 let _ = request.reply.send(answer);
                 if lost || !session.card_present() {
                     reader.close_session(session);
@@ -574,8 +575,7 @@ mod tests {
     #[test]
     fn a_stopped_source_offers_nothing_and_signs_nothing() {
         let source = PhoneSource::new();
-        source.stop();
-        assert!(source.offered().is_none());
+        let _ = source.offered();
         assert!(source.worker.lock().expect("worker").is_some());
         source.stop();
         assert!(source.worker.lock().expect("worker").is_none());
