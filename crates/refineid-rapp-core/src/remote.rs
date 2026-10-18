@@ -41,6 +41,21 @@ use crate::stream::{
 use crate::transport::TcpFrameTransport;
 use refineid_rapp::{DiscoveryKey, RevocationKey, RoutingKey, TransportProfile, WithdrawalKey};
 
+/// The names a phone gives when its system hands the app only the
+/// device type.
+const DEVICE_TYPE_NAMES: [&str; 2] = ["iPhone", "iPad"];
+
+/// The name a custodian is listed under: the one it introduced itself
+/// with, or its host name on the network when the introduction was only
+/// its device type and the host name is known.
+fn custodian_name(introduced: &str, host: &str) -> String {
+    if DEVICE_TYPE_NAMES.contains(&introduced) && !host.is_empty() {
+        host.to_owned()
+    } else {
+        introduced.to_owned()
+    }
+}
+
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
 /// How long pairing waits for each custodian message; the holder may be
@@ -504,6 +519,14 @@ impl RemoteReader {
                     .pair_with_code(code, transport, |_, requested| Some(requested.to_vec()))
                 {
                     Ok(pair_id) => {
+                        let host = service.host.clone();
+                        self.requester
+                            .store_mut()
+                            .update(pair_id, &mut |entry| {
+                                entry.peer_display_name =
+                                    custodian_name(&entry.peer_display_name, &host);
+                            })
+                            .map_err(RemoteError::Store)?;
                         return self
                             .pairs()
                             .into_iter()
@@ -757,10 +780,24 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    #[test]
+    fn a_device_type_introduction_yields_to_the_host_name() {
+        assert_eq!(
+            super::custodian_name("iPhone", "alpha-phone"),
+            "alpha-phone"
+        );
+        assert_eq!(super::custodian_name("iPhone", ""), "iPhone");
+        assert_eq!(
+            super::custodian_name("Alpha Phone", "Android-3"),
+            "Alpha Phone"
+        );
+    }
+
     fn service(instance: &str, txt: &[(&str, String)]) -> StreamService {
         StreamService {
             instance: instance.to_owned(),
             endpoints: vec!["192.0.2.10:47110".to_owned()],
+            host: String::new(),
             txt: txt
                 .iter()
                 .map(|(key, value)| ((*key).to_owned(), value.clone()))

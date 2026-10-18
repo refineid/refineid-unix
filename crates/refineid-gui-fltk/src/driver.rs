@@ -1491,8 +1491,8 @@ mod tests {
     fn browser_text_escapes_format_characters() {
         assert_eq!(escape_browser_text("a@b\tc"), "a@@b c");
         assert_eq!(
-            escape_browser_text("Alpha Phone (iOS): paired"),
-            "Alpha Phone (iOS): paired"
+            escape_browser_text("Alpha Phone: paired"),
+            "Alpha Phone: paired"
         );
     }
 }

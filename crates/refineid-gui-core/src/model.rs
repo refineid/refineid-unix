@@ -258,11 +258,7 @@ impl PairedPhone {
     /// The one line the phone list shows for this phone.
     #[must_use]
     pub fn line(&self) -> String {
-        if self.platform.is_empty() {
-            format!("{}: {}", self.name, self.state.label())
-        } else {
-            format!("{} ({}): {}", self.name, self.platform, self.state.label())
-        }
+        format!("{}: {}", self.name, self.state.label())
     }
 }
 
@@ -467,7 +463,7 @@ mod tests {
     #[test]
     fn the_phone_line_names_the_phone_and_its_state() {
         let phone = PairedPhone::from_summary(&summary(false, true, false));
-        assert_eq!(phone.line(), "Alpha Phone (Android): unconfirmed");
+        assert_eq!(phone.line(), "Alpha Phone: unconfirmed");
         assert!(!phone.state.usable());
         assert!(PhoneState::Paired.usable());
     }

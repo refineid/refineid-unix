@@ -58,6 +58,8 @@ pub struct StreamService {
     pub instance: String,
     /// `ip:port` endpoints that answered for this instance.
     pub endpoints: Vec<String>,
+    /// The host name the service record names, without the local domain.
+    pub host: String,
     /// The TXT `key=value` entries as published, in order.
     pub txt: Vec<(String, String)>,
 }
@@ -395,11 +397,19 @@ impl MdnsRecords {
             found.push(StreamService {
                 instance: label,
                 endpoints,
+                host: host_label(host),
                 txt: self.texts.get(&instance).cloned().unwrap_or_default(),
             });
         }
         found
     }
+}
+
+/// The host name as the device calls itself: the SRV target without its
+/// trailing dot and local domain.
+fn host_label(host: &str) -> String {
+    let trimmed = host.strip_suffix('.').unwrap_or(host);
+    trimmed.strip_suffix(".local").unwrap_or(trimmed).to_owned()
 }
 
 /// Parses one mDNS response into `records`; malformed input is ignored.
@@ -827,10 +837,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_host_label_drops_the_local_domain() {
+        assert_eq!(super::host_label("alpha-phone.local."), "alpha-phone");
+        assert_eq!(super::host_label("alpha-desk.local"), "alpha-desk");
+        assert_eq!(super::host_label("bare"), "bare");
+    }
+
     fn service(txt: &[(&str, String)]) -> StreamService {
         StreamService {
             instance: INSTANCE.to_owned(),
             endpoints: vec!["192.0.2.10:47110".to_owned()],
+            host: String::new(),
             txt: txt
                 .iter()
                 .map(|(key, value)| ((*key).to_owned(), value.clone()))
