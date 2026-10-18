@@ -290,6 +290,12 @@ impl<Transport: FrameTransport> Session<Transport> {
         self.card_present
     }
 
+    /// The pairing this session serves.
+    #[must_use]
+    pub const fn pair_id(&self) -> PairId {
+        self.pair_id
+    }
+
     /// Whether the custodian reported its consent view on screen during
     /// the current operation.
     #[must_use]

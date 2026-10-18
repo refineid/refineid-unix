@@ -36,6 +36,7 @@ use refineid_rapp_core::engine::{
 use refineid_rapp_core::file_journal::FileOperationJournal;
 use refineid_rapp_core::operations::SignatureAlgorithmExt as _;
 use refineid_rapp_core::profiles::{PROFILE_AUTHENTICATION, PROFILE_CARD_STATUS};
+use refineid_rapp_core::remote::execute_on_session;
 use refineid_rapp_core::store::{
     MemoryJournal, MemoryPairingStore, OperationJournal, PairingDisposition, PairingStore,
 };
@@ -652,6 +653,45 @@ fn authentication_executes_directly_to_its_result() {
         outcome,
         OperationOutcome::Completed(CardOperationResult::Signature(vec![0xAB; 96]))
     );
+}
+
+#[test]
+fn the_lifetime_asked_for_reaches_the_wire() {
+    let mut requester = test_requester();
+    let granted = vec![PROFILE_AUTHENTICATION.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationRequest(request) = session.receive() else {
+            panic!("expected an operation request");
+        };
+        let reference = OperationReference {
+            operation_id: request.operation_id,
+            request_hash: request.request_hash().unwrap(),
+        };
+        session.send(&TypedMessage::OperationResult(
+            OperationResultMessage::completed(
+                reference,
+                &CardOperationResult::Signature(vec![0xAB; 96]),
+            ),
+        ));
+        let TypedMessage::OperationResultAck(_) = session.receive() else {
+            panic!("expected result ack");
+        };
+        request.expires_after_ms
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    assert_eq!(requester.await_card_status(&mut session), Ok(true));
+    let result = execute_on_session(
+        &mut requester,
+        &mut session,
+        &authentication_operation(),
+        Duration::from_secs(45),
+    )
+    .unwrap();
+    assert_eq!(result, CardOperationResult::Signature(vec![0xAB; 96]));
+    assert_eq!(proxy.join().unwrap(), 45_000);
 }
 
 #[test]

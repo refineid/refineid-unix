@@ -32,12 +32,14 @@ use crate::ids::OperationId;
 use crate::ids::PairId;
 use crate::message::CloseReason;
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
+use crate::session_lock::{LockError, SessionLock, ceremony_lock_path, session_lock_path};
 use crate::store::PairingRecord;
-use crate::store::{PairingDisposition, PairingStore, StoreError};
+use crate::store::{OperationJournal, PairingDisposition, PairingStore, StoreError};
 use crate::stream::{
     DiscoveryMode, HintMatch, RoutingPreamble, STREAM_CANDIDATE_ID, StreamService, browse,
     browse_stream_services, dial,
 };
+use crate::transport::FrameTransport;
 use crate::transport::TcpFrameTransport;
 use refineid_rapp::{DiscoveryKey, RevocationKey, RoutingKey, TransportProfile, WithdrawalKey};
 
@@ -64,8 +66,9 @@ const PAIRING_RECEIVE_DEADLINE: Duration = Duration::from_secs(60);
 /// How long an operation waits for each custodian message; consent, PIN
 /// entry, and the card tap all happen on the phone in that time.
 const OPERATION_RECEIVE_DEADLINE: Duration = Duration::from_secs(120);
-/// The lifetime each request asks for (section 8.2.1).
-const OPERATION_LIFETIME_MS: u64 = 120_000;
+/// The lifetime each request asks for unless the caller bounds it
+/// (section 8.2.1).
+const OPERATION_LIFETIME: Duration = Duration::from_millis(120_000);
 
 /// The keys one stored pairing uses to find and reach its custodian.
 struct PairingKeys {
@@ -176,6 +179,32 @@ const fn withdrawn_by(end: Option<SessionEnd>) -> bool {
     )
 }
 
+/// Runs one operation on an open session of any transport, asking the
+/// phone to let it expire `lifetime` after the request (section 8.2.1);
+/// the runner behind [`RemoteReader::execute_on_with_lifetime`].
+///
+/// # Errors
+/// [`RemoteError`] when the phone reports no card, the operation cannot
+/// be admitted, or it ends without a result.
+pub fn execute_on_session<Store, Journal, Transport>(
+    requester: &mut Requester<Store, Journal>,
+    session: &mut Session<Transport>,
+    operation: &CardOperation,
+    lifetime: Duration,
+) -> Result<CardOperationResult, RemoteError>
+where
+    Store: PairingStore,
+    Journal: OperationJournal,
+    Transport: FrameTransport,
+{
+    if session.card_present() != Some(true) {
+        return Err(RemoteError::CardAbsent);
+    }
+    let outcome = requester.execute(session, operation, lifetime_ms(lifetime));
+    let withdrawn = withdrawn_by(Requester::<Store, Journal>::session_end(session));
+    operation_result(outcome, withdrawn)
+}
+
 /// Why a remote reader call ended without its answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteError {
@@ -202,6 +231,9 @@ pub enum RemoteError {
     Admission(AdmissionError),
     /// The operation ended without a result.
     Outcome(Box<OperationOutcome>),
+    /// Another program on this computer holds the phone session, or is
+    /// pairing.
+    Busy,
 }
 
 impl core::fmt::Display for RemoteError {
@@ -221,6 +253,9 @@ impl core::fmt::Display for RemoteError {
                 f.write_str("the phone's message was not understood")
             }
             Self::Outcome(outcome) => write!(f, "operation ended: {outcome:?}"),
+            Self::Busy => {
+                f.write_str("the phone session is held by another program on this computer")
+            }
         }
     }
 }
@@ -276,10 +311,25 @@ pub struct RemoteReader {
     requester: Requester<FilePairingStore, FileOperationJournal>,
 }
 
-/// One open session to a phone that reported a card it can serve.
+/// One open session to a phone that reported a card it can serve; the
+/// pairing's lock is held with it.
 #[derive(Debug)]
 pub struct RemoteSession {
     session: Session<TcpFrameTransport>,
+    _lock: SessionLock,
+}
+
+/// Takes `path`, naming the holder of a held lock.
+fn take_lock(path: &std::path::Path) -> Result<SessionLock, RemoteError> {
+    SessionLock::acquire(path).map_err(|error| match error {
+        LockError::Held => RemoteError::Busy,
+        LockError::Unavailable => RemoteError::Store(StoreError::WriteRefused),
+    })
+}
+
+/// A lifetime as the wire's milliseconds.
+fn lifetime_ms(lifetime: Duration) -> u64 {
+    u64::try_from(lifetime.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl RemoteSession {
@@ -526,11 +576,15 @@ impl RemoteReader {
     /// Every profile the code-derived offer names is requested and granted;
     /// the phone decides what it grants and the sets must agree.
     ///
+    /// One ceremony runs at a time on this computer: the store's pairing
+    /// lock is held until this returns.
+    ///
     /// # Errors
     /// [`RemoteError::Pairing`] for a malformed or mistyped code and other
     /// pairing failures, [`RemoteError::NotFound`] when no phone in a
-    /// pairing ceremony answered, and [`RemoteError::Store`] when the
-    /// record of a completed ceremony cannot be written.
+    /// pairing ceremony answered, [`RemoteError::Busy`] when another
+    /// program is pairing, and [`RemoteError::Store`] when the record of a
+    /// completed ceremony cannot be written.
     pub fn pair_with_code(
         &mut self,
         code: &str,
@@ -539,6 +593,7 @@ impl RemoteReader {
         if crate::offer::normalize_pairing_code(code).is_none() {
             return Err(RemoteError::Pairing(PairingError::InvalidCode));
         }
+        let _ceremony = take_lock(&ceremony_lock_path(self.requester.store().directory()))?;
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
@@ -607,11 +662,13 @@ impl RemoteReader {
     ///
     /// A consumer that offers the phone's identity keeps the session for
     /// as long as it offers it: the offer is withdrawn with the session.
+    /// The pairing's lock is held from here until the session is dropped,
+    /// so one program at a time on this computer holds the phone.
     ///
     /// # Errors
-    /// [`RemoteError`] when no pairing matches, no phone opens a session
-    /// for it, the phone forgot this computer, or no card is reported
-    /// before the timeout.
+    /// [`RemoteError`] when no pairing matches, another program holds the
+    /// pairing's session, no phone opens a session for it, the phone
+    /// forgot this computer, or no card is reported before the timeout.
     pub fn open_session(
         &mut self,
         pair_id: Option<PairId>,
@@ -627,6 +684,10 @@ impl RemoteReader {
             .get(pair_id)
             .map_err(|_| RemoteError::NotPaired)?;
         let keys = PairingKeys::derive(record)?;
+        let lock = take_lock(&session_lock_path(
+            self.requester.store().directory(),
+            pair_id,
+        ))?;
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
@@ -661,7 +722,12 @@ impl RemoteReader {
                     Err(error) => Err(error),
                 };
                 match reported {
-                    Ok(true) => return Ok(RemoteSession { session }),
+                    Ok(true) => {
+                        return Ok(RemoteSession {
+                            session,
+                            _lock: lock,
+                        });
+                    }
                     Ok(false) => {
                         self.requester.disconnect(&mut session, CloseReason::Normal);
                         return Err(RemoteError::CardAbsent);
@@ -682,26 +748,57 @@ impl RemoteReader {
         Err(last)
     }
 
-    /// Runs one operation on an open session.
+    /// Runs one operation on an open session with the default lifetime.
     ///
     /// # Errors
-    /// [`RemoteError`] when the phone reports no card, the operation cannot
-    /// be admitted, or it ends without a result.
+    /// As [`Self::execute_on_with_lifetime`].
     pub fn execute_on(
         &mut self,
         session: &mut RemoteSession,
         operation: &CardOperation,
     ) -> Result<CardOperationResult, RemoteError> {
-        if session.session.card_present() != Some(true) {
-            return Err(RemoteError::CardAbsent);
+        self.execute_on_with_lifetime(session, operation, OPERATION_LIFETIME)
+    }
+
+    /// Runs one operation on an open session, asking the phone to let it
+    /// expire `lifetime` after the request (section 8.2.1).
+    ///
+    /// # Errors
+    /// [`RemoteError`] when the phone reports no card, the operation cannot
+    /// be admitted, or it ends without a result.
+    pub fn execute_on_with_lifetime(
+        &mut self,
+        session: &mut RemoteSession,
+        operation: &CardOperation,
+        lifetime: Duration,
+    ) -> Result<CardOperationResult, RemoteError> {
+        execute_on_session(
+            &mut self.requester,
+            &mut session.session,
+            operation,
+            lifetime,
+        )
+    }
+
+    /// Sends one liveness ping on an open session and waits for its echo,
+    /// recording any notice the phone sends meanwhile.
+    ///
+    /// # Errors
+    /// [`RemoteError::Withdrawn`] or [`RemoteError::RevokedByPhone`] when
+    /// the phone closed the session with that reason, and
+    /// [`RemoteError::Session`] when the session is not healthy or the
+    /// transport was lost.
+    pub fn check_liveness(&mut self, session: &mut RemoteSession) -> Result<(), RemoteError> {
+        match self.requester.check_liveness(&mut session.session) {
+            Ok(()) => Ok(()),
+            Err(SessionError::ClosedByPeer(CloseReason::ServiceWithdrawn)) => {
+                Err(RemoteError::Withdrawn)
+            }
+            Err(SessionError::ClosedByPeer(CloseReason::PairingRevoked)) => {
+                Err(RemoteError::RevokedByPhone)
+            }
+            Err(error) => Err(RemoteError::Session(error)),
         }
-        let outcome =
-            self.requester
-                .execute(&mut session.session, operation, OPERATION_LIFETIME_MS);
-        let withdrawn = withdrawn_by(
-            Requester::<FilePairingStore, FileOperationJournal>::session_end(&session.session),
-        );
-        operation_result(outcome, withdrawn)
     }
 
     /// Closes a session deliberately; an already ended session is left
@@ -731,8 +828,8 @@ impl RemoteReader {
         result
     }
 
-    /// Reads the authentication certificate through the phone and caches it
-    /// on the pairing.
+    /// Reads the authentication certificate through the phone, on a session
+    /// opened and closed for it, and caches it on the pairing.
     ///
     /// # Errors
     /// As [`Self::execute`], and [`RemoteError::Store`] when the cache write
@@ -742,24 +839,42 @@ impl RemoteReader {
         pair_id: PairId,
         discovery_timeout: Duration,
     ) -> Result<Vec<u8>, RemoteError> {
+        let mut session = self.open_session(Some(pair_id), discovery_timeout)?;
+        let result = self.refresh_auth_cert_on(&mut session);
+        self.close_session(session);
+        result
+    }
+
+    /// Reads the authentication certificate through the phone on an open
+    /// session and caches it on the session's pairing. Whichever program
+    /// holds the session fetches a missing certificate this way; the write
+    /// replaces the record file whole, under the session's lock.
+    ///
+    /// # Errors
+    /// As [`Self::execute_on`], and [`RemoteError::Store`] when the cache
+    /// write fails.
+    pub fn refresh_auth_cert_on(
+        &mut self,
+        session: &mut RemoteSession,
+    ) -> Result<Vec<u8>, RemoteError> {
         let operation = CardOperation::ReadCertificate {
             kind: CertificateKind::Authentication,
         };
-        let CardOperationResult::Certificate(der) =
-            self.execute(Some(pair_id), &operation, discovery_timeout)?
-        else {
+        let CardOperationResult::Certificate(der) = self.execute_on(session, &operation)? else {
             return Err(RemoteError::Outcome(Box::new(OperationOutcome::Rejected(
                 None,
             ))));
         };
-        let cached = der.clone();
+        self.cache_auth_cert(session.session.pair_id(), &der)?;
+        Ok(der)
+    }
+
+    /// Writes `der` as the pairing's cached authentication certificate.
+    fn cache_auth_cert(&mut self, pair_id: PairId, der: &[u8]) -> Result<(), RemoteError> {
         self.requester
             .store_mut()
-            .update(pair_id, &mut |record| {
-                record.auth_cert = Some(cached.clone())
-            })
-            .map_err(RemoteError::Store)?;
-        Ok(der)
+            .update(pair_id, &mut |record| record.auth_cert = Some(der.to_vec()))
+            .map_err(RemoteError::Store)
     }
 }
 
@@ -775,15 +890,185 @@ mod tests {
         withdrawal_counter,
     };
 
+    use std::time::Duration;
+
     use super::{
         AdmissionError, CardOperationResult, OperationOutcome, PairingKeys, RemoteError,
-        StreamService, operation_result, sessions_for, unix_seconds,
+        RemoteReader, StreamService, lifetime_ms, operation_result, sessions_for, unix_seconds,
     };
+    use crate::file_journal::FileOperationJournal;
+    use crate::file_store::FilePairingStore;
+    use crate::session_lock::{SessionLock, ceremony_lock_path, session_lock_path};
+    use crate::store::{PairingDisposition, PairingRecord, PairingStore as _};
 
     const PAIR_ID: [u8; 16] = [0x22; 16];
     const PEER_PUBLIC: [u8; 32] = [0x44; 32];
     const MINE: [u8; 32] = [0x11; 32];
     const THEIRS: [u8; 32] = [0x33; 32];
+
+    fn scratch() -> std::path::PathBuf {
+        let mut name = [0u8; 8];
+        getrandom::fill(&mut name).unwrap();
+        let suffix: String = name.iter().map(|b| format!("{b:02x}")).collect();
+        std::env::temp_dir().join(format!("refineid-rapp-remote-{suffix}"))
+    }
+
+    /// A reader over a store in `directory` holding one paired record.
+    fn reader_with_pairing(directory: &std::path::Path) -> RemoteReader {
+        let mut store = FilePairingStore::open(directory).unwrap();
+        store
+            .insert(PairingRecord {
+                pair_id: PairId::from_array(PAIR_ID),
+                local_private: zeroize::Zeroizing::new(MINE.to_vec()),
+                local_public: vec![0x22; 32],
+                peer_public: PEER_PUBLIC.to_vec(),
+                granted_profiles: vec![crate::profiles::PROFILE_CARD_STATUS.to_owned()],
+                grants_hash: [0x44; 32],
+                peer_display_name: "Alpha Phone".into(),
+                peer_platform: "iOS".into(),
+                disposition: PairingDisposition::Paired,
+                peer_initiated_termination: false,
+                candidate_failures: 0,
+                auth_cert: None,
+                signature_cert: None,
+                root_ca: None,
+                intermediate_ca: None,
+            })
+            .unwrap();
+        let journal = FileOperationJournal::open(&directory.join("journal")).unwrap();
+        RemoteReader::with_stores("alpha-desk", "Linux", store, journal)
+    }
+
+    #[test]
+    fn a_session_held_by_another_program_makes_the_pairing_busy() {
+        let directory = scratch();
+        let mut reader = reader_with_pairing(&directory);
+        let pair_id = PairId::from_array(PAIR_ID);
+        let held = SessionLock::acquire(&session_lock_path(&directory, pair_id)).unwrap();
+        assert_eq!(
+            reader.open_session(Some(pair_id), Duration::ZERO).err(),
+            Some(RemoteError::Busy)
+        );
+        drop(held);
+        // Released: the search runs and ends on its deadline instead.
+        assert_eq!(
+            reader.open_session(Some(pair_id), Duration::ZERO).err(),
+            Some(RemoteError::NotFound)
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn two_readers_on_one_store_contend_for_the_pairing() {
+        let directory = scratch();
+        let mut first = reader_with_pairing(&directory);
+        let mut second = reader_with_pairing(&directory);
+        let pair_id = PairId::from_array(PAIR_ID);
+        // The first reader searches for a phone for a second, finding none,
+        // and holds the pairing's lock for the whole search.
+        let (started, searching) = std::sync::mpsc::channel();
+        let searcher = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            first.open_session(Some(pair_id), Duration::from_secs(1))
+        });
+        searching.recv().unwrap();
+        // The second reader, asking during that search, is told the phone
+        // is busy. The lock is taken a moment after the start signal, so
+        // the ask is repeated until it meets the search, within a bound
+        // well inside the search.
+        let bound = std::time::Instant::now() + Duration::from_millis(800);
+        let mut seen = None;
+        while std::time::Instant::now() < bound {
+            match second.open_session(Some(pair_id), Duration::ZERO) {
+                Err(RemoteError::Busy) => {
+                    seen = Some(RemoteError::Busy);
+                    break;
+                }
+                other => seen = other.err(),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(seen, Some(RemoteError::Busy));
+        assert_eq!(searcher.join().unwrap().err(), Some(RemoteError::NotFound));
+        assert_eq!(
+            second.open_session(Some(pair_id), Duration::ZERO).err(),
+            Some(RemoteError::NotFound)
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_ceremony_held_by_another_program_makes_pairing_busy() {
+        let directory = scratch();
+        let mut reader = reader_with_pairing(&directory);
+        let held = SessionLock::acquire(&ceremony_lock_path(&directory)).unwrap();
+        assert_eq!(
+            reader.pair_with_code("7KX4M9", Duration::ZERO).err(),
+            Some(RemoteError::Busy)
+        );
+        drop(held);
+        assert_eq!(
+            reader.pair_with_code("7KX4M9", Duration::ZERO).err(),
+            Some(RemoteError::NotFound)
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_cached_certificate_replaces_the_record_file_and_survives_reopening() {
+        let directory = scratch();
+        let mut reader = reader_with_pairing(&directory);
+        let pair_id = PairId::from_array(PAIR_ID);
+        reader
+            .cache_auth_cert(pair_id, &[0x30, 0x03, 0x02, 0x01, 0x07])
+            .unwrap();
+        let record_path = directory.join("22222222222222222222222222222222.pair");
+        assert!(record_path.exists());
+        assert!(!record_path.with_extension("tmp").exists());
+        let reopened = reader_with_pairing(&directory.join("other"));
+        drop(reopened);
+        let store = FilePairingStore::open_without_sweep(&directory).unwrap();
+        let summary = RemoteReader::with_stores(
+            "alpha-desk",
+            "Linux",
+            store,
+            FileOperationJournal::open(&directory.join("journal")).unwrap(),
+        )
+        .pairs();
+        assert_eq!(
+            summary[0].auth_cert.as_deref(),
+            Some(&[0x30, 0x03, 0x02, 0x01, 0x07][..])
+        );
+        assert_eq!(
+            reader
+                .cache_auth_cert(PairId::from_array([0x77; 16]), &[])
+                .err(),
+            Some(RemoteError::Store(crate::store::StoreError::Unknown))
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn busy_is_its_own_outcome_and_not_an_unreachable_phone() {
+        assert_ne!(RemoteError::Busy, RemoteError::NotFound);
+        assert_ne!(RemoteError::Busy, RemoteError::NotPaired);
+        assert!(!matches!(RemoteError::Busy, RemoteError::Session(_)));
+    }
+
+    #[test]
+    fn the_busy_error_names_another_program_on_this_computer() {
+        assert_eq!(
+            RemoteError::Busy.to_string(),
+            "the phone session is held by another program on this computer"
+        );
+    }
+
+    #[test]
+    fn a_lifetime_is_sent_as_whole_milliseconds() {
+        assert_eq!(lifetime_ms(Duration::from_secs(90)), 90_000);
+        assert_eq!(lifetime_ms(Duration::from_micros(1_500)), 1);
+        assert_eq!(lifetime_ms(Duration::MAX), u64::MAX);
+    }
 
     fn keys(local: [u8; 32]) -> PairingKeys {
         let pair_id = PairId::from_array(PAIR_ID);
