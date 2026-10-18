@@ -62,6 +62,15 @@ install -m 644 packaging/refineid.desktop \
     "$DESTDIR$PREFIX/share/applications/refineid.desktop"
 install -m 644 crates/refineid-gui/assets/app-icon.svg \
     "$DESTDIR$PREFIX/share/icons/hicolor/scalable/apps/refineid.svg"
+# Menus that do not rasterise SVG take the sizes the icon theme names.
+if command -v rsvg-convert >/dev/null 2>&1; then
+    for size in 16 22 24 32 48 64 128 256; do
+        sized="$DESTDIR$PREFIX/share/icons/hicolor/${size}x${size}/apps"
+        install -d "$sized"
+        rsvg-convert -w "$size" -h "$size" -o "$sized/refineid.png" \
+            crates/refineid-gui/assets/app-icon.svg
+    done
+fi
 
 # Slint's font stack (fontique) finds no system fonts on NetBSD, so the GUI
 # aborts in font fallback unless told where a default font lives. When the
