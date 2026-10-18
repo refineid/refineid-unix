@@ -38,7 +38,8 @@ refineid-rapp = { git = "https://github.com/refineid/refineid-core.git", branch 
 refineid-sign = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-emrtd = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pcsc = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
-refineid-pkcs11 = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
+refineid-pkcs11 = { git = "https://github.com/refineid/refineid-core.git", branch = "main", default-features = false }
+refineid-remote = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 fltk = "1.5.23"
 
 # rustls backend for server-authenticated HTTPS (TSA calls, trusted

@@ -145,6 +145,17 @@ under "p11-kit-proxy" in Settings > Privacy & Security > Security
 Devices. A card-login site then asks for the certificate and for PIN 1.
 Without a card nothing is offered and nothing is asked.
 
+The paired phone (section 7) is one more slot of the same module,
+"RefineID Remote" with the phone's name, whose token "Phone (PIN 1)" is
+present while the module holds a session to the phone and the phone
+reports a card on it. The module reads the certificate from the card
+on that session, so the identity offered is the card lying on the
+phone now. A card-login site asks for the certificate only; PIN 1 is
+entered on the phone, which verifies it, and the browser is never
+asked. One program on the computer holds the phone session at a time:
+while a browser holds it, `refineid card` and the desktop application
+report the phone as in use.
+
 OpenSSH reaches the same module through the proxy:
 `ssh -I /usr/local/lib/p11-kit-proxy.so host`.
 

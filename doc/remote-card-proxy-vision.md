@@ -91,7 +91,7 @@ Pairing establishes cryptographic association between the Unix workstation and t
    * In `refineid-gui` (or CLI `refineid pair`), the user turns on "Remote Phone Reader" and selects the discovered phone.
    * Desktop prompts for the 6-character code displayed on the phone.
 3. **Mutual Authentication (`CPaceRistretto255` KC2 + `Noise_XXpsk3`)**:
-   * The 6-character code is normalized via canonical NFKC and Crockford aliasing (mapping `I`/`L` to `1`, `O` to `0`, rejecting `U`).
+   * The 6-character code is upper-cased; the letters `I`, `L`, `O` and `U` are not in the alphabet and a code carrying one is refused (RAPP v26.10.18 section 3.1).
    * PAKE exchange (`CPaceRistretto255`) mutually authenticates both endpoints and derives a 256-bit PSK.
    * `Noise_XXpsk3` performs authenticated key exchange, binding the handshake to canonical offer hashes.
    * Both devices exchange and authenticate static Curve25519 public keys.
@@ -108,25 +108,20 @@ Pairing establishes cryptographic association between the Unix workstation and t
 
 Once paired, routine authentication requires zero re-pairing:
 
-1. **Slot Enumeration**:
-   * When Firefox or Chromium opens, `librefineid_pkcs11.so` checks `RappDeviceVault`.
-   * Each active paired phone is exposed as a virtual PKCS#11 slot (e.g. `Slot 1: Mobile Reader (RefineID)`).
-2. **Zero-Latency Attribute Lookups**:
-   * NSS queries `CKA_VALUE`, `CKA_ISSUER`, `CKA_SUBJECT`, and CA trust anchors.
-   * The PKCS#11 module answers directly from in-memory cache without waking up the phone or card.
-3. **Sign Request Dispatch**:
-   * When TLS client authentication reaches the CertificateVerify step:
-   * PKCS#11 module establishes an outbound connection to the phone over `Noise_KK`.
-   * Module sends a `CardOperation::BrowserAuthenticate` message containing:
-     * Request Origin (`"https://www.suomi.fi"`)
-     * Key Profile (`"eccP384"` / `"rsa3072"`)
-     * SHA-384 / SHA-256 Digest
-4. **Mobile Authorization & Card Execution**:
-   * Phone displays authentication prompt with origin and certificate details.
-   * User confirms and presents physical ID card to the phone's NFC reader.
-   * Phone verifies PIN1 locally, executes APDUs on the card, and returns the signature over the encrypted Noise channel.
-5. **TLS Completion**:
-   * PKCS#11 module delivers the signature to NSS; the browser completes login seamlessly.
+1. **One slot for the paired phone**:
+   * `librefineid_pkcs11.so` reads the pairing record the desktop application or the CLI keeps, without sweeping it, and raises one slot, "RefineID Remote" with the phone's name, for the one phone paired with this computer.
+   * A thread inside the module holds the session: it dials while the record is usable, and keeps the session while the phone reports a card. The pairing's lock file keeps the module, the desktop application and the CLI from two sessions under one static key; the loser reports the phone as in use.
+2. **The token is the card on the phone**:
+   * On each session the module reads the authentication certificate from the card, so the token "Phone (PIN 1)" is present exactly while the phone can serve, and the identity offered is the card lying on the phone now (RAPP v26.10.18 section 8.4).
+   * NSS reads `CKA_VALUE`, `CKA_ISSUER`, `CKA_SUBJECT` and the CA certificates from the module's memory; enumeration never dials.
+   * `C_Login` reads no PIN: the token declares a protected authentication path, and succeeds only while the token is present.
+3. **Sign request dispatch**:
+   * `C_Sign` becomes one `browser_authenticate` on the held session: the key profile from the certificate, the algorithm from the mechanism (RSA PKCS#1 v1.5 by the DigestInfo's hash, ECDSA by the digest's length), the digest, and a context naming this computer. PKCS#11 carries no relying party, so no origin is claimed.
+   * The request is bounded by one deadline, sent to the phone as the operation's lifetime; the module never repeats a request whose outcome it could not classify.
+4. **The phone verifies PIN 1 and signs**:
+   * The phone asks for PIN 1 on its own screen, verifies it on the card, signs, and returns the signature. PIN 1 is never on the wire (Rule #1).
+5. **TLS completion**:
+   * The module hands the signature to NSS and the browser completes the login.
 
 ---
 
