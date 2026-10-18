@@ -8,15 +8,9 @@ cd "$REPO_ROOT"
 # The version is the UTC day the tree was last committed on. When the day
 # has changed since the stamp, the commit carries a fresh stamp, so no
 # build published from main names an earlier day.
-yy=$(date -u +%y); yy=${yy#0}
-mo=$(date -u +%m); mo=${mo#0}
-dd=$(date -u +%d); dd=${dd#0}
-today="$yy.$mo.$dd"
-stamped=$(tr -d '\n' < VERSION)
-stamped_day=${stamped%.*}
-if [ "$stamped_day" != "$today" ]; then
-    ./script/version-stamp.sh
-    git add VERSION .cargo/config.toml Cargo.toml Cargo.lock
-fi
+# Every commit carries the minute it was made, so a build says which
+# commit it is.
+./script/version-stamp.sh
+git add VERSION .cargo/config.toml Cargo.toml Cargo.lock
 
 exec "$REPO_ROOT/script/verify-commit.sh"
