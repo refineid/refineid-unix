@@ -130,6 +130,12 @@ impl FilePairingStore {
         )
     }
 
+    /// Whether the key vault answers, so a pairing made now would be kept.
+    #[must_use]
+    pub fn vault_reachable(&self) -> bool {
+        self.vault.reachable()
+    }
+
     /// Keeps the vault in step with `record`'s key, then writes its file.
     fn save(&self, record: &PairingRecord) -> Result<(), StoreError> {
         if let Ok(key) = <[u8; PAIR_PRIVATE_KEY_SIZE]>::try_from(record.local_private.as_slice()) {
@@ -320,6 +326,7 @@ mod tests {
         let directory = scratch();
         let mut store =
             FilePairingStore::open(&directory, Box::new(MemoryKeyVault::unavailable())).unwrap();
+        assert!(!store.vault_reachable());
         assert_eq!(store.insert(record(4)), Err(StoreError::SecretsUnavailable));
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         std::fs::remove_dir_all(&directory).unwrap();

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use fltk::app::{self, Receiver, Scheme};
 use fltk::browser::HoldBrowser;
 use fltk::button::{Button, CheckButton, RadioRoundButton};
-use fltk::dialog::{FileDialogType, NativeFileChooser, alert, input_default, message};
+use fltk::dialog::{FileDialogType, NativeFileChooser, alert, choice2_default};
 use fltk::enums::{Align, Color, ColorDepth, Font, FrameType};
 use fltk::frame::Frame;
 use fltk::group::{Group, Tabs};
@@ -36,7 +36,8 @@ use refineid_gui_core::driver::UiDriver;
 use refineid_gui_core::error::GuiCoreError;
 use refineid_gui_core::image::RgbaImageBuffer;
 use refineid_gui_core::model::{SignFormat, TimestampConfig, UiState, UserIntent};
-use refineid_lib_core::auth::{PinStatus, PukStatus};
+use refineid_lib_core::apdu::status_word::PinRetries;
+use refineid_lib_core::auth::{PIN_TRY_LIMIT, PinStatus, PukStatus};
 use refineid_lib_core::pin::PinBytes;
 
 fn to_pin_bytes(s: &str) -> Option<PinBytes> {
@@ -58,8 +59,6 @@ struct FltkWidgets {
     card_choice: Choice,
     card_status_badge: Frame,
     holder_name_frame: Frame,
-    holder_sub_frame: Frame,
-    serial_frame: Frame,
     pin1_status_frame: Frame,
     pin2_status_frame: Frame,
     puk_status_frame: Frame,
@@ -67,6 +66,9 @@ struct FltkWidgets {
     change_pin2_btn: Button,
     reactivate_btn: Button,
     activate_btn: Button,
+    pin_subtabs: Tabs,
+    tab_change_pin1: Group,
+    tab_activate: Group,
     can_input: Input,
     read_images_btn: Button,
     portrait_frame: Frame,
@@ -80,11 +82,12 @@ struct FltkWidgets {
     format_asice: RadioRoundButton,
     sign_btn: Button,
     sign_result_frame: Frame,
-    start_pair_btn: Button,
+    pair_code_input: Input,
+    pair_btn: Button,
     cancel_pair_btn: Button,
-    pair_code_frame: Frame,
-    qr_frame: Frame,
     pair_status_frame: Frame,
+    phone_browser: HoldBrowser,
+    forget_phone_btn: Button,
     status_frame: Frame,
 }
 
@@ -140,7 +143,7 @@ impl FltkDriver {
         card_choice.set_align(Align::Left);
 
         let mut refresh_btn = Button::new(605, 15, 80, 32, "Refresh");
-        let mut card_status_badge = Frame::new(695, 15, 205, 32, "No Card Detected");
+        let mut card_status_badge = Frame::new(695, 15, 205, 32, "No card");
         card_status_badge.set_frame(FrameType::RFlatBox);
         card_status_badge.set_label_font(Font::HelveticaBold);
         card_status_badge.set_label_size(12);
@@ -151,39 +154,27 @@ impl FltkDriver {
         // ---------------------------------------------------------------------
         // TAB 1: Card & PIN Management
         // ---------------------------------------------------------------------
-        let pin_tab = Group::new(20, 88, 880, 550, "Card & PIN   ");
+        let pin_tab = Group::new(20, 88, 880, 550, "PINs   ");
 
         // Hero Card: Cardholder profile and PIN retries
         let mut hero_card = Group::new(35, 98, 850, 96, "");
         hero_card.set_frame(FrameType::RFlatBox);
         hero_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut holder_name_frame = Frame::new(50, 108, 430, 28, "No Card Detected");
+        let mut holder_name_frame = Frame::new(50, 104, 430, 28, "No card");
         holder_name_frame.set_label_font(Font::HelveticaBold);
         holder_name_frame.set_label_size(18);
         holder_name_frame.set_align(Align::Left | Align::Inside);
 
-        let mut holder_sub_frame =
-            Frame::new(50, 138, 430, 20, "Insert your smart card into the reader");
-        holder_sub_frame.set_label_size(12);
-        holder_sub_frame.set_label_color(Color::from_rgb(108, 117, 125));
-        holder_sub_frame.set_align(Align::Left | Align::Inside);
-
-        let mut serial_frame = Frame::new(50, 160, 430, 18, "");
-        serial_frame.set_label_size(11);
-        serial_frame.set_label_color(Color::from_rgb(140, 145, 150));
-        serial_frame.set_align(Align::Left | Align::Inside);
-
-        let mut pin1_status_frame =
-            Frame::new(490, 108, 380, 24, "Authentication PIN (PIN 1): Unknown");
+        let mut pin1_status_frame = Frame::new(490, 108, 380, 24, "");
         pin1_status_frame.set_label_size(12);
         pin1_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut pin2_status_frame = Frame::new(490, 134, 380, 24, "Signing PIN (PIN 2): Unknown");
+        let mut pin2_status_frame = Frame::new(490, 134, 380, 24, "");
         pin2_status_frame.set_label_size(12);
         pin2_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut puk_status_frame = Frame::new(490, 160, 380, 24, "PUK Code: Unknown");
+        let mut puk_status_frame = Frame::new(490, 160, 380, 24, "");
         puk_status_frame.set_label_size(12);
         puk_status_frame.set_align(Align::Left | Align::Inside);
         hero_card.end();
@@ -319,11 +310,6 @@ impl FltkDriver {
         read_images_btn.set_color(Color::from_rgb(0, 122, 255));
         read_images_btn.set_label_color(Color::from_rgb(255, 255, 255));
         read_images_btn.set_label_font(Font::HelveticaBold);
-
-        let mut can_hint = Frame::new(525, 105, 340, 30, "6 digits on front of card");
-        can_hint.set_label_size(12);
-        can_hint.set_label_color(Color::from_rgb(108, 117, 125));
-        can_hint.set_align(Align::Left | Align::Inside);
         can_bar.end();
 
         // Photo Card
@@ -336,7 +322,7 @@ impl FltkDriver {
         p_title.set_label_size(14);
         p_title.set_align(Align::Left | Align::Inside);
 
-        let mut portrait_frame = Frame::new(60, 192, 320, 370, "No image loaded");
+        let mut portrait_frame = Frame::new(60, 192, 320, 370, "");
         portrait_frame.set_frame(FrameType::ThinDownBox);
 
         let copy_portrait_btn = Button::new(85, 575, 120, 32, "Copy Photo");
@@ -353,34 +339,12 @@ impl FltkDriver {
         s_title.set_label_size(14);
         s_title.set_align(Align::Left | Align::Inside);
 
-        let mut signature_frame = Frame::new(435, 192, 435, 165, "No signature loaded");
+        let mut signature_frame = Frame::new(435, 192, 435, 165, "");
         signature_frame.set_frame(FrameType::ThinDownBox);
 
         let copy_sig_btn = Button::new(490, 372, 140, 32, "Copy Signature");
         let save_sig_btn = Button::new(650, 372, 140, 32, "Save As...");
         sig_card.end();
-
-        // Security Privacy Card
-        let mut sec_card = Group::new(420, 430, 465, 192, "");
-        sec_card.set_frame(FrameType::RFlatBox);
-        sec_card.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut sec_title = Frame::new(435, 442, 435, 24, "Security & Privacy");
-        sec_title.set_label_font(Font::HelveticaBold);
-        sec_title.set_label_size(14);
-        sec_title.set_align(Align::Left | Align::Inside);
-
-        let mut sec_text = Frame::new(
-            435,
-            475,
-            435,
-            60,
-            "Biometric data is read directly from your smart card using\nPACE-ECDH encryption. Photos are never stored remotely.",
-        );
-        sec_text.set_label_size(12);
-        sec_text.set_label_color(Color::from_rgb(108, 117, 125));
-        sec_text.set_align(Align::Left | Align::Inside);
-        sec_card.end();
 
         pace_tab.end();
 
@@ -448,79 +412,54 @@ impl FltkDriver {
         sign_tab.end();
 
         // ---------------------------------------------------------------------
-        // TAB 4: Mobile Reader (RAPP / CPace PAKE)
+        // TAB 4: Phone (RAPP)
         // ---------------------------------------------------------------------
-        let rapp_tab = Group::new(20, 88, 880, 550, "Mobile Reader   ");
+        let rapp_tab = Group::new(20, 88, 880, 550, "Phone   ");
 
-        // Header Description Card
-        let mut desc_card = Group::new(35, 98, 850, 65, "");
-        desc_card.set_frame(FrameType::RFlatBox);
-        desc_card.set_color(Color::from_rgb(255, 255, 255));
+        // Reader card: the opt-in and the code the phone shows
+        let mut reader_card = Group::new(35, 98, 850, 110, "");
+        reader_card.set_frame(FrameType::RFlatBox);
+        reader_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut r_title = Frame::new(50, 106, 820, 24, "Use this card on your mobile phone");
-        r_title.set_label_font(Font::HelveticaBold);
-        r_title.set_label_size(15);
-        r_title.set_align(Align::Left | Align::Inside);
+        let mut code_label = Frame::new(50, 110, 170, 32, "Code on the phone:");
+        code_label.set_align(Align::Left | Align::Inside);
+        let mut pair_code_input = Input::new(225, 110, 150, 32, "");
+        pair_code_input.set_maximum_size(PAIRING_CODE_INPUT_SIZE);
+        pair_code_input.set_text_font(Font::CourierBold);
+        pair_code_input.set_text_size(18);
 
-        let mut r_sub = Frame::new(
-            50,
-            132,
-            820,
-            20,
-            "Open RefineID Authenticator on your phone to sign and log in securely.",
-        );
-        r_sub.set_label_size(12);
-        r_sub.set_label_color(Color::from_rgb(108, 117, 125));
-        r_sub.set_align(Align::Left | Align::Inside);
-        desc_card.end();
+        let mut pair_btn = Button::new(390, 110, 110, 32, "Pair");
+        pair_btn.set_color(Color::from_rgb(0, 122, 255));
+        pair_btn.set_label_color(Color::from_rgb(255, 255, 255));
+        pair_btn.set_label_font(Font::HelveticaBold);
 
-        // Controls Card
-        let mut ctrl_card = Group::new(35, 175, 385, 445, "");
-        ctrl_card.set_frame(FrameType::RFlatBox);
-        ctrl_card.set_color(Color::from_rgb(255, 255, 255));
+        let mut cancel_pair_btn = Button::new(510, 110, 100, 32, "Cancel");
 
-        let mut start_pair_btn = Button::new(55, 195, 170, 36, "Start Pairing");
-        start_pair_btn.set_color(Color::from_rgb(0, 122, 255));
-        start_pair_btn.set_label_color(Color::from_rgb(255, 255, 255));
-        start_pair_btn.set_label_font(Font::HelveticaBold);
+        let mut pair_status_frame = Frame::new(50, 155, 820, 36, "");
+        pair_status_frame.set_align(Align::Left | Align::Inside);
+        pair_status_frame.set_label_size(12);
+        reader_card.end();
 
-        let mut cancel_pair_btn = Button::new(240, 195, 110, 36, "Cancel");
+        // Paired phones card
+        let mut phones_card = Group::new(35, 260, 850, 360, "");
+        phones_card.set_frame(FrameType::RFlatBox);
+        phones_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut pcode_lbl = Frame::new(55, 250, 340, 22, "Verification Code:");
-        pcode_lbl.set_label_font(Font::HelveticaBold);
-        pcode_lbl.set_align(Align::Left | Align::Inside);
+        let mut phones_title = Frame::new(50, 268, 820, 24, "Paired phones");
+        phones_title.set_label_font(Font::HelveticaBold);
+        phones_title.set_label_size(14);
+        phones_title.set_align(Align::Left | Align::Inside);
 
-        let mut pair_code_frame = Frame::new(55, 280, 345, 65, "-- -- --");
-        pair_code_frame.set_frame(FrameType::ThinDownBox);
-        pair_code_frame.set_label_font(Font::CourierBold);
-        pair_code_frame.set_label_size(28);
+        let phone_browser = HoldBrowser::new(50, 298, 820, 270, "");
 
-        let mut pair_status_frame = Frame::new(55, 365, 345, 45, "Status: Idle");
-        pair_status_frame.set_frame(FrameType::ThinDownBox);
-        pair_status_frame.set_align(Align::Center | Align::Inside);
-        ctrl_card.end();
-
-        // QR Code Card
-        let mut qr_card = Group::new(435, 175, 450, 445, "");
-        qr_card.set_frame(FrameType::RFlatBox);
-        qr_card.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut qr_frame = Frame::new(
-            465,
-            200,
-            390,
-            390,
-            "Start pairing on your phone, then type the code it shows.",
-        );
-        qr_frame.set_frame(FrameType::ThinDownBox);
-        qr_frame.set_align(Align::Center | Align::Inside);
-        qr_card.end();
+        let mut forget_phone_btn = Button::new(50, 576, 110, 32, "Forget");
+        phones_card.end();
 
         rapp_tab.end();
         tabs.end();
 
         // Bottom status bar
-        let mut status_frame = Frame::new(20, 642, 880, 24, "Initializing RefineID...");
+        let mut status_frame = Frame::new(20, 642, 880, 24, "");
         status_frame.set_align(Align::Left | Align::Inside);
         status_frame.set_label_size(12);
         status_frame.set_label_color(Color::from_rgb(108, 117, 125));
@@ -820,10 +759,13 @@ impl FltkDriver {
         }
         {
             let c = Arc::clone(controller);
-            start_pair_btn.set_callback(move |_| {
-                if let Some(code) = input_default("Type the code your phone shows:", "") {
-                    c.handle_intent(UserIntent::StartPairing { code });
+            let code = pair_code_input.clone();
+            pair_btn.set_callback(move |_| {
+                let typed = code.value();
+                if typed.trim().is_empty() {
+                    return;
                 }
+                c.handle_intent(UserIntent::StartPairing { code: typed });
             });
         }
         {
@@ -832,14 +774,30 @@ impl FltkDriver {
                 c.handle_intent(UserIntent::CancelPairing);
             });
         }
+        {
+            let c = Arc::clone(controller);
+            let browser = phone_browser.clone();
+            forget_phone_btn.set_callback(move |_| {
+                let selected = browser.value();
+                if selected < 1 {
+                    return;
+                }
+                let phones = c.state().phones;
+                let Some(phone) = phones.get((selected - 1) as usize) else {
+                    return;
+                };
+                let question = format!("Forget {}?", phone.name);
+                if choice2_default(&question, "Cancel", "Forget", "") == Some(FORGET_CHOICE) {
+                    c.handle_intent(UserIntent::ForgetPhone(phone.pair_id));
+                }
+            });
+        }
 
         self.widgets = Some(FltkWidgets {
             window,
             card_choice,
             card_status_badge,
             holder_name_frame,
-            holder_sub_frame,
-            serial_frame,
             pin1_status_frame,
             pin2_status_frame,
             puk_status_frame,
@@ -847,6 +805,9 @@ impl FltkDriver {
             change_pin2_btn,
             reactivate_btn,
             activate_btn,
+            pin_subtabs,
+            tab_change_pin1,
+            tab_activate,
             can_input,
             read_images_btn,
             portrait_frame,
@@ -860,11 +821,12 @@ impl FltkDriver {
             format_asice,
             sign_btn,
             sign_result_frame,
-            start_pair_btn,
+            pair_code_input,
+            pair_btn,
             cancel_pair_btn,
-            pair_code_frame,
-            qr_frame,
             pair_status_frame,
+            phone_browser,
+            forget_phone_btn,
             status_frame,
         });
 
@@ -914,7 +876,6 @@ fn copy_image_to_clipboard() {
             bytes: Cow::Borrowed(portrait.rgba_bytes()),
         };
         if cb.set_image(img_data).is_ok() {
-            message(200, 200, "Portrait image copied to clipboard.");
             return;
         }
     }
@@ -942,11 +903,6 @@ fn save_image_to_file() {
             )
             .is_ok()
             {
-                message(
-                    200,
-                    200,
-                    &format!("Saved portrait to {}", save_path.display()),
-                );
                 return;
             }
         }
@@ -965,7 +921,6 @@ fn copy_sig_to_clipboard() {
             bytes: Cow::Borrowed(sig.rgba_bytes()),
         };
         if cb.set_image(img_data).is_ok() {
-            message(200, 200, "Signature image copied to clipboard.");
             return;
         }
     }
@@ -993,11 +948,6 @@ fn save_sig_to_file() {
             )
             .is_ok()
             {
-                message(
-                    200,
-                    200,
-                    &format!("Saved signature to {}", save_path.display()),
-                );
                 return;
             }
         }
@@ -1029,39 +979,6 @@ fn create_fitted_image(buf: &RgbaImageBuffer, max_w: i32, max_h: i32) -> Option<
     Some(fltk_img)
 }
 
-/// Render a 2D boolean matrix of QR modules into an FLTK `RgbImage`.
-fn render_qr_image(matrix: &[Vec<bool>], target_size: i32) -> Option<RgbImage> {
-    let size = matrix.len();
-    if size == 0 {
-        return None;
-    }
-    let quiet_zone = 4;
-    let full_modules = size + 2 * quiet_zone;
-    let scale = (target_size / full_modules as i32).max(1);
-    let img_dim = full_modules as i32 * scale;
-    let mut buf = vec![255u8; (img_dim * img_dim * 3) as usize];
-
-    for (y, row) in matrix.iter().enumerate() {
-        for (x, &is_dark) in row.iter().enumerate() {
-            if is_dark {
-                let px_start_x = (x + quiet_zone) as i32 * scale;
-                let px_start_y = (y + quiet_zone) as i32 * scale;
-                for py in 0..scale {
-                    for px in 0..scale {
-                        let idx = (((px_start_y + py) * img_dim + (px_start_x + px)) * 3) as usize;
-                        if idx + 2 < buf.len() {
-                            buf[idx] = 0;
-                            buf[idx + 1] = 0;
-                            buf[idx + 2] = 0;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    RgbImage::new(&buf, img_dim, img_dim, ColorDepth::Rgb8).ok()
-}
-
 impl UiDriver for FltkDriver {
     fn init(&mut self) -> Result<(), GuiCoreError> {
         Ok(())
@@ -1083,13 +1000,16 @@ impl UiDriver for FltkDriver {
                 .card_choice
                 .add_choice(&escape_fltk_menu_text(&card.label()));
         }
-        if let Some(idx) = state.selected_card {
-            widgets.card_choice.set_value(idx as i32);
-        }
+        let selected = state
+            .selected_card
+            .and_then(|idx| i32::try_from(idx).ok())
+            .unwrap_or(-1);
+        widgets.card_choice.set_value(selected);
+        widgets.card_choice.redraw();
 
         // Top bar: Card presence badge & Hero Card
         if state.cards.is_empty() {
-            widgets.card_status_badge.set_label("○ No Card");
+            widgets.card_status_badge.set_label("No card");
             widgets
                 .card_status_badge
                 .set_color(Color::from_rgb(238, 240, 242));
@@ -1097,13 +1017,9 @@ impl UiDriver for FltkDriver {
                 .card_status_badge
                 .set_label_color(Color::from_rgb(120, 120, 120));
 
-            widgets.holder_name_frame.set_label("No Card Detected");
-            widgets
-                .holder_sub_frame
-                .set_label("Insert your smart card into the reader");
-            widgets.serial_frame.set_label("");
+            widgets.holder_name_frame.set_label("No card");
         } else if state.busy {
-            widgets.card_status_badge.set_label("◌ Reading...");
+            widgets.card_status_badge.set_label("Reading");
             widgets
                 .card_status_badge
                 .set_color(Color::from_rgb(254, 247, 224));
@@ -1113,12 +1029,9 @@ impl UiDriver for FltkDriver {
 
             if let Some(card) = state.selected_card.and_then(|i| state.cards.get(i)) {
                 widgets.holder_name_frame.set_label(&card.display_name());
-                widgets
-                    .holder_sub_frame
-                    .set_label("Finnish Identity Card (FINEID)");
             }
         } else {
-            widgets.card_status_badge.set_label("● Card Ready");
+            widgets.card_status_badge.set_label("Card ready");
             widgets
                 .card_status_badge
                 .set_color(Color::from_rgb(230, 244, 234));
@@ -1128,68 +1041,40 @@ impl UiDriver for FltkDriver {
 
             if let Some(card) = state.selected_card.and_then(|i| state.cards.get(i)) {
                 widgets.holder_name_frame.set_label(&card.display_name());
-                widgets
-                    .holder_sub_frame
-                    .set_label("Finnish Identity Card (FINEID)");
-                widgets.serial_frame.set_label(&format!(
-                    "Card ID: {}",
-                    state.card_serial.as_deref().unwrap_or("—")
-                ));
             }
         }
         widgets.card_status_badge.redraw();
 
         // Tab 1: PIN Status
-        let p1_text = match state.pin1_status {
-            Some(PinStatus::Remaining(retries)) => {
-                let count = retries.get();
-                if retries.is_exhausted() {
-                    "Authentication PIN (PIN 1):  BLOCKED".to_string()
-                } else {
-                    format!("Authentication PIN (PIN 1):  Ready ({count} tries left)")
-                }
-            }
-            Some(PinStatus::Verified) => "Authentication PIN (PIN 1):  Verified".to_string(),
-            Some(PinStatus::Locked) => "Authentication PIN (PIN 1):  BLOCKED".to_string(),
-            Some(PinStatus::NoInfo) => "Authentication PIN (PIN 1):  No retry info".to_string(),
-            Some(PinStatus::Other(sw)) => format!("Authentication PIN (PIN 1):  Status 0x{sw:04X}"),
-            None => "Authentication PIN (PIN 1):  Not Inspected".to_string(),
-        };
-        widgets.pin1_status_frame.set_label(&p1_text);
+        widgets.pin1_status_frame.set_label(&credential_line(
+            PIN1_LABEL,
+            with_factory_flag(pin_value(state.pin1_status), state.pin1_changed),
+        ));
+        widgets.pin2_status_frame.set_label(&credential_line(
+            PIN2_LABEL,
+            with_factory_flag(pin_value(state.pin2_status), state.pin2_changed),
+        ));
+        widgets
+            .puk_status_frame
+            .set_label(&credential_line(PUK_LABEL, puk_value(state.puk_status)));
 
-        let p2_text = match state.pin2_status {
-            Some(PinStatus::Remaining(retries)) => {
-                let count = retries.get();
-                if retries.is_exhausted() {
-                    "Signing PIN (PIN 2):         BLOCKED".to_string()
-                } else {
-                    format!("Signing PIN (PIN 2):         Ready ({count} tries left)")
-                }
+        // The activation sub-tab exists only for a card that still needs it.
+        let setup_listed =
+            widgets.pin_subtabs.find(&widgets.tab_activate) < widgets.pin_subtabs.children();
+        if state.activation_available && !setup_listed {
+            widgets.pin_subtabs.add(&widgets.tab_activate);
+            widgets.pin_subtabs.redraw();
+        } else if !state.activation_available && setup_listed {
+            let showing_setup = widgets
+                .pin_subtabs
+                .value()
+                .is_some_and(|tab| tab.is_same(&widgets.tab_activate));
+            widgets.pin_subtabs.remove(&widgets.tab_activate);
+            if showing_setup {
+                let _ = widgets.pin_subtabs.set_value(&widgets.tab_change_pin1);
             }
-            Some(PinStatus::Verified) => "Signing PIN (PIN 2):         Verified".to_string(),
-            Some(PinStatus::Locked) => "Signing PIN (PIN 2):         BLOCKED".to_string(),
-            Some(PinStatus::NoInfo) => "Signing PIN (PIN 2):         No retry info".to_string(),
-            Some(PinStatus::Other(sw)) => format!("Signing PIN (PIN 2):         Status 0x{sw:04X}"),
-            None => "Signing PIN (PIN 2):         Not Inspected".to_string(),
-        };
-        widgets.pin2_status_frame.set_label(&p2_text);
-
-        let puk_text = match state.puk_status {
-            Some(PukStatus::Remaining(retries)) => {
-                let count = retries.get();
-                if retries.is_exhausted() {
-                    "PUK Code:                    BLOCKED".to_string()
-                } else {
-                    format!("PUK Code:                    Ready ({count} tries left)")
-                }
-            }
-            Some(PukStatus::Locked) => "PUK Code:                    BLOCKED".to_string(),
-            Some(PukStatus::Invalidated) => "PUK Code:                    Invalidated".to_string(),
-            Some(PukStatus::NoInfo) => "PUK Code:                    No retry info".to_string(),
-            Some(PukStatus::Other(sw)) => format!("PUK Code:                    Status 0x{sw:04X}"),
-            None => "PUK Code:                    Unknown".to_string(),
-        };
-        widgets.puk_status_frame.set_label(&puk_text);
+            widgets.pin_subtabs.redraw();
+        }
 
         set_active(
             &mut widgets.change_pin1_btn,
@@ -1233,7 +1118,7 @@ impl UiDriver for FltkDriver {
                 set_active(&mut widgets.save_portrait_btn, true);
             } else {
                 widgets.portrait_frame.set_image(None::<RgbImage>);
-                widgets.portrait_frame.set_label("No image loaded");
+                widgets.portrait_frame.set_label("");
                 set_active(&mut widgets.copy_portrait_btn, false);
                 set_active(&mut widgets.save_portrait_btn, false);
             }
@@ -1256,7 +1141,7 @@ impl UiDriver for FltkDriver {
                 set_active(&mut widgets.save_sig_btn, true);
             } else {
                 widgets.signature_frame.set_image(None::<RgbImage>);
-                widgets.signature_frame.set_label("No signature loaded");
+                widgets.signature_frame.set_label("");
                 set_active(&mut widgets.copy_sig_btn, false);
                 set_active(&mut widgets.save_sig_btn, false);
             }
@@ -1288,30 +1173,46 @@ impl UiDriver for FltkDriver {
             widgets.sign_result_frame.set_label("");
         }
 
-        // Tab 4: Phone Pairing (RAPP)
+        // Tab 4: Phone (RAPP)
         if let Some(ref pairing) = state.pairing {
-            widgets.pair_code_frame.set_label(&pairing.code);
-            widgets.pair_status_frame.set_label(&pairing.status);
-
-            if let Some(ref modules) = pairing.qr_modules
-                && let Some(qr_img) = render_qr_image(modules, 340)
-            {
-                widgets.qr_frame.set_label("");
-                widgets.qr_frame.set_image(Some(qr_img));
-            }
-            set_active(&mut widgets.start_pair_btn, false);
+            widgets
+                .pair_status_frame
+                .set_label(&format!("{}  {}", pairing.code, pairing.status));
+            widgets.pair_code_input.set_value("");
+            set_active(&mut widgets.pair_btn, false);
+            set_active(&mut widgets.pair_code_input, false);
             set_active(&mut widgets.cancel_pair_btn, true);
         } else {
-            widgets.pair_code_frame.set_label("-- -- --");
-            widgets.pair_status_frame.set_label("Status: Idle");
-            widgets.qr_frame.set_image(None::<RgbImage>);
-            widgets
-                .qr_frame
-                .set_label("Start pairing on your phone, then type the code it shows.");
-            set_active(&mut widgets.start_pair_btn, true);
+            widgets.pair_status_frame.set_label("");
+            set_active(&mut widgets.pair_btn, true);
+            set_active(&mut widgets.pair_code_input, true);
             set_active(&mut widgets.cancel_pair_btn, false);
         }
-        widgets.qr_frame.redraw();
+
+        let lines: Vec<String> = state
+            .phones
+            .iter()
+            .map(|phone| escape_browser_text(&phone.line()))
+            .collect();
+        let listed = (1..=widgets.phone_browser.size())
+            .map(|row| widgets.phone_browser.text(row).unwrap_or_default());
+        if listed.ne(lines.iter().cloned()) {
+            let selected_phone = widgets.phone_browser.value();
+            widgets.phone_browser.clear();
+            for line in &lines {
+                widgets.phone_browser.add(line);
+            }
+            if selected_phone >= 1 && selected_phone <= widgets.phone_browser.size() {
+                widgets.phone_browser.select(selected_phone);
+            }
+        }
+        if widgets.phone_browser.value() < 1 && widgets.phone_browser.size() >= 1 {
+            widgets.phone_browser.select(1);
+        }
+        set_active(
+            &mut widgets.forget_phone_btn,
+            widgets.phone_browser.value() >= 1,
+        );
     }
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
@@ -1335,6 +1236,77 @@ impl UiDriver for FltkDriver {
     }
 }
 
+/// The most characters a typed pairing code may hold: six characters
+/// with room for the separators and spaces a paste may carry.
+const PAIRING_CODE_INPUT_SIZE: i32 = 16;
+
+/// The index of the "Forget" button in the forget confirmation.
+const FORGET_CHOICE: i32 = 1;
+
+/// The credential labels of the status lines.
+const PIN1_LABEL: &str = "PIN 1";
+const PIN2_LABEL: &str = "PIN 2";
+const PUK_LABEL: &str = "PUK";
+
+/// A credential line: nothing while the value is in its normal state,
+/// otherwise the label and the value.
+fn credential_line(label: &str, value: String) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        format!("{label}: {value}")
+    }
+}
+
+/// What a PIN's counter says: nothing at the try limit, the tries left
+/// below it, and the blocked or unknown state otherwise.
+fn pin_value(status: Option<PinStatus>) -> String {
+    match status {
+        Some(PinStatus::Remaining(retries)) => tries_left(retries),
+        Some(PinStatus::Locked) => "blocked".to_owned(),
+        Some(PinStatus::NoInfo) => "no retry count".to_owned(),
+        Some(PinStatus::Other(sw)) => format!("status {sw:04X}"),
+        Some(PinStatus::Verified) | None => String::new(),
+    }
+}
+
+/// What the PUK's counter says, by the same rule as [`pin_value`].
+fn puk_value(status: Option<PukStatus>) -> String {
+    match status {
+        Some(PukStatus::Remaining(retries)) => tries_left(retries),
+        Some(PukStatus::Locked) => "blocked".to_owned(),
+        Some(PukStatus::Invalidated) => "invalidated".to_owned(),
+        Some(PukStatus::NoInfo) => "no retry count".to_owned(),
+        Some(PukStatus::Other(sw)) => format!("status {sw:04X}"),
+        None => String::new(),
+    }
+}
+
+fn tries_left(retries: PinRetries) -> String {
+    let count = retries.get();
+    if retries.is_exhausted() {
+        "blocked".to_owned()
+    } else if count < PIN_TRY_LIMIT {
+        format!("{count} of {PIN_TRY_LIMIT} tries left")
+    } else {
+        String::new()
+    }
+}
+
+/// Appends the factory-value flag to a credential value.
+fn with_factory_flag(value: String, changed: Option<bool>) -> String {
+    match (changed, value.is_empty()) {
+        (Some(false), true) => "factory value".to_owned(),
+        (Some(false), false) => format!("{value}; factory value"),
+        (Some(true) | None, _) => value,
+    }
+}
+
+/// Escapes the column and format characters FLTK browsers interpret.
+fn escape_browser_text(s: &str) -> String {
+    s.replace('@', "@@").replace('\t', " ")
+}
+
 /// Escapes special menu characters in FLTK choice items (`/`, `&`, `_`).
 fn escape_fltk_menu_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
@@ -1356,13 +1328,64 @@ mod tests {
     #[test]
     fn test_escape_fltk_menu_text() {
         assert_eq!(
-            escape_fltk_menu_text("KOISTINEN PETRI / Alcor Reader / CardOS"),
-            "KOISTINEN PETRI \\/ Alcor Reader \\/ CardOS"
+            escape_fltk_menu_text("ALPHA HOLDER / Alcor Reader / CardOS"),
+            "ALPHA HOLDER \\/ Alcor Reader \\/ CardOS"
         );
         assert_eq!(
             escape_fltk_menu_text("R&D / Test_Case"),
             "R&&D \\/ Test\\_Case"
         );
         assert_eq!(escape_fltk_menu_text("Clean Name"), "Clean Name");
+    }
+
+    #[test]
+    fn factory_flag_follows_the_card() {
+        assert_eq!(
+            with_factory_flag(String::new(), Some(false)),
+            "factory value"
+        );
+        assert_eq!(
+            with_factory_flag("blocked".to_owned(), Some(false)),
+            "blocked; factory value"
+        );
+        assert_eq!(with_factory_flag(String::new(), Some(true)), "");
+        assert_eq!(with_factory_flag(String::new(), None), "");
+    }
+
+    #[test]
+    fn a_credential_line_is_silent_in_its_normal_state() {
+        let full = PinRetries::from_nibble(PIN_TRY_LIMIT).expect("retry nibble");
+        let spent = PinRetries::from_nibble(PIN_TRY_LIMIT - 1).expect("retry nibble");
+        let none = PinRetries::from_nibble(0).expect("retry nibble");
+        assert_eq!(
+            credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(full)))),
+            ""
+        );
+        assert_eq!(
+            credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(spent)))),
+            "PIN 1: 4 of 5 tries left"
+        );
+        assert_eq!(
+            credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(none)))),
+            "PIN 1: blocked"
+        );
+        assert_eq!(
+            credential_line("PIN 1", pin_value(Some(PinStatus::Verified))),
+            ""
+        );
+        assert_eq!(credential_line("PUK", puk_value(None)), "");
+        assert_eq!(
+            credential_line("PUK", puk_value(Some(PukStatus::Locked))),
+            "PUK: blocked"
+        );
+    }
+
+    #[test]
+    fn browser_text_escapes_format_characters() {
+        assert_eq!(escape_browser_text("a@b\tc"), "a@@b c");
+        assert_eq!(
+            escape_browser_text("Alpha Phone (iOS): paired"),
+            "Alpha Phone (iOS): paired"
+        );
     }
 }

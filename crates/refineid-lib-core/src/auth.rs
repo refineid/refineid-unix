@@ -135,6 +135,10 @@ pub const PUK_STORED_LENGTH: usize = 12;
 pub const PUK_MIN_LENGTH: usize = 8;
 /// Maximum PUK length: the stored (padded) block length.
 pub const PUK_MAX_LENGTH: usize = 12;
+/// The try limit PIN 1, PIN 2 and the PUK are personalized with
+/// (FINEID S4-1 v4.2, PIN/PUK policy settings): the retry counter
+/// of a credential that has never been presented wrongly.
+pub const PIN_TRY_LIMIT: u8 = 5;
 
 /// Which PIN slot a `verify_pin` call targets. `Pin1` is the auth
 /// PIN (digital signature, TLS client cert, SSH); `Pin2` is the

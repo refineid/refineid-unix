@@ -2919,6 +2919,10 @@ pub struct CredentialIdentity {
     /// X.520 `surName` (OID 2.5.4.4). FINEID stores the family
     /// name as a single value here.
     pub surname: Option<Surname>,
+    /// X.520 `commonName` (OID 2.5.4.3) of the subject, as the
+    /// certificate carries it. FINEID composes it from the surname,
+    /// the given names and the PEUIN; the composition is not parsed.
+    pub common_name: Option<CommonName>,
     /// Personal Electronic Unique Identification Number per the
     /// Finnish administrative-terminology service. Held in the
     /// `serialNumber` DN attribute (OID 2.5.4.5) -- distinct
@@ -2990,6 +2994,13 @@ impl CredentialIdentity {
     #[must_use]
     pub fn with_surname(mut self, value: Surname) -> Self {
         self.surname = Some(value);
+        self
+    }
+
+    /// Set the [`common_name`](Self::common_name) and return `self`.
+    #[must_use]
+    pub fn with_common_name(mut self, value: CommonName) -> Self {
+        self.common_name = Some(value);
         self
     }
 

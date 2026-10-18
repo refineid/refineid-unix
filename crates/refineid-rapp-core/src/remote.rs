@@ -18,6 +18,7 @@
 //! consumer that offers the phone's identity holds the session it was
 //! reported on.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::engine::Session;
@@ -170,6 +171,8 @@ pub enum RemoteError {
     NotPaired,
     /// No custodian advertised the needed mode before the deadline.
     NotFound,
+    /// The caller cancelled the search for the phone.
+    Cancelled,
     /// The phone announced that it stopped serving the pairing.
     Withdrawn,
     /// The phone announced that it forgot this computer; the pairing is
@@ -199,6 +202,7 @@ impl core::fmt::Display for RemoteError {
             Self::Store(error) => write!(f, "pairing store: {error:?}"),
             Self::NotPaired => f.write_str("no paired phone"),
             Self::NotFound => f.write_str("no phone found on the local network"),
+            Self::Cancelled => f.write_str("pairing cancelled"),
             Self::Withdrawn => f.write_str("the phone turned remote card access off"),
             Self::RevokedByPhone => f.write_str("the phone forgot this computer; pair it again"),
             Self::CardAbsent => f.write_str("the phone has no card on it"),
@@ -465,27 +469,38 @@ impl RemoteReader {
     }
 
     /// Pairs with the phone showing `code`, browsing for it until
-    /// `discovery_timeout` passes.
+    /// `discovery_timeout` passes or `cancel` is set. A ceremony that has
+    /// reached the phone runs to its end.
     ///
     /// Every profile the code-derived offer names is requested and granted;
     /// the phone decides what it grants and the sets must agree.
     ///
     /// # Errors
     /// [`RemoteError::Pairing`] for a malformed or mistyped code and other
-    /// pairing failures, and [`RemoteError::NotFound`] when no phone in a
-    /// pairing ceremony answered.
+    /// pairing failures, [`RemoteError::Store`] when the key vault does not
+    /// answer (checked before the phone's code is spent),
+    /// [`RemoteError::Cancelled`] when `cancel` was set before a phone
+    /// answered, and [`RemoteError::NotFound`] when no phone in a pairing
+    /// ceremony answered.
     pub fn pair_with_code(
         &mut self,
         code: &str,
         discovery_timeout: Duration,
+        cancel: &AtomicBool,
     ) -> Result<PairSummary, RemoteError> {
         if crate::offer::normalize_pairing_code(code).is_none() {
             return Err(RemoteError::Pairing(PairingError::InvalidCode));
+        }
+        if !self.requester.store().vault_reachable() {
+            return Err(RemoteError::Store(StoreError::SecretsUnavailable));
         }
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
             for service in browse(DiscoveryMode::Pairing, BROWSE_ROUND) {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(RemoteError::Cancelled);
+                }
                 let Ok(transport) = dial(
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
@@ -513,6 +528,9 @@ impl RemoteReader {
                     Err(error) => last = RemoteError::Pairing(error),
                 }
             }
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err(RemoteError::Cancelled);
         }
         Err(last)
     }
