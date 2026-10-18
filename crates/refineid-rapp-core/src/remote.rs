@@ -655,13 +655,16 @@ impl RemoteReader {
         Err(last)
     }
 
-    /// Browses once for the phone holding `pair_id` without dialing it,
+    /// Listens once for the phone holding `pair_id` without dialing it,
     /// applying what it announces: a revocation hint naming the pairing
-    /// (RAPP v26.10.18 section 4.6 item 3) revokes it here. Returns
-    /// whether the phone's session record was in sight.
+    /// (RAPP v26.10.18 section 4.6 item 3) revokes it here, under the
+    /// pairing's lock. Returns whether the phone's session record was in
+    /// sight.
     ///
     /// # Errors
     /// [`RemoteError::NotPaired`] when no record names `pair_id`,
+    /// [`RemoteError::Busy`] when another program holds the pairing's
+    /// session and so hears the phone itself,
     /// [`RemoteError::RevokedByPhone`] when the phone announced that it
     /// forgot this computer, [`RemoteError::Withdrawn`] when it withdrew
     /// its service.
@@ -672,6 +675,12 @@ impl RemoteReader {
             .get(pair_id)
             .map_err(|_| RemoteError::NotPaired)?;
         let keys = PairingKeys::derive(record)?;
+        // The holder of the session learns of the phone's announcements
+        // itself; an observer records nothing while it holds.
+        let _lock = take_lock(&session_lock_path(
+            self.requester.store().directory(),
+            pair_id,
+        ))?;
         Ok(!self.sessions_for(pair_id, &keys)?.is_empty())
     }
 
@@ -986,15 +995,17 @@ mod tests {
     }
 
     #[test]
-    fn observing_browses_without_a_lock_and_names_an_unknown_pairing() {
+    fn observing_stands_aside_for_a_session_holder_and_names_an_unknown_pairing() {
         let directory = scratch();
         let mut reader = reader_with_pairing(&directory);
         let pair_id = PairId::from_array(PAIR_ID);
         let held = SessionLock::acquire(&session_lock_path(&directory, pair_id)).unwrap();
-        // No phone announces this pairing on the test network: not seen,
-        // and the held lock is no obstacle since nothing is dialed.
-        assert_eq!(reader.observe(pair_id), Ok(false));
+        // The session's holder hears the phone itself; an observer stands
+        // aside while the lock is held.
+        assert_eq!(reader.observe(pair_id).err(), Some(RemoteError::Busy));
         drop(held);
+        // No phone announces this pairing on the test network: not seen.
+        assert_eq!(reader.observe(pair_id), Ok(false));
         assert_eq!(
             reader.observe(PairId::from_array([9; 16])).err(),
             Some(RemoteError::NotPaired)
