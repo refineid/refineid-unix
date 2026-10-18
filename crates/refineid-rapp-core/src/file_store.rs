@@ -31,6 +31,15 @@ const FILE_MODE: u32 = 0o600;
 /// The length of a pair private key.
 const PAIR_PRIVATE_KEY_SIZE: usize = 32;
 
+/// What an opener does with the files of records it cannot use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+    /// Delete them; the owning program's open.
+    Remove,
+    /// Leave them; a reader beside the owner.
+    Keep,
+}
+
 /// Pairings stored as files in one owner-only directory, each file
 /// holding the whole record, its private key included.
 #[derive(Debug)]
@@ -65,6 +74,21 @@ impl FilePairingStore {
     /// [`StoreError::WriteRefused`] when the directory cannot be created or
     /// read.
     pub fn open(directory: &Path) -> Result<Self, StoreError> {
+        Self::load(directory, Sweep::Remove)
+    }
+
+    /// Opens (creating if needed) the store in `directory` and loads every
+    /// usable record, leaving the files of other records in place: a
+    /// program that reads the store beside the one that owns it opens it
+    /// this way, and never deletes a record.
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    pub fn open_without_sweep(directory: &Path) -> Result<Self, StoreError> {
+        Self::load(directory, Sweep::Keep)
+    }
+
+    fn load(directory: &Path, sweep: Sweep) -> Result<Self, StoreError> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(DIRECTORY_MODE)
@@ -81,7 +105,7 @@ impl FilePairingStore {
                 continue;
             };
             let Ok(mut record) = decode_pairing_record(&bytes) else {
-                if superseded_pair_id(&bytes).is_some() {
+                if sweep == Sweep::Remove && superseded_pair_id(&bytes).is_some() {
                     // A pairing from an earlier protocol version: its
                     // holder pairs again, so the record goes.
                     let _ = fs::remove_file(&path);
@@ -93,7 +117,9 @@ impl FilePairingStore {
             {
                 // A pairing without a usable key cannot open a session:
                 // its holder pairs again, so the record goes.
-                let _ = fs::remove_file(&path);
+                if sweep == Sweep::Remove {
+                    let _ = fs::remove_file(&path);
+                }
                 continue;
             }
             keep_key_only_while_paired(&mut record);
@@ -108,6 +134,12 @@ impl FilePairingStore {
             directory: directory.to_path_buf(),
             records: loaded.into_iter().map(|(_, record)| record).collect(),
         })
+    }
+
+    /// The directory holding the records.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
     }
 
     /// Opens the store in [`Self::default_directory`].
@@ -375,6 +407,39 @@ mod tests {
         let paired = reopened.get(PairId::from_array([14; 16])).unwrap();
         assert_eq!(paired.disposition, PairingDisposition::Paired);
         assert_eq!(paired.local_private.as_slice(), [0x11; 32]);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_open_without_sweep_skips_unusable_records_and_deletes_nothing() {
+        let directory = scratch();
+        {
+            let mut store = FilePairingStore::open(&directory).unwrap();
+            store.insert(record(21)).unwrap();
+            store.insert(record(22)).unwrap();
+        }
+        let mut keyless = record(21);
+        keyless.local_private = zeroize::Zeroizing::new(Vec::new());
+        let keyless_path = super::path_for(&directory, PairId::from_array([21; 16]));
+        std::fs::write(
+            &keyless_path,
+            crate::persistence::encode_pairing_record(&keyless),
+        )
+        .unwrap();
+        let mut earlier = b"RAPP-pair-record".to_vec();
+        earlier.push(5);
+        earlier.extend_from_slice(PairId::from_array([9; 16]).as_bytes());
+        earlier.extend_from_slice(&[0x55; 40]);
+        let earlier_path = directory.join("earlier.pair");
+        std::fs::write(&earlier_path, &earlier).unwrap();
+        let store = FilePairingStore::open_without_sweep(&directory).unwrap();
+        assert_eq!(store.pair_ids(), vec![PairId::from_array([22; 16])]);
+        assert!(keyless_path.exists());
+        assert!(earlier_path.exists());
+        let swept = FilePairingStore::open(&directory).unwrap();
+        assert_eq!(swept.pair_ids(), vec![PairId::from_array([22; 16])]);
+        assert!(!keyless_path.exists());
+        assert!(!earlier_path.exists());
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

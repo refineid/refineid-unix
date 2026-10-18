@@ -18,6 +18,7 @@ pub mod operations;
 pub mod persistence;
 pub mod profiles;
 pub mod remote;
+pub mod session_lock;
 pub mod store;
 pub mod stream;
 pub mod transport;
