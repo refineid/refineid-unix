@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+use crate::policy::TransportPolicy;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -206,9 +207,10 @@ pub fn get_with_rapp_client_auth(
     let port = url.port();
     let origin = format!("https://{host}");
 
-    // Load CA roots
-    let ca_path = "/etc/ssl/certs/ca-certificates.crt";
-    let file = std::fs::File::open(ca_path)
+    // The CA roots come from the same bundle every other HTTPS client
+    // in this crate reads, found by the transport policy.
+    let ca_path = crate::simple_https::ca_bundle_path(&TransportPolicy::client_auth())?;
+    let file = std::fs::File::open(&ca_path)
         .map_err(|e| HttpsError::Tls(format!("open({ca_path}): {e}")))?;
     let mut reader = std::io::BufReader::new(file);
     let mut roots = rustls::RootCertStore::empty();

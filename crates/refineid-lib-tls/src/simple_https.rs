@@ -410,7 +410,7 @@ fn tcp_connect(url: &Uri, address: Option<SocketAddr>) -> Result<TcpStream, Http
     Ok(stream)
 }
 
-fn ca_bundle_path(policy: &TransportPolicy) -> Result<String, HttpsError> {
+pub(crate) fn ca_bundle_path(policy: &TransportPolicy) -> Result<String, HttpsError> {
     if let Ok(path) = std::env::var("REFINEID_CA_BUNDLE")
         && !path.trim().is_empty()
     {
