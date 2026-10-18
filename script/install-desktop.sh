@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Install the RefineID desktop GUI outside of .deb packaging:
-# binary, freedesktop launcher, and icon.
+# Install the RefineID desktop GUI outside of .deb packaging: binary,
+# freedesktop launcher, icon, and the browser setup that makes Firefox and
+# Chromium offer the card for every user without touching either browser:
+# a Firefox enterprise policy naming the PKCS#11 module, and a desktop
+# autostart entry that gives each signed-in user's NSS database the module.
 #
 # Usage:
 #   script/install-desktop.sh [--prefix /usr/local] [--openbox-menu]
@@ -71,6 +74,31 @@ if command -v rsvg-convert >/dev/null 2>&1; then
             crates/refineid-gui/assets/app-icon.svg
     done
 fi
+
+# Browsers. Firefox reads a system policy, so every profile of every user
+# loads the module; the policy goes where this Firefox looks for it.
+# Chromium reads the user's NSS database only, so an autostart entry
+# gives it the module at each desktop login.
+MODULE="$PREFIX/lib/refineid/librefineid_pkcs11.so"
+if [ -d "$DESTDIR$PREFIX/lib/firefox" ]; then
+    POLICY_DIR="$DESTDIR$PREFIX/lib/firefox/distribution"
+else
+    POLICY_DIR="$DESTDIR/etc/firefox/policies"
+fi
+if [ -d "$DESTDIR$PREFIX/etc/xdg" ]; then
+    AUTOSTART_DIR="$DESTDIR$PREFIX/etc/xdg/autostart"
+else
+    AUTOSTART_DIR="$DESTDIR/etc/xdg/autostart"
+fi
+install -d "$POLICY_DIR" "$DESTDIR$PREFIX/libexec/refineid" "$AUTOSTART_DIR"
+printf '{ "policies": { "SecurityDevices": { "RefineID": "%s" } } }\n' "$MODULE" \
+    > "$POLICY_DIR/policies.json"
+sed "s|@MODULE@|$MODULE|" packaging/refineid-browser-token \
+    > "$DESTDIR$PREFIX/libexec/refineid/refineid-browser-token"
+chmod 755 "$DESTDIR$PREFIX/libexec/refineid/refineid-browser-token"
+sed "s|@EXEC@|$PREFIX/libexec/refineid/refineid-browser-token|" \
+    packaging/refineid-browser-token.desktop \
+    > "$AUTOSTART_DIR/refineid-browser-token.desktop"
 
 # Slint's font stack (fontique) finds no system fonts on NetBSD, so the GUI
 # aborts in font fallback unless told where a default font lives. When the

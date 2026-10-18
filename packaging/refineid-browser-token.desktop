@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=RefineID browser token
+Exec=@EXEC@
+NoDisplay=true
+Terminal=false
+X-GNOME-Autostart-enabled=true

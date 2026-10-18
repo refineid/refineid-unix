@@ -186,8 +186,20 @@ cat > "$STAGING_PKCS11/etc/firefox/policies/policies.json" << POLICIESEOF
 POLICIESEOF
 chmod 644 "$STAGING_PKCS11/etc/firefox/policies/policies.json"
 
+# Chromium reads the user's NSS database only: an autostart entry gives
+# each signed-in user's database the module at every desktop login.
+install -d "$STAGING_PKCS11/usr/libexec/refineid" "$STAGING_PKCS11/etc/xdg/autostart"
+sed "s|@MODULE@|$FIREFOX_LIB_PATH|" packaging/refineid-browser-token \
+    > "$STAGING_PKCS11/usr/libexec/refineid/refineid-browser-token"
+chmod 755 "$STAGING_PKCS11/usr/libexec/refineid/refineid-browser-token"
+sed "s|@EXEC@|/usr/libexec/refineid/refineid-browser-token|" \
+    packaging/refineid-browser-token.desktop \
+    > "$STAGING_PKCS11/etc/xdg/autostart/refineid-browser-token.desktop"
+chmod 644 "$STAGING_PKCS11/etc/xdg/autostart/refineid-browser-token.desktop"
+
 cat > "$STAGING_PKCS11/DEBIAN/conffiles" << 'CONFFILESEOF'
 /etc/firefox/policies/policies.json
+/etc/xdg/autostart/refineid-browser-token.desktop
 CONFFILESEOF
 chmod 644 "$STAGING_PKCS11/DEBIAN/conffiles"
 
