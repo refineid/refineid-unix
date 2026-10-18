@@ -103,69 +103,62 @@ install -m 755 target/release/refineid /usr/local/bin/
 RefineID then appears in the xfce application menu. Reinstall after
 every rebuild.
 
-## 6. PKCS#11 through p11-kit
+## 6. Browsers
 
-Nothing names the RefineID module in any browser. The module is
-registered with p11-kit, and NSS loads p11-kit's proxy module, through
-which every p11-kit module appears.
+Neither browser is configured by the user. The module is installed on a
+stable path, and `script/install-desktop.sh` (section 5) installs the
+two things the browsers need: a Firefox enterprise policy naming the
+module, and a desktop autostart entry that gives each signed-in user's
+NSS database the module before any browser starts.
 
-Install the module on a stable path and register it:
+Install the module:
 
 ```sh
 install -d /usr/local/lib/refineid
 install -m 0755 target/release/librefineid_pkcs11.so /usr/local/lib/refineid/
+```
+
+Then `sh script/install-desktop.sh --prefix /usr/local` as root writes
+`/usr/local/lib/firefox/distribution/policies.json`, which every Firefox
+profile of every user reads, and
+`/usr/local/etc/xdg/autostart/refineid-browser-token.desktop`, which runs
+`/usr/local/libexec/refineid/refineid-browser-token` at each desktop
+login: the script creates `~/.pki/nssdb` when it is missing and adds the
+module to it when it is not there, in under a second, so a new user and
+a wiped home directory are handled alike. Chromium and every other NSS
+program reading that database then see the card. Reinstall the module
+copy after every rebuild; the policy and the autostart entry need no
+change.
+
+In Firefox the module appears under "RefineID" in Settings > Privacy &
+Security > Security Devices, with the reader as one slot and the paired
+phone (section 7) as another, "RefineID Remote" with the phone's name.
+A card in the reader shows the token "Basic (PIN 1)"; a card lying on
+the paired phone shows "Phone (PIN 1)" while the module holds a session
+to the phone. A card-login site asks for the certificate; PIN 1 is
+asked by the browser for the reader's card and by the phone for the
+phone's card. Without a card nothing is offered and nothing is asked.
+One program on the computer holds the phone session at a time: while a
+browser holds it, `refineid card` and the desktop application report
+the phone as in use.
+
+OpenSSH and OpenSSL reach the module through p11-kit when it is
+registered there, which the browsers no longer need:
+
+```sh
 cat > /usr/local/etc/pkcs11/modules/refineid.module <<'MODULE'
 module: /usr/local/lib/refineid/librefineid_pkcs11.so
 critical: no
 MODULE
 ```
 
-`p11-kit list-modules` lists `refineid` and, with a card in the reader,
-its token "Basic (PIN 1)". Reinstall the copy after every rebuild.
-
-Firefox loads the proxy through its enterprise policy, which names only
-the proxy; the file is
-`/usr/local/lib/firefox/distribution/policies.json`:
-
-```json
-{ "policies": { "SecurityDevices": { "p11-kit-proxy": "/usr/local/lib/p11-kit-proxy.so" } } }
-```
-
-Chromium reads the user's NSS database; as the user:
-
-```sh
-certutil -N -d sql:$HOME/.pki/nssdb --empty-password
-modutil -dbdir sql:$HOME/.pki/nssdb -add p11-kit-proxy -libfile /usr/local/lib/p11-kit-proxy.so
-modutil -dbdir sql:$HOME/.pki/nssdb -list
-```
-
-The listing shows the proxy with the reader as its slot and the token
-"Basic (PIN 1)" while a card is inserted. In Firefox the token appears
-under "p11-kit-proxy" in Settings > Privacy & Security > Security
-Devices. A card-login site then asks for the certificate and for PIN 1.
-Without a card nothing is offered and nothing is asked.
-
-The paired phone (section 7) is one more slot of the same module,
-"RefineID Remote" with the phone's name, whose token "Phone (PIN 1)" is
-present while the module holds a session to the phone and the phone
-reports a card on it. The module reads the certificate from the card
-on that session, so the identity offered is the card lying on the
-phone now. A card-login site asks for the certificate only; PIN 1 is
-entered on the phone, which verifies it, and the browser is never
-asked. One program on the computer holds the phone session at a time:
-while a browser holds it, `refineid card` and the desktop application
-report the phone as in use.
-
-OpenSSH reaches the same module through the proxy:
-`ssh -I /usr/local/lib/p11-kit-proxy.so host`.
-
+`ssh -I /usr/local/lib/p11-kit-proxy.so host` then uses the card.
 `p11tool --provider p11-kit-proxy.so` answers "PKCS #11 initialization
 error" because p11tool is itself a p11-kit client; `p11tool --list-tokens`
 without a provider, or `p11-kit list-modules`, is the check.
 
-The Debian package and the NixOS module register the module with
-p11-kit the same way but name the module itself in Firefox's policy;
-FreeBSD names only the proxy.
+The Debian package and the NixOS module install the same policy and
+autostart entry under `/etc`.
 
 ## 7. Pairing a phone
 

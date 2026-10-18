@@ -1,0 +1,33 @@
+#!/bin/sh
+# Copyright 2026 Petri Koistinen
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Gives the signed-in user's NSS database the RefineID PKCS#11 module, so
+# Chromium and every other NSS program that reads ~/.pki/nssdb offers the
+# card without the user touching the browser. Runs at each desktop login
+# from the system autostart entry; does nothing when the module is there.
+set -eu
+MODULE="@MODULE@"
+NAME="RefineID"
+DB="${HOME}/.pki/nssdb"
+[ -f "$MODULE" ] || exit 0
+command -v modutil >/dev/null 2>&1 || exit 0
+if [ ! -f "$DB/cert9.db" ]; then
+    mkdir -p "$DB"
+    chmod 700 "$HOME/.pki" "$DB"
+    certutil -N -d "sql:$DB" --empty-password
+fi
+if ! modutil -dbdir "sql:$DB" -list 2>/dev/null | grep -q "library name: $MODULE\$"; then
+    modutil -dbdir "sql:$DB" -add "$NAME" -libfile "$MODULE" -force >/dev/null
+fi

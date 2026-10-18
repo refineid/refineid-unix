@@ -15,6 +15,7 @@ Binary `.deb` packages are produced automatically by `script/package-deb.sh`
    - System p11-kit module `/usr/share/p11-kit/modules/refineid.module`
    - Polkit access rule `/usr/share/polkit-1/rules.d/50-refineid-pcscd.rules`
    - Firefox enterprise policy `/etc/firefox/policies/policies.json`
+   - Desktop autostart entry `/etc/xdg/autostart/refineid-browser-token.desktop` running `/usr/libexec/refineid/refineid-browser-token`, which gives the signed-in user's NSS database the module for Chromium
    - Maintainer scripts (`postinst`, `postrm`, `prerm`) managing `ldconfig`, polkit reload, and `pcscd.socket` activation.
 2. **`refineid-cli`** (`Multi-Arch: foreign`):
    - Command-line tool `/usr/bin/refineid`
