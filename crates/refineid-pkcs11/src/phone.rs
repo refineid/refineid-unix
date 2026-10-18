@@ -25,7 +25,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -60,6 +60,10 @@ const UNPAIRED_PAUSE: Duration = Duration::from_secs(3);
 /// and the phone's card status.
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How long the first slot refresh waits for the thread's first word,
+/// so a host that lists the slots once at load sees the phone's slot.
+const FIRST_WORD_WAIT: Duration = Duration::from_secs(2);
+
 /// A signature request from the browser, answered on the held session.
 struct SignRequest {
     pair_id: RemoteSlotId,
@@ -75,12 +79,26 @@ struct Shared {
     requests: Mutex<Option<Sender<SignRequest>>>,
     stop: AtomicBool,
     context: DisplayText,
+    spoken: (Mutex<bool>, Condvar),
 }
 
 impl Shared {
     fn publish(&self, offer: Option<RemoteOffer>) {
         if let Ok(mut slot) = self.offer.lock() {
             *slot = offer;
+        }
+        let (spoken, word) = &self.spoken;
+        if let Ok(mut spoken) = spoken.lock() {
+            *spoken = true;
+            word.notify_all();
+        }
+    }
+
+    /// Waits until the thread has published once, or `limit` passed.
+    fn await_first_word(&self, limit: Duration) {
+        let (spoken, word) = &self.spoken;
+        if let Ok(guard) = spoken.lock() {
+            let _ = word.wait_timeout_while(guard, limit, |spoken| !*spoken);
         }
     }
 
@@ -120,6 +138,7 @@ impl PhoneSource {
                 requests: Mutex::new(None),
                 stop: AtomicBool::new(false),
                 context: computer_context(),
+                spoken: (Mutex::new(false), Condvar::new()),
             }),
             worker: Mutex::new(None),
         }
@@ -141,6 +160,8 @@ impl PhoneSource {
             .name("refineid-phone".to_owned())
             .spawn(move || serve(&shared, &receiver))
             .ok();
+        drop(worker);
+        self.shared.await_first_word(FIRST_WORD_WAIT);
     }
 }
 
@@ -208,7 +229,8 @@ fn computer_context() -> DisplayText {
     })
 }
 
-/// The session thread: dial, read the certificate, hold, answer.
+/// The session thread: read the record, dial, read the certificate,
+/// hold, answer.
 fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
     while !shared.stopped() {
         let Ok(mut reader) = RemoteReader::open_local_without_sweep() else {
@@ -507,6 +529,24 @@ mod tests {
             RemoteSignError::Unsupported
         );
         assert_eq!(rejection_error(None), RemoteSignError::Unsupported);
+    }
+
+    #[test]
+    fn the_first_word_is_awaited_and_a_later_one_is_not() {
+        let shared = Shared {
+            offer: Mutex::new(None),
+            requests: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
+            spoken: (Mutex::new(false), Condvar::new()),
+        };
+        let started = std::time::Instant::now();
+        shared.await_first_word(Duration::from_millis(50));
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        shared.publish(None);
+        let started = std::time::Instant::now();
+        shared.await_first_word(Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
