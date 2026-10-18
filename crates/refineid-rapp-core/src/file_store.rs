@@ -246,6 +246,7 @@ impl PairingStore for FilePairingStore {
             .ok_or(StoreError::Unknown)?;
         fs::remove_file(path_for(&self.directory, pair_id))
             .map_err(|_| StoreError::WriteRefused)?;
+        crate::addresses::forget(&self.directory, pair_id);
         self.records.remove(index);
         Ok(())
     }

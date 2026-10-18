@@ -18,7 +18,10 @@
 //! consumer that offers the phone's identity holds the session it was
 //! reported on.
 
+use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
+
+use crate::addresses;
 
 use crate::engine::Session;
 use crate::engine::SessionEnd;
@@ -556,7 +559,10 @@ impl RemoteReader {
                         continue;
                     };
                     let mut session = match self.requester.connect(pair_id, transport) {
-                        Ok(session) => session,
+                        Ok(session) => {
+                            self.remember_address(pair_id, &service);
+                            session
+                        }
                         Err(SessionError::ClosedByPeer(CloseReason::ServiceWithdrawn)) => {
                             return Err(RemoteError::Withdrawn);
                         }
@@ -678,7 +684,7 @@ impl RemoteReader {
         // The listening needs no lock; recording the phone's word does,
         // and the holder of the session hears the phone itself, so an
         // observer that cannot take the lock records nothing.
-        match sessions_for(&keys, browse_stream_services(BROWSE_ROUND)) {
+        match sessions_for(&keys, self.browse_for(pair_id)) {
             Err(RemoteError::RevokedByPhone) => {
                 let _lock = take_lock(&session_lock_path(
                     self.requester.store().directory(),
@@ -700,13 +706,33 @@ impl RemoteReader {
         pair_id: PairId,
         keys: &PairingKeys,
     ) -> Result<Vec<StreamService>, RemoteError> {
-        match sessions_for(keys, browse_stream_services(BROWSE_ROUND)) {
+        match sessions_for(keys, self.browse_for(pair_id)) {
             Err(RemoteError::RevokedByPhone) => {
                 self.requester.revoke_announced_by_peer(pair_id);
                 Err(RemoteError::RevokedByPhone)
             }
             other => other,
         }
+    }
+
+    /// One browse round for `pair_id`, asking the phone's remembered
+    /// addresses directly as well as the network.
+    fn browse_for(&self, pair_id: PairId) -> Vec<StreamService> {
+        let remembered = addresses::remembered(self.requester.store().directory(), pair_id);
+        browse_stream_services(BROWSE_ROUND, &remembered)
+    }
+
+    /// Remembers where the phone holding `pair_id` answered from, for the
+    /// next browse.
+    fn remember_address(&self, pair_id: PairId, service: &StreamService) {
+        let Some(address) = service
+            .endpoints
+            .iter()
+            .find_map(|endpoint| endpoint.parse::<SocketAddrV4>().ok())
+        else {
+            return;
+        };
+        addresses::remember(self.requester.store().directory(), pair_id, *address.ip());
     }
 
     /// Opens a session to the phone holding `pair_id`, or the selected
@@ -756,7 +782,10 @@ impl RemoteReader {
                     continue;
                 };
                 let mut session = match self.requester.connect(pair_id, transport) {
-                    Ok(session) => session,
+                    Ok(session) => {
+                        self.remember_address(pair_id, &service);
+                        session
+                    }
                     Err(SessionError::ClosedByPeer(CloseReason::ServiceWithdrawn)) => {
                         return Err(RemoteError::Withdrawn);
                     }
