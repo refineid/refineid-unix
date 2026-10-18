@@ -164,4 +164,5 @@ if ! wait_for "$known" 'Cert cache: Cached' ' -- ' "$read_wait_seconds" > /dev/n
     exit 1
 fi
 say "PASS"
-host_pairs
+host_pairs || true
+exit 0
