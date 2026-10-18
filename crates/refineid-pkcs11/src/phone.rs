@@ -221,19 +221,37 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
             pause(shared, UNPAIRED_PAUSE);
             continue;
         };
+        let Some(slot) = slot_id(&phone) else {
+            shared.publish(None);
+            pause(shared, UNPAIRED_PAUSE);
+            continue;
+        };
+        // The slot stands while the pairing does; its token comes with
+        // the session.
+        shared.publish(Some(offer(slot, &phone, shared, None)));
         match reader.open_session(Some(phone.pair_id), DIAL_TIMEOUT) {
-            Ok(session) => hold(shared, requests, &mut reader, session, &phone),
-            Err(RemoteError::Busy) => {
-                shared.publish(None);
-                pause(shared, BUSY_PAUSE);
-            }
-            Err(_) => {
-                shared.publish(None);
-                pause(shared, REDIAL_PAUSE);
-            }
+            Ok(session) => hold(shared, requests, &mut reader, session, &phone, slot),
+            Err(RemoteError::Busy) => pause(shared, BUSY_PAUSE),
+            Err(_) => pause(shared, REDIAL_PAUSE),
         }
     }
     shared.publish(None);
+}
+
+/// The phone's slot, with its token when a certificate was read on the
+/// open session.
+fn offer(
+    slot: RemoteSlotId,
+    phone: &PairSummary,
+    shared: &Shared,
+    certificate: Option<Vec<u8>>,
+) -> RemoteOffer {
+    RemoteOffer::new(
+        slot,
+        phone.peer_display_name.clone(),
+        shared.context.clone(),
+        certificate.map(SessionCertificate::new),
+    )
 }
 
 /// Keeps `session` while the record stays usable and the phone reports
@@ -244,25 +262,14 @@ fn hold(
     reader: &mut RemoteReader,
     mut session: RemoteSession,
     phone: &PairSummary,
+    slot: RemoteSlotId,
 ) {
     let Ok(certificate) = reader.refresh_auth_cert_on(&mut session) else {
         reader.close_session(session);
-        shared.publish(None);
         pause(shared, REDIAL_PAUSE);
         return;
     };
-    let Some(slot) = slot_id(phone) else {
-        reader.close_session(session);
-        shared.publish(None);
-        pause(shared, UNPAIRED_PAUSE);
-        return;
-    };
-    shared.publish(Some(RemoteOffer::new(
-        slot,
-        phone.peer_display_name.clone(),
-        shared.context.clone(),
-        Some(SessionCertificate::new(certificate)),
-    )));
+    shared.publish(Some(offer(slot, phone, shared, Some(certificate))));
     loop {
         if shared.stopped() {
             reader.close_session(session);
@@ -298,7 +305,7 @@ fn hold(
             }
         }
     }
-    shared.publish(None);
+    shared.publish(Some(offer(slot, phone, shared, None)));
 }
 
 /// Whether the record another program keeps still names `pair_id` as
