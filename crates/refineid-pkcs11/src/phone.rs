@@ -30,6 +30,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use refineid_lib_core::x509::{MessageSignatureAlgorithm, OwnedCert};
 use refineid_pkcs11::remote::{
     RemoteOffer, RemoteSignError, RemoteTokenSource, SessionCertificate,
 };
@@ -305,7 +306,7 @@ fn hold(
             }
         },
     };
-    shared.publish(Some(offer(slot, phone, shared, Some(certificate))));
+    shared.publish(Some(offer(slot, phone, shared, Some(certificate.clone()))));
     loop {
         if shared.stopped() {
             reader.close_session(session);
@@ -316,15 +317,36 @@ fn hold(
                 let _ = request.reply.send(Err(RemoteSignError::Withdrawn));
             }
             Ok(request) => {
-                let answer = answer(reader, &mut session, &request);
-                let lost = matches!(
-                    answer,
-                    Err(RemoteSignError::Unreachable | RemoteSignError::Withdrawn)
-                );
-                let _ = request.reply.send(answer);
-                if lost || !session.card_present() {
-                    reader.close_session(session);
-                    break;
+                let signed = sign(reader, &mut session, &request);
+                match checked(signed, &certificate, &request.request) {
+                    Ok(signature) => {
+                        let _ = request.reply.send(Ok(signature));
+                        if !session.card_present() {
+                            reader.close_session(session);
+                            break;
+                        }
+                    }
+                    // A signature the cached certificate does not verify
+                    // says the card on the phone is not the one cached:
+                    // the token goes, the cache goes, and the next session
+                    // reads the card again.
+                    Err(Failure::Mismatch) => {
+                        let _ = request.reply.send(Err(RemoteSignError::Ambiguous));
+                        let _ = reader.forget_auth_cert(phone.pair_id);
+                        reader.close_session(session);
+                        break;
+                    }
+                    Err(Failure::Sign(error)) => {
+                        let lost = matches!(
+                            error,
+                            RemoteSignError::Unreachable | RemoteSignError::Withdrawn
+                        );
+                        let _ = request.reply.send(Err(error));
+                        if lost || !session.card_present() {
+                            reader.close_session(session);
+                            break;
+                        }
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -371,8 +393,18 @@ fn record_state(pair_id: PairId) -> RecordState {
     }
 }
 
+/// Why a request yielded no signature for the browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// The phone answered with a signature the cached certificate does
+    /// not verify: the card on the phone is not the one cached.
+    Mismatch,
+    /// The phone gave no signature, for the reason the module reports.
+    Sign(RemoteSignError),
+}
+
 /// Runs one signature request on the session.
-fn answer(
+fn sign(
     reader: &mut RemoteReader,
     session: &mut RemoteSession,
     request: &SignRequest,
@@ -382,6 +414,49 @@ fn answer(
         Ok(CardOperationResult::Signature(signature)) => Ok(signature),
         Ok(_) => Err(RemoteSignError::Unsupported),
         Err(error) => Err(sign_error(&error)),
+    }
+}
+
+/// The signature as it may be handed on: checked under the public key
+/// of the certificate the token carries, which this computer does
+/// alone. A profile the module cannot check is reported unsupported and
+/// the cache kept; a signature that does not verify is a mismatch.
+fn checked(
+    signed: Result<Vec<u8>, RemoteSignError>,
+    certificate: &[u8],
+    request: &SignatureRequest,
+) -> Result<Vec<u8>, Failure> {
+    let signature = signed.map_err(Failure::Sign)?;
+    let algorithm = message_algorithm(request.algorithm())
+        .ok_or(Failure::Sign(RemoteSignError::Unsupported))?;
+    let verifies = OwnedCert::from_der(certificate).is_ok_and(|certificate| {
+        certificate
+            .view()
+            .spki
+            .verify_digest_signature(algorithm, request.digest(), &signature)
+            .is_ok()
+    });
+    if verifies {
+        Ok(signature)
+    } else {
+        Err(Failure::Mismatch)
+    }
+}
+
+/// The verification profile of a request's algorithm; the card signs a
+/// digest, and ECDSA comes back as `r || s`.
+const fn message_algorithm(
+    algorithm: RemoteSignatureAlgorithm,
+) -> Option<MessageSignatureAlgorithm> {
+    match algorithm {
+        RemoteSignatureAlgorithm::EcdsaSha256 => Some(MessageSignatureAlgorithm::EcdsaSha256Raw),
+        RemoteSignatureAlgorithm::EcdsaSha384 => Some(MessageSignatureAlgorithm::EcdsaSha384Raw),
+        RemoteSignatureAlgorithm::EcdsaSha512 => Some(MessageSignatureAlgorithm::EcdsaSha512Raw),
+        RemoteSignatureAlgorithm::RsaPkcs1Sha256 => Some(MessageSignatureAlgorithm::RsaPkcs1Sha256),
+        RemoteSignatureAlgorithm::RsaPkcs1Sha384 => Some(MessageSignatureAlgorithm::RsaPkcs1Sha384),
+        RemoteSignatureAlgorithm::RsaPkcs1Sha512 => Some(MessageSignatureAlgorithm::RsaPkcs1Sha512),
+        RemoteSignatureAlgorithm::RsaPssSha256 => Some(MessageSignatureAlgorithm::RsaPssSha256),
+        RemoteSignatureAlgorithm::EcdsaSha224 => None,
     }
 }
 
@@ -579,6 +654,44 @@ mod tests {
         let started = std::time::Instant::now();
         shared.await_first_word(Duration::from_secs(5));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_signature_is_handed_on_only_after_it_verifies_under_the_certificate() {
+        let request = SignatureRequest::new(
+            RemoteKeyProfile::EcdsaP384,
+            RemoteSignatureAlgorithm::EcdsaSha384,
+            vec![7; DIGEST_SHA384_LEN],
+        )
+        .expect("a registered combination");
+        // A signature the certificate cannot vouch for is a mismatch,
+        // never a signature for the browser; here the certificate parses
+        // as nothing, so no signature can verify under it.
+        assert_eq!(
+            checked(Ok(vec![0; 96]), &[], &request),
+            Err(Failure::Mismatch)
+        );
+        // The phone's own refusal passes through and keeps the cache.
+        assert_eq!(
+            checked(Err(RemoteSignError::Cancelled), &[], &request),
+            Err(Failure::Sign(RemoteSignError::Cancelled))
+        );
+        // A profile the module cannot check is unsupported, not a
+        // mismatch.
+        let unchecked = SignatureRequest::new(
+            RemoteKeyProfile::EcdsaP256,
+            RemoteSignatureAlgorithm::EcdsaSha224,
+            vec![7; 28],
+        )
+        .expect("a registered combination");
+        assert_eq!(
+            checked(Ok(vec![0; 64]), &[], &unchecked),
+            Err(Failure::Sign(RemoteSignError::Unsupported))
+        );
+        assert_eq!(
+            message_algorithm(RemoteSignatureAlgorithm::EcdsaSha384),
+            Some(MessageSignatureAlgorithm::EcdsaSha384Raw)
+        );
     }
 
     #[test]
