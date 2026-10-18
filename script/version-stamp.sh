@@ -14,7 +14,7 @@
 # permissions and limitations under the License.
 
 # Stamp the project version across the tree. The canonical version is
-# CalVer YY.M.D.B, where B is a within-day 10-minute bucket
+# CalVer YY.M.D.HHMM, where HHMM is the UTC time of day of the stamp
 # (hour*10 + minute/10, 0..235). Updates:
 #   VERSION                 canonical four-component string
 #   .cargo/config.toml      REFINEID_VERSION (compiled into binaries)
@@ -25,10 +25,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-read -r year month day hour minute < <(date -u '+%y %-m %-d %-H %-M')
+read -r year month day hour minute < <(date -u '+%y %-m %-d %H %M')
 today="$year.$month.$day"
-time_bucket=$((10#$hour * 10 + 10#$minute / 10))
-project_version="$today.$time_bucket"
+time_of_day="$hour$minute"
+project_version="$today.$time_of_day"
 old=$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml | head -n 1)
 [ -n "$old" ] || { echo "version-stamp: no workspace version" >&2; exit 1; }
 old_project=$(tr -d '\n' < VERSION)
@@ -47,10 +47,6 @@ for component in "$@"; do
         exit 1
     }
 done
-[ "$time_bucket" -le 255 ] || {
-    echo "version-stamp: time bucket $time_bucket exceeds PKCS#11 byte range" >&2
-    exit 1
-}
 
 printf '%s\n' "$project_version" > VERSION
 
