@@ -22,7 +22,12 @@ use refineid_gui_fltk::FltkDriver;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize presentation driver and state notification channel
-    let (driver, on_state_change) = FltkDriver::create();
+    let (mut driver, on_state_change) = FltkDriver::create();
+    // `--pair` opens the Phone tab with the code boxes focused, so a
+    // pairing can be typed straight away, by a person or by a test.
+    if std::env::args().any(|argument| argument == "--pair") {
+        driver.open_on_phone_tab();
+    }
 
     // 2. Initialize controller with dialogue state management
     let controller = RefineIdController::new(on_state_change);

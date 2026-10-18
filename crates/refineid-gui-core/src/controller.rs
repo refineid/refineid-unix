@@ -123,6 +123,44 @@ impl RefineIdController {
         thread::spawn(move || {
             controller.run_presence_monitor();
         });
+        let controller = Arc::clone(self);
+        thread::spawn(move || {
+            controller.run_certificate_fetcher();
+        });
+    }
+
+    /// Reads the authentication certificate of every paired phone that
+    /// has none cached yet, whenever the phone is on the network, so a
+    /// pairing whose first read did not reach the phone serves once the
+    /// phone is back.
+    fn run_certificate_fetcher(self: &Arc<Self>) {
+        while !self.presence_stop.load(Ordering::Acquire) {
+            let missing: Vec<PairId> = self
+                .state()
+                .phones
+                .iter()
+                .filter(|phone| phone.state.usable() && !phone.certificate_cached)
+                .map(|phone| phone.pair_id)
+                .collect();
+            let mut fetched = false;
+            if !missing.is_empty()
+                && let Ok(mut reader) = RemoteReader::open_local()
+            {
+                for pair_id in missing {
+                    if reader
+                        .refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT)
+                        .is_ok()
+                    {
+                        fetched = true;
+                    }
+                }
+            }
+            if fetched {
+                self.refresh_phones();
+                self.refresh_cards();
+            }
+            thread::sleep(CERTIFICATE_FETCH_INTERVAL);
+        }
     }
 
     /// Stop the background card presence monitor.
@@ -796,6 +834,10 @@ impl RefineIdController {
 
 /// How long pairing browses for the phone showing the code.
 const PAIRING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long one certificate fetch browses for a paired phone.
+const CERTIFICATE_FETCH_TIMEOUT: Duration = Duration::from_secs(6);
+/// The pause between rounds of certificate fetches.
+const CERTIFICATE_FETCH_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The status line after a pairing: nothing when the card was read,
 /// otherwise what stands between the user and the card.
