@@ -182,7 +182,7 @@ pub trait UiDriver: Send + 'static {
 - `QueueDocuments(Vec<PathBuf>)` and `ClearDocuments`
 - `ExecuteSign { pin2: PinBytes, format: SignFormat, timestamp_config: TimestampConfig }`
 - `StartPairing { code }` and `CancelPairing`
-- `ForgetPhone(PairId)` and `RefreshPhones`
+- `ForgetPhone(PairId)`
 
 ### 4.3 Workstation UX Hygiene Contract
 

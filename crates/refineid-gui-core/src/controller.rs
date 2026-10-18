@@ -66,6 +66,7 @@ pub struct RefineIdController {
     image_cache: Mutex<HashMap<String, CachedImages>>,
     presence_stop: AtomicBool,
     inspection_in_flight: AtomicBool,
+    pairing_cancel: AtomicBool,
     on_state_change: Box<dyn Fn(&UiState) + Send + Sync + 'static>,
 }
 
@@ -88,6 +89,7 @@ impl RefineIdController {
             image_cache: Mutex::new(HashMap::new()),
             presence_stop: AtomicBool::new(false),
             inspection_in_flight: AtomicBool::new(false),
+            pairing_cancel: AtomicBool::new(false),
             on_state_change: Box::new(on_state_change),
         })
     }
@@ -344,7 +346,12 @@ impl RefineIdController {
             let cards = refineid_client::card_manager::inspect_cards(None)
                 .map(|reports| deduplicate_cards(reports, include_phones))
                 .unwrap_or_default();
-            if inspection_settled(signature, cards.iter().any(|card| !is_phone_card(card)))
+            let readers: Vec<&str> = cards
+                .iter()
+                .filter(|card| !is_phone_card(card))
+                .map(|card| card.report.reader.as_str())
+                .collect();
+            if inspection_settled(signature, &readers)
                 || attempt >= CARD_SETTLE_RETRIES
                 || self.presence_stop.load(Ordering::Acquire)
             {
@@ -726,6 +733,7 @@ impl RefineIdController {
             });
             return;
         };
+        self.pairing_cancel.store(false, Ordering::Release);
         self.update_state(|s| {
             s.pairing = Some(RappPairingState {
                 code: format_pairing_code(&normalized),
@@ -745,8 +753,19 @@ impl RefineIdController {
                     return;
                 }
             };
-            let pair = match reader.pair_with_code(&normalized, PAIRING_DISCOVERY_TIMEOUT) {
+            let pair = match reader.pair_with_code(
+                &normalized,
+                PAIRING_DISCOVERY_TIMEOUT,
+                &controller.pairing_cancel,
+            ) {
                 Ok(pair) => pair,
+                Err(RemoteError::Cancelled) => {
+                    controller.update_state(|s| {
+                        s.pairing = None;
+                        s.status_message = String::new();
+                    });
+                    return;
+                }
                 Err(RemoteError::Pairing(
                     refineid_rapp_core::engine::PairingError::CodeMismatch,
                 )) => {
@@ -782,12 +801,14 @@ impl RefineIdController {
         });
     }
 
-    /// Clears the pairing display. A ceremony under way ends at the phone,
-    /// and its outcome is applied when it does.
+    /// Stops the search for the phone. A ceremony that has reached the
+    /// phone runs to its end, and the display clears when it does.
     fn cancel_pairing(&self) {
+        self.pairing_cancel.store(true, Ordering::Release);
         self.update_state(|s| {
-            s.pairing = None;
-            s.status_message = String::new();
+            if let Some(p) = &mut s.pairing {
+                p.status = "Stopping".into();
+            }
         });
     }
 }
@@ -807,10 +828,12 @@ fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String
     }
 }
 
-/// Whether an inspection agrees with the presence signature: either a
-/// local card was found, or no reader reports one.
-fn inspection_settled(signature: &[(String, bool)], found_local_card: bool) -> bool {
-    found_local_card || !signature.iter().any(|(_, present)| *present)
+/// Whether an inspection agrees with the presence signature: every reader
+/// that reports a card is among `readers`, the readers a card was found in.
+fn inspection_settled(signature: &[(String, bool)], readers: &[&str]) -> bool {
+    signature
+        .iter()
+        .all(|(reader, present)| !present || readers.contains(&reader.as_str()))
 }
 
 /// Whether a managed card is served by a paired phone rather than a reader.
@@ -971,10 +994,13 @@ mod tests {
     fn an_inspection_settles_when_it_agrees_with_the_readers() {
         let card_in_reader = vec![("Reader".to_owned(), true)];
         let empty_reader = vec![("Reader".to_owned(), false)];
-        assert!(inspection_settled(&card_in_reader, true));
-        assert!(!inspection_settled(&card_in_reader, false));
-        assert!(inspection_settled(&empty_reader, false));
-        assert!(inspection_settled(&[], false));
+        let two_readers = vec![("Reader".to_owned(), true), ("Second".to_owned(), true)];
+        assert!(inspection_settled(&card_in_reader, &["Reader"]));
+        assert!(!inspection_settled(&card_in_reader, &[]));
+        assert!(inspection_settled(&empty_reader, &[]));
+        assert!(inspection_settled(&[], &[]));
+        assert!(!inspection_settled(&two_readers, &["Reader"]));
+        assert!(inspection_settled(&two_readers, &["Second", "Reader"]));
     }
 
     #[test]
