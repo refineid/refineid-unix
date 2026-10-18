@@ -160,11 +160,20 @@ FreeBSD names only the proxy.
 
 Each pairing's private key is kept in the desktop's Secret Service
 (`secret-tool` from `libsecret`), so a provider must run in the session:
-`gnome-keyring` is the one installed above. It starts with the Xfce
-session through its autostart entries and keeps its keyring unlocked
-when the keyring password is the login password or empty. Pairing
-refuses to start when the service does not answer, before the phone's
-code is spent.
+`gnome-keyring` is the one installed above. Its autostart entries are
+for GNOME only, so on Xfce the display manager starts it through PAM
+and unlocks the login keyring with the login password. Append to
+`/usr/local/etc/pam.d/lightdm`:
+
+```
+auth      optional  /usr/local/lib/pam_gnome_keyring.so
+session   optional  /usr/local/lib/pam_gnome_keyring.so auto_start
+```
+
+The login keyring is created at the next login when none exists; a
+keyring with another password asks for it on first use. Pairing refuses
+to start when the service does not answer, before the phone's code is
+spent.
 
 The RefineID desktop application and `refineid pair` must run inside the
 desktop session (with `DBUS_SESSION_BUS_ADDRESS` set), not over a plain

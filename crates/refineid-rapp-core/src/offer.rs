@@ -39,19 +39,30 @@ pub fn normalize_pairing_code(input: &str) -> Option<String> {
         if !character.is_ascii() {
             return None;
         }
-        let upper = character.to_ascii_uppercase();
-        let mapped = match upper {
-            ' ' | '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | '-' => continue,
-            'I' | 'L' => '1',
-            'O' => '0',
-            other => other,
-        };
-        if !CODE_ALPHABET.contains(mapped) {
-            return None;
+        if matches!(
+            character,
+            ' ' | '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | '-'
+        ) {
+            continue;
         }
-        code.push(mapped);
+        code.push(pairing_code_character(character)?);
     }
     (code.len() == PAIRING_CODE_LENGTH).then_some(code)
+}
+
+/// The code character a typed character stands for: its uppercase form
+/// with the Crockford aliases applied, or `None` outside the alphabet.
+#[must_use]
+pub fn pairing_code_character(character: char) -> Option<char> {
+    if !character.is_ascii() {
+        return None;
+    }
+    let mapped = match character.to_ascii_uppercase() {
+        'I' | 'L' => '1',
+        'O' => '0',
+        other => other,
+    };
+    CODE_ALPHABET.contains(mapped).then_some(mapped)
 }
 
 /// Formats a normalized code in two-character clusters (`7K X4 M9`).
@@ -81,6 +92,16 @@ pub fn offer_from_bootstrap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_character_maps_to_its_code_character() {
+        assert_eq!(pairing_code_character('k'), Some('K'));
+        assert_eq!(pairing_code_character('l'), Some('1'));
+        assert_eq!(pairing_code_character('o'), Some('0'));
+        assert_eq!(pairing_code_character('U'), None);
+        assert_eq!(pairing_code_character(' '), None);
+        assert_eq!(pairing_code_character('ä'), None);
+    }
 
     #[test]
     fn normalization_follows_section_3_1() {

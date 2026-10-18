@@ -81,8 +81,7 @@ impl PairArgs {
             "Looking for the phone showing {} on the local network...",
             format_pairing_code(&normalized)
         );
-        let never = std::sync::atomic::AtomicBool::new(false);
-        let pair = match reader.pair_with_code(&normalized, DISCOVERY_TIMEOUT, &never) {
+        let pair = match reader.pair_with_code(&normalized, DISCOVERY_TIMEOUT) {
             Ok(pair) => pair,
             Err(RemoteError::Pairing(refineid_rapp_core::engine::PairingError::CodeMismatch)) => {
                 eprintln!("Pairing failed: the code does not match the one on the phone.");

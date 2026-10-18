@@ -423,8 +423,6 @@ pub enum UserIntent {
         /// The code as the user typed it.
         code: String,
     },
-    /// Cancel active RAPP pairing.
-    CancelPairing,
     /// Forget one paired phone.
     ForgetPhone(PairId),
 }

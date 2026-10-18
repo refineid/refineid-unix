@@ -66,7 +66,6 @@ pub struct RefineIdController {
     image_cache: Mutex<HashMap<String, CachedImages>>,
     presence_stop: AtomicBool,
     inspection_in_flight: AtomicBool,
-    pairing_cancel: AtomicBool,
     on_state_change: Box<dyn Fn(&UiState) + Send + Sync + 'static>,
 }
 
@@ -89,7 +88,6 @@ impl RefineIdController {
             image_cache: Mutex::new(HashMap::new()),
             presence_stop: AtomicBool::new(false),
             inspection_in_flight: AtomicBool::new(false),
-            pairing_cancel: AtomicBool::new(false),
             on_state_change: Box::new(on_state_change),
         })
     }
@@ -156,7 +154,6 @@ impl RefineIdController {
             UserIntent::SetTimestampConfig(config) => self.set_timestamp_config(config),
             UserIntent::SignDocuments { pin2 } => self.sign_documents(pin2),
             UserIntent::StartPairing { code } => self.start_pairing(&code),
-            UserIntent::CancelPairing => self.cancel_pairing(),
             UserIntent::ForgetPhone(pair_id) => self.forget_phone(pair_id),
         }
     }
@@ -733,7 +730,6 @@ impl RefineIdController {
             });
             return;
         };
-        self.pairing_cancel.store(false, Ordering::Release);
         self.update_state(|s| {
             s.pairing = Some(RappPairingState {
                 code: format_pairing_code(&normalized),
@@ -753,19 +749,8 @@ impl RefineIdController {
                     return;
                 }
             };
-            let pair = match reader.pair_with_code(
-                &normalized,
-                PAIRING_DISCOVERY_TIMEOUT,
-                &controller.pairing_cancel,
-            ) {
+            let pair = match reader.pair_with_code(&normalized, PAIRING_DISCOVERY_TIMEOUT) {
                 Ok(pair) => pair,
-                Err(RemoteError::Cancelled) => {
-                    controller.update_state(|s| {
-                        s.pairing = None;
-                        s.status_message = String::new();
-                    });
-                    return;
-                }
                 Err(RemoteError::Pairing(
                     refineid_rapp_core::engine::PairingError::CodeMismatch,
                 )) => {
@@ -798,17 +783,6 @@ impl RefineIdController {
             });
             controller.refresh_phones();
             controller.refresh_cards();
-        });
-    }
-
-    /// Stops the search for the phone. A ceremony that has reached the
-    /// phone runs to its end, and the display clears when it does.
-    fn cancel_pairing(&self) {
-        self.pairing_cancel.store(true, Ordering::Release);
-        self.update_state(|s| {
-            if let Some(p) = &mut s.pairing {
-                p.status = "Stopping".into();
-            }
         });
     }
 }
