@@ -17,8 +17,8 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use refineid_rapp::{
-    DiscoveryKey, DiscoveryRecord, InstanceName, PreambleError, SessionRouting, TransportProfile,
-    WithdrawalKey, WithdrawnRecord, discovery_epoch, withdrawal_counter,
+    DiscoveryKey, DiscoveryRecord, InstanceName, PreambleError, RevocationKey, SessionRouting,
+    TransportProfile, WithdrawalKey, WithdrawnRecord, discovery_epoch, withdrawal_counter,
 };
 
 use crate::transport::{FrameTransport, TcpFrameTransport, TransportError};
@@ -110,6 +110,20 @@ impl StreamService {
         } else {
             HintMatch::Other
         }
+    }
+
+    /// Whether this session record's `revoked` entries announce, for this
+    /// instance at `unix_seconds`, that the custodian forgot the pairing
+    /// keyed by `key` (RAPP v26.10.18 section 4.6 item 5).
+    #[must_use]
+    pub fn revokes(&self, key: &RevocationKey, unix_seconds: u64) -> bool {
+        let (Ok(record), Ok(instance)) = (
+            DiscoveryRecord::parse(&self.entries()),
+            InstanceName::new(&self.instance),
+        ) else {
+            return false;
+        };
+        key.matches(&record, &instance, discovery_epoch(unix_seconds))
     }
 
     /// Whether this is a withdrawn record that announces the pairing keyed

@@ -1,6 +1,6 @@
 //! Pair private keys in the desktop's secret store.
 //!
-//! RAPP v26.10.10 section 4.3.4 keeps each pairing's static private key in
+//! RAPP v26.10.18 section 4.3.4 keeps each pairing's static private key in
 //! platform-encrypted secure storage. On Linux and the BSDs that is the
 //! freedesktop Secret Service (GNOME Keyring, `KWallet`, `KeePassXC`). This
 //! module reaches it through `secret-tool`, the libsecret command-line

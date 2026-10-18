@@ -3,7 +3,7 @@
 //! A pairing record is the atomic result of pairing: pair keys, `pair_id`,
 //! granted profiles, `grants_hash`, labels, and the
 //! fail-stop marker. The journal records each operation from the moment its
-//! request is written (RAPP v26.10.10 section 8): an unanswered consequential
+//! request is written (RAPP v26.10.18 section 8): an unanswered consequential
 //! request is in flight and ends ambiguous, and terminal states are
 //! permanent.
 //!
@@ -20,8 +20,12 @@ pub use refineid_rapp::OperationState;
 /// The fail-stop disposition of a stored pairing (Section 14.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairingDisposition {
-    /// The pairing is usable.
+    /// The pairing is usable: both endpoints confirmed storing it.
     Paired,
+    /// The record was stored before the peer confirmed its own storage
+    /// (RAPP v26.10.18 section 4.3 item 4). It opens no session and is
+    /// never dialed; one found at start-up is revoked.
+    Unconfirmed,
     /// The pairing was terminated — by local action, authenticated peer
     /// notice, an authenticated protocol violation, or credential rejection.
     /// Keys are destroyed; the record is the tombstone.
@@ -144,7 +148,11 @@ impl PairingRecord {
             grants_hash: *core.grants_hash().as_bytes(),
             peer_display_name,
             peer_platform,
-            disposition: PairingDisposition::Paired,
+            disposition: if core.is_storage_confirmed() {
+                PairingDisposition::Paired
+            } else {
+                PairingDisposition::Unconfirmed
+            },
             peer_initiated_termination: false,
             candidate_failures: 0,
             auth_cert: None,

@@ -165,7 +165,15 @@ impl PairsArgs {
                 idx + 1,
                 pair.peer_display_name,
                 pair.peer_platform,
-                if pair.revoked { " -- revoked" } else { "" }
+                if pair.forgotten_by_phone {
+                    " -- the phone forgot this computer; pair again"
+                } else if pair.revoked {
+                    " -- revoked"
+                } else if pair.unconfirmed {
+                    " -- pairing unconfirmed; pair again"
+                } else {
+                    ""
+                }
             );
             println!("      Pair ID:    {}", pair.pair_id_hex());
             println!("      Profiles:   {}", pair.granted_profiles.join(", "));

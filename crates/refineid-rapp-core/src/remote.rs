@@ -9,10 +9,18 @@
 //! next one is tried. A withdrawn record announcing the pairing, or a session
 //! close carrying `service_withdrawn`, ends the search at once; the
 //! withdrawn instance is never dialed, and the pairing is dialed again only
-//! when a session record on another instance names it.
+//! when a session record on another instance names it. A session record
+//! whose `revoked` entries name the pairing is the phone's word that it
+//! forgot this computer: the pairing is revoked here and the user told.
+//!
+//! An open session reports whether the phone can serve a card (section
+//! 8.4); an operation is sent only on a session that reports one, and a
+//! consumer that offers the phone's identity holds the session it was
+//! reported on.
 
 use std::time::{Duration, Instant};
 
+use crate::engine::Session;
 use crate::engine::SessionEnd;
 use crate::engine::{
     AdmissionError, OperationOutcome, PairingError, Reconciliation, Requester, RequesterConfig,
@@ -30,7 +38,8 @@ use crate::stream::{
     DiscoveryMode, HintMatch, RoutingPreamble, STREAM_CANDIDATE_ID, StreamService, browse,
     browse_stream_services, dial,
 };
-use refineid_rapp::{DiscoveryKey, RoutingKey, TransportProfile, WithdrawalKey};
+use crate::transport::TcpFrameTransport;
+use refineid_rapp::{DiscoveryKey, RevocationKey, RoutingKey, TransportProfile, WithdrawalKey};
 
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
@@ -48,10 +57,14 @@ struct PairingKeys {
     discovery: DiscoveryKey,
     routing: RoutingKey,
     withdrawal: WithdrawalKey,
+    revocation: RevocationKey,
 }
 
 impl PairingKeys {
     fn derive(record: &PairingRecord) -> Result<Self, RemoteError> {
+        if record.disposition != PairingDisposition::Paired {
+            return Err(RemoteError::NotPaired);
+        }
         let core = record
             .to_core_pair_record()
             .map_err(|_| RemoteError::NotPaired)?;
@@ -59,6 +72,7 @@ impl PairingKeys {
             discovery: DiscoveryKey::derive(&core).map_err(|_| RemoteError::NotPaired)?,
             routing: RoutingKey::derive(&core).map_err(|_| RemoteError::NotPaired)?,
             withdrawal: WithdrawalKey::derive(&core).map_err(|_| RemoteError::NotPaired)?,
+            revocation: RevocationKey::derive(&core).map_err(|_| RemoteError::NotPaired)?,
         })
     }
 
@@ -86,13 +100,21 @@ fn unix_seconds() -> u64 {
 /// for the pairing.
 ///
 /// # Errors
-/// [`RemoteError::Withdrawn`] when a custodian announced its withdrawal for
-/// the pairing and no session record on another instance names it.
+/// [`RemoteError::RevokedByPhone`] when a session record announces that
+/// the custodian forgot the pairing, and [`RemoteError::Withdrawn`] when a
+/// custodian announced its withdrawal for the pairing and no session record
+/// on another instance names it.
 fn sessions_for(
     keys: &PairingKeys,
     services: Vec<StreamService>,
 ) -> Result<Vec<StreamService>, RemoteError> {
     let now = unix_seconds();
+    if services
+        .iter()
+        .any(|service| service.revokes(&keys.revocation, now))
+    {
+        return Err(RemoteError::RevokedByPhone);
+    }
     let withdrawn: Vec<String> = services
         .iter()
         .filter(|service| service.withdraws(&keys.withdrawal, now))
@@ -150,6 +172,11 @@ pub enum RemoteError {
     NotFound,
     /// The phone announced that it stopped serving the pairing.
     Withdrawn,
+    /// The phone announced that it forgot this computer; the pairing is
+    /// revoked here and the user pairs again.
+    RevokedByPhone,
+    /// The phone opened the session but reports no card it can serve.
+    CardAbsent,
     /// The system random source failed.
     RandomUnavailable,
     /// Pairing failed.
@@ -173,6 +200,8 @@ impl core::fmt::Display for RemoteError {
             Self::NotPaired => f.write_str("no paired phone"),
             Self::NotFound => f.write_str("no phone found on the local network"),
             Self::Withdrawn => f.write_str("the phone turned remote card access off"),
+            Self::RevokedByPhone => f.write_str("the phone forgot this computer; pair it again"),
+            Self::CardAbsent => f.write_str("the phone has no card on it"),
             Self::RandomUnavailable => f.write_str("the system random source failed"),
             Self::Pairing(error) => write!(f, "pairing: {error}"),
             Self::Session(error) => write!(f, "session: {error}"),
@@ -199,9 +228,23 @@ pub struct PairSummary {
     pub auth_cert: Option<Vec<u8>>,
     /// Whether the pairing is revoked.
     pub revoked: bool,
+    /// Whether the record was stored before the phone confirmed its own
+    /// storage (section 4.3 item 4): it opens no session until pairing
+    /// is run again.
+    pub unconfirmed: bool,
+    /// Whether the phone ended the pairing: it forgot this computer, or
+    /// rejected the credential (section 4.6).
+    pub forgotten_by_phone: bool,
 }
 
 impl PairSummary {
+    /// Whether the pairing can open a session: neither revoked nor
+    /// unconfirmed.
+    #[must_use]
+    pub const fn usable(&self) -> bool {
+        !self.revoked && !self.unconfirmed
+    }
+
     /// The pair identifier as lowercase hex.
     #[must_use]
     pub fn pair_id_hex(&self) -> String {
@@ -217,6 +260,27 @@ impl PairSummary {
 #[derive(Debug)]
 pub struct RemoteReader {
     requester: Requester<FilePairingStore, FileOperationJournal>,
+}
+
+/// One open session to a phone that reported a card it can serve.
+#[derive(Debug)]
+pub struct RemoteSession {
+    session: Session<TcpFrameTransport>,
+}
+
+impl RemoteSession {
+    /// Whether the phone still reports a card it can serve.
+    #[must_use]
+    pub fn card_present(&self) -> bool {
+        self.session.card_present() == Some(true)
+    }
+
+    /// Whether the phone reported its consent view on screen during the
+    /// last operation.
+    #[must_use]
+    pub const fn consent_shown(&self) -> bool {
+        self.session.consent_shown()
+    }
 }
 
 /// The platform label this workstation introduces itself with.
@@ -261,16 +325,16 @@ impl RemoteReader {
         store: FilePairingStore,
         journal: FileOperationJournal,
     ) -> Self {
-        Self {
-            requester: Requester::new(
-                RequesterConfig {
-                    display_name: display_name.to_owned(),
-                    platform: platform.to_owned(),
-                },
-                store,
-                journal,
-            ),
-        }
+        let mut requester = Requester::new(
+            RequesterConfig {
+                display_name: display_name.to_owned(),
+                platform: platform.to_owned(),
+            },
+            store,
+            journal,
+        );
+        requester.revoke_unconfirmed_pairings();
+        Self { requester }
     }
 
     /// Every stored pairing, newest first.
@@ -288,14 +352,17 @@ impl RemoteReader {
                 granted_profiles: record.granted_profiles.clone(),
                 auth_cert: record.auth_cert.clone(),
                 revoked: record.disposition == PairingDisposition::Revoked,
+                unconfirmed: record.disposition == PairingDisposition::Unconfirmed,
+                forgotten_by_phone: record.disposition == PairingDisposition::Revoked
+                    && record.peer_initiated_termination,
             })
             .collect()
     }
 
-    /// The newest pairing that is not revoked.
+    /// The newest pairing that can open a session.
     #[must_use]
     pub fn selected(&self) -> Option<PairSummary> {
-        self.pairs().into_iter().find(|pair| !pair.revoked)
+        self.pairs().into_iter().find(PairSummary::usable)
     }
 
     /// Forgets one pairing locally.
@@ -355,7 +422,7 @@ impl RemoteReader {
             let deadline = Instant::now() + discovery_timeout;
             let mut answer = Err(RemoteError::NotFound);
             'search: while Instant::now() < deadline {
-                for service in sessions_for(&keys, browse_stream_services(BROWSE_ROUND))? {
+                for service in self.sessions_for(pair_id, &keys)? {
                     let Ok(transport) = dial(
                         &service.endpoints,
                         STREAM_CANDIDATE_ID,
@@ -368,6 +435,9 @@ impl RemoteReader {
                         Ok(session) => session,
                         Err(SessionError::ClosedByPeer(CloseReason::ServiceWithdrawn)) => {
                             return Err(RemoteError::Withdrawn);
+                        }
+                        Err(SessionError::ClosedByPeer(CloseReason::PairingRevoked)) => {
+                            return Err(RemoteError::RevokedByPhone);
                         }
                         Err(error) => {
                             answer = Err(RemoteError::Session(error));
@@ -447,19 +517,41 @@ impl RemoteReader {
         Err(last)
     }
 
-    /// Runs one operation against the phone holding `pair_id`, or the
-    /// selected pairing when `None`, browsing until `discovery_timeout`
-    /// passes.
+    /// The session custodians worth dialing for `pair_id`, applying the
+    /// phone's announcements: a withdrawal ends the search, and a
+    /// revocation revokes the pairing here before reporting it.
+    fn sessions_for(
+        &mut self,
+        pair_id: PairId,
+        keys: &PairingKeys,
+    ) -> Result<Vec<StreamService>, RemoteError> {
+        match sessions_for(keys, browse_stream_services(BROWSE_ROUND)) {
+            Err(RemoteError::RevokedByPhone) => {
+                self.requester.revoke_announced_by_peer(pair_id);
+                Err(RemoteError::RevokedByPhone)
+            }
+            other => other,
+        }
+    }
+
+    /// Opens a session to the phone holding `pair_id`, or the selected
+    /// pairing when `None`, browsing until `discovery_timeout` passes, and
+    /// waits for the phone's word on its card (section 8.4). A phone that
+    /// first reports no card is given the rest of `discovery_timeout` to
+    /// report one, so a card tapped after the dial still serves.
+    ///
+    /// A consumer that offers the phone's identity keeps the session for
+    /// as long as it offers it: the offer is withdrawn with the session.
     ///
     /// # Errors
-    /// [`RemoteError`] when no pairing matches, no phone opens a session for
-    /// it, or the operation ends without a result.
-    pub fn execute(
+    /// [`RemoteError`] when no pairing matches, no phone opens a session
+    /// for it, the phone forgot this computer, or no card is reported
+    /// before the timeout.
+    pub fn open_session(
         &mut self,
         pair_id: Option<PairId>,
-        operation: &CardOperation,
         discovery_timeout: Duration,
-    ) -> Result<CardOperationResult, RemoteError> {
+    ) -> Result<RemoteSession, RemoteError> {
         let pair_id = match pair_id {
             Some(pair_id) => pair_id,
             None => self.selected().ok_or(RemoteError::NotPaired)?.pair_id,
@@ -469,14 +561,11 @@ impl RemoteReader {
             .store()
             .get(pair_id)
             .map_err(|_| RemoteError::NotPaired)?;
-        if record.disposition != PairingDisposition::Paired {
-            return Err(RemoteError::NotPaired);
-        }
         let keys = PairingKeys::derive(record)?;
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
-            for service in sessions_for(&keys, browse_stream_services(BROWSE_ROUND))? {
+            for service in self.sessions_for(pair_id, &keys)? {
                 let Ok(transport) = dial(
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
@@ -490,23 +579,91 @@ impl RemoteReader {
                     Err(SessionError::ClosedByPeer(CloseReason::ServiceWithdrawn)) => {
                         return Err(RemoteError::Withdrawn);
                     }
+                    Err(SessionError::ClosedByPeer(CloseReason::PairingRevoked)) => {
+                        return Err(RemoteError::RevokedByPhone);
+                    }
                     Err(error) => {
                         last = RemoteError::Session(error);
                         continue;
                     }
                 };
-                let outcome =
-                    self.requester
-                        .execute(&mut session, operation, OPERATION_LIFETIME_MS);
-                let withdrawn = withdrawn_by(
-                    Requester::<FilePairingStore, FileOperationJournal>::session_end(&session),
-                );
-                self.requester
-                    .disconnect(&mut session, CloseReason::Complete);
-                return operation_result(outcome, withdrawn);
+                let reported = match self.requester.await_card_status(&mut session) {
+                    Ok(true) => Ok(true),
+                    Ok(false) => self.requester.await_card_present(
+                        &mut session,
+                        deadline.saturating_duration_since(Instant::now()),
+                    ),
+                    Err(error) => Err(error),
+                };
+                match reported {
+                    Ok(true) => return Ok(RemoteSession { session }),
+                    Ok(false) => {
+                        self.requester.disconnect(&mut session, CloseReason::Normal);
+                        return Err(RemoteError::CardAbsent);
+                    }
+                    Err(SessionError::ClosedByPeer(CloseReason::ServiceWithdrawn)) => {
+                        return Err(RemoteError::Withdrawn);
+                    }
+                    Err(SessionError::ClosedByPeer(CloseReason::PairingRevoked)) => {
+                        return Err(RemoteError::RevokedByPhone);
+                    }
+                    Err(error) => {
+                        last = RemoteError::Session(error);
+                        continue;
+                    }
+                }
             }
         }
         Err(last)
+    }
+
+    /// Runs one operation on an open session.
+    ///
+    /// # Errors
+    /// [`RemoteError`] when the phone reports no card, the operation cannot
+    /// be admitted, or it ends without a result.
+    pub fn execute_on(
+        &mut self,
+        session: &mut RemoteSession,
+        operation: &CardOperation,
+    ) -> Result<CardOperationResult, RemoteError> {
+        if session.session.card_present() != Some(true) {
+            return Err(RemoteError::CardAbsent);
+        }
+        let outcome =
+            self.requester
+                .execute(&mut session.session, operation, OPERATION_LIFETIME_MS);
+        let withdrawn = withdrawn_by(
+            Requester::<FilePairingStore, FileOperationJournal>::session_end(&session.session),
+        );
+        operation_result(outcome, withdrawn)
+    }
+
+    /// Closes a session deliberately; an already ended session is left
+    /// as it ended.
+    pub fn close_session(&mut self, mut session: RemoteSession) {
+        self.requester
+            .disconnect(&mut session.session, CloseReason::Complete);
+    }
+
+    /// Runs one operation against the phone holding `pair_id`, or the
+    /// selected pairing when `None`, browsing until `discovery_timeout`
+    /// passes, on a session opened and closed for it.
+    ///
+    /// # Errors
+    /// [`RemoteError`] when no pairing matches, no phone opens a session for
+    /// it, the phone reports no card, or the operation ends without a
+    /// result.
+    pub fn execute(
+        &mut self,
+        pair_id: Option<PairId>,
+        operation: &CardOperation,
+        discovery_timeout: Duration,
+    ) -> Result<CardOperationResult, RemoteError> {
+        let mut session = self.open_session(pair_id, discovery_timeout)?;
+        let result = self.execute_on(&mut session, operation);
+        self.close_session(session);
+        result
     }
 
     /// Reads the authentication certificate through the phone and caches it
@@ -548,8 +705,9 @@ impl RemoteReader {
 )]
 mod tests {
     use refineid_rapp::{
-        AnnouncementCandidate, DiscoveryKey, InstanceName, PairId, RoutingKey, WithdrawalKey,
-        WithdrawnRecord, discovery_epoch, withdrawal_counter,
+        AnnouncementCandidate, DiscoveryKey, DiscoveryRecord, InstanceName, PairId, RevocationKey,
+        RevokedAnnouncement, RoutingKey, WithdrawalKey, WithdrawnRecord, discovery_epoch,
+        withdrawal_counter,
     };
 
     use super::{
@@ -568,7 +726,26 @@ mod tests {
             discovery: DiscoveryKey::from_parts(pair_id, &local, &PEER_PUBLIC).unwrap(),
             routing: RoutingKey::from_parts(pair_id, &local, &PEER_PUBLIC).unwrap(),
             withdrawal: WithdrawalKey::from_parts(pair_id, &local, &PEER_PUBLIC).unwrap(),
+            revocation: RevocationKey::from_parts(pair_id, &local, &PEER_PUBLIC).unwrap(),
         }
+    }
+
+    /// A session record on `instance` whose `revoked` entries name the
+    /// pairing keyed by `key` (section 4.6 item 4).
+    fn revoking(instance: &str, key: &RevocationKey) -> StreamService {
+        let name = InstanceName::new(instance).unwrap();
+        let candidate = AnnouncementCandidate {
+            hint: key.hint(&name, discovery_epoch(unix_seconds())),
+            last_used_ms: 1,
+        };
+        let announcement = RevokedAnnouncement::assemble(&[candidate], |bytes| {
+            getrandom::fill(bytes).map_err(|_| refineid_rapp::RevocationError::RandomUnavailable)
+        })
+        .unwrap();
+        service(
+            instance,
+            &DiscoveryRecord::assemble(&[], Some(announcement)).txt_entries(),
+        )
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -609,6 +786,33 @@ mod tests {
 
     fn names(services: &[StreamService]) -> Vec<&str> {
         services.iter().map(|svc| svc.instance.as_str()).collect()
+    }
+
+    #[test]
+    fn a_revocation_for_the_pairing_is_the_phones_word() {
+        let mine = keys(MINE);
+        let announced = sessions_for(
+            &mine,
+            vec![
+                session("refineid-unhinted", None),
+                revoking("refineid-forgot", &mine.revocation),
+            ],
+        );
+        assert_eq!(announced, Err(RemoteError::RevokedByPhone));
+    }
+
+    #[test]
+    fn another_pairings_revocation_is_ignored() {
+        let mine = keys(MINE);
+        let dialable = sessions_for(
+            &mine,
+            vec![
+                session("refineid-unhinted", None),
+                revoking("refineid-other", &keys(THEIRS).revocation),
+            ],
+        )
+        .unwrap();
+        assert_eq!(names(&dialable), ["refineid-unhinted", "refineid-other"]);
     }
 
     #[test]

@@ -73,7 +73,7 @@ ble-routing-preamble = [
   tstr,                             ; "pairing" or "session"
   bstr                              ; empty (for pairing), or for a session a fresh
                                     ; 16-byte nonce || 16-byte routing tag keyed by
-                                    ; the pairing's static agreement (RAPP v26.10.10 §2.2.1)
+                                    ; the pairing's static agreement (RAPP v26.10.18 §2.2.1)
 ]
 ```
 

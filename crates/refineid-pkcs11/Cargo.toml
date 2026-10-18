@@ -11,7 +11,6 @@ publish = false
 [features]
 default = []
 pin-change = ["refineid-pkcs11/pin-change"]
-test-pin-env = ["refineid-pkcs11/test-pin-env"]
 
 [lints]
 workspace = true
