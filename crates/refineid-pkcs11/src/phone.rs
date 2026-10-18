@@ -15,13 +15,14 @@
 //! The paired phone as a token source.
 //!
 //! One thread holds the session to the phone: it reads the pairing
-//! record another program keeps, dials while the record is usable,
-//! reads the authentication certificate on each session it opens, and
+//! record another program keeps, dials while the record is usable, and
 //! keeps the session while the phone reports a card. The slot's token is
-//! the certificate read on the open session and nothing else, so the
-//! browser is offered an identity only while the phone can serve it
-//! (RAPP v26.10.18 section 8.4). A signature asked for by the browser is
-//! handed to that thread and answered on the same session.
+//! the authentication certificate the record caches, read from the card
+//! once when the record lacks it and kept from then on, so the phone
+//! does nothing for the slot but answer pings; it is offered only while
+//! the session reports a card (RAPP v26.10.18 section 8.4). A signature
+//! asked for by the browser is handed to that thread and answered on the
+//! same session; that is the one thing the phone does.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -291,10 +292,18 @@ fn hold(
     phone: &PairSummary,
     slot: RemoteSlotId,
 ) {
-    let Ok(certificate) = reader.refresh_auth_cert_on(&mut session) else {
-        reader.close_session(session);
-        pause(shared, REDIAL_PAUSE);
-        return;
+    // The certificate comes from the record; the card is read for it
+    // once, when no program has cached it yet.
+    let certificate = match phone.auth_cert.clone() {
+        Some(certificate) => certificate,
+        None => match reader.refresh_auth_cert_on(&mut session) {
+            Ok(certificate) => certificate,
+            Err(_) => {
+                reader.close_session(session);
+                pause(shared, REDIAL_PAUSE);
+                return;
+            }
+        },
     };
     shared.publish(Some(offer(slot, phone, shared, Some(certificate))));
     loop {
