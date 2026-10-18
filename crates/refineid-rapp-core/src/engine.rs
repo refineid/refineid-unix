@@ -1040,7 +1040,12 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                                 .is_err()
                         {
                             Self::refuse_message(session);
-                            return Ok(self.refuse_after_close(operation_id, state));
+                            return Ok(self.refuse_after_close(
+                                operation_id,
+                                operation,
+                                state,
+                                true,
+                            ));
                         }
                         // Every result is journaled first and acknowledged
                         // second, whatever its status (section 8.2 item 5).
@@ -1066,7 +1071,12 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                                     .map(|response| response.typed_for(operation))
                                 else {
                                     Self::refuse_message(session);
-                                    return Ok(self.refuse_after_close(operation_id, state));
+                                    return Ok(self.refuse_after_close(
+                                        operation_id,
+                                        operation,
+                                        state,
+                                        true,
+                                    ));
                                 };
                                 state = OperationState::Completed;
                                 self.journal_state(operation_id, state, false);
@@ -1137,7 +1147,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                     notice if session.note(&notice) => {}
                     _ => {
                         Self::refuse_message(session);
-                        return Ok(self.refuse_after_close(operation_id, state));
+                        return Ok(self.refuse_after_close(operation_id, operation, state, false));
                     }
                 },
                 ReceiveOutcome::SessionClosed(_) => {
@@ -1547,7 +1557,6 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         }
     }
 
-    /// Handles an authenticated protocol violation: revokes pairing and closes session.
     /// Refuses a message of the peer's that the protocol did not call for
     /// here: the session closes with `protocol_violation`. The pairing
     /// stands; only the core's authenticated violations of section 10.1
@@ -1564,18 +1573,23 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         finish_close(session, SessionEnd::Violation);
     }
 
-    /// The outcome of an operation whose answer was refused: ambiguous when
-    /// the card may already have acted, refused otherwise.
+    /// The outcome of an operation whose message was refused. A safe read
+    /// acts on nothing, so it is refused and journaled as cancelled whatever
+    /// arrived. A consequential operation is ambiguous when a result was
+    /// refused, since a result means the card acted, or when it was already
+    /// committed; before that it is refused and journaled as cancelled.
     fn refuse_after_close(
         &mut self,
         operation_id: OperationId,
+        operation: &CardOperation,
         state: OperationState,
+        result_refused: bool,
     ) -> OperationOutcome {
-        if state == OperationState::Committed {
+        if operation.is_consequential() && (result_refused || state == OperationState::Committed) {
             self.journal_state(operation_id, OperationState::Ambiguous, true);
             return OperationOutcome::Ambiguous;
         }
-        self.journal_state(operation_id, OperationState::Rejected, false);
+        self.journal_state(operation_id, OperationState::Cancelled, false);
         OperationOutcome::Refused
     }
 

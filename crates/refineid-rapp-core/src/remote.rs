@@ -218,7 +218,7 @@ impl core::fmt::Display for RemoteError {
             Self::Session(error) => write!(f, "session: {error}"),
             Self::Admission(error) => write!(f, "operation: {error}"),
             Self::Outcome(outcome) if **outcome == OperationOutcome::Refused => {
-                f.write_str("the phone's answer was not understood")
+                f.write_str("the phone's message was not understood")
             }
             Self::Outcome(outcome) => write!(f, "operation ended: {outcome:?}"),
         }

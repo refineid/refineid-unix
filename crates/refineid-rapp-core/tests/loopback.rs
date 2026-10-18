@@ -1037,6 +1037,44 @@ fn a_result_that_does_not_match_its_request_is_refused_and_the_pairing_stands() 
 }
 
 #[test]
+fn a_refused_result_of_a_consequential_operation_is_ambiguous() {
+    let mut requester = test_requester();
+    let granted = vec![PROFILE_AUTHENTICATION.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session(&proxy_pairing, proxy_transport);
+        let TypedMessage::OperationRequest(request) = session.receive() else {
+            panic!("expected an operation request");
+        };
+        let bad_reference = OperationReference {
+            operation_id: request.operation_id,
+            request_hash: refineid_rapp::RequestHash::from_array([0xee; 32]),
+        };
+        session.send(&TypedMessage::OperationResult(
+            OperationResultMessage::completed(
+                bad_reference,
+                &CardOperationResult::Signature(vec![0xAB; 96]),
+            ),
+        ));
+        let TypedMessage::SessionClose(close) = session.receive() else {
+            panic!("expected the requester's close");
+        };
+        assert_eq!(close.reason, CloseReason::ProtocolViolation);
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    let outcome = requester
+        .execute(&mut session, &authentication_operation(), 60_000)
+        .unwrap();
+    proxy.join().unwrap();
+    // A result means the card acted, so the signature is ambiguous and
+    // never retried on its own; the pairing stands.
+    assert_eq!(outcome, OperationOutcome::Ambiguous);
+    let record = requester.store().get(pair_id).unwrap();
+    assert_eq!(record.disposition, PairingDisposition::Paired);
+}
+
+#[test]
 fn stream_pairing_and_session_route_only_by_their_preambles() {
     use refineid_rapp::{RoutingKey, TransportProfile, route_session};
     use refineid_rapp_core::stream::{

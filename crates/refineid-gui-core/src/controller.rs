@@ -809,7 +809,7 @@ fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String
             format!("{phone} ended the read before a card was read")
         }
         Some(RemoteError::Outcome(outcome)) if matches!(**outcome, OperationOutcome::Refused) => {
-            format!("{phone}'s answer was not understood")
+            format!("{phone}'s message was not understood")
         }
         Some(error) => format!("{phone}: {error}"),
     }
@@ -982,7 +982,7 @@ mod tests {
                 "Alpha Phone",
                 Some(&RemoteError::Outcome(Box::new(OperationOutcome::Refused)))
             ),
-            "Alpha Phone's answer was not understood"
+            "Alpha Phone's message was not understood"
         );
         assert_eq!(
             pairing_outcome_line("Alpha Phone", Some(&RemoteError::RevokedByPhone)),
