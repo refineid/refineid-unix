@@ -41,6 +41,7 @@ See [INSTALL](INSTALL) for full installation and uninstallation instructions.
 
 - **NixOS**:
   See [doc/install-nixos.md](doc/install-nixos.md) for declarative system installation.
+  See [doc/install-freebsd.md](doc/install-freebsd.md) for FreeBSD, with the reader, the build environment and PKCS#11 through p11-kit.
 
 - **Generic source build**:
   ```sh
