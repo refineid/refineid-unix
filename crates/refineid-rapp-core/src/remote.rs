@@ -510,14 +510,13 @@ impl RemoteReader {
                     .pair_with_code(code, transport, |_, requested| Some(requested.to_vec()))
                 {
                     Ok(pair_id) => {
+                        // The name is for display; a refused rewrite keeps
+                        // the introduced one, the pairing stands either way.
                         let host = service.host.clone();
-                        self.requester
-                            .store_mut()
-                            .update(pair_id, &mut |entry| {
-                                entry.peer_display_name =
-                                    custodian_name(&entry.peer_display_name, &host);
-                            })
-                            .map_err(RemoteError::Store)?;
+                        let _ = self.requester.store_mut().update(pair_id, &mut |entry| {
+                            entry.peer_display_name =
+                                custodian_name(&entry.peer_display_name, &host);
+                        });
                         return self
                             .pairs()
                             .into_iter()

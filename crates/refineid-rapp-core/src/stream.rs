@@ -406,11 +406,21 @@ impl MdnsRecords {
 }
 
 /// The host name as the device calls itself: the SRV target without its
-/// trailing dot and local domain.
+/// trailing dot and local domain, which DNS matches without regard to
+/// case (RFC 6762 section 16).
 fn host_label(host: &str) -> String {
     let trimmed = host.strip_suffix('.').unwrap_or(host);
-    trimmed.strip_suffix(".local").unwrap_or(trimmed).to_owned()
+    let label = trimmed
+        .len()
+        .checked_sub(LOCAL_DOMAIN.len())
+        .filter(|&cut| trimmed.is_char_boundary(cut))
+        .filter(|&cut| trimmed[cut..].eq_ignore_ascii_case(LOCAL_DOMAIN))
+        .map_or(trimmed, |cut| &trimmed[..cut]);
+    label.to_owned()
 }
+
+/// The domain mDNS host names carry, with its leading dot.
+const LOCAL_DOMAIN: &str = ".local";
 
 /// Parses one mDNS response into `records`; malformed input is ignored.
 fn parse_mdns_response(
@@ -841,6 +851,7 @@ mod tests {
     fn a_host_label_drops_the_local_domain() {
         assert_eq!(super::host_label("alpha-phone.local."), "alpha-phone");
         assert_eq!(super::host_label("alpha-desk.local"), "alpha-desk");
+        assert_eq!(super::host_label("Alpha-Desk.LOCAL."), "Alpha-Desk");
         assert_eq!(super::host_label("bare"), "bare");
     }
 
