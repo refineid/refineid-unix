@@ -16,7 +16,7 @@
 # Stamp the project version across the tree. The canonical version is
 # CalVer YY.M.D.HHMM, where HHMM is the UTC time of day of the stamp as one
 # integer (905 at 09:05), the spelling every platform's version field takes
-# (hour*10 + minute/10, 0..235). Updates:
+# (hour * 100 + minute, 0..2359). Updates:
 #   VERSION                 canonical four-component string
 #   .cargo/config.toml      REFINEID_VERSION (compiled into binaries)
 #   Cargo.toml              workspace three-component SemVer projection
