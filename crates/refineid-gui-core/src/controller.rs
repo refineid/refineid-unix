@@ -343,14 +343,14 @@ impl RefineIdController {
         let mut wait = CARD_SETTLE_FIRST_RETRY;
         let mut attempt = 0;
         loop {
-            let cards = refineid_client::card_manager::inspect_cards(None)
-                .map(|reports| deduplicate_cards(reports, include_phones))
-                .unwrap_or_default();
-            let readers: Vec<&str> = cards
+            let reports = refineid_client::card_manager::inspect_cards(None).unwrap_or_default();
+            let readers: Vec<String> = reports
                 .iter()
-                .filter(|card| !is_phone_card(card))
-                .map(|card| card.report.reader.as_str())
+                .map(|report| report.reader.clone())
+                .filter(|reader| !reader.starts_with(PHONE_READER_PREFIX))
                 .collect();
+            let cards = deduplicate_cards(reports, include_phones);
+            let readers: Vec<&str> = readers.iter().map(String::as_str).collect();
             if inspection_settled(signature, &readers)
                 || attempt >= CARD_SETTLE_RETRIES
                 || self.presence_stop.load(Ordering::Acquire)
@@ -828,17 +828,16 @@ fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String
     }
 }
 
-/// Whether an inspection agrees with the presence signature: every reader
-/// that reports a card is among `readers`, the readers a card was found in.
+/// Whether an inspection agrees with the presence signature: the readers
+/// that report a card are exactly `readers`, the readers a card was read
+/// in.
 fn inspection_settled(signature: &[(String, bool)], readers: &[&str]) -> bool {
     signature
         .iter()
-        .all(|(reader, present)| !present || readers.contains(&reader.as_str()))
-}
-
-/// Whether a managed card is served by a paired phone rather than a reader.
-fn is_phone_card(card: &ManagedCard) -> bool {
-    card.report.reader.starts_with(PHONE_READER_PREFIX)
+        .all(|(reader, present)| *present == readers.contains(&reader.as_str()))
+        && readers
+            .iter()
+            .all(|reader| signature.iter().any(|(name, _)| name == reader))
 }
 
 /// The reader name prefix of a card served by a paired phone.
@@ -998,7 +997,9 @@ mod tests {
         assert!(inspection_settled(&card_in_reader, &["Reader"]));
         assert!(!inspection_settled(&card_in_reader, &[]));
         assert!(inspection_settled(&empty_reader, &[]));
+        assert!(!inspection_settled(&empty_reader, &["Reader"]));
         assert!(inspection_settled(&[], &[]));
+        assert!(!inspection_settled(&[], &["Reader"]));
         assert!(!inspection_settled(&two_readers, &["Reader"]));
         assert!(inspection_settled(&two_readers, &["Second", "Reader"]));
     }

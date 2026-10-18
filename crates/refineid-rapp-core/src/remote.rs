@@ -497,10 +497,10 @@ impl RemoteReader {
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
-            if cancel.load(Ordering::Acquire) {
-                return Err(RemoteError::Cancelled);
-            }
             for service in browse(DiscoveryMode::Pairing, BROWSE_ROUND) {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(RemoteError::Cancelled);
+                }
                 let Ok(transport) = dial(
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
@@ -528,6 +528,9 @@ impl RemoteReader {
                     Err(error) => last = RemoteError::Pairing(error),
                 }
             }
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err(RemoteError::Cancelled);
         }
         Err(last)
     }

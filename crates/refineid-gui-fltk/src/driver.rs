@@ -1063,7 +1063,6 @@ impl UiDriver for FltkDriver {
             widgets.pin_subtabs.find(&widgets.tab_activate) < widgets.pin_subtabs.children();
         if state.activation_available && !setup_listed {
             widgets.pin_subtabs.add(&widgets.tab_activate);
-            widgets.tab_activate.show();
             widgets.pin_subtabs.redraw();
         } else if !state.activation_available && setup_listed {
             let showing_setup = widgets
@@ -1071,7 +1070,6 @@ impl UiDriver for FltkDriver {
                 .value()
                 .is_some_and(|tab| tab.is_same(&widgets.tab_activate));
             widgets.pin_subtabs.remove(&widgets.tab_activate);
-            widgets.tab_activate.hide();
             if showing_setup {
                 let _ = widgets.pin_subtabs.set_value(&widgets.tab_change_pin1);
             }
