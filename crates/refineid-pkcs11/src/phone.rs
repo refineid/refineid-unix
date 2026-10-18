@@ -217,6 +217,12 @@ impl RemoteTokenSource for PhoneSource {
             let _ = handle.join();
         }
         self.shared.publish(None);
+        // A host that initialises the module again starts the thread
+        // again at its first slot refresh.
+        if let Ok(mut spoken) = self.shared.spoken.0.lock() {
+            *spoken = false;
+        }
+        self.shared.stop.store(false, Ordering::Release);
     }
 }
 
@@ -312,9 +318,12 @@ fn hold(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                if !record_still_usable(phone.pair_id) {
-                    reader.close_session_revoked(session);
-                    break;
+                match record_state(phone.pair_id) {
+                    RecordState::Usable | RecordState::Unreadable => {}
+                    RecordState::Gone => {
+                        reader.close_session_revoked(session);
+                        break;
+                    }
                 }
                 if reader.check_liveness(&mut session).is_err() || !session.card_present() {
                     reader.close_session(session);
@@ -330,13 +339,26 @@ fn hold(
     shared.publish(Some(offer(slot, phone, shared, None)));
 }
 
-/// Whether the record another program keeps still names `pair_id` as
-/// the usable pairing.
-fn record_still_usable(pair_id: PairId) -> bool {
-    RemoteReader::open_local_without_sweep()
-        .ok()
-        .and_then(|reader| reader.phone())
-        .is_some_and(|phone| phone.pair_id == pair_id)
+/// What the record another program keeps says about the held pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordState {
+    /// The record still names the pairing as the usable one.
+    Usable,
+    /// The store could be read and no longer names it: forgotten or
+    /// superseded here, so the phone is told.
+    Gone,
+    /// The store could not be read just now; nothing is concluded.
+    Unreadable,
+}
+
+fn record_state(pair_id: PairId) -> RecordState {
+    match RemoteReader::open_local_without_sweep() {
+        Err(_) => RecordState::Unreadable,
+        Ok(reader) => match reader.phone() {
+            Some(phone) if phone.pair_id == pair_id => RecordState::Usable,
+            _ => RecordState::Gone,
+        },
+    }
 }
 
 /// Runs one signature request on the session.
@@ -412,7 +434,7 @@ fn rejection_error(reason: Option<&str>) -> RemoteSignError {
         Some(ResultError::OperationExpired) => RemoteSignError::Expired,
         Some(ResultError::InvalidCredential) => RemoteSignError::CredentialRejected,
         Some(ResultError::CardBlocked) => RemoteSignError::CredentialLocked,
-        Some(ResultError::CardError) => RemoteSignError::CardAbsent,
+        Some(ResultError::CardError) => RemoteSignError::Ambiguous,
         _ => RemoteSignError::Unsupported,
     }
 }
@@ -523,7 +545,7 @@ mod tests {
             named(ResultError::CardBlocked),
             RemoteSignError::CredentialLocked
         );
-        assert_eq!(named(ResultError::CardError), RemoteSignError::CardAbsent);
+        assert_eq!(named(ResultError::CardError), RemoteSignError::Ambiguous);
         assert_eq!(
             named(ResultError::UnsupportedParameter),
             RemoteSignError::Unsupported
@@ -554,6 +576,11 @@ mod tests {
         let source = PhoneSource::new();
         source.stop();
         assert!(source.offered().is_none());
+        assert!(source.worker.lock().expect("worker").is_some());
+        source.stop();
+        assert!(source.worker.lock().expect("worker").is_none());
+        assert!(source.shared.offer.lock().expect("offer").is_none());
+        assert!(source.shared.requests.lock().expect("requests").is_none());
         let request = SignatureRequest::new(
             RemoteKeyProfile::EcdsaP384,
             RemoteSignatureAlgorithm::EcdsaSha384,
@@ -566,5 +593,9 @@ mod tests {
             source.sign(&pair_id, &request, &context, Duration::from_millis(10)),
             Err(RemoteSignError::Unreachable)
         );
+        // A host that initialises again gets the thread again.
+        let _ = source.offered();
+        assert!(source.worker.lock().expect("worker").is_some());
+        source.stop();
     }
 }
