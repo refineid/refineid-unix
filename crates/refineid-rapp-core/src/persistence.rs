@@ -136,7 +136,7 @@ fn encoded_record_size(record: &PairingRecord) -> usize {
         + record.grants_hash.len()
         + 1
         + 1
-        + size_of_val(&record.candidate_failures)
+        + record.candidate_failures.to_be_bytes().len()
         + bytes(&record.local_private)
         + bytes(&record.local_public)
         + bytes(&record.peer_public)
@@ -469,10 +469,20 @@ mod tests {
 
     #[test]
     fn the_encoder_sizes_its_buffer_once() {
-        let record = sample();
-        let encoded = encode_pairing_record(&record);
-        assert_eq!(encoded.len(), super::encoded_record_size(&record));
-        assert_eq!(encoded.capacity(), encoded.len());
+        let full = sample();
+        let mut bare = sample();
+        bare.local_private = Zeroizing::new(Vec::new());
+        bare.granted_profiles.clear();
+        bare.auth_cert = None;
+        bare.signature_cert = None;
+        bare.root_ca = None;
+        bare.intermediate_ca = None;
+        bare.peer_display_name.clear();
+        for record in [full, bare] {
+            let encoded = encode_pairing_record(&record);
+            assert_eq!(encoded.len(), super::encoded_record_size(&record));
+            assert_eq!(encoded.capacity(), encoded.len());
+        }
     }
 
     #[test]

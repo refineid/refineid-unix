@@ -56,9 +56,10 @@ impl FilePairingStore {
 
     /// Opens (creating if needed) the store in `directory` and loads every
     /// readable record. A record of an earlier encoding revision, and a
-    /// paired record without its key, are removed: their pairings are made
-    /// again. Any other file that does not decode is skipped, never
-    /// rewritten. A record that is not paired is loaded without a key.
+    /// paired record whose key is missing or not a key, are removed: their
+    /// pairings are made again. Any other file that does not decode is
+    /// skipped, never rewritten. A record that is not paired is loaded
+    /// without a key.
     ///
     /// # Errors
     /// [`StoreError::WriteRefused`] when the directory cannot be created or
@@ -90,8 +91,8 @@ impl FilePairingStore {
             if record.disposition == PairingDisposition::Paired
                 && record.local_private.len() != PAIR_PRIVATE_KEY_SIZE
             {
-                // A pairing without its key cannot open a session: its
-                // holder pairs again, so the record goes.
+                // A pairing without a usable key cannot open a session:
+                // its holder pairs again, so the record goes.
                 let _ = fs::remove_file(&path);
                 continue;
             }
@@ -134,16 +135,14 @@ fn keep_key_only_while_paired(record: &mut PairingRecord) {
     }
 }
 
-/// Writes `record`'s file atomically: a paired record with its key, any
-/// other without one.
+/// Writes `record`'s file atomically. The caller has already dropped the
+/// key of a record that is not paired.
 ///
 /// # Errors
 /// [`StoreError::WriteRefused`] when a paired record's key is not a key,
 /// or the file cannot be written.
 fn write_record(directory: &Path, record: &PairingRecord) -> Result<(), StoreError> {
     {
-        let mut record = record.clone();
-        keep_key_only_while_paired(&mut record);
         if record.disposition == PairingDisposition::Paired
             && record.local_private.len() != PAIR_PRIVATE_KEY_SIZE
         {
@@ -151,7 +150,7 @@ fn write_record(directory: &Path, record: &PairingRecord) -> Result<(), StoreErr
         }
         let path = path_for(directory, record.pair_id);
         let temporary = path.with_extension("tmp");
-        let blob = encode_pairing_record(&record);
+        let blob = encode_pairing_record(record);
         let written = (|| {
             let mut file: File = OpenOptions::new()
                 .write(true)
@@ -173,8 +172,8 @@ fn write_record(directory: &Path, record: &PairingRecord) -> Result<(), StoreErr
 
 impl PairingStore for FilePairingStore {
     fn insert(&mut self, mut record: PairingRecord) -> Result<(), StoreError> {
-        write_record(&self.directory, &record)?;
         keep_key_only_while_paired(&mut record);
+        write_record(&self.directory, &record)?;
         self.records.retain(|entry| entry.pair_id != record.pair_id);
         self.records.push(record);
         Ok(())
@@ -199,8 +198,8 @@ impl PairingStore for FilePairingStore {
             .ok_or(StoreError::Unknown)?;
         let mut next = self.records[index].clone();
         change(&mut next);
-        write_record(&self.directory, &next)?;
         keep_key_only_while_paired(&mut next);
+        write_record(&self.directory, &next)?;
         self.records[index] = next;
         Ok(())
     }
@@ -320,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn a_paired_record_without_its_key_is_dropped_and_a_bad_key_is_refused() {
+    fn a_paired_record_without_a_usable_key_is_dropped_and_a_bad_key_is_refused() {
         let directory = scratch();
         {
             let mut store = FilePairingStore::open(&directory).unwrap();
@@ -328,14 +327,29 @@ mod tests {
             short.local_private = zeroize::Zeroizing::new(vec![0x11; 16]);
             assert_eq!(store.insert(short), Err(StoreError::WriteRefused));
             store.insert(record(11)).unwrap();
+            store.insert(record(12)).unwrap();
+            store.insert(record(13)).unwrap();
         }
         let mut keyless = record(11);
         keyless.local_private = zeroize::Zeroizing::new(Vec::new());
-        let path = super::path_for(&directory, PairId::from_array([11; 16]));
-        std::fs::write(&path, crate::persistence::encode_pairing_record(&keyless)).unwrap();
+        let keyless_path = super::path_for(&directory, PairId::from_array([11; 16]));
+        std::fs::write(
+            &keyless_path,
+            crate::persistence::encode_pairing_record(&keyless),
+        )
+        .unwrap();
+        let mut short_key = record(12);
+        short_key.local_private = zeroize::Zeroizing::new(vec![0x11; 16]);
+        let short_path = super::path_for(&directory, PairId::from_array([12; 16]));
+        std::fs::write(
+            &short_path,
+            crate::persistence::encode_pairing_record(&short_key),
+        )
+        .unwrap();
         let store = FilePairingStore::open(&directory).unwrap();
-        assert!(store.pair_ids().is_empty());
-        assert!(!path.exists());
+        assert_eq!(store.pair_ids(), vec![PairId::from_array([13; 16])]);
+        assert!(!keyless_path.exists());
+        assert!(!short_path.exists());
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
