@@ -1,23 +1,11 @@
-// Copyright 2026 Petri Koistinen
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-// implied. See the License for the specific language governing
-// permissions and limitations under the License.
-
 //! Client certificate authentication using remote RAPP card readers over TLS.
 //!
 //! The certificate is offered only on a session the phone opened and on
-//! which it reports a card (RAPP v26.10.18 section 8.4): the resolver
-//! opens the session when the server asks for a certificate, the signer
-//! signs on that same session, and the session closes with the handshake.
+//! which it reports a card (RAPP v26.10.18 section 8.4). Each handshake
+//! gets its own reader and session: the resolver opens them when the
+//! server asks for a certificate, the signing key owns them, the signer
+//! signs on that session and closes it, and a key dropped without
+//! signing closes it on the way out.
 
 extern crate alloc;
 
@@ -52,57 +40,50 @@ use crate::simple_https::HttpsError;
 /// How long the signer browses for the paired phone.
 const REMOTE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The reader and the session the identity is offered on, shared by the
-/// resolver that opens it and the signer that signs on it.
-#[derive(Debug)]
-struct OfferedIdentity {
-    reader: RemoteReader,
-    session: Option<RemoteSession>,
+/// The one signature scheme the phone's authentication key signs under.
+const SUPPORTED_SCHEME: SignatureScheme = SignatureScheme::ECDSA_NISTP384_SHA384;
+
+/// Whether the server's offered schemes include the one the phone signs
+/// under; without it the handshake cannot use the certificate and no
+/// session is worth opening.
+fn offers_supported_scheme(offered: &[SignatureScheme]) -> bool {
+    offered.contains(&SUPPORTED_SCHEME)
 }
 
-impl OfferedIdentity {
-    /// Closes the session the identity was offered on, if one is open.
-    fn withdraw(&mut self) {
-        if let Some(session) = self.session.take() {
-            self.reader.close_session(session);
-        }
+/// The reader and the session one handshake's identity is offered on.
+#[derive(Debug)]
+struct OfferedSession {
+    reader: RemoteReader,
+    session: RemoteSession,
+}
+
+impl OfferedSession {
+    fn close(mut self) {
+        self.reader.close_session(self.session);
     }
 }
 
 /// Client certificate resolver backed by a paired RAPP remote card reader.
 ///
 /// The certificate is offered only once the phone has opened a session
-/// and reported a card on it; the session is held for the signer and
-/// closed when the resolver is dropped.
+/// and reported a card on it; that session belongs to the handshake's
+/// signing key.
 #[derive(Debug)]
 pub struct RappClientCertResolver {
     pair: PairId,
     cert_der: Vec<u8>,
     origin: String,
-    offered: Arc<Mutex<OfferedIdentity>>,
 }
 
 impl RappClientCertResolver {
-    /// Create a resolver over `reader` for the given active pair,
-    /// authentication certificate, and origin.
+    /// Create a resolver for the given active pair, authentication
+    /// certificate, and origin.
     #[must_use]
-    pub fn new(reader: RemoteReader, pair: PairId, cert_der: Vec<u8>, origin: String) -> Self {
+    pub fn new(pair: PairId, cert_der: Vec<u8>, origin: String) -> Self {
         Self {
             pair,
             cert_der,
             origin,
-            offered: Arc::new(Mutex::new(OfferedIdentity {
-                reader,
-                session: None,
-            })),
-        }
-    }
-}
-
-impl Drop for RappClientCertResolver {
-    fn drop(&mut self) {
-        if let Ok(mut offered) = self.offered.lock() {
-            offered.withdraw();
         }
     }
 }
@@ -111,19 +92,19 @@ impl ResolvesClientCert for RappClientCertResolver {
     fn resolve(
         &self,
         _root_hint_subjects: &[&[u8]],
-        _sigschemes: &[SignatureScheme],
+        sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        let mut offered = self.offered.lock().ok()?;
-        offered.withdraw();
-        let session = offered
-            .reader
+        if !offers_supported_scheme(sigschemes) {
+            return None;
+        }
+        let mut reader = RemoteReader::open_local().ok()?;
+        let session = reader
             .open_session(Some(self.pair), REMOTE_DISCOVERY_TIMEOUT)
             .ok()?;
-        offered.session = Some(session);
         let cert = CertificateDer::from(self.cert_der.clone());
         let key = Arc::new(RappSigningKey {
             origin: self.origin.clone(),
-            offered: Arc::clone(&self.offered),
+            offered: Arc::new(Mutex::new(Some(OfferedSession { reader, session }))),
         });
         Some(Arc::new(CertifiedKey::new(vec![cert], key)))
     }
@@ -133,24 +114,31 @@ impl ResolvesClientCert for RappClientCertResolver {
     }
 }
 
+/// One handshake's signing key: it owns the session its identity was
+/// offered on until the signer takes it or the key is dropped.
 #[derive(Debug)]
 struct RappSigningKey {
     origin: String,
-    offered: Arc<Mutex<OfferedIdentity>>,
+    offered: Arc<Mutex<Option<OfferedSession>>>,
+}
+
+impl Drop for RappSigningKey {
+    fn drop(&mut self) {
+        if let Some(offered) = self.offered.lock().ok().and_then(|mut slot| slot.take()) {
+            offered.close();
+        }
+    }
 }
 
 impl SigningKey for RappSigningKey {
     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
-        for s in offered {
-            if *s == SignatureScheme::ECDSA_NISTP384_SHA384 {
-                return Some(Box::new(RappSigner {
-                    origin: self.origin.clone(),
-                    offered: Arc::clone(&self.offered),
-                    scheme: *s,
-                }));
-            }
-        }
-        None
+        offers_supported_scheme(offered).then(|| {
+            Box::new(RappSigner {
+                origin: self.origin.clone(),
+                offered: Arc::clone(&self.offered),
+                scheme: SUPPORTED_SCHEME,
+            }) as Box<dyn Signer>
+        })
     }
 
     fn algorithm(&self) -> SignatureAlgorithm {
@@ -161,11 +149,13 @@ impl SigningKey for RappSigningKey {
 #[derive(Debug)]
 struct RappSigner {
     origin: String,
-    offered: Arc<Mutex<OfferedIdentity>>,
+    offered: Arc<Mutex<Option<OfferedSession>>>,
     scheme: SignatureScheme,
 }
 
 impl Signer for RappSigner {
+    /// Signs once on the handshake's session and closes it; a second
+    /// signature on the same key finds no session.
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
         let digest = Sha384::of(message);
         let op = CardOperation::BrowserAuthenticate {
@@ -174,18 +164,18 @@ impl Signer for RappSigner {
             algorithm: CardAlgorithm::EcdsaSha384,
             digest: digest.as_bytes().to_vec(),
         };
-        let mut offered = self
+        let OfferedSession {
+            mut reader,
+            mut session,
+        } = self
             .offered
             .lock()
-            .map_err(|_| rustls::Error::General("RAPP session lock poisoned".into()))?;
-        let OfferedIdentity { reader, session } = &mut *offered;
-        let session = session
-            .as_mut()
+            .map_err(|_| rustls::Error::General("RAPP session lock poisoned".into()))?
+            .take()
             .ok_or_else(|| rustls::Error::General("no RAPP session offers this identity".into()))?;
-        let res = reader
-            .execute_on(session, &op)
-            .map_err(|e| rustls::Error::General(format!("RAPP operation failed: {e}")))?;
-        match res {
+        let res = reader.execute_on(&mut session, &op);
+        reader.close_session(session);
+        match res.map_err(|e| rustls::Error::General(format!("RAPP operation failed: {e}")))? {
             CardOperationResult::Signature(signature_bytes) => {
                 let der = ecdsa_signature_to_cms(&signature_bytes)
                     .ok_or_else(|| rustls::Error::General("DER conversion failed".into()))?;
@@ -232,14 +222,7 @@ pub fn get_with_rapp_client_auth(
     let versions: &[&rustls::SupportedProtocolVersion] =
         &[&rustls::version::TLS13, &rustls::version::TLS12];
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let reader =
-        RemoteReader::open_local().map_err(|e| HttpsError::Tls(format!("RAPP reader: {e}")))?;
-    let resolver = Arc::new(RappClientCertResolver::new(
-        reader,
-        pair,
-        cert_der.to_vec(),
-        origin,
-    ));
+    let resolver = Arc::new(RappClientCertResolver::new(pair, cert_der.to_vec(), origin));
 
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)
@@ -278,4 +261,61 @@ pub fn get_with_rapp_client_auth(
 
     let text = String::from_utf8_lossy(&resp).to_string();
     Ok(text)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixtures are constructed to be infallible"
+)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use rustls::SignatureScheme;
+    use rustls::sign::{Signer as _, SigningKey as _};
+
+    use super::{RappSigner, RappSigningKey, offers_supported_scheme};
+
+    #[test]
+    fn only_the_phones_scheme_is_worth_a_session() {
+        assert!(offers_supported_scheme(&[
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+        ]));
+        assert!(!offers_supported_scheme(&[
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ED25519,
+        ]));
+        assert!(!offers_supported_scheme(&[]));
+    }
+
+    #[test]
+    fn a_key_without_a_session_chooses_the_scheme_but_signs_nothing() {
+        let key = RappSigningKey {
+            origin: "https://example.test".into(),
+            offered: Arc::new(Mutex::new(None)),
+        };
+        assert!(
+            key.choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+                .is_none()
+        );
+        let signer = key
+            .choose_scheme(&[SignatureScheme::ECDSA_NISTP384_SHA384])
+            .unwrap();
+        assert_eq!(signer.scheme(), SignatureScheme::ECDSA_NISTP384_SHA384);
+        assert!(signer.sign(b"transcript").is_err());
+    }
+
+    #[test]
+    fn signing_takes_the_session_so_a_second_signature_finds_none() {
+        let signer = RappSigner {
+            origin: "https://example.test".into(),
+            offered: Arc::new(Mutex::new(None)),
+            scheme: SignatureScheme::ECDSA_NISTP384_SHA384,
+        };
+        assert!(signer.sign(b"transcript").is_err());
+        assert!(signer.offered.lock().unwrap().is_none());
+    }
 }

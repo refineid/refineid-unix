@@ -169,6 +169,8 @@ impl PairsArgs {
                     " -- the phone forgot this computer; pair again"
                 } else if pair.revoked {
                     " -- revoked"
+                } else if pair.unconfirmed {
+                    " -- pairing unconfirmed; pair again"
                 } else {
                     ""
                 }

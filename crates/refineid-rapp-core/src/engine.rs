@@ -25,6 +25,7 @@ use refineid_rapp::{
     SessionCloseMessage, SessionHandshake, SessionState, TransportProfile, TypedMessage,
     generate_pair_key_material,
 };
+use std::time::{Duration, Instant};
 
 /// Local labels sent inside `pairing.hello`. Labels, not identities.
 #[derive(Clone, Debug)]
@@ -607,16 +608,17 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             .insert(local_record)
             .map_err(PairingError::Store)?;
         match Self::confirm_storage(&mut transport, storage, confirmation_deadline, pair_record) {
-            Ok(confirmed) => {
-                let disposition = if confirmed.is_storage_confirmed() {
-                    PairingDisposition::Paired
-                } else {
-                    PairingDisposition::Unconfirmed
-                };
+            Ok(confirmed) if confirmed.is_storage_confirmed() => {
                 self.store
-                    .update(pair_id, &mut |entry| entry.disposition = disposition)
+                    .update(pair_id, &mut |entry| {
+                        entry.disposition = PairingDisposition::Paired;
+                    })
                     .map_err(PairingError::Store)?;
                 Ok(pair_id)
+            }
+            Ok(_) => {
+                self.revoke_pairing(pair_id, false);
+                Err(PairingError::StorageUnconfirmed)
             }
             Err(error) => {
                 self.revoke_pairing(pair_id, false);
@@ -1094,7 +1096,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                             }
                             ResultStatus::CredentialRejected => {
                                 state = OperationState::CredentialRejected;
-                                self.revoke_pairing(session.pair_id, false);
+                                self.revoke_pairing(session.pair_id, true);
                                 self.journal_state(operation_id, state, true);
                                 Self::acknowledge(session, reference);
                                 self.await_close_after_credential_rejection(session);
@@ -1249,7 +1251,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                 };
                 self.journal_state(operation_id, state, true);
                 if status == ResultStatus::CredentialRejected {
-                    self.revoke_pairing(session.pair_id, false);
+                    self.revoke_pairing(session.pair_id, true);
                     Self::acknowledge(session, reference);
                     self.await_close_after_credential_rejection(session);
                 } else {
@@ -1312,45 +1314,116 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         session: &mut Session<Transport>,
     ) -> Result<TypedMessage, SessionError> {
         loop {
-            let recv_bytes = session.transport.receive_frame().map_err(|e| {
-                finish_close(session, SessionEnd::TransportLoss);
-                SessionError::Transport(e)
-            })?;
-            let frame = BinaryFrame::reconstruct(recv_bytes).map_err(|_| {
-                finish_close(session, SessionEnd::IntegrityFailure);
-                SessionError::Transport(TransportError::Failed)
-            })?;
-            let now_ms = current_time_ms();
-            let mut adapter = CorePairStoreAdapter::new(&mut self.store);
-            match session.endpoint.receive(&mut adapter, &frame, now_ms) {
-                Ok(ReceiveOutcome::Message(TypedMessage::LivenessPing(incoming_ping))) => {
-                    let reply_pong = TypedMessage::LivenessPong(LivenessMessage {
-                        challenge: incoming_ping.challenge,
-                        last_received_sequence: session
-                            .endpoint
-                            .last_received_sequence()
-                            .unwrap_or(0),
-                    });
-                    if let Ok(pong_frame) = session.endpoint.send(&reply_pong) {
-                        let _ = session.transport.send_frame(pong_frame.as_bytes());
-                    }
-                }
-                Ok(ReceiveOutcome::Message(TypedMessage::SessionClose(close_msg))) => {
-                    self.apply_peer_close_reason(session.pair_id, close_msg.reason);
-                    finish_close(session, SessionEnd::PeerClose(close_msg.reason));
-                    return Err(SessionError::ClosedByPeer(close_msg.reason));
-                }
-                Ok(ReceiveOutcome::Message(message)) => return Ok(message),
-                Ok(ReceiveOutcome::SessionClosed(_) | ReceiveOutcome::PairRevoked { .. }) => {
-                    finish_close(session, SessionEnd::Violation);
-                    return Err(SessionError::EngineFault);
-                }
-                Err(_) => {
-                    finish_close(session, SessionEnd::IntegrityFailure);
-                    return Err(SessionError::Transport(TransportError::Failed));
-                }
+            if let Some(message) = self.receive_once(session, QuietDeadline::No)? {
+                return Ok(message);
             }
         }
+    }
+
+    /// Receives one frame and answers it where the engine does: a ping is
+    /// answered here and yields nothing, a peer close ends the session,
+    /// and any other message is returned. Under [`QuietDeadline::Yes`] a
+    /// receive that reaches the transport deadline yields nothing and
+    /// leaves the session as it is.
+    fn receive_once<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+        quiet_deadline: QuietDeadline,
+    ) -> Result<Option<TypedMessage>, SessionError> {
+        let recv_bytes = match session.transport.receive_frame() {
+            Ok(bytes) => bytes,
+            Err(TransportError::TimedOut) if quiet_deadline == QuietDeadline::Yes => {
+                return Ok(None);
+            }
+            Err(error) => {
+                finish_close(session, SessionEnd::TransportLoss);
+                return Err(SessionError::Transport(error));
+            }
+        };
+        let frame = BinaryFrame::reconstruct(recv_bytes).map_err(|_| {
+            finish_close(session, SessionEnd::IntegrityFailure);
+            SessionError::Transport(TransportError::Failed)
+        })?;
+        let now_ms = current_time_ms();
+        let mut adapter = CorePairStoreAdapter::new(&mut self.store);
+        match session.endpoint.receive(&mut adapter, &frame, now_ms) {
+            Ok(ReceiveOutcome::Message(TypedMessage::LivenessPing(incoming_ping))) => {
+                let reply_pong = TypedMessage::LivenessPong(LivenessMessage {
+                    challenge: incoming_ping.challenge,
+                    last_received_sequence: session.endpoint.last_received_sequence().unwrap_or(0),
+                });
+                if let Ok(pong_frame) = session.endpoint.send(&reply_pong) {
+                    let _ = session.transport.send_frame(pong_frame.as_bytes());
+                }
+                Ok(None)
+            }
+            Ok(ReceiveOutcome::Message(TypedMessage::SessionClose(close_msg))) => {
+                self.apply_peer_close_reason(session.pair_id, close_msg.reason);
+                finish_close(session, SessionEnd::PeerClose(close_msg.reason));
+                Err(SessionError::ClosedByPeer(close_msg.reason))
+            }
+            Ok(ReceiveOutcome::Message(message)) => Ok(Some(message)),
+            Ok(ReceiveOutcome::SessionClosed(_) | ReceiveOutcome::PairRevoked { .. }) => {
+                finish_close(session, SessionEnd::Violation);
+                Err(SessionError::EngineFault)
+            }
+            Err(_) => {
+                finish_close(session, SessionEnd::IntegrityFailure);
+                Err(SessionError::Transport(TransportError::Failed))
+            }
+        }
+    }
+
+    /// Waits up to `wait` for the custodian to report a card it can serve
+    /// (section 8.4), answering liveness pings meanwhile. Returns whether
+    /// one was reported; a wait that runs out leaves the session open, so
+    /// the caller decides whether to keep offering nothing or to close.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] on closed session, peer close, violation,
+    /// transport loss, or a message that is not a notice.
+    pub fn await_card_present<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+        wait: Duration,
+    ) -> Result<bool, SessionError> {
+        if session.state != SessionState::Healthy || session.end.is_some() {
+            return Err(SessionError::EngineFault);
+        }
+        let deadline = Instant::now() + wait;
+        let previous = session
+            .transport
+            .set_receive_deadline(wait)
+            .map_err(SessionError::Transport)?;
+        let outcome = loop {
+            if session.card_present == Some(true) {
+                break Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Ok(false);
+            }
+            if let Err(error) = session.transport.set_receive_deadline(remaining) {
+                break Err(SessionError::Transport(error));
+            }
+            match self.receive_once(session, QuietDeadline::Yes) {
+                Ok(None) => {}
+                Ok(Some(message)) => {
+                    if !session.note(&message) {
+                        self.handle_violation(session);
+                        break Err(SessionError::EngineFault);
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        if session.end.is_none() {
+            session
+                .transport
+                .set_receive_deadline(previous)
+                .map_err(SessionError::Transport)?;
+        }
+        outcome
     }
 
     /// Waits for the custodian's `card.status`, which it sends right after
@@ -1547,6 +1620,16 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
 }
 
 /// Walks the session into closed and records the end.
+/// Whether a receive that reaches the transport deadline is an answer
+/// (nothing arrived in the time given) or a loss of the transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuietDeadline {
+    /// The deadline is the caller's wait: reaching it yields nothing.
+    Yes,
+    /// The deadline is the transport's: reaching it ends the session.
+    No,
+}
+
 fn finish_close<Transport: FrameTransport>(session: &mut Session<Transport>, end: SessionEnd) {
     session.endpoint.close_session();
     session.state = SessionState::Closed;
@@ -1559,15 +1642,15 @@ fn finish_close<Transport: FrameTransport>(session: &mut Session<Transport>, end
 )]
 /// A monotonic deadline for one post-PAKE pairing phase (section 3.3).
 #[derive(Clone, Copy, Debug)]
-struct PhaseDeadline(std::time::Instant);
+struct PhaseDeadline(Instant);
 
 impl PhaseDeadline {
     fn after(window_ms: u64) -> Self {
-        Self(std::time::Instant::now() + std::time::Duration::from_millis(window_ms))
+        Self(Instant::now() + Duration::from_millis(window_ms))
     }
 
     fn check(self) -> Result<(), PairingError> {
-        if std::time::Instant::now() > self.0 {
+        if Instant::now() > self.0 {
             Err(PairingError::DeadlineExpired)
         } else {
             Ok(())
@@ -1588,14 +1671,15 @@ fn current_time_ms() -> u64 {
 
 #[cfg(test)]
 mod phase_deadline_tests {
+    use std::time::{Duration, Instant};
+
     use super::{PairingError, PhaseDeadline};
 
     #[test]
     fn a_phase_past_its_window_fails_closed() {
         let open = PhaseDeadline::after(refineid_rapp::POST_PAKE_HANDSHAKE_MS);
         assert_eq!(open.check(), Ok(()));
-        let elapsed =
-            PhaseDeadline(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        let elapsed = PhaseDeadline(Instant::now() - Duration::from_millis(1));
         assert_eq!(elapsed.check(), Err(PairingError::DeadlineExpired));
     }
 }

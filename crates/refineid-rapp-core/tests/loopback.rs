@@ -399,6 +399,101 @@ fn a_session_reports_whether_the_phone_has_a_card() {
 }
 
 #[test]
+fn a_card_reported_after_the_dial_is_waited_for() {
+    let mut requester = test_requester();
+    let granted = vec![PROFILE_CARD_STATUS.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session_with_card(&proxy_pairing, proxy_transport, false);
+        session.send(&TypedMessage::CardStatus(CardStatusMessage {
+            card_present: false,
+        }));
+        std::thread::sleep(Duration::from_millis(150));
+        session.send(&TypedMessage::CardStatus(CardStatusMessage {
+            card_present: true,
+        }));
+        let TypedMessage::SessionClose(close) = session.receive() else {
+            panic!("expected the requester's close");
+        };
+        assert_eq!(close.reason, CloseReason::Normal);
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    assert_eq!(requester.await_card_status(&mut session), Ok(false));
+    // Section 8.4: a later card.status reporting presence is waited for.
+    assert_eq!(
+        requester.await_card_present(&mut session, Duration::from_secs(1)),
+        Ok(true)
+    );
+    assert_eq!(session.card_present(), Some(true));
+    requester.disconnect(&mut session, CloseReason::Normal);
+    proxy.join().unwrap();
+}
+
+#[test]
+fn a_wait_for_a_card_that_runs_out_leaves_the_session_open() {
+    let mut requester = test_requester();
+    let granted = vec![PROFILE_CARD_STATUS.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session_with_card(&proxy_pairing, proxy_transport, false);
+        session.send(&TypedMessage::CardStatus(CardStatusMessage {
+            card_present: false,
+        }));
+        std::thread::sleep(Duration::from_millis(400));
+        session.send(&TypedMessage::CardStatus(CardStatusMessage {
+            card_present: true,
+        }));
+        let TypedMessage::SessionClose(_) = session.receive() else {
+            panic!("expected the requester's close");
+        };
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    assert_eq!(requester.await_card_status(&mut session), Ok(false));
+    // The wait runs out before the phone reports a card; the session is
+    // neither closed nor marked lost, and the transport keeps its deadline.
+    assert_eq!(
+        requester.await_card_present(&mut session, Duration::from_millis(100)),
+        Ok(false)
+    );
+    assert!(Requester::<MemoryPairingStore, MemoryJournal>::session_end(&session).is_none());
+    assert_eq!(
+        requester.await_card_present(&mut session, Duration::from_secs(1)),
+        Ok(true)
+    );
+    requester.disconnect(&mut session, CloseReason::Normal);
+    proxy.join().unwrap();
+}
+
+#[test]
+fn a_pairing_revoked_close_while_awaiting_the_card_revokes_here() {
+    let mut requester = test_requester();
+    let granted = vec![PROFILE_CARD_STATUS.to_owned()];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut session = proxy_accept_session_with_card(&proxy_pairing, proxy_transport, false);
+        session.send(&TypedMessage::SessionClose(SessionCloseMessage {
+            reason: CloseReason::PairingRevoked,
+            last_received_sequence: 0,
+        }));
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    assert_eq!(
+        requester.await_card_status(&mut session),
+        Err(SessionError::ClosedByPeer(CloseReason::PairingRevoked))
+    );
+    proxy.join().unwrap();
+    // Section 4.6 item 1: the in-session notice is the phone's word; the
+    // pairing is revoked here as one it ended.
+    let record = requester.store().get(pair_id).unwrap();
+    assert_eq!(record.disposition, PairingDisposition::Revoked);
+    assert!(record.peer_initiated_termination);
+    assert!(record.local_private.is_empty());
+}
+
+#[test]
 fn a_mistyped_code_fails_at_the_custodian_tag_and_stores_nothing() {
     let mut requester = test_requester();
     let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
@@ -628,9 +723,11 @@ fn credential_rejection_revokes_the_pairing() {
     proxy.join().unwrap();
     assert_eq!(outcome, OperationOutcome::CredentialRejected);
     // Section 13.4: the authenticated credential_rejected result durably
-    // revokes the pairing before the terminal outcome is reported.
+    // revokes the pairing before the terminal outcome is reported, and the
+    // phone is the one that ended it (section 4.6).
     let record = requester.store().get(pair_id).unwrap();
     assert_eq!(record.disposition, PairingDisposition::Revoked);
+    assert!(record.peer_initiated_termination);
     assert!(record.local_private.is_empty());
     assert!(record.peer_public.is_empty());
 

@@ -33,7 +33,7 @@ use refineid_lib_core::pin::{
 };
 use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
-use refineid_rapp_core::remote::{RemoteError, RemoteReader};
+use refineid_rapp_core::remote::{PairSummary, RemoteError, RemoteReader};
 
 use crate::error::GuiCoreError;
 use crate::image::{RgbaImageBuffer, decode_document_image};
@@ -781,7 +781,7 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>) -> Vec<ManagedCard> {
 
     // Include paired phones whose authentication certificate is cached.
     if let Ok(reader) = RemoteReader::open_local() {
-        for pair in reader.pairs().into_iter().filter(|pair| !pair.revoked) {
+        for pair in reader.pairs().into_iter().filter(PairSummary::usable) {
             if let Some(cached_der) = pair.auth_cert
                 && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(cached_der)
             {

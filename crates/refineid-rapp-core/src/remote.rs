@@ -228,12 +228,23 @@ pub struct PairSummary {
     pub auth_cert: Option<Vec<u8>>,
     /// Whether the pairing is revoked.
     pub revoked: bool,
+    /// Whether the record was stored before the phone confirmed its own
+    /// storage (section 4.3 item 4): it opens no session until pairing
+    /// is run again.
+    pub unconfirmed: bool,
     /// Whether the phone ended the pairing: it forgot this computer, or
     /// rejected the credential (section 4.6).
     pub forgotten_by_phone: bool,
 }
 
 impl PairSummary {
+    /// Whether the pairing can open a session: neither revoked nor
+    /// unconfirmed.
+    #[must_use]
+    pub const fn usable(&self) -> bool {
+        !self.revoked && !self.unconfirmed
+    }
+
     /// The pair identifier as lowercase hex.
     #[must_use]
     pub fn pair_id_hex(&self) -> String {
@@ -341,16 +352,17 @@ impl RemoteReader {
                 granted_profiles: record.granted_profiles.clone(),
                 auth_cert: record.auth_cert.clone(),
                 revoked: record.disposition == PairingDisposition::Revoked,
+                unconfirmed: record.disposition == PairingDisposition::Unconfirmed,
                 forgotten_by_phone: record.disposition == PairingDisposition::Revoked
                     && record.peer_initiated_termination,
             })
             .collect()
     }
 
-    /// The newest pairing that is not revoked.
+    /// The newest pairing that can open a session.
     #[must_use]
     pub fn selected(&self) -> Option<PairSummary> {
-        self.pairs().into_iter().find(|pair| !pair.revoked)
+        self.pairs().into_iter().find(PairSummary::usable)
     }
 
     /// Forgets one pairing locally.
@@ -524,14 +536,17 @@ impl RemoteReader {
 
     /// Opens a session to the phone holding `pair_id`, or the selected
     /// pairing when `None`, browsing until `discovery_timeout` passes, and
-    /// waits for the phone's word on its card (section 8.4).
+    /// waits for the phone's word on its card (section 8.4). A phone that
+    /// first reports no card is given the rest of `discovery_timeout` to
+    /// report one, so a card tapped after the dial still serves.
     ///
     /// A consumer that offers the phone's identity keeps the session for
     /// as long as it offers it: the offer is withdrawn with the session.
     ///
     /// # Errors
     /// [`RemoteError`] when no pairing matches, no phone opens a session
-    /// for it, the phone forgot this computer, or it reports no card.
+    /// for it, the phone forgot this computer, or no card is reported
+    /// before the timeout.
     pub fn open_session(
         &mut self,
         pair_id: Option<PairId>,
@@ -572,7 +587,15 @@ impl RemoteReader {
                         continue;
                     }
                 };
-                match self.requester.await_card_status(&mut session) {
+                let reported = match self.requester.await_card_status(&mut session) {
+                    Ok(true) => Ok(true),
+                    Ok(false) => self.requester.await_card_present(
+                        &mut session,
+                        deadline.saturating_duration_since(Instant::now()),
+                    ),
+                    Err(error) => Err(error),
+                };
+                match reported {
                     Ok(true) => return Ok(RemoteSession { session }),
                     Ok(false) => {
                         self.requester.disconnect(&mut session, CloseReason::Normal);
