@@ -91,7 +91,7 @@ pub enum VerbTag {
     CardPair,
     /// `pairs` -- list paired mobile devices.
     CardPairs,
-    /// `unpair` -- revoke and delete a paired mobile device.
+    /// `unpair` -- forget the paired phone.
     CardUnpair,
     /// `auth` -- authenticate to a TLS site via paired mobile device.
     CardAuth,
@@ -182,7 +182,7 @@ pub enum Verb {
     CardPair(super::card_pair::PairArgs),
     /// `pairs` -- list paired mobile devices.
     CardPairs(super::card_pair::PairsArgs),
-    /// `unpair` -- revoke paired mobile device.
+    /// `unpair` -- forget the paired phone.
     CardUnpair(super::card_pair::UnpairArgs),
     /// `auth` -- authenticate to a TLS site via paired mobile device.
     CardAuth(super::card_pair::AuthArgs),
@@ -629,11 +629,7 @@ mod tests {
         }
         let sub = parse_argv(&argv(&["refineid", "pairs"]))?;
         check(&sub.tag(), &VerbTag::CardPairs, "pairs tag")?;
-        let sub = parse_argv(&argv(&[
-            "refineid",
-            "unpair",
-            "0123456789abcdef0123456789abcdef",
-        ]))?;
+        let sub = parse_argv(&argv(&["refineid", "unpair"]))?;
         check(&sub.tag(), &VerbTag::CardUnpair, "unpair tag")?;
         let sub = parse_argv(&argv(&["refineid", "auth", "https://card.refineid.fi"]))?;
         check(&sub.tag(), &VerbTag::CardAuth, "auth tag")?;

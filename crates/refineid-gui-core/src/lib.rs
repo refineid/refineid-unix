@@ -30,8 +30,5 @@ pub use controller::RefineIdController;
 pub use driver::UiDriver;
 pub use error::GuiCoreError;
 pub use image::{RgbaImageBuffer, decode_document_image};
-pub use model::{
-    ManagedCard, RappPairingState, SignFormat, TimestampConfig, UiState, UserIntent,
-    condense_reader_name,
-};
+pub use model::{ManagedCard, RappPairingState, SignFormat, UiState, UserIntent};
 pub use refineid_client::card_pin::PinManageSlot;

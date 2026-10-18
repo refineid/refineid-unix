@@ -25,6 +25,7 @@ use refineid_client::card_check::{CardCheckError, CardCheckReport};
 use refineid_client::card_pin::{
     ActivateOptions, ChangePinOptions, PinManageSlot, UnblockPinOptions,
 };
+use refineid_client::card_sign::DEFAULT_TIMESTAMP_AUTHORITY;
 use refineid_lib_core::auth::{ChangePinOutcome, PinStatus, UnblockOutcome};
 use refineid_lib_core::backend::{ReaderFilter, ReaderPickError};
 use refineid_lib_core::identity::render_token_serial;
@@ -33,15 +34,13 @@ use refineid_lib_core::pin::{
 };
 use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_rapp_core::engine::OperationOutcome;
-use refineid_rapp_core::ids::PairId;
+
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
-use refineid_rapp_core::remote::{PairSummary, RemoteError, RemoteReader};
+use refineid_rapp_core::remote::{RemoteError, RemoteReader};
 
 use crate::error::GuiCoreError;
 use crate::image::{RgbaImageBuffer, decode_document_image};
-use crate::model::{
-    ManagedCard, PairedPhone, RappPairingState, SignFormat, TimestampConfig, UiState, UserIntent,
-};
+use crate::model::{ManagedCard, PairedPhone, RappPairingState, SignFormat, UiState, UserIntent};
 
 const DENIED_PINS: &[&[u8]] = &[
     b"1122", b"1004", b"2000", b"2001", b"2002", b"2020", b"2580", b"5683", b"0852", b"112233",
@@ -135,25 +134,20 @@ impl RefineIdController {
     /// phone is back.
     fn run_certificate_fetcher(self: &Arc<Self>) {
         while !self.presence_stop.load(Ordering::Acquire) {
-            let missing: Vec<PairId> = self
+            let missing = self
                 .state()
-                .phones
-                .iter()
-                .filter(|phone| phone.state.usable() && !phone.certificate_cached)
-                .map(|phone| phone.pair_id)
-                .collect();
+                .phone
+                .as_ref()
+                .filter(|phone| !phone.certificate_cached)
+                .map(|phone| phone.pair_id);
             let mut fetched = false;
-            if !missing.is_empty()
+            if let Some(pair_id) = missing
                 && let Ok(mut reader) = RemoteReader::open_local()
+                && reader
+                    .refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT)
+                    .is_ok()
             {
-                for pair_id in missing {
-                    if reader
-                        .refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT)
-                        .is_ok()
-                    {
-                        fetched = true;
-                    }
-                }
+                fetched = true;
             }
             if fetched {
                 self.refresh_phones();
@@ -171,8 +165,6 @@ impl RefineIdController {
     /// Handle a user action dispatched from a presentation driver.
     pub fn handle_intent(self: &Arc<Self>, intent: UserIntent) {
         match intent {
-            UserIntent::SelectCard(index) => self.select_card(index),
-            UserIntent::RefreshCards => self.refresh_cards(),
             UserIntent::ActivateCard {
                 activation_code,
                 new_pin1,
@@ -190,42 +182,35 @@ impl RefineIdController {
             UserIntent::AddDocuments(paths) => self.add_documents(paths),
             UserIntent::ClearDocuments => self.clear_documents(),
             UserIntent::SetSignFormat(format) => self.set_sign_format(format),
-            UserIntent::SetTimestampConfig(config) => self.set_timestamp_config(config),
             UserIntent::SignDocuments { pin2 } => self.sign_documents(pin2),
             UserIntent::StartPairing { code } => self.start_pairing(&code),
-            UserIntent::ForgetPhone(pair_id) => self.forget_phone(pair_id),
+            UserIntent::ForgetPhone => self.forget_phone(),
         }
     }
 
-    /// Reads the stored pairings into the phone list.
+    /// Reads the paired phone from the store.
     pub fn refresh_phones(&self) {
-        let phones = RemoteReader::open_local()
-            .map(|reader| {
-                reader
-                    .pairs()
-                    .iter()
-                    .map(PairedPhone::from_summary)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        self.update_state(|state| state.phones = phones);
+        let phone = RemoteReader::open_local()
+            .ok()
+            .and_then(|reader| reader.phone())
+            .and_then(|summary| PairedPhone::from_summary(&summary));
+        self.update_state(|state| state.phone = phone);
     }
 
-    /// Whether a paired phone can serve its card: the phone list is
-    /// consulted only while such a pairing exists.
+    /// Whether a paired phone can serve its card: the phone is dialed
+    /// only while a pairing exists.
     fn has_usable_phone(&self) -> bool {
-        self.state().phones.iter().any(|phone| phone.state.usable())
+        self.state().phone.is_some()
     }
 
-    fn forget_phone(self: &Arc<Self>, pair_id: PairId) {
+    fn forget_phone(self: &Arc<Self>) {
         let name = self
             .state()
-            .phones
-            .iter()
-            .find(|phone| phone.pair_id == pair_id)
+            .phone
+            .as_ref()
             .map(|phone| phone.name.clone())
             .unwrap_or_default();
-        let outcome = RemoteReader::open_local().and_then(|mut reader| reader.remove(pair_id));
+        let outcome = RemoteReader::open_local().and_then(|mut reader| reader.forget());
         self.update_state(|state| {
             state.status_message = match &outcome {
                 Ok(()) => String::new(),
@@ -236,20 +221,15 @@ impl RefineIdController {
         self.refresh_cards();
     }
 
-    /// Replaces the listed cards and keeps the selection on the card that
-    /// was selected when it is still listed, otherwise on the same index,
-    /// otherwise on the last card, otherwise on none.
+    /// Replaces the listed cards and selects the card in use: a card in a
+    /// reader attached to this computer before the phone's card, the
+    /// first of either.
     fn replace_cards(&self, cards: Vec<ManagedCard>) {
-        let index = {
-            let state = self.state();
-            let selected = state.selected_card;
-            let previous = selected
-                .and_then(|index| state.cards.get(index))
-                .map(ManagedCard::key);
-            previous
-                .and_then(|key| cards.iter().position(|card| card.key() == key))
-                .unwrap_or_else(|| selected.unwrap_or(0).min(cards.len().saturating_sub(1)))
-        };
+        let index = cards
+            .iter()
+            .position(|card| !card.report.reader.starts_with(PHONE_READER_PREFIX))
+            .or_else(|| (!cards.is_empty()).then_some(0))
+            .unwrap_or(0);
         self.update_state(|state| state.cards = cards);
         self.select_card(index);
     }
@@ -669,14 +649,8 @@ impl RefineIdController {
         });
     }
 
-    fn set_timestamp_config(&self, config: TimestampConfig) {
-        self.update_state(|state| {
-            state.timestamp_config = config;
-        });
-    }
-
     fn sign_documents(self: &Arc<Self>, pin2: PinBytes) {
-        let (reader, serial, signature_buf, documents, format, ts_config) = {
+        let (reader, serial, signature_buf, documents, format) = {
             let state = self.state();
             let Some(card) = state.selected_card.and_then(|idx| state.cards.get(idx)) else {
                 self.update_state(|s| s.status_message = "No card selected for signing.".into());
@@ -688,7 +662,6 @@ impl RefineIdController {
                 state.signature.clone(),
                 state.pdf_documents.clone(),
                 state.sign_format,
-                state.timestamp_config.clone(),
             )
         };
 
@@ -724,7 +697,7 @@ impl RefineIdController {
                             can: None,
                             reader_filter: Some(reader.clone()),
                             expected_serial: render_token_serial(serial.clone()),
-                            timestamp_authority: ts_config.host_path.clone(),
+                            timestamp_authority: DEFAULT_TIMESTAMP_AUTHORITY.to_owned(),
                             timestamp_credentials: None,
                         },
                     )
@@ -740,7 +713,7 @@ impl RefineIdController {
                             reader_filter: Some(reader.clone()),
                             expected_serial: render_token_serial(serial.clone()),
                             handwriting: handwriting.clone(),
-                            timestamp_authority: ts_config.host_path.clone(),
+                            timestamp_authority: DEFAULT_TIMESTAMP_AUTHORITY.to_owned(),
                             timestamp_credentials: None,
                         },
                     )
@@ -870,7 +843,7 @@ fn inspection_settled(signature: &[(String, bool)], readers: &[&str]) -> bool {
 }
 
 /// The reader name prefix of a card served by a paired phone.
-const PHONE_READER_PREFIX: &str = "Mobile: ";
+const PHONE_READER_PREFIX: &str = "Phone: ";
 
 fn validate_gui_pin(pin: &PinBytes, label: &str, minimum_length: usize) -> Result<(), String> {
     let bytes = pin.as_bytes();
@@ -933,8 +906,11 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
     }
 
     // Include paired phones whose authentication certificate is cached.
-    if include_phones && let Ok(reader) = RemoteReader::open_local() {
-        for pair in reader.pairs().into_iter().filter(PairSummary::usable) {
+    if include_phones
+        && let Ok(reader) = RemoteReader::open_local()
+        && let Some(pair) = reader.phone()
+    {
+        {
             if let Some(cached_der) = pair.auth_cert
                 && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(cached_der)
             {
@@ -944,30 +920,16 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
                 let serial = owned_cert.serial().to_string();
                 let token_info = refineid_lib_core::pkcs15::TokenInfo {
                     serial_number_hex: Some(refineid_lib_core::identity::TokenSerial::new(serial)),
-                    label: Some(format!("Mobile NFC ({dev_name})")),
+                    label: Some(format!("Phone ({dev_name})")),
                     ..Default::default()
                 };
 
                 let mut identity = refineid_lib_core::identity::CredentialIdentity::new();
                 if let Some(cn) = view.subject.common_name() {
                     identity = identity.with_common_name(cn.clone());
-                    let name_str = cn.as_str();
-                    if let Some((first, last)) = name_str.split_once(' ') {
-                        if let Ok(fn_val) =
-                            refineid_lib_core::identity::FirstName::new(first.to_owned())
-                        {
-                            identity = identity.with_first_name(fn_val);
-                        }
-                        if let Ok(sn_val) =
-                            refineid_lib_core::identity::Surname::new(last.to_owned())
-                        {
-                            identity = identity.with_surname(sn_val);
-                        }
-                    } else if let Ok(sn_val) =
-                        refineid_lib_core::identity::Surname::new(name_str.to_owned())
-                    {
-                        identity = identity.with_surname(sn_val);
-                    }
+                }
+                if let Some(peuin) = view.subject.peuin() {
+                    identity = identity.with_peuin(peuin);
                 }
 
                 let report = CardCheckReport {

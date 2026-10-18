@@ -399,17 +399,20 @@ impl RemoteReader {
             .collect()
     }
 
-    /// The newest pairing that can open a session.
+    /// The paired phone: the one pairing that can open a session. A new
+    /// pairing supersedes the one before it, so there is at most one.
     #[must_use]
-    pub fn selected(&self) -> Option<PairSummary> {
+    pub fn phone(&self) -> Option<PairSummary> {
         self.pairs().into_iter().find(PairSummary::usable)
     }
 
-    /// Forgets one pairing locally.
+    /// Forgets the paired phone.
     ///
     /// # Errors
-    /// [`RemoteError::Store`] when the record is unknown or cannot be removed.
-    pub fn remove(&mut self, pair_id: PairId) -> Result<(), RemoteError> {
+    /// [`RemoteError::NotPaired`] when no phone is paired, and
+    /// [`RemoteError::Store`] when the record cannot be removed.
+    pub fn forget(&mut self) -> Result<(), RemoteError> {
+        let pair_id = self.phone().ok_or(RemoteError::NotPaired)?.pair_id;
         self.requester
             .store_mut()
             .remove(pair_id)
@@ -418,6 +421,19 @@ impl RemoteReader {
             .journal_mut()
             .forget_pair(pair_id)
             .map_err(RemoteError::Store)
+    }
+
+    /// Revokes every usable pairing but `kept`, so one phone is paired.
+    fn supersede_others(&mut self, kept: PairId) {
+        let older: Vec<PairId> = self
+            .pairs()
+            .into_iter()
+            .filter(|pair| pair.usable() && pair.pair_id != kept)
+            .map(|pair| pair.pair_id)
+            .collect();
+        for pair_id in older {
+            self.requester.revoke_locally(pair_id);
+        }
     }
 
     /// Operations of `pair_id` that ended ambiguous and await section 8.3
@@ -540,6 +556,7 @@ impl RemoteReader {
                     .pair_with_code(code, transport, |_, requested| Some(requested.to_vec()))
                 {
                     Ok(pair_id) => {
+                        self.supersede_others(pair_id);
                         // The name is for display; a refused rewrite keeps
                         // the introduced one, the pairing stands either way.
                         let host = service.host.clone();
@@ -602,7 +619,7 @@ impl RemoteReader {
     ) -> Result<RemoteSession, RemoteError> {
         let pair_id = match pair_id {
             Some(pair_id) => pair_id,
-            None => self.selected().ok_or(RemoteError::NotPaired)?.pair_id,
+            None => self.phone().ok_or(RemoteError::NotPaired)?.pair_id,
         };
         let record = self
             .requester

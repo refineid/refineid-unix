@@ -15,7 +15,6 @@
 //! `refineid pair`, `refineid pairs`, and `refineid unpair` CLI commands.
 
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use std::io::{BufRead as _, Write as _};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -151,74 +150,46 @@ impl PairsArgs {
                 return ExitCode::FAILURE;
             }
         };
-        let pairs = reader.pairs();
-        if pairs.is_empty() {
-            println!("No paired remote devices found.");
-            println!("Run `refineid pair` to pair an iPhone or Android phone.");
+        let Some(pair) = reader.phone() else {
+            println!("No phone paired.");
             return ExitCode::SUCCESS;
-        }
-
-        println!("Paired Remote Card Readers ({}):", pairs.len());
-        for (idx, pair) in pairs.iter().enumerate() {
-            println!(
-                "\n  [{}] {} ({}){}",
-                idx + 1,
-                pair.peer_display_name,
-                pair.peer_platform,
-                if pair.forgotten_by_phone {
-                    " -- the phone forgot this computer; pair again"
-                } else if pair.revoked {
-                    " -- revoked"
-                } else if pair.unconfirmed {
-                    " -- pairing unconfirmed; pair again"
-                } else {
-                    ""
-                }
-            );
-            println!("      Pair ID:    {}", pair.pair_id_hex());
-            println!("      Profiles:   {}", pair.granted_profiles.join(", "));
-            println!(
-                "      Cert cache: {}",
-                if pair.auth_cert.is_some() {
-                    "Cached"
-                } else {
-                    "None"
-                }
-            );
-        }
+        };
+        println!("Phone: {} ({})", pair.peer_display_name, pair.peer_platform);
+        println!("  Pair ID:    {}", pair.pair_id_hex());
+        println!("  Profiles:   {}", pair.granted_profiles.join(", "));
+        println!(
+            "  Cert cache: {}",
+            if pair.auth_cert.is_some() {
+                "Cached"
+            } else {
+                "None"
+            }
+        );
         ExitCode::SUCCESS
     }
 }
 
-/// Arguments for `refineid unpair`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnpairArgs {
-    /// Hex pair ID or prefix to remove.
-    pub pair_id: String,
-}
+/// Arguments for `refineid unpair`, which takes none: it forgets the
+/// paired phone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnpairArgs;
 
 impl UnpairArgs {
-    /// Parse arguments for `refineid unpair`.
+    /// Parse arguments for `refineid unpair`, which takes none.
     ///
     /// # Errors
-    /// Returns [`ArgParseError`] on missing required argument or unexpected flags.
+    /// Returns [`ArgParseError`] on any argument.
     pub fn parse(argv: RemainingArgv) -> Result<Self, ArgParseError> {
-        let tokens = argv.into_vec();
-        let mut iter = tokens.into_iter();
-        let pair_id = iter.next().ok_or(ArgParseError::Required {
-            cmd: VerbTag::CardUnpair,
-            name: "PAIR_ID",
-        })?;
-        if let Some(extra) = iter.next() {
-            return Err(ArgParseError::Unexpected {
+        match argv.into_vec().first() {
+            None => Ok(Self),
+            Some(got) => Err(ArgParseError::Unexpected {
                 cmd: VerbTag::CardUnpair,
-                got: extra,
-            });
+                got: got.clone(),
+            }),
         }
-        Ok(Self { pair_id })
     }
 
-    /// Delete the pair record from disk.
+    /// Forget the paired phone.
     #[must_use]
     pub fn run(self) -> ExitCode {
         let mut reader = match RemoteReader::open_local() {
@@ -228,28 +199,18 @@ impl UnpairArgs {
                 return ExitCode::FAILURE;
             }
         };
-        let matching: Vec<_> = reader
-            .pairs()
-            .into_iter()
-            .filter(|pair| pair.pair_id_hex().starts_with(&self.pair_id))
-            .collect();
-
-        if matching.is_empty() {
-            eprintln!("No paired device matches ID '{}'.", self.pair_id);
+        let Some(phone) = reader.phone() else {
+            eprintln!("No phone paired.");
+            return ExitCode::FAILURE;
+        };
+        if let Err(e) = reader.forget() {
+            eprintln!("Error forgetting {}: {e}", phone.peer_display_name);
             return ExitCode::FAILURE;
         }
-        if matching.len() > 1 {
-            eprintln!("Ambiguous ID '{}' matches multiple pairs.", self.pair_id);
-            return ExitCode::FAILURE;
-        }
-
-        let target = &matching[0];
-        let id_hex = target.pair_id_hex();
-        if let Err(e) = reader.remove(target.pair_id) {
-            eprintln!("Error deleting pair {id_hex}: {e}");
-            return ExitCode::FAILURE;
-        }
-        println!("Unpaired {id_hex}. Remove this computer on the phone as well.");
+        println!(
+            "Forgot {}. Remove this computer on the phone as well.",
+            phone.peer_display_name
+        );
         ExitCode::SUCCESS
     }
 }
@@ -293,8 +254,8 @@ impl AuthArgs {
                 return ExitCode::FAILURE;
             }
         };
-        let Some(pair) = reader.selected() else {
-            eprintln!("No paired mobile card reader found. Run `refineid pair` first.");
+        let Some(pair) = reader.phone() else {
+            eprintln!("No phone paired. Run `refineid pair` first.");
             return ExitCode::FAILURE;
         };
         println!(

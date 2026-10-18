@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use fltk::app::{self, Receiver, Scheme};
 use fltk::browser::HoldBrowser;
-use fltk::button::{Button, CheckButton, RadioRoundButton};
+use fltk::button::{Button, RadioRoundButton};
 use fltk::dialog::{FileDialogType, NativeFileChooser, alert, choice2_default};
 use fltk::draw;
 use fltk::enums::{Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType, Key};
@@ -36,7 +36,7 @@ use refineid_gui_core::controller::RefineIdController;
 use refineid_gui_core::driver::UiDriver;
 use refineid_gui_core::error::GuiCoreError;
 use refineid_gui_core::image::RgbaImageBuffer;
-use refineid_gui_core::model::{SignFormat, TimestampConfig, UiState, UserIntent};
+use refineid_gui_core::model::{SignFormat, UiState, UserIntent};
 use refineid_lib_core::apdu::status_word::PinRetries;
 use refineid_lib_core::auth::{PIN_TRY_LIMIT, PinStatus, PukStatus};
 use refineid_lib_core::pin::PinBytes;
@@ -58,8 +58,6 @@ fn set_active<W: WidgetExt>(w: &mut W, active: bool) {
 #[derive(Clone, Debug)]
 struct FltkWidgets {
     window: Window,
-    card_choice: Choice,
-    card_status_badge: Frame,
     holder_name_frame: Frame,
     pin1_status_frame: Frame,
     pin2_status_frame: Frame,
@@ -88,8 +86,12 @@ struct FltkWidgets {
     /// Whether the last rendered state had a pairing ceremony running.
     pairing_running: bool,
     pair_status_frame: Frame,
-    phone_browser: HoldBrowser,
-    forget_phone_btn: Button,
+    /// The code boxes, shown while no phone is paired.
+    reader_card: Group,
+    /// The paired phone's row, shown while one is paired.
+    phone_card: Group,
+    phone_name_frame: Frame,
+    phone_state_frame: Frame,
     status_frame: Frame,
 }
 
@@ -147,153 +149,197 @@ impl FltkDriver {
 
     /// Build all UI controls and attach callbacks dispatching to `controller`.
     fn init_ui(&mut self, controller: &Arc<RefineIdController>) {
-        let window = Window::default().with_size(920, 680).with_label("RefineID");
-
-        // Top bar: Card selector, Refresh, Status Badge
-        let mut card_choice = Choice::new(70, 15, 520, 32, "Card:");
-        card_choice.set_align(Align::Left);
-
-        let mut refresh_btn = Button::new(605, 15, 80, 32, "Refresh");
-        let mut card_status_badge = Frame::new(695, 15, 205, 32, "No card");
-        card_status_badge.set_frame(FrameType::RFlatBox);
-        card_status_badge.set_label_font(Font::HelveticaBold);
-        card_status_badge.set_label_size(12);
+        let window = Window::default().with_size(920, 642).with_label("RefineID");
 
         // Main Tabs
         let mut tabs = Tabs::new(20, 58, 880, 580, "");
 
         // ---------------------------------------------------------------------
-        // TAB 1: Card & PIN Management
+        // TAB 1: Identity (Portrait & Signature)
         // ---------------------------------------------------------------------
-        let pin_tab = Group::new(20, 88, 880, 550, "PINs   ");
+        let pace_tab = Group::new(20, 88, 880, 550, "Identity   ");
 
-        // Hero Card: Cardholder profile and PIN retries
-        let mut hero_card = Group::new(35, 98, 850, 96, "");
-        hero_card.set_frame(FrameType::RFlatBox);
-        hero_card.set_color(Color::from_rgb(255, 255, 255));
+        // The holder's name from the certificate
+        let mut name_card = Group::new(35, 98, 850, 40, "");
+        name_card.set_frame(FrameType::RFlatBox);
+        name_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut holder_name_frame = Frame::new(50, 104, 430, 28, "No card");
+        let mut holder_name_frame = Frame::new(50, 104, 820, 28, "");
         holder_name_frame.set_label_font(Font::HelveticaBold);
         holder_name_frame.set_label_size(18);
         holder_name_frame.set_align(Align::Left | Align::Inside);
+        name_card.end();
 
-        let mut pin1_status_frame = Frame::new(490, 108, 380, 24, "");
-        pin1_status_frame.set_label_size(12);
-        pin1_status_frame.set_align(Align::Left | Align::Inside);
+        // CAN Bar
+        let mut can_bar = Group::new(35, 146, 850, 44, "");
+        can_bar.set_frame(FrameType::RFlatBox);
+        can_bar.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut pin2_status_frame = Frame::new(490, 134, 380, 24, "");
-        pin2_status_frame.set_label_size(12);
-        pin2_status_frame.set_align(Align::Left | Align::Inside);
+        let mut can_label = Frame::new(50, 153, 210, 30, "Card Access Number (CAN):");
+        can_label.set_align(Align::Left | Align::Inside);
+        let mut can_input = Input::new(265, 153, 90, 30, "");
+        can_input.set_maximum_size(6);
 
-        let mut puk_status_frame = Frame::new(490, 160, 380, 24, "");
-        puk_status_frame.set_label_size(12);
-        puk_status_frame.set_align(Align::Left | Align::Inside);
-        hero_card.end();
+        let mut read_images_btn = Button::new(370, 153, 140, 30, "Load Photos");
+        read_images_btn.set_color(Color::from_rgb(0, 122, 255));
+        read_images_btn.set_label_color(Color::from_rgb(255, 255, 255));
+        read_images_btn.set_label_font(Font::HelveticaBold);
+        can_bar.end();
+
+        // Photo Card
+        let mut photo_card = Group::new(35, 200, 370, 422, "");
+        photo_card.set_frame(FrameType::RFlatBox);
+        photo_card.set_color(Color::from_rgb(255, 255, 255));
+
+        let mut p_title = Frame::new(50, 208, 340, 24, "Official Photo");
+        p_title.set_label_font(Font::HelveticaBold);
+        p_title.set_label_size(14);
+        p_title.set_align(Align::Left | Align::Inside);
+
+        let mut portrait_frame = Frame::new(60, 240, 320, 330, "");
+        portrait_frame.set_frame(FrameType::ThinDownBox);
+
+        let copy_portrait_btn = Button::new(85, 580, 120, 32, "Copy Photo");
+        let save_portrait_btn = Button::new(225, 580, 120, 32, "Save As...");
+        photo_card.end();
+
+        // Signature Card
+        let mut sig_card = Group::new(420, 200, 465, 265, "");
+        sig_card.set_frame(FrameType::RFlatBox);
+        sig_card.set_color(Color::from_rgb(255, 255, 255));
+
+        let mut s_title = Frame::new(435, 208, 435, 24, "Cardholder Signature");
+        s_title.set_label_font(Font::HelveticaBold);
+        s_title.set_label_size(14);
+        s_title.set_align(Align::Left | Align::Inside);
+
+        let mut signature_frame = Frame::new(435, 240, 435, 165, "");
+        signature_frame.set_frame(FrameType::ThinDownBox);
+
+        let copy_sig_btn = Button::new(490, 420, 140, 32, "Copy Signature");
+        let save_sig_btn = Button::new(650, 420, 140, 32, "Save As...");
+        sig_card.end();
+
+        pace_tab.end();
+
+        // ---------------------------------------------------------------------
+        // TAB 2: PIN Management
+        // ---------------------------------------------------------------------
+        let pin_tab = Group::new(20, 88, 880, 550, "PINs   ");
 
         // Subtabs for PIN operations
-        let pin_subtabs = Tabs::new(35, 204, 850, 420, "");
+        let pin_subtabs = Tabs::new(35, 98, 850, 526, "");
 
         // Subtab 1: Change PIN 1
-        let mut tab_change_pin1 = Group::new(35, 234, 850, 390, "Change PIN 1   ");
+        let mut tab_change_pin1 = Group::new(35, 128, 850, 496, "Change PIN 1   ");
         tab_change_pin1.set_frame(FrameType::RFlatBox);
         tab_change_pin1.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut l1 = Frame::new(120, 265, 150, 32, "Current PIN 1:");
+        let mut l1 = Frame::new(120, 159, 150, 32, "Current PIN 1:");
         l1.set_align(Align::Right | Align::Inside);
-        let cur_p1_in = SecretInput::new(285, 265, 260, 32, "");
+        let cur_p1_in = SecretInput::new(285, 159, 260, 32, "");
+        let mut pin1_status_frame = Frame::new(560, 159, 310, 32, "");
+        pin1_status_frame.set_label_size(12);
+        pin1_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut l2 = Frame::new(120, 310, 150, 32, "New PIN 1:");
+        let mut l2 = Frame::new(120, 204, 150, 32, "New PIN 1:");
         l2.set_align(Align::Right | Align::Inside);
-        let new_p1_in = SecretInput::new(285, 310, 260, 32, "");
+        let new_p1_in = SecretInput::new(285, 204, 260, 32, "");
 
-        let mut l3 = Frame::new(120, 355, 150, 32, "Confirm PIN 1:");
+        let mut l3 = Frame::new(120, 249, 150, 32, "Confirm PIN 1:");
         l3.set_align(Align::Right | Align::Inside);
-        let conf_p1_in = SecretInput::new(285, 355, 260, 32, "");
+        let conf_p1_in = SecretInput::new(285, 249, 260, 32, "");
 
-        let mut change_pin1_btn = Button::new(285, 405, 180, 36, "Change PIN 1");
+        let mut change_pin1_btn = Button::new(285, 299, 180, 36, "Change PIN 1");
         change_pin1_btn.set_color(Color::from_rgb(0, 122, 255));
         change_pin1_btn.set_label_color(Color::from_rgb(255, 255, 255));
         change_pin1_btn.set_label_font(Font::HelveticaBold);
         tab_change_pin1.end();
 
         // Subtab 2: Change PIN 2
-        let mut tab_change_pin2 = Group::new(35, 234, 850, 390, "Change PIN 2   ");
+        let mut tab_change_pin2 = Group::new(35, 128, 850, 496, "Change PIN 2   ");
         tab_change_pin2.set_frame(FrameType::RFlatBox);
         tab_change_pin2.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut l1_p2 = Frame::new(120, 265, 150, 32, "Current PIN 2:");
+        let mut l1_p2 = Frame::new(120, 159, 150, 32, "Current PIN 2:");
         l1_p2.set_align(Align::Right | Align::Inside);
-        let cur_p2_in = SecretInput::new(285, 265, 260, 32, "");
+        let cur_p2_in = SecretInput::new(285, 159, 260, 32, "");
+        let mut pin2_status_frame = Frame::new(560, 159, 310, 32, "");
+        pin2_status_frame.set_label_size(12);
+        pin2_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut l2_p2 = Frame::new(120, 310, 150, 32, "New PIN 2:");
+        let mut l2_p2 = Frame::new(120, 204, 150, 32, "New PIN 2:");
         l2_p2.set_align(Align::Right | Align::Inside);
-        let new_p2_in = SecretInput::new(285, 310, 260, 32, "");
+        let new_p2_in = SecretInput::new(285, 204, 260, 32, "");
 
-        let mut l3_p2 = Frame::new(120, 355, 150, 32, "Confirm PIN 2:");
+        let mut l3_p2 = Frame::new(120, 249, 150, 32, "Confirm PIN 2:");
         l3_p2.set_align(Align::Right | Align::Inside);
-        let conf_p2_in = SecretInput::new(285, 355, 260, 32, "");
+        let conf_p2_in = SecretInput::new(285, 249, 260, 32, "");
 
-        let mut change_pin2_btn = Button::new(285, 405, 180, 36, "Change PIN 2");
+        let mut change_pin2_btn = Button::new(285, 299, 180, 36, "Change PIN 2");
         change_pin2_btn.set_color(Color::from_rgb(0, 122, 255));
         change_pin2_btn.set_label_color(Color::from_rgb(255, 255, 255));
         change_pin2_btn.set_label_font(Font::HelveticaBold);
         tab_change_pin2.end();
 
         // Subtab 3: Unblock PIN
-        let mut tab_reactivate = Group::new(35, 234, 850, 390, "Unblock PIN   ");
+        let mut tab_reactivate = Group::new(35, 128, 850, 496, "Unblock PIN   ");
         tab_reactivate.set_frame(FrameType::RFlatBox);
         tab_reactivate.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut l_slot = Frame::new(120, 260, 150, 32, "PIN to Unblock:");
+        let mut l_slot = Frame::new(120, 154, 150, 32, "PIN to Unblock:");
         l_slot.set_align(Align::Right | Align::Inside);
-        let mut react_slot_choice = Choice::new(285, 260, 260, 32, "");
+        let mut react_slot_choice = Choice::new(285, 154, 260, 32, "");
         react_slot_choice.add_choice("PIN 1 (Authentication)|PIN 2 (Signing)");
         react_slot_choice.set_value(0);
 
-        let mut l_puk = Frame::new(120, 300, 150, 32, "PUK Code:");
+        let mut l_puk = Frame::new(120, 194, 150, 32, "PUK Code:");
         l_puk.set_align(Align::Right | Align::Inside);
-        let puk_in = SecretInput::new(285, 300, 260, 32, "");
+        let puk_in = SecretInput::new(285, 194, 260, 32, "");
+        let mut puk_status_frame = Frame::new(560, 194, 310, 32, "");
+        puk_status_frame.set_label_size(12);
+        puk_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut l_rnew = Frame::new(120, 340, 150, 32, "New PIN:");
+        let mut l_rnew = Frame::new(120, 234, 150, 32, "New PIN:");
         l_rnew.set_align(Align::Right | Align::Inside);
-        let react_new_pin = SecretInput::new(285, 340, 260, 32, "");
+        let react_new_pin = SecretInput::new(285, 234, 260, 32, "");
 
-        let mut l_rconf = Frame::new(120, 380, 150, 32, "Confirm New PIN:");
+        let mut l_rconf = Frame::new(120, 274, 150, 32, "Confirm New PIN:");
         l_rconf.set_align(Align::Right | Align::Inside);
-        let react_conf_pin = SecretInput::new(285, 380, 260, 32, "");
+        let react_conf_pin = SecretInput::new(285, 274, 260, 32, "");
 
-        let mut reactivate_btn = Button::new(285, 428, 180, 36, "Unblock PIN");
+        let mut reactivate_btn = Button::new(285, 322, 180, 36, "Unblock PIN");
         reactivate_btn.set_color(Color::from_rgb(0, 122, 255));
         reactivate_btn.set_label_color(Color::from_rgb(255, 255, 255));
         reactivate_btn.set_label_font(Font::HelveticaBold);
         tab_reactivate.end();
 
         // Subtab 4: First-Time Setup
-        let mut tab_activate = Group::new(35, 234, 850, 390, "First-Time Setup   ");
+        let mut tab_activate = Group::new(35, 128, 850, 496, "First-Time Setup   ");
         tab_activate.set_frame(FrameType::RFlatBox);
         tab_activate.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut l_acode = Frame::new(120, 250, 150, 30, "Activation Code:");
+        let mut l_acode = Frame::new(120, 144, 150, 30, "Activation Code:");
         l_acode.set_align(Align::Right | Align::Inside);
-        let act_code_in = SecretInput::new(285, 250, 260, 30, "");
+        let act_code_in = SecretInput::new(285, 144, 260, 30, "");
 
-        let mut l_ap1 = Frame::new(120, 290, 150, 30, "New PIN 1:");
+        let mut l_ap1 = Frame::new(120, 184, 150, 30, "New PIN 1:");
         l_ap1.set_align(Align::Right | Align::Inside);
-        let act_p1_in = SecretInput::new(285, 290, 260, 30, "");
+        let act_p1_in = SecretInput::new(285, 184, 260, 30, "");
 
-        let mut l_ap1c = Frame::new(120, 330, 150, 30, "Confirm PIN 1:");
+        let mut l_ap1c = Frame::new(120, 224, 150, 30, "Confirm PIN 1:");
         l_ap1c.set_align(Align::Right | Align::Inside);
-        let act_p1_conf = SecretInput::new(285, 330, 260, 30, "");
+        let act_p1_conf = SecretInput::new(285, 224, 260, 30, "");
 
-        let mut l_ap2 = Frame::new(120, 370, 150, 30, "New PIN 2:");
+        let mut l_ap2 = Frame::new(120, 264, 150, 30, "New PIN 2:");
         l_ap2.set_align(Align::Right | Align::Inside);
-        let act_p2_in = SecretInput::new(285, 370, 260, 30, "");
+        let act_p2_in = SecretInput::new(285, 264, 260, 30, "");
 
-        let mut l_ap2c = Frame::new(120, 410, 150, 30, "Confirm PIN 2:");
+        let mut l_ap2c = Frame::new(120, 304, 150, 30, "Confirm PIN 2:");
         l_ap2c.set_align(Align::Right | Align::Inside);
-        let act_p2_conf = SecretInput::new(285, 410, 260, 30, "");
+        let act_p2_conf = SecretInput::new(285, 304, 260, 30, "");
 
-        let mut activate_btn = Button::new(285, 455, 180, 36, "Activate Card");
+        let mut activate_btn = Button::new(285, 349, 180, 36, "Activate Card");
         activate_btn.set_color(Color::from_rgb(0, 122, 255));
         activate_btn.set_label_color(Color::from_rgb(255, 255, 255));
         activate_btn.set_label_font(Font::HelveticaBold);
@@ -301,63 +347,6 @@ impl FltkDriver {
 
         pin_subtabs.end();
         pin_tab.end();
-
-        // ---------------------------------------------------------------------
-        // TAB 2: Identity (Portrait & Signature)
-        // ---------------------------------------------------------------------
-        let pace_tab = Group::new(20, 88, 880, 550, "Identity   ");
-
-        // CAN Bar
-        let mut can_bar = Group::new(35, 98, 850, 44, "");
-        can_bar.set_frame(FrameType::RFlatBox);
-        can_bar.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut can_label = Frame::new(50, 105, 210, 30, "Card Access Number (CAN):");
-        can_label.set_align(Align::Left | Align::Inside);
-        let mut can_input = Input::new(265, 105, 90, 30, "");
-        can_input.set_maximum_size(6);
-
-        let mut read_images_btn = Button::new(370, 105, 140, 30, "Load Photos");
-        read_images_btn.set_color(Color::from_rgb(0, 122, 255));
-        read_images_btn.set_label_color(Color::from_rgb(255, 255, 255));
-        read_images_btn.set_label_font(Font::HelveticaBold);
-        can_bar.end();
-
-        // Photo Card
-        let mut photo_card = Group::new(35, 152, 370, 470, "");
-        photo_card.set_frame(FrameType::RFlatBox);
-        photo_card.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut p_title = Frame::new(50, 160, 340, 24, "Official Photo");
-        p_title.set_label_font(Font::HelveticaBold);
-        p_title.set_label_size(14);
-        p_title.set_align(Align::Left | Align::Inside);
-
-        let mut portrait_frame = Frame::new(60, 192, 320, 370, "");
-        portrait_frame.set_frame(FrameType::ThinDownBox);
-
-        let copy_portrait_btn = Button::new(85, 575, 120, 32, "Copy Photo");
-        let save_portrait_btn = Button::new(225, 575, 120, 32, "Save As...");
-        photo_card.end();
-
-        // Signature Card
-        let mut sig_card = Group::new(420, 152, 465, 265, "");
-        sig_card.set_frame(FrameType::RFlatBox);
-        sig_card.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut s_title = Frame::new(435, 160, 435, 24, "Cardholder Signature");
-        s_title.set_label_font(Font::HelveticaBold);
-        s_title.set_label_size(14);
-        s_title.set_align(Align::Left | Align::Inside);
-
-        let mut signature_frame = Frame::new(435, 192, 435, 165, "");
-        signature_frame.set_frame(FrameType::ThinDownBox);
-
-        let copy_sig_btn = Button::new(490, 372, 140, 32, "Copy Signature");
-        let save_sig_btn = Button::new(650, 372, 140, 32, "Save As...");
-        sig_card.end();
-
-        pace_tab.end();
 
         // ---------------------------------------------------------------------
         // TAB 3: Sign Documents
@@ -402,18 +391,11 @@ impl FltkDriver {
         format_pades.set_value(true);
         let format_asice = RadioRoundButton::new(560, 200, 290, 25, "BDOC Container (ASiC-E)");
 
-        let mut tsa_label = Frame::new(560, 240, 310, 20, "Timestamp Authority:");
-        tsa_label.set_align(Align::Left | Align::Inside);
-        let mut tsa_check = CheckButton::new(560, 265, 290, 25, "Include Qualified Timestamp");
-        tsa_check.set_value(true);
-        let mut tsa_url_input = Input::new(560, 295, 310, 28, "");
-        tsa_url_input.set_value("https://timestamp.sectigo.com/qualified");
-
-        let mut p2_label = Frame::new(560, 345, 310, 20, "Signing PIN (PIN 2):");
+        let mut p2_label = Frame::new(560, 240, 310, 20, "Signing PIN (PIN 2):");
         p2_label.set_align(Align::Left | Align::Inside);
-        let sign_pin2_input = SecretInput::new(560, 370, 310, 32, "");
+        let sign_pin2_input = SecretInput::new(560, 265, 310, 32, "");
 
-        let mut sign_btn = Button::new(560, 425, 310, 42, "Sign Documents");
+        let mut sign_btn = Button::new(560, 320, 310, 42, "Sign Documents");
         sign_btn.set_color(Color::from_rgb(0, 122, 255));
         sign_btn.set_label_color(Color::from_rgb(255, 255, 255));
         sign_btn.set_label_font(Font::HelveticaBold);
@@ -469,30 +451,39 @@ impl FltkDriver {
         pair_status_frame.set_label_size(12);
         reader_card.end();
 
-        // Paired phones card
-        let mut phones_card = Group::new(35, 260, 850, 360, "");
-        phones_card.set_frame(FrameType::RFlatBox);
-        phones_card.set_color(Color::from_rgb(255, 255, 255));
+        // The paired phone's row, in the place of the code boxes
+        let mut phone_card = Group::new(35, 98, 850, 56, "");
+        phone_card.set_frame(FrameType::RFlatBox);
+        phone_card.set_color(CARD_BACKGROUND);
 
-        let mut phones_title = Frame::new(50, 268, 820, 24, "Paired phones");
-        phones_title.set_label_font(Font::HelveticaBold);
-        phones_title.set_label_size(14);
-        phones_title.set_align(Align::Left | Align::Inside);
+        let mut phone_name_frame = Frame::new(50, 110, 560, 32, "");
+        phone_name_frame.set_label_font(Font::HelveticaBold);
+        phone_name_frame.set_label_size(16);
+        phone_name_frame.set_align(Align::Left | Align::Inside);
 
-        let phone_browser = HoldBrowser::new(50, 298, 820, 270, "");
+        let mut phone_state_frame = Frame::new(610, 110, 210, 32, "");
+        phone_state_frame.set_label_size(12);
+        phone_state_frame.set_label_color(Color::from_rgb(108, 117, 125));
+        phone_state_frame.set_align(Align::Right | Align::Inside);
 
-        let mut forget_phone_btn = Button::new(50, 576, 110, 32, "Forget");
-        phones_card.end();
+        let mut forget_phone_btn = Button::new(830, 110, 32, 32, "");
+        forget_phone_btn.set_frame(FrameType::NoBox);
+        forget_phone_btn.clear_visible_focus();
+        forget_phone_btn.set_tooltip("Forget this phone");
+        forget_phone_btn.draw(draw_trash_icon);
+        phone_card.end();
+        phone_card.hide();
 
         rapp_tab.end();
         tabs.end();
+        tabs.resize(20, 20, 880, 580);
         if self.opens_on_phone_tab {
             let _ = tabs.set_value(&rapp_tab);
             let _ = pair_code_input.take_focus();
         }
 
         // Bottom status bar
-        let mut status_frame = Frame::new(20, 642, 880, 24, "");
+        let mut status_frame = Frame::new(20, 604, 880, 24, "");
         status_frame.set_align(Align::Left | Align::Inside);
         status_frame.set_label_size(12);
         status_frame.set_label_color(Color::from_rgb(108, 117, 125));
@@ -502,19 +493,6 @@ impl FltkDriver {
         // ---------------------------------------------------------------------
         // Set up Callbacks
         // ---------------------------------------------------------------------
-        {
-            let c = Arc::clone(controller);
-            card_choice.set_callback(move |choice| {
-                let idx = choice.value() as usize;
-                c.handle_intent(UserIntent::SelectCard(idx));
-            });
-        }
-        {
-            let c = Arc::clone(controller);
-            refresh_btn.set_callback(move |_| {
-                c.handle_intent(UserIntent::RefreshCards);
-            });
-        }
         {
             let c = Arc::clone(controller);
             let mut cur = cur_p1_in.clone();
@@ -753,28 +731,6 @@ impl FltkDriver {
         }
         {
             let c = Arc::clone(controller);
-            let tsa_url = tsa_url_input.clone();
-            tsa_check.set_callback({
-                let c = Arc::clone(&c);
-                let tsa_url = tsa_url.clone();
-                move |_chk| {
-                    c.handle_intent(UserIntent::SetTimestampConfig(TimestampConfig {
-                        host_path: tsa_url.value(),
-                        username: None,
-                        password: None,
-                    }));
-                }
-            });
-            tsa_url_input.set_callback(move |input| {
-                c.handle_intent(UserIntent::SetTimestampConfig(TimestampConfig {
-                    host_path: input.value(),
-                    username: None,
-                    password: None,
-                }));
-            });
-        }
-        {
-            let c = Arc::clone(controller);
             let mut p2 = sign_pin2_input.clone();
             sign_btn.set_callback(move |_| {
                 let pin2_val = p2.value();
@@ -806,27 +762,19 @@ impl FltkDriver {
         }
         {
             let c = Arc::clone(controller);
-            let browser = phone_browser.clone();
             forget_phone_btn.set_callback(move |_| {
-                let selected = browser.value();
-                if selected < 1 {
-                    return;
-                }
-                let phones = c.state().phones;
-                let Some(phone) = phones.get((selected - 1) as usize) else {
+                let Some(phone) = c.state().phone else {
                     return;
                 };
                 let question = format!("Forget {}?", phone.name);
                 if choice2_default(&question, "Cancel", "Forget", "") == Some(FORGET_CHOICE) {
-                    c.handle_intent(UserIntent::ForgetPhone(phone.pair_id));
+                    c.handle_intent(UserIntent::ForgetPhone);
                 }
             });
         }
 
         self.widgets = Some(FltkWidgets {
             window,
-            card_choice,
-            card_status_badge,
             holder_name_frame,
             pin1_status_frame,
             pin2_status_frame,
@@ -854,8 +802,10 @@ impl FltkDriver {
             pair_code_input,
             pairing_running: false,
             pair_status_frame,
-            phone_browser,
-            forget_phone_btn,
+            reader_card,
+            phone_card,
+            phone_name_frame,
+            phone_state_frame,
             status_frame,
         });
 
@@ -1022,59 +972,15 @@ impl UiDriver for FltkDriver {
         widgets.window.set_label(&state.window_title);
         widgets.status_frame.set_label(&state.status_message);
 
-        // Top bar: Card selector
-        widgets.card_choice.clear();
-        for card in &state.cards {
-            widgets
-                .card_choice
-                .add_choice(&escape_fltk_menu_text(&card.label()));
-        }
-        let selected = state
+        // The holder of the card in use
+        let holder = state
             .selected_card
-            .and_then(|idx| i32::try_from(idx).ok())
-            .unwrap_or(-1);
-        widgets.card_choice.set_value(selected);
-        widgets.card_choice.redraw();
+            .and_then(|index| state.cards.get(index))
+            .map(|card| card.display_name())
+            .unwrap_or_default();
+        widgets.holder_name_frame.set_label(&holder);
 
-        // Top bar: Card presence badge & Hero Card
-        if state.cards.is_empty() {
-            widgets.card_status_badge.set_label("No card");
-            widgets
-                .card_status_badge
-                .set_color(Color::from_rgb(238, 240, 242));
-            widgets
-                .card_status_badge
-                .set_label_color(Color::from_rgb(120, 120, 120));
-
-            widgets.holder_name_frame.set_label("No card");
-        } else if state.busy {
-            widgets.card_status_badge.set_label("Reading");
-            widgets
-                .card_status_badge
-                .set_color(Color::from_rgb(254, 247, 224));
-            widgets
-                .card_status_badge
-                .set_label_color(Color::from_rgb(180, 100, 0));
-
-            if let Some(card) = state.selected_card.and_then(|i| state.cards.get(i)) {
-                widgets.holder_name_frame.set_label(&card.display_name());
-            }
-        } else {
-            widgets.card_status_badge.set_label("Card ready");
-            widgets
-                .card_status_badge
-                .set_color(Color::from_rgb(230, 244, 234));
-            widgets
-                .card_status_badge
-                .set_label_color(Color::from_rgb(46, 125, 50));
-
-            if let Some(card) = state.selected_card.and_then(|i| state.cards.get(i)) {
-                widgets.holder_name_frame.set_label(&card.display_name());
-            }
-        }
-        widgets.card_status_badge.redraw();
-
-        // Tab 1: PIN Status
+        // Tab 2: PIN Status
         widgets.pin1_status_frame.set_label(&credential_line(
             PIN1_LABEL,
             with_factory_flag(pin_value(state.pin1_status), state.pin1_changed),
@@ -1122,7 +1028,7 @@ impl UiDriver for FltkDriver {
             state.activation_available && !state.busy,
         );
 
-        // Tab 2: Identity & PACE
+        // Tab 1: Identity & PACE
         set_active(
             &mut widgets.read_images_btn,
             !state.busy && state.selected_card.is_some(),
@@ -1139,7 +1045,7 @@ impl UiDriver for FltkDriver {
                 .expect("current portrait write lock") = state.portrait.clone();
 
             if let Some(ref buf) = state.portrait {
-                if let Some(img) = create_fitted_image(buf, 310, 360) {
+                if let Some(img) = create_fitted_image(buf, 310, 320) {
                     widgets.portrait_frame.set_label("");
                     widgets.portrait_frame.set_image(Some(img));
                 }
@@ -1217,30 +1123,23 @@ impl UiDriver for FltkDriver {
         widgets.pairing_running = state.pairing.is_some();
         widgets.pair_code_input.redraw();
 
-        let lines: Vec<String> = state
-            .phones
-            .iter()
-            .map(|phone| escape_browser_text(&phone.line()))
-            .collect();
-        let listed = (1..=widgets.phone_browser.size())
-            .map(|row| widgets.phone_browser.text(row).unwrap_or_default());
-        if listed.ne(lines.iter().cloned()) {
-            let selected_phone = widgets.phone_browser.value();
-            widgets.phone_browser.clear();
-            for line in &lines {
-                widgets.phone_browser.add(line);
+        if let Some(ref phone) = state.phone {
+            widgets.phone_name_frame.set_label(&phone.name);
+            widgets
+                .phone_state_frame
+                .set_label(if phone.certificate_cached {
+                    &phone.platform
+                } else {
+                    "Reading the card"
+                });
+            if !widgets.phone_card.visible() {
+                widgets.reader_card.hide();
+                widgets.phone_card.show();
             }
-            if selected_phone >= 1 && selected_phone <= widgets.phone_browser.size() {
-                widgets.phone_browser.select(selected_phone);
-            }
+        } else if !widgets.reader_card.visible() {
+            widgets.phone_card.hide();
+            widgets.reader_card.show();
         }
-        if widgets.phone_browser.value() < 1 && widgets.phone_browser.size() >= 1 {
-            widgets.phone_browser.select(1);
-        }
-        set_active(
-            &mut widgets.forget_phone_btn,
-            widgets.phone_browser.value() >= 1,
-        );
     }
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
@@ -1412,41 +1311,36 @@ fn with_factory_flag(value: String, changed: Option<bool>) -> String {
     }
 }
 
-/// Escapes the column and format characters FLTK browsers interpret.
-fn escape_browser_text(s: &str) -> String {
-    s.replace('@', "@@").replace('\t', " ")
+/// Draws `button` as a trash can: the lid with its handle, the body
+/// and three ribs, in the accent while the button is active.
+fn draw_trash_icon(button: &mut Button) {
+    let (x, y) = (button.x(), button.y());
+    let color = if button.active() {
+        TRASH_COLOR
+    } else {
+        Color::from_rgb(170, 170, 170)
+    };
+    draw::set_draw_color(color);
+    draw::set_line_style(draw::LineStyle::Solid, 2);
+    draw::draw_line(x + 7, y + 9, x + 25, y + 9);
+    draw::draw_line(x + 13, y + 9, x + 13, y + 5);
+    draw::draw_line(x + 13, y + 5, x + 19, y + 5);
+    draw::draw_line(x + 19, y + 5, x + 19, y + 9);
+    draw::draw_line(x + 9, y + 12, x + 10, y + 27);
+    draw::draw_line(x + 10, y + 27, x + 22, y + 27);
+    draw::draw_line(x + 22, y + 27, x + 23, y + 12);
+    draw::draw_line(x + 13, y + 15, x + 13, y + 24);
+    draw::draw_line(x + 16, y + 15, x + 16, y + 24);
+    draw::draw_line(x + 19, y + 15, x + 19, y + 24);
+    draw::set_line_style(draw::LineStyle::Solid, 0);
 }
 
-/// Escapes special menu characters in FLTK choice items (`/`, `&`, `_`).
-fn escape_fltk_menu_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for ch in s.chars() {
-        match ch {
-            '/' => out.push_str("\\/"),
-            '&' => out.push_str("&&"),
-            '_' => out.push_str("\\_"),
-            other => out.push(other),
-        }
-    }
-    out
-}
+/// The trash can's colour.
+const TRASH_COLOR: Color = Color::from_rgb(200, 60, 50);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_escape_fltk_menu_text() {
-        assert_eq!(
-            escape_fltk_menu_text("ALPHA HOLDER / Alcor Reader / CardOS"),
-            "ALPHA HOLDER \\/ Alcor Reader \\/ CardOS"
-        );
-        assert_eq!(
-            escape_fltk_menu_text("R&D / Test_Case"),
-            "R&&D \\/ Test\\_Case"
-        );
-        assert_eq!(escape_fltk_menu_text("Clean Name"), "Clean Name");
-    }
 
     #[test]
     fn factory_flag_follows_the_card() {
@@ -1509,15 +1403,6 @@ mod tests {
         assert_eq!(
             code_boxes_width(),
             code_box_offset(PAIRING_CODE_LENGTH - 1) + CODE_BOX_SIZE
-        );
-    }
-
-    #[test]
-    fn browser_text_escapes_format_characters() {
-        assert_eq!(escape_browser_text("a@b\tc"), "a@@b c");
-        assert_eq!(
-            escape_browser_text("Alpha Phone: paired"),
-            "Alpha Phone: paired"
         );
     }
 }

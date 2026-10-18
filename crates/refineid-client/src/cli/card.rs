@@ -133,7 +133,7 @@ impl CardArgs {
 
     fn try_remote_card_check() -> Option<std::process::ExitCode> {
         let mut reader = refineid_rapp_core::remote::RemoteReader::open_local().ok()?;
-        let pair = reader.selected()?;
+        let pair = reader.phone()?;
         Some(Self::run_remote_card_check_with_pair(&mut reader, &pair))
     }
 
@@ -142,8 +142,8 @@ impl CardArgs {
             eprintln!("cannot open the paired-phone store.");
             return std::process::ExitCode::FAILURE;
         };
-        let Some(pair) = reader.selected() else {
-            eprintln!("no paired remote device found. Run `refineid pair` first.");
+        let Some(pair) = reader.phone() else {
+            eprintln!("no phone paired. Run `refineid pair` first.");
             return std::process::ExitCode::FAILURE;
         };
         Self::run_remote_card_check_with_pair(&mut reader, &pair)

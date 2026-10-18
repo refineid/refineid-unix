@@ -612,7 +612,7 @@ mod tests {
         use refineid_rapp_core::remote::RemoteReader;
 
         let reader = RemoteReader::open_local().expect("paired-phone store");
-        let pair = reader.selected().expect("Need at least 1 active pair");
+        let pair = reader.phone().expect("a paired phone");
         let cert_der = pair
             .auth_cert
             .as_ref()
