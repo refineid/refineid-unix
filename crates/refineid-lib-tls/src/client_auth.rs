@@ -74,6 +74,10 @@ pub struct RappClientCertResolver {
     pair: PairId,
     cert_der: Vec<u8>,
     origin: String,
+    /// Why no identity was offered, when the handshake asked and the
+    /// resolver had none to give; the caller reports it instead of a
+    /// server answer that could not have used the card.
+    refusal: Mutex<Option<String>>,
 }
 
 impl RappClientCertResolver {
@@ -85,7 +89,21 @@ impl RappClientCertResolver {
             pair,
             cert_der,
             origin,
+            refusal: Mutex::new(None),
         }
+    }
+
+    fn record_refusal(&self, reason: String) {
+        if let Ok(mut refusal) = self.refusal.lock() {
+            *refusal = Some(reason);
+        }
+    }
+
+    /// Why the identity was not offered in the last handshake, if it
+    /// was not.
+    #[must_use]
+    pub fn refusal(&self) -> Option<String> {
+        self.refusal.lock().ok().and_then(|refusal| refusal.clone())
     }
 }
 
@@ -96,12 +114,25 @@ impl ResolvesClientCert for RappClientCertResolver {
         sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
         if !offers_supported_scheme(sigschemes) {
+            self.record_refusal(
+                "the server accepts no signature scheme the card offers".to_owned(),
+            );
             return None;
         }
-        let mut reader = RemoteReader::open_local().ok()?;
-        let session = reader
-            .open_session(Some(self.pair), REMOTE_DISCOVERY_TIMEOUT)
-            .ok()?;
+        let mut reader = match RemoteReader::open_local() {
+            Ok(reader) => reader,
+            Err(error) => {
+                self.record_refusal(error.to_string());
+                return None;
+            }
+        };
+        let session = match reader.open_session(Some(self.pair), REMOTE_DISCOVERY_TIMEOUT) {
+            Ok(session) => session,
+            Err(error) => {
+                self.record_refusal(error.to_string());
+                return None;
+            }
+        };
         let cert = CertificateDer::from(self.cert_der.clone());
         let key = Arc::new(RappSigningKey {
             origin: self.origin.clone(),
@@ -230,7 +261,7 @@ pub fn get_with_rapp_client_auth(
         .with_protocol_versions(versions)
         .map_err(|e| HttpsError::Tls(format!("protocol versions: {e}")))?
         .with_root_certificates(roots)
-        .with_client_cert_resolver(resolver);
+        .with_client_cert_resolver(shared_resolver(&resolver));
 
     let server_name = rustls::pki_types::ServerName::try_from(host.clone())
         .map_err(|e| HttpsError::Tls(format!("server name {host}: {e}")))?;
@@ -261,8 +292,22 @@ pub fn get_with_rapp_client_auth(
     let mut resp = Vec::new();
     let _ = tls_stream.read_to_end(&mut resp);
 
+    // A server answer reached without the card is no login: the
+    // handshake went on without an identity, and the reason is the
+    // result.
+    if let Some(reason) = resolver.refusal() {
+        return Err(HttpsError::Tls(format!(
+            "the card was not offered: {reason}"
+        )));
+    }
     let text = String::from_utf8_lossy(&resp).to_string();
     Ok(text)
+}
+
+/// The resolver as the TLS configuration takes it.
+fn shared_resolver(resolver: &Arc<RappClientCertResolver>) -> Arc<dyn ResolvesClientCert> {
+    let shared: Arc<dyn ResolvesClientCert> = resolver.clone();
+    shared
 }
 
 #[cfg(test)]
