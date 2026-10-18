@@ -655,6 +655,26 @@ impl RemoteReader {
         Err(last)
     }
 
+    /// Browses once for the phone holding `pair_id` without dialing it,
+    /// applying what it announces: a revocation hint naming the pairing
+    /// (RAPP v26.10.18 section 4.6 item 3) revokes it here. Returns
+    /// whether the phone's session record was in sight.
+    ///
+    /// # Errors
+    /// [`RemoteError::NotPaired`] when no record names `pair_id`,
+    /// [`RemoteError::RevokedByPhone`] when the phone announced that it
+    /// forgot this computer, [`RemoteError::Withdrawn`] when it withdrew
+    /// its service.
+    pub fn observe(&mut self, pair_id: PairId) -> Result<bool, RemoteError> {
+        let record = self
+            .requester
+            .store()
+            .get(pair_id)
+            .map_err(|_| RemoteError::NotPaired)?;
+        let keys = PairingKeys::derive(record)?;
+        Ok(!self.sessions_for(pair_id, &keys)?.is_empty())
+    }
+
     /// The session custodians worth dialing for `pair_id`, applying the
     /// phone's announcements: a withdrawal ends the search, and a
     /// revocation revokes the pairing here before reporting it.
@@ -963,6 +983,23 @@ mod tests {
             .unwrap();
         let journal = FileOperationJournal::open(&directory.join("journal")).unwrap();
         RemoteReader::with_stores("alpha-desk", "Linux", store, journal)
+    }
+
+    #[test]
+    fn observing_browses_without_a_lock_and_names_an_unknown_pairing() {
+        let directory = scratch();
+        let mut reader = reader_with_pairing(&directory);
+        let pair_id = PairId::from_array(PAIR_ID);
+        let held = SessionLock::acquire(&session_lock_path(&directory, pair_id)).unwrap();
+        // No phone announces this pairing on the test network: not seen,
+        // and the held lock is no obstacle since nothing is dialed.
+        assert_eq!(reader.observe(pair_id), Ok(false));
+        drop(held);
+        assert_eq!(
+            reader.observe(PairId::from_array([9; 16])).err(),
+            Some(RemoteError::NotPaired)
+        );
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

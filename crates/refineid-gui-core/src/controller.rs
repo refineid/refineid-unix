@@ -124,36 +124,34 @@ impl RefineIdController {
         });
         let controller = Arc::clone(self);
         thread::spawn(move || {
-            controller.run_certificate_fetcher();
+            controller.run_phone_watch();
         });
     }
 
-    /// Reads the authentication certificate of every paired phone that
-    /// has none cached yet, whenever the phone is on the network, so a
-    /// pairing whose first read did not reach the phone serves once the
-    /// phone is back.
-    fn run_certificate_fetcher(self: &Arc<Self>) {
+    /// Keeps the Phone tab true while the GUI holds no session: at each
+    /// round it browses for the paired phone's record and applies what
+    /// the phone announces, a revocation hint foremost; reads the
+    /// authentication certificate when none is cached yet and the phone
+    /// is on the network; and re-reads the pairing record, which another
+    /// program on this computer may have rewritten.
+    fn run_phone_watch(self: &Arc<Self>) {
         while !self.presence_stop.load(Ordering::Acquire) {
-            let missing = self
+            if let Some(phone) = self
                 .state()
                 .phone
                 .as_ref()
-                .filter(|phone| !phone.certificate_cached)
-                .map(|phone| phone.pair_id);
-            let mut fetched = false;
-            if let Some(pair_id) = missing
+                .map(|phone| (phone.pair_id, phone.certificate_cached))
                 && let Ok(mut reader) = RemoteReader::open_local()
-                && reader
-                    .refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT)
-                    .is_ok()
             {
-                fetched = true;
+                let (pair_id, certificate_cached) = phone;
+                let seen = reader.observe(pair_id);
+                if !certificate_cached && seen == Ok(true) {
+                    let _ = reader.refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT);
+                }
             }
-            if fetched {
-                self.refresh_phones();
-                self.refresh_cards();
-            }
-            thread::sleep(CERTIFICATE_FETCH_INTERVAL);
+            self.refresh_phones();
+            self.refresh_cards();
+            thread::sleep(PHONE_WATCH_INTERVAL);
         }
     }
 
@@ -810,7 +808,7 @@ const PAIRING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long one certificate fetch browses for a paired phone.
 const CERTIFICATE_FETCH_TIMEOUT: Duration = Duration::from_secs(6);
 /// The pause between rounds of certificate fetches.
-const CERTIFICATE_FETCH_INTERVAL: Duration = Duration::from_secs(15);
+const PHONE_WATCH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The status line after a pairing: nothing when the card was read,
 /// otherwise what stands between the user and the card.
