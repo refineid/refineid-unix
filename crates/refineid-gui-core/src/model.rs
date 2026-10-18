@@ -232,6 +232,8 @@ pub struct PairedPhone {
     pub platform: String,
     /// The pairing's state.
     pub state: PhoneState,
+    /// Whether the phone's authentication certificate is cached.
+    pub certificate_cached: bool,
 }
 
 impl PairedPhone {
@@ -251,6 +253,7 @@ impl PairedPhone {
             pair_id: summary.pair_id,
             name: summary.peer_display_name.clone(),
             platform: summary.peer_platform.clone(),
+            certificate_cached: summary.auth_cert.is_some(),
             state,
         }
     }
