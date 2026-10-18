@@ -136,21 +136,28 @@ impl RefineIdController {
     /// program on this computer may have rewritten.
     fn run_phone_watch(self: &Arc<Self>) {
         while !self.presence_stop.load(Ordering::Acquire) {
-            if let Some(phone) = self
-                .state()
-                .phone
-                .as_ref()
-                .map(|phone| (phone.pair_id, phone.certificate_cached))
-                && let Ok(mut reader) = RemoteReader::open_local()
-            {
-                let (pair_id, certificate_cached) = phone;
-                let seen = reader.observe(pair_id);
-                if !certificate_cached && seen == Ok(true) {
-                    let _ = reader.refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT);
+            // The round stands aside while the user pairs: that writes the
+            // record itself and refreshes the screen after.
+            if self.state().pairing.is_none() {
+                self.refresh_phones();
+                let phone = self
+                    .state()
+                    .phone
+                    .as_ref()
+                    .map(|phone| (phone.pair_id, phone.certificate_cached));
+                if let Some((pair_id, certificate_cached)) = phone
+                    && let Ok(mut reader) = RemoteReader::open_local()
+                {
+                    let seen = reader.observe(pair_id);
+                    if !certificate_cached && seen == Ok(true) {
+                        let _ = reader.refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT);
+                    }
+                    if seen != Ok(false) {
+                        self.refresh_phones();
+                    }
                 }
+                self.refresh_cards();
             }
-            self.refresh_phones();
-            self.refresh_cards();
             thread::sleep(PHONE_WATCH_INTERVAL);
         }
     }
