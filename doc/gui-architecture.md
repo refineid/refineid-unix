@@ -168,8 +168,10 @@ pub trait UiDriver: Send + 'static {
 - `pin_status: BTreeMap<PinManageSlot, PinStatus>` (retry counters, blocked flags)
 - `portrait: Option<Arc<DocumentImage>>` and `signature: Option<Arc<DocumentImage>>`
 - `signing_queue: Vec<PathBuf>`
-- `remote_reader_enabled: bool` (default: `false` — local PC/SC smart card reader only)
-- `rapp_pairing: Option<RappPairingState>` (PAKE state, 6-character Crockford Base32 code)
+- `remote_reader_enabled: bool` (off until the user turns it on; a workstation that already holds a usable pairing starts with it on, because pairing was the opt-in)
+- `phones: Vec<PairedPhone>` (every stored pairing with its name, platform and state: paired, unconfirmed, forgotten by the phone, revoked)
+- `card_model`, `issuance_scheme`, `pin1_changed`, `pin2_changed` (what the card page shows beside the PIN counters)
+- `pairing: Option<RappPairingState>` (the typed code and the status line while the ceremony runs)
 - `busy_message: Option<String>`
 - `status_banner: Option<StatusBanner>`
 
@@ -181,7 +183,8 @@ pub trait UiDriver: Send + 'static {
 - `LoadPortrait { can: PinBytes }`
 - `QueueDocuments(Vec<PathBuf>)` and `ClearDocuments`
 - `ExecuteSign { pin2: PinBytes, format: SignFormat, timestamp_config: TimestampConfig }`
-- `StartRappPairing` and `CancelRappPairing`
+- `StartPairing { code }` and `CancelPairing`
+- `ForgetPhone(PairId)` and `RefreshPhones`
 
 ### 4.3 Workstation UX Hygiene Contract
 

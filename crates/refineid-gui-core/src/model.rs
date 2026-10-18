@@ -24,6 +24,8 @@ use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_lib_core::sign::document::Format;
+use refineid_rapp_core::ids::PairId;
+use refineid_rapp_core::remote::PairSummary;
 
 use crate::image::RgbaImageBuffer;
 
@@ -192,8 +194,95 @@ pub struct RappPairingState {
     pub code: String,
     /// Human-readable status line.
     pub status: String,
-    /// 2D boolean grid representing the QR code matrix (true = dark module).
-    pub qr_modules: Option<Vec<Vec<bool>>>,
+}
+
+/// What a stored pairing with a phone is to the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhoneState {
+    /// The pairing opens sessions.
+    Paired,
+    /// Stored before the phone confirmed its own storage; it opens no
+    /// session until pairing runs again.
+    Unconfirmed,
+    /// The phone forgot this computer or rejected the credential.
+    ForgottenByPhone,
+    /// Revoked on this computer.
+    Revoked,
+}
+
+impl PhoneState {
+    /// The state as the phone list shows it.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Paired => "paired",
+            Self::Unconfirmed => "pairing unconfirmed; pair again",
+            Self::ForgottenByPhone => "the phone forgot this computer; pair again",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    /// Whether a pairing in this state can serve a card.
+    #[must_use]
+    pub const fn usable(self) -> bool {
+        matches!(self, Self::Paired)
+    }
+}
+
+/// One phone this workstation has paired with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairedPhone {
+    /// The pair identifier.
+    pub pair_id: PairId,
+    /// The name the phone introduced itself with.
+    pub name: String,
+    /// The platform the phone introduced itself with.
+    pub platform: String,
+    /// The pairing's state.
+    pub state: PhoneState,
+}
+
+impl PairedPhone {
+    /// The phone as its stored pairing describes it.
+    #[must_use]
+    pub fn from_summary(summary: &PairSummary) -> Self {
+        let state = if summary.forgotten_by_phone {
+            PhoneState::ForgottenByPhone
+        } else if summary.revoked {
+            PhoneState::Revoked
+        } else if summary.unconfirmed {
+            PhoneState::Unconfirmed
+        } else {
+            PhoneState::Paired
+        };
+        Self {
+            pair_id: summary.pair_id,
+            name: summary.peer_display_name.clone(),
+            platform: summary.peer_platform.clone(),
+            state,
+        }
+    }
+
+    /// The one line the phone list shows for this phone.
+    #[must_use]
+    pub fn line(&self) -> String {
+        if self.platform.is_empty() {
+            format!("{}: {}", self.name, self.state.label())
+        } else {
+            format!("{} ({}): {}", self.name, self.platform, self.state.label())
+        }
+    }
+}
+
+/// The issuance scheme of a card generation, as the card page names it;
+/// none for a generation the card did not reveal.
+#[must_use]
+pub const fn issuance_scheme_label(generation: CardGeneration) -> Option<&'static str> {
+    match generation {
+        CardGeneration::Newer => Some("Current single-use activation scheme"),
+        CardGeneration::Older => Some("Legacy reusable activation scheme"),
+        CardGeneration::Unknown => None,
+    }
 }
 
 /// An immutable snapshot of the user interface state.
@@ -211,6 +300,14 @@ pub struct UiState {
     pub selected_card: Option<usize>,
     /// Serial number of selected card.
     pub card_serial: Option<TokenSerial>,
+    /// The card model, from the token label or manufacturer.
+    pub card_model: Option<String>,
+    /// The issuance scheme of the selected card's generation.
+    pub issuance_scheme: Option<&'static str>,
+    /// Whether PIN1 has been changed from its factory value.
+    pub pin1_changed: Option<bool>,
+    /// Whether PIN2 has been changed from its factory value.
+    pub pin2_changed: Option<bool>,
 
     /// Authentication PIN1 status.
     pub pin1_status: Option<PinStatus>,
@@ -253,6 +350,12 @@ pub struct UiState {
 
     /// Active RAPP phone pairing state.
     pub pairing: Option<RappPairingState>,
+    /// Whether paired phones are used as card readers. Off until the
+    /// user turns it on, except that a workstation that already holds a
+    /// usable pairing starts with it on: pairing was the opt-in.
+    pub remote_reader_enabled: bool,
+    /// Every phone this workstation has paired with, newest first.
+    pub phones: Vec<PairedPhone>,
 }
 
 impl Default for UiState {
@@ -264,6 +367,10 @@ impl Default for UiState {
             cards: Vec::new(),
             selected_card: None,
             card_serial: None,
+            card_model: None,
+            issuance_scheme: None,
+            pin1_changed: None,
+            pin2_changed: None,
             pin1_status: None,
             pin2_status: None,
             puk_status: None,
@@ -283,6 +390,8 @@ impl Default for UiState {
             timestamp_config: TimestampConfig::default(),
             sign_result: None,
             pairing: None,
+            remote_reader_enabled: false,
+            phones: Vec::new(),
         }
     }
 }
@@ -346,4 +455,59 @@ pub enum UserIntent {
     },
     /// Cancel active RAPP pairing.
     CancelPairing,
+    /// Use, or stop using, paired phones as card readers.
+    ToggleRemoteReader(bool),
+    /// Forget one paired phone.
+    ForgetPhone(PairId),
+    /// Read the stored pairings again.
+    RefreshPhones,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(revoked: bool, unconfirmed: bool, forgotten: bool) -> PairSummary {
+        PairSummary {
+            pair_id: PairId::from_array([0; 16]),
+            peer_display_name: "Alpha Phone".to_owned(),
+            peer_platform: "Android".to_owned(),
+            granted_profiles: Vec::new(),
+            auth_cert: None,
+            revoked,
+            unconfirmed,
+            forgotten_by_phone: forgotten,
+        }
+    }
+
+    #[test]
+    fn a_pairing_maps_to_one_state() {
+        assert_eq!(
+            PairedPhone::from_summary(&summary(false, false, false)).state,
+            PhoneState::Paired
+        );
+        assert_eq!(
+            PairedPhone::from_summary(&summary(false, true, false)).state,
+            PhoneState::Unconfirmed
+        );
+        assert_eq!(
+            PairedPhone::from_summary(&summary(true, false, true)).state,
+            PhoneState::ForgottenByPhone
+        );
+        assert_eq!(
+            PairedPhone::from_summary(&summary(true, false, false)).state,
+            PhoneState::Revoked
+        );
+    }
+
+    #[test]
+    fn the_phone_line_names_the_phone_and_its_state() {
+        let phone = PairedPhone::from_summary(&summary(false, true, false));
+        assert_eq!(
+            phone.line(),
+            "Alpha Phone (Android): pairing unconfirmed; pair again"
+        );
+        assert!(!phone.state.usable());
+        assert!(PhoneState::Paired.usable());
+    }
 }

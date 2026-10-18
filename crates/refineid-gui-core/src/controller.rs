@@ -32,13 +32,15 @@ use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
 use refineid_lib_core::pkcs15::CardGeneration;
+use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
 use refineid_rapp_core::remote::{PairSummary, RemoteError, RemoteReader};
 
 use crate::error::GuiCoreError;
 use crate::image::{RgbaImageBuffer, decode_document_image};
 use crate::model::{
-    ManagedCard, RappPairingState, SignFormat, TimestampConfig, UiState, UserIntent,
+    ManagedCard, PairedPhone, RappPairingState, SignFormat, TimestampConfig, UiState, UserIntent,
+    issuance_scheme_label,
 };
 
 const DENIED_PINS: &[&[u8]] = &[
@@ -104,7 +106,13 @@ impl RefineIdController {
     }
 
     /// Start the background card presence monitor and inspect cards.
+    ///
+    /// The stored pairings are read first: a workstation that already
+    /// holds a usable pairing starts with the phone reader on.
     pub fn start(self: &Arc<Self>) {
+        self.refresh_phones();
+        let has_usable_phone = self.state().phones.iter().any(|phone| phone.state.usable());
+        self.update_state(|state| state.remote_reader_enabled = has_usable_phone);
         self.refresh_cards();
 
         let controller = Arc::clone(self);
@@ -144,7 +152,53 @@ impl RefineIdController {
             UserIntent::SignDocuments { pin2 } => self.sign_documents(pin2),
             UserIntent::StartPairing { code } => self.start_pairing(&code),
             UserIntent::CancelPairing => self.cancel_pairing(),
+            UserIntent::ToggleRemoteReader(enabled) => self.toggle_remote_reader(enabled),
+            UserIntent::ForgetPhone(pair_id) => self.forget_phone(pair_id),
+            UserIntent::RefreshPhones => self.refresh_phones(),
         }
+    }
+
+    /// Reads the stored pairings into the phone list.
+    pub fn refresh_phones(&self) {
+        let phones = RemoteReader::open_local()
+            .map(|reader| {
+                reader
+                    .pairs()
+                    .iter()
+                    .map(PairedPhone::from_summary)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.update_state(|state| state.phones = phones);
+    }
+
+    fn toggle_remote_reader(self: &Arc<Self>, enabled: bool) {
+        self.update_state(|state| {
+            state.remote_reader_enabled = enabled;
+            if !enabled {
+                state.pairing = None;
+            }
+        });
+        self.refresh_cards();
+    }
+
+    fn forget_phone(self: &Arc<Self>, pair_id: PairId) {
+        let name = self
+            .state()
+            .phones
+            .iter()
+            .find(|phone| phone.pair_id == pair_id)
+            .map(|phone| phone.name.clone())
+            .unwrap_or_default();
+        let outcome = RemoteReader::open_local().and_then(|mut reader| reader.remove(pair_id));
+        self.update_state(|state| {
+            state.status_message = match &outcome {
+                Ok(()) => format!("Forgot {name}."),
+                Err(error) => format!("Could not forget {name}: {error}"),
+            };
+        });
+        self.refresh_phones();
+        self.refresh_cards();
     }
 
     fn select_card(&self, index: usize) {
@@ -153,6 +207,18 @@ impl RefineIdController {
                 state.selected_card = Some(index);
                 let card = &state.cards[index];
                 state.card_serial = card.report.token_info.serial_number_hex.clone();
+                state.card_model = card
+                    .report
+                    .token_info
+                    .label
+                    .clone()
+                    .or_else(|| card.report.token_info.manufacturer_id.clone());
+                state.issuance_scheme = card
+                    .activation_context
+                    .as_ref()
+                    .and_then(|ctx| issuance_scheme_label(ctx.generation));
+                state.pin1_changed = card.report.pin1_changed;
+                state.pin2_changed = card.report.pin2_changed;
                 state.pin1_status = card.report.pin1;
                 state.pin2_status = card.report.pin2;
                 state.puk_status = card.report.puk;
@@ -185,6 +251,10 @@ impl RefineIdController {
             } else {
                 state.selected_card = None;
                 state.card_serial = None;
+                state.card_model = None;
+                state.issuance_scheme = None;
+                state.pin1_changed = None;
+                state.pin2_changed = None;
                 state.pin1_status = None;
                 state.pin2_status = None;
                 state.puk_status = None;
@@ -209,9 +279,10 @@ impl RefineIdController {
         });
 
         let controller = Arc::clone(self);
+        let include_phones = self.state().remote_reader_enabled;
         thread::spawn(move || {
             let result = refineid_client::card_manager::inspect_cards(None)
-                .map(deduplicate_cards)
+                .map(|reports| deduplicate_cards(reports, include_phones))
                 .map_err(|e| e.to_string());
 
             controller
@@ -253,8 +324,9 @@ impl RefineIdController {
                     thread::sleep(CARD_PRESENCE_SETTLE);
                     baseline = refineid_lib_pcsc::presence_signature().unwrap_or(baseline);
                     if !self.presence_stop.load(Ordering::Acquire) {
+                        let include_phones = self.state().remote_reader_enabled;
                         let result = refineid_client::card_manager::inspect_cards(None)
-                            .map(deduplicate_cards);
+                            .map(|reports| deduplicate_cards(reports, include_phones));
                         if let Ok(cards) = result {
                             self.update_state(|state| {
                                 state.cards = cards;
@@ -654,10 +726,10 @@ impl RefineIdController {
             return;
         };
         self.update_state(|s| {
+            s.remote_reader_enabled = true;
             s.pairing = Some(RappPairingState {
                 code: format_pairing_code(&normalized),
                 status: "Looking for your phone on the local network...".into(),
-                qr_modules: None,
             });
         });
 
@@ -695,15 +767,17 @@ impl RefineIdController {
 
             controller.update_state(|s| {
                 if let Some(p) = &mut s.pairing {
-                    p.status = "Paired. Reading the authentication certificate...".into();
+                    p.status = "Paired. Reading the card...".into();
                 }
             });
-            let _ = reader.refresh_auth_cert(pair.pair_id, PAIRING_DISCOVERY_TIMEOUT);
+            let phone = pair.peer_display_name.clone();
+            let read = reader.refresh_auth_cert(pair.pair_id, PAIRING_DISCOVERY_TIMEOUT);
 
             controller.update_state(|s| {
                 s.pairing = None;
-                s.status_message = "Phone paired successfully! Remote card is available.".into();
+                s.status_message = pairing_outcome_line(&phone, read.as_ref().err());
             });
+            controller.refresh_phones();
             controller.refresh_cards();
         });
     }
@@ -718,6 +792,19 @@ impl RefineIdController {
 
 /// How long pairing browses for the phone showing the code.
 const PAIRING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The status line after a pairing, from how the first card read ended.
+fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String {
+    match read_error {
+        None => format!("Paired with {phone}."),
+        Some(RemoteError::CardAbsent) => format!("Paired with {phone}. No card on the phone."),
+        Some(RemoteError::RevokedByPhone) => format!("{phone} forgot this computer; pair again."),
+        Some(RemoteError::Withdrawn) => {
+            format!("Paired with {phone}. The phone turned remote card access off.")
+        }
+        Some(error) => format!("Paired with {phone}. The card was not read: {error}"),
+    }
+}
 
 fn validate_gui_pin(pin: &PinBytes, label: &str, minimum_length: usize) -> Result<(), String> {
     let bytes = pin.as_bytes();
@@ -762,7 +849,7 @@ fn card_key(card: &CardCheckReport) -> String {
     )
 }
 
-fn deduplicate_cards(reports: Vec<CardCheckReport>) -> Vec<ManagedCard> {
+fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec<ManagedCard> {
     let mut cards = Vec::new();
     for report in reports {
         if !cards
@@ -780,7 +867,7 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>) -> Vec<ManagedCard> {
     }
 
     // Include paired phones whose authentication certificate is cached.
-    if let Ok(reader) = RemoteReader::open_local() {
+    if include_phones && let Ok(reader) = RemoteReader::open_local() {
         for pair in reader.pairs().into_iter().filter(PairSummary::usable) {
             if let Some(cached_der) = pair.auth_cert
                 && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(cached_der)
@@ -845,4 +932,32 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>) -> Vec<ManagedCard> {
     }
 
     cards
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pairing_line_names_the_phone_and_the_card() {
+        assert_eq!(
+            pairing_outcome_line("Alpha Phone", None),
+            "Paired with Alpha Phone."
+        );
+        assert_eq!(
+            pairing_outcome_line("Alpha Phone", Some(&RemoteError::CardAbsent)),
+            "Paired with Alpha Phone. No card on the phone."
+        );
+        assert_eq!(
+            pairing_outcome_line("Alpha Phone", Some(&RemoteError::RevokedByPhone)),
+            "Alpha Phone forgot this computer; pair again."
+        );
+    }
+
+    #[test]
+    fn predictable_pins_are_refused() {
+        assert!(is_predictable_pin(b"1234"));
+        assert!(is_predictable_pin(b"1111"));
+        assert!(!is_predictable_pin(b"2719"));
+    }
 }
