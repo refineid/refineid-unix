@@ -24,7 +24,7 @@ const PAIRING_BLOB_MAGIC: &[u8] = b"RAPP-pair-record";
 
 /// The one encoding revision this build reads and writes. Records of earlier
 /// revisions belong to earlier protocol versions and are re-paired.
-const PAIRING_BLOB_VERSION: u8 = 6;
+const PAIRING_BLOB_VERSION: u8 = 7;
 
 /// Format tag identifying a whole stored pairing set.
 const PAIRING_SET_MAGIC: &[u8] = b"RAPP-pair-set";
@@ -36,6 +36,9 @@ const PAIRING_SET_VERSION: u8 = 1;
 const DISPOSITION_PAIRED: u8 = 0;
 /// Disposition tag for a revoked (tombstoned) pairing.
 const DISPOSITION_REVOKED: u8 = 1;
+/// Disposition tag for a pairing stored before the peer confirmed its
+/// storage.
+const DISPOSITION_UNCONFIRMED: u8 = 2;
 
 /// Boolean false on the wire.
 const BOOLEAN_FALSE: u8 = 0;
@@ -246,6 +249,7 @@ const fn disposition_tag(disposition: PairingDisposition) -> u8 {
     match disposition {
         PairingDisposition::Paired => DISPOSITION_PAIRED,
         PairingDisposition::Revoked => DISPOSITION_REVOKED,
+        PairingDisposition::Unconfirmed => DISPOSITION_UNCONFIRMED,
     }
 }
 
@@ -254,6 +258,7 @@ const fn disposition_from_tag(tag: u8) -> Result<PairingDisposition, PairingCode
     match tag {
         DISPOSITION_PAIRED => Ok(PairingDisposition::Paired),
         DISPOSITION_REVOKED => Ok(PairingDisposition::Revoked),
+        DISPOSITION_UNCONFIRMED => Ok(PairingDisposition::Unconfirmed),
         _ => Err(PairingCodecError::InvalidDisposition),
     }
 }
@@ -445,6 +450,14 @@ mod tests {
         record.peer_initiated_termination = true;
         record.local_private = Zeroizing::new(Vec::new());
         record.peer_public = Vec::new();
+        let decoded = decode_pairing_record(&encode_pairing_record(&record)).unwrap();
+        assert_same(&record, &decoded);
+    }
+
+    #[test]
+    fn round_trips_an_unconfirmed_record() {
+        let mut record = sample();
+        record.disposition = PairingDisposition::Unconfirmed;
         let decoded = decode_pairing_record(&encode_pairing_record(&record)).unwrap();
         assert_same(&record, &decoded);
     }

@@ -13,6 +13,11 @@
 // permissions and limitations under the License.
 
 //! Client certificate authentication using remote RAPP card readers over TLS.
+//!
+//! The certificate is offered only on a session the phone opened and on
+//! which it reports a card (RAPP v26.10.18 section 8.4): the resolver
+//! opens the session when the server asks for a certificate, the signer
+//! signs on that same session, and the session closes with the handshake.
 
 extern crate alloc;
 
@@ -24,6 +29,7 @@ use alloc::vec::Vec;
 use core::fmt::Debug;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use refineid_lib_core::crypto::digest::Sha384;
@@ -33,7 +39,7 @@ use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::operations::{
     CardKeyProfile, CardOperation, CardOperationResult, SignatureAlgorithm as CardAlgorithm,
 };
-use refineid_rapp_core::remote::RemoteReader;
+use refineid_rapp_core::remote::{RemoteReader, RemoteSession};
 
 use rustls::client::ResolvesClientCert;
 use rustls::pki_types::CertificateDer;
@@ -46,22 +52,57 @@ use crate::simple_https::HttpsError;
 /// How long the signer browses for the paired phone.
 const REMOTE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The reader and the session the identity is offered on, shared by the
+/// resolver that opens it and the signer that signs on it.
+#[derive(Debug)]
+struct OfferedIdentity {
+    reader: RemoteReader,
+    session: Option<RemoteSession>,
+}
+
+impl OfferedIdentity {
+    /// Closes the session the identity was offered on, if one is open.
+    fn withdraw(&mut self) {
+        if let Some(session) = self.session.take() {
+            self.reader.close_session(session);
+        }
+    }
+}
+
 /// Client certificate resolver backed by a paired RAPP remote card reader.
+///
+/// The certificate is offered only once the phone has opened a session
+/// and reported a card on it; the session is held for the signer and
+/// closed when the resolver is dropped.
 #[derive(Debug)]
 pub struct RappClientCertResolver {
     pair: PairId,
     cert_der: Vec<u8>,
     origin: String,
+    offered: Arc<Mutex<OfferedIdentity>>,
 }
 
 impl RappClientCertResolver {
-    /// Create a resolver for the given active pair, authentication certificate, and origin.
+    /// Create a resolver over `reader` for the given active pair,
+    /// authentication certificate, and origin.
     #[must_use]
-    pub fn new(pair: PairId, cert_der: Vec<u8>, origin: String) -> Self {
+    pub fn new(reader: RemoteReader, pair: PairId, cert_der: Vec<u8>, origin: String) -> Self {
         Self {
             pair,
             cert_der,
             origin,
+            offered: Arc::new(Mutex::new(OfferedIdentity {
+                reader,
+                session: None,
+            })),
+        }
+    }
+}
+
+impl Drop for RappClientCertResolver {
+    fn drop(&mut self) {
+        if let Ok(mut offered) = self.offered.lock() {
+            offered.withdraw();
         }
     }
 }
@@ -72,10 +113,17 @@ impl ResolvesClientCert for RappClientCertResolver {
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
+        let mut offered = self.offered.lock().ok()?;
+        offered.withdraw();
+        let session = offered
+            .reader
+            .open_session(Some(self.pair), REMOTE_DISCOVERY_TIMEOUT)
+            .ok()?;
+        offered.session = Some(session);
         let cert = CertificateDer::from(self.cert_der.clone());
         let key = Arc::new(RappSigningKey {
-            pair: self.pair,
             origin: self.origin.clone(),
+            offered: Arc::clone(&self.offered),
         });
         Some(Arc::new(CertifiedKey::new(vec![cert], key)))
     }
@@ -87,8 +135,8 @@ impl ResolvesClientCert for RappClientCertResolver {
 
 #[derive(Debug)]
 struct RappSigningKey {
-    pair: PairId,
     origin: String,
+    offered: Arc<Mutex<OfferedIdentity>>,
 }
 
 impl SigningKey for RappSigningKey {
@@ -96,8 +144,8 @@ impl SigningKey for RappSigningKey {
         for s in offered {
             if *s == SignatureScheme::ECDSA_NISTP384_SHA384 {
                 return Some(Box::new(RappSigner {
-                    pair: self.pair,
                     origin: self.origin.clone(),
+                    offered: Arc::clone(&self.offered),
                     scheme: *s,
                 }));
             }
@@ -112,8 +160,8 @@ impl SigningKey for RappSigningKey {
 
 #[derive(Debug)]
 struct RappSigner {
-    pair: PairId,
     origin: String,
+    offered: Arc<Mutex<OfferedIdentity>>,
     scheme: SignatureScheme,
 }
 
@@ -126,10 +174,16 @@ impl Signer for RappSigner {
             algorithm: CardAlgorithm::EcdsaSha384,
             digest: digest.as_bytes().to_vec(),
         };
-        let mut reader = RemoteReader::open_local()
-            .map_err(|e| rustls::Error::General(format!("RAPP reader: {e}")))?;
+        let mut offered = self
+            .offered
+            .lock()
+            .map_err(|_| rustls::Error::General("RAPP session lock poisoned".into()))?;
+        let OfferedIdentity { reader, session } = &mut *offered;
+        let session = session
+            .as_mut()
+            .ok_or_else(|| rustls::Error::General("no RAPP session offers this identity".into()))?;
         let res = reader
-            .execute(Some(self.pair), &op, REMOTE_DISCOVERY_TIMEOUT)
+            .execute_on(session, &op)
             .map_err(|e| rustls::Error::General(format!("RAPP operation failed: {e}")))?;
         match res {
             CardOperationResult::Signature(signature_bytes) => {
@@ -178,7 +232,14 @@ pub fn get_with_rapp_client_auth(
     let versions: &[&rustls::SupportedProtocolVersion] =
         &[&rustls::version::TLS13, &rustls::version::TLS12];
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let resolver = Arc::new(RappClientCertResolver::new(pair, cert_der.to_vec(), origin));
+    let reader =
+        RemoteReader::open_local().map_err(|e| HttpsError::Tls(format!("RAPP reader: {e}")))?;
+    let resolver = Arc::new(RappClientCertResolver::new(
+        reader,
+        pair,
+        cert_der.to_vec(),
+        origin,
+    ));
 
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)

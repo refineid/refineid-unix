@@ -1,4 +1,4 @@
-//! The requester engine: the workstation side of RAPP v26.10.10.
+//! The requester engine: the workstation side of RAPP v26.10.18.
 //!
 //! The engine drives pairing, sessions, and operations using the canonical
 //! protocol boundaries from `refineid_rapp`.
@@ -20,9 +20,10 @@ use crate::store::{
 use crate::transport::{BinaryFrame, FrameTransport, TransportError};
 use refineid_rapp::{
     EndpointRole, EstablishedEndpoint, ExplicitUserIntent, LivenessMessage, OperationReference,
-    OperationRequest, OperationState, PairingHandshake, PingChallenge, ProfileName,
-    ProtocolErrorMessage, ReceiveOutcome, ResultError, SessionCloseMessage, SessionHandshake,
-    SessionState, TransportProfile, TypedMessage, generate_pair_key_material,
+    OperationRequest, OperationState, PairRecord, PairingHandshake, PairingStorage, PingChallenge,
+    ProfileName, ProgressEvent, ProtocolErrorMessage, ReceiveOutcome, ResultError,
+    SessionCloseMessage, SessionHandshake, SessionState, TransportProfile, TypedMessage,
+    generate_pair_key_material,
 };
 
 /// Local labels sent inside `pairing.hello`. Labels, not identities.
@@ -79,6 +80,9 @@ pub enum PairingError {
     /// A post-PAKE phase outlived its section 3.3 deadline; nothing is
     /// recorded.
     DeadlineExpired,
+    /// The peer never confirmed storing the pairing (section 4.3 item 4);
+    /// the record stored here is revoked.
+    StorageUnconfirmed,
 }
 
 impl core::fmt::Display for PairingError {
@@ -95,6 +99,7 @@ impl core::fmt::Display for PairingError {
             Self::DeniedLocally => f.write_str("pairing denied locally"),
             Self::AbortedByPeer => f.write_str("pairing aborted by peer"),
             Self::DeadlineExpired => f.write_str("pairing step outlived its deadline"),
+            Self::StorageUnconfirmed => f.write_str("the phone did not confirm the pairing"),
             Self::GrantsMismatch => f.write_str("grants mismatch"),
             Self::GrantsNotSubset => f.write_str("grants not a valid subset"),
             Self::Store(e) => write!(f, "store error: {e:?}"),
@@ -264,6 +269,45 @@ pub struct Session<Transport: FrameTransport> {
     state: SessionState,
     granted_profiles: Vec<String>,
     end: Option<SessionEnd>,
+    /// What the custodian last said about its card (section 8.4), once it
+    /// has said anything.
+    card_present: Option<bool>,
+    /// Whether the custodian reported its consent view on screen during
+    /// the current operation (section 8.2 item 3).
+    consent_shown: bool,
+}
+
+impl<Transport: FrameTransport> Session<Transport> {
+    /// Whether the custodian can serve a card, as it last reported; `None`
+    /// before its first `card.status`.
+    #[must_use]
+    pub const fn card_present(&self) -> Option<bool> {
+        self.card_present
+    }
+
+    /// Whether the custodian reported its consent view on screen during
+    /// the current operation.
+    #[must_use]
+    pub const fn consent_shown(&self) -> bool {
+        self.consent_shown
+    }
+
+    /// Records what an in-session notice says, and whether it was one.
+    fn note(&mut self, message: &TypedMessage) -> bool {
+        match message {
+            TypedMessage::CardStatus(status) => {
+                self.card_present = Some(status.card_present);
+                true
+            }
+            TypedMessage::OperationProgress(progress) => {
+                if progress.event == ProgressEvent::ConsentShown {
+                    self.consent_shown = true;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl<Transport: FrameTransport> core::fmt::Debug for Session<Transport> {
@@ -318,7 +362,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
     }
 
     /// Pairs with the custodian showing `code`, as the requester (RAPP
-    /// v26.10.10 sections 3, 4.2 and 6).
+    /// v26.10.18 sections 3, 4.2 and 6).
     ///
     /// The transport is already past its `"pairing"` routing preamble. The
     /// custodian's first frame is its offer (section 4.2); the requester
@@ -551,9 +595,10 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                 _ => PairingError::ProtocolViolation,
             })?;
 
-        // Into PairRecord and store
-        let pair_record = confirmation
-            .into_pair_record(now_ms)
+        // Store the record, then confirm the storage both ways (section
+        // 4.3 item 4). A record the peer never confirms is revoked.
+        let (pair_record, storage) = confirmation
+            .into_storage(now_ms)
             .map_err(|_| PairingError::Channel)?;
         let local_record =
             PairingRecord::from_core_pair_record(&pair_record, intro.display_name, intro.platform);
@@ -561,8 +606,58 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         self.store
             .insert(local_record)
             .map_err(PairingError::Store)?;
+        match Self::confirm_storage(&mut transport, storage, confirmation_deadline, pair_record) {
+            Ok(confirmed) => {
+                let disposition = if confirmed.is_storage_confirmed() {
+                    PairingDisposition::Paired
+                } else {
+                    PairingDisposition::Unconfirmed
+                };
+                self.store
+                    .update(pair_id, &mut |entry| entry.disposition = disposition)
+                    .map_err(PairingError::Store)?;
+                Ok(pair_id)
+            }
+            Err(error) => {
+                self.revoke_pairing(pair_id, false);
+                Err(error)
+            }
+        }
+    }
 
-        Ok(pair_id)
+    /// Sends this side's `pairing.stored`, receives the peer's, and proves
+    /// the pairing active; the channel closes with the storage value.
+    fn confirm_storage<Transport: FrameTransport>(
+        transport: &mut Transport,
+        mut storage: PairingStorage,
+        confirmation_deadline: PhaseDeadline,
+        pair_record: PairRecord,
+    ) -> Result<PairRecord, PairingError> {
+        let stored_frame = storage.send_stored().map_err(|_| PairingError::Channel)?;
+        transport
+            .send_frame(stored_frame.as_bytes())
+            .map_err(PairingError::Transport)?;
+        // Whatever ends the wait, the peer did not confirm: the record
+        // stored here is revoked by the caller.
+        let peer_stored_bytes = transport
+            .receive_frame()
+            .map_err(|_| PairingError::StorageUnconfirmed)?;
+        confirmation_deadline
+            .check()
+            .map_err(|_| PairingError::StorageUnconfirmed)?;
+        let peer_stored_frame =
+            BinaryFrame::reconstruct(peer_stored_bytes).map_err(|_| PairingError::Channel)?;
+        storage
+            .receive_stored(&peer_stored_frame, current_time_ms())
+            .map_err(|err| match err {
+                refineid_rapp::PairingError::PairIdMismatch => PairingError::ProtocolViolation,
+                _ => PairingError::Channel,
+            })?;
+        storage
+            .into_active()
+            .map_err(|_| PairingError::StorageUnconfirmed)?
+            .confirm(pair_record)
+            .map_err(|_| PairingError::ProtocolViolation)
     }
 
     /// Opens a session to a paired proxy over a connected transport.
@@ -669,6 +764,8 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             state: SessionState::Healthy,
             granted_profiles,
             end: None,
+            card_present: None,
+            consent_shown: false,
         })
     }
 
@@ -735,6 +832,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                     finish_close(session, SessionEnd::PeerClose(close_msg.reason));
                     return Err(SessionError::ClosedByPeer(close_msg.reason));
                 }
+                Ok(ReceiveOutcome::Message(notice)) if session.note(&notice) => {}
                 Ok(ReceiveOutcome::Message(_)) => {
                     self.handle_violation(session);
                     return Err(SessionError::EngineFault);
@@ -851,7 +949,8 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             return Ok(outcome);
         }
 
-        // RAPP v26.10.10 section 8.2 executes directly: once a consequential
+        session.consent_shown = false;
+        // RAPP v26.10.18 section 8.2 executes directly: once a consequential
         // request is sent the custodian may act on it after consent, so an
         // unanswered one is in flight and ends ambiguous, never cancelled.
         let mut state = if consequential {
@@ -937,12 +1036,19 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                             self.handle_violation(session);
                             return Ok(self.classify_after_close(operation_id, state));
                         }
+                        // Every result is journaled first and acknowledged
+                        // second, whatever its status (section 8.2 item 5).
+                        let reference = OperationReference {
+                            operation_id,
+                            request_hash: req_hash,
+                        };
                         match result_msg.status {
                             ResultStatus::Completed if result_msg.retired => {
                                 // A retired result's response was pruned; there
                                 // is nothing left to deliver.
                                 state = OperationState::Completed;
                                 self.journal_state(operation_id, state, false);
+                                Self::acknowledge(session, reference);
                                 return Ok(OperationOutcome::Rejected(
                                     result_msg.error.map(|e| e.as_str().to_owned()),
                                 ));
@@ -958,14 +1064,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                                 };
                                 state = OperationState::Completed;
                                 self.journal_state(operation_id, state, false);
-                                let ack_msg =
-                                    TypedMessage::OperationResultAck(OperationReference {
-                                        operation_id,
-                                        request_hash: req_hash,
-                                    });
-                                if let Ok(ack_frame) = session.endpoint.send(&ack_msg) {
-                                    let _ = session.transport.send_frame(ack_frame.as_bytes());
-                                }
+                                Self::acknowledge(session, reference);
                                 return Ok(OperationOutcome::Completed(result));
                             }
                             ResultStatus::Rejected
@@ -976,16 +1075,19 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                             {
                                 state = OperationState::Denied;
                                 self.journal_state(operation_id, state, false);
+                                Self::acknowledge(session, reference);
                                 return Ok(OperationOutcome::Denied);
                             }
                             ResultStatus::Cancelled => {
                                 state = OperationState::Cancelled;
                                 self.journal_state(operation_id, state, false);
+                                Self::acknowledge(session, reference);
                                 return Ok(OperationOutcome::Cancelled);
                             }
                             ResultStatus::Rejected => {
                                 state = OperationState::Rejected;
                                 self.journal_state(operation_id, state, false);
+                                Self::acknowledge(session, reference);
                                 return Ok(OperationOutcome::Rejected(
                                     result_msg.error.map(|e| e.as_str().to_owned()),
                                 ));
@@ -994,12 +1096,14 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                                 state = OperationState::CredentialRejected;
                                 self.revoke_pairing(session.pair_id, false);
                                 self.journal_state(operation_id, state, true);
+                                Self::acknowledge(session, reference);
                                 self.await_close_after_credential_rejection(session);
                                 return Ok(OperationOutcome::CredentialRejected);
                             }
                             ResultStatus::Ambiguous => {
                                 state = OperationState::Ambiguous;
                                 self.journal_state(operation_id, state, true);
+                                Self::acknowledge(session, reference);
                                 return Ok(OperationOutcome::Ambiguous);
                             }
                         }
@@ -1020,11 +1124,11 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                             "duplicate_operation".to_owned(),
                         )));
                     }
-                    TypedMessage::OperationProgress(_)
-                    | TypedMessage::Error(
+                    TypedMessage::Error(
                         ProtocolErrorMessage::UnknownOperation(_)
                         | ProtocolErrorMessage::DuplicateOperation(_),
                     ) => {}
+                    notice if session.note(&notice) => {}
                     _ => {
                         self.handle_violation(session);
                         return Ok(self.classify_after_close(operation_id, state));
@@ -1123,16 +1227,16 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             self.handle_violation(session);
             return Err(SessionError::EngineFault);
         }
+        // Every re-delivered result is journaled first and acknowledged
+        // second (section 8.3 item 3).
+        let reference = OperationReference {
+            operation_id,
+            request_hash: result.request_hash,
+        };
         reconciliation.result = Some(match (result.status, result.retired, result.response) {
             (ResultStatus::Completed, false, Some(response)) => {
                 self.journal_state(operation_id, OperationState::Completed, true);
-                self.send_on(
-                    session,
-                    &TypedMessage::OperationResultAck(OperationReference {
-                        operation_id,
-                        request_hash: result.request_hash,
-                    }),
-                )?;
+                self.send_on(session, &TypedMessage::OperationResultAck(reference))?;
                 ReconciledResult::Completed(response)
             }
             (status, _, _) => {
@@ -1146,7 +1250,10 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                 self.journal_state(operation_id, state, true);
                 if status == ResultStatus::CredentialRejected {
                     self.revoke_pairing(session.pair_id, false);
+                    Self::acknowledge(session, reference);
                     self.await_close_after_credential_rejection(session);
+                } else {
+                    self.send_on(session, &TypedMessage::OperationResultAck(reference))?;
                 }
                 ReconciledResult::Failed {
                     status,
@@ -1182,9 +1289,25 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             .map_err(SessionError::Transport)
     }
 
-    /// Receives the next operation-layer message, answering liveness pings
-    /// and ending the session on a close, a failure, or a revocation.
+    /// Receives the next operation-layer message that is not a notice,
+    /// answering liveness pings and recording notices on the way, and
+    /// ending the session on a close, a failure, or a revocation.
     fn receive_on<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+    ) -> Result<TypedMessage, SessionError> {
+        loop {
+            let message = self.receive_next(session)?;
+            if !session.note(&message) {
+                return Ok(message);
+            }
+        }
+    }
+
+    /// Receives the next message, notices included, answering liveness
+    /// pings and ending the session on a close, a failure, or a
+    /// revocation.
+    fn receive_next<Transport: FrameTransport>(
         &mut self,
         session: &mut Session<Transport>,
     ) -> Result<TypedMessage, SessionError> {
@@ -1228,6 +1351,73 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                 }
             }
         }
+    }
+
+    /// Waits for the custodian's `card.status`, which it sends right after
+    /// `session.ready` and on every change (section 8.4), answering
+    /// liveness pings meanwhile. Returns whether a card can answer now.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] on closed session, peer close, violation,
+    /// transport loss, or a message that is not a notice.
+    pub fn await_card_status<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+    ) -> Result<bool, SessionError> {
+        if session.state != SessionState::Healthy || session.end.is_some() {
+            return Err(SessionError::EngineFault);
+        }
+        loop {
+            if let Some(present) = session.card_present {
+                return Ok(present);
+            }
+            let message = self.receive_next(session)?;
+            if !session.note(&message) {
+                self.handle_violation(session);
+                return Err(SessionError::EngineFault);
+            }
+        }
+    }
+
+    /// Sends the acknowledgement of one result, best effort: a lost
+    /// acknowledgement is repaired by the custodian's re-delivery on the
+    /// next session (section 8.3).
+    fn acknowledge<Transport: FrameTransport>(
+        session: &mut Session<Transport>,
+        reference: OperationReference,
+    ) {
+        let ack = TypedMessage::OperationResultAck(reference);
+        if let Ok(frame) = session.endpoint.send(&ack) {
+            let _ = session.transport.send_frame(frame.as_bytes());
+        }
+    }
+
+    /// Revokes every record stored before the peer confirmed its storage
+    /// (section 4.3 item 4): such a record was written inside a
+    /// confirmation window this endpoint did not complete. Returns how
+    /// many were revoked.
+    pub fn revoke_unconfirmed_pairings(&mut self) -> usize {
+        let unconfirmed: Vec<PairId> = self
+            .store
+            .pair_ids()
+            .into_iter()
+            .filter(|pair_id| {
+                self.store
+                    .get(*pair_id)
+                    .is_ok_and(|record| record.disposition == PairingDisposition::Unconfirmed)
+            })
+            .collect();
+        for pair_id in &unconfirmed {
+            self.revoke_pairing(*pair_id, false);
+        }
+        unconfirmed.len()
+    }
+
+    /// Revokes the pairing the custodian announced it forgot (section 4.6
+    /// item 5): the keys go, and the record stays as the tombstone the
+    /// user is told about.
+    pub fn revoke_announced_by_peer(&mut self, pair_id: PairId) {
+        self.revoke_pairing(pair_id, true);
     }
 
     /// How the session ended, once closed.
@@ -1385,6 +1575,10 @@ impl PhaseDeadline {
     }
 }
 
+/// Milliseconds since the Unix epoch: the requester's continuous clock
+/// for request timestamps (section 8.2 item 1). It keeps advancing while
+/// the machine sleeps or the process is stopped, which the process-local
+/// monotonic clock does not.
 fn current_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

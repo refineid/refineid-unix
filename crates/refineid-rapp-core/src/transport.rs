@@ -133,7 +133,7 @@ impl FrameTransport for MemoryTransport {
     }
 
     /// The in-process stand-in for a stream connection binds the stream
-    /// profile: v26.10.10 binds only registered transport profiles.
+    /// profile: v26.10.18 binds only registered transport profiles.
     fn profile(&self) -> &str {
         STREAM_PROFILE
     }
