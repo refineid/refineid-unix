@@ -58,8 +58,8 @@ impl FilePairingStore {
     /// readable record. A record of an earlier encoding revision, and a
     /// paired record whose key is missing or not a key, are removed: their
     /// pairings are made again. Any other file that does not decode is
-    /// skipped, never rewritten. A record that is not paired is loaded
-    /// without a key.
+    /// skipped, never rewritten. A revoked record is loaded without a
+    /// key.
     ///
     /// # Errors
     /// [`StoreError::WriteRefused`] when the directory cannot be created or
@@ -128,9 +128,11 @@ fn path_for(directory: &Path, pair_id: PairId) -> PathBuf {
     directory.join(name).with_extension(RECORD_EXTENSION)
 }
 
-/// Drops the private key of a record that is no longer paired.
+/// Drops the private key of a revoked record. A record awaiting the
+/// peer's storage confirmation keeps its key: it becomes paired when the
+/// confirmation arrives, and is revoked at the next start when none did.
 fn keep_key_only_while_paired(record: &mut PairingRecord) {
-    if record.disposition != PairingDisposition::Paired {
+    if record.disposition == PairingDisposition::Revoked {
         record.local_private = Zeroizing::new(Vec::new());
     }
 }
@@ -350,6 +352,29 @@ mod tests {
         assert_eq!(store.pair_ids(), vec![PairId::from_array([13; 16])]);
         assert!(!keyless_path.exists());
         assert!(!short_path.exists());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_unconfirmed_record_keeps_its_key_until_it_is_paired() {
+        let directory = scratch();
+        let mut store = FilePairingStore::open(&directory).unwrap();
+        let mut awaiting = record(14);
+        awaiting.disposition = PairingDisposition::Unconfirmed;
+        store.insert(awaiting).unwrap();
+        let on_disk = FilePairingStore::open(&directory).unwrap();
+        let loaded = on_disk.get(PairId::from_array([14; 16])).unwrap();
+        assert_eq!(loaded.disposition, PairingDisposition::Unconfirmed);
+        assert_eq!(loaded.local_private.as_slice(), [0x11; 32]);
+        store
+            .update(PairId::from_array([14; 16]), &mut |entry| {
+                entry.disposition = PairingDisposition::Paired;
+            })
+            .unwrap();
+        let reopened = FilePairingStore::open(&directory).unwrap();
+        let paired = reopened.get(PairId::from_array([14; 16])).unwrap();
+        assert_eq!(paired.disposition, PairingDisposition::Paired);
+        assert_eq!(paired.local_private.as_slice(), [0x11; 32]);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
