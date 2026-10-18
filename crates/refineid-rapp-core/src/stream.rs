@@ -744,6 +744,15 @@ mod tests {
             &[SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)],
         );
         answering.join().unwrap();
+        // The multicast query reaches the real network too; the loopback
+        // responder's instance is counted alone.
+        assert_eq!(
+            services
+                .iter()
+                .filter(|service| service.instance == INSTANCE)
+                .count(),
+            1
+        );
         let found = services
             .iter()
             .find(|service| service.instance == INSTANCE)

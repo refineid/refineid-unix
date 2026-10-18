@@ -723,12 +723,15 @@ impl RemoteReader {
     }
 
     /// Remembers where the phone holding `pair_id` answered from, for the
-    /// next browse.
+    /// next browse. Only an address of a private or link-local network is
+    /// kept: a remembered address is asked again on whatever network the
+    /// computer joins next, and a query must not leave that network.
     fn remember_address(&self, pair_id: PairId, service: &StreamService) {
         let Some(address) = service
             .endpoints
             .iter()
-            .find_map(|endpoint| endpoint.parse::<SocketAddrV4>().ok())
+            .filter_map(|endpoint| endpoint.parse::<SocketAddrV4>().ok())
+            .find(|address| address.ip().is_private() || address.ip().is_link_local())
         else {
             return;
         };
