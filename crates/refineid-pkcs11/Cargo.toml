@@ -20,11 +20,11 @@ crate-type = ["cdylib"]
 name = "refineid_pkcs11"
 
 [dependencies]
+refineid-lib-core.workspace = true
 refineid-pkcs11.workspace = true
 refineid-rapp.workspace = true
 refineid-rapp-core.workspace = true
 refineid-remote.workspace = true
 
 [dev-dependencies]
-refineid-lib-core.workspace = true
 libc = "0.2"

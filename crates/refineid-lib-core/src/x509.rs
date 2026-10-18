@@ -1421,6 +1421,95 @@ impl<'a> SpkiDer<'a> {
         Sec1UncompressedPoint::from_bytes(self.subject_public_key.to_vec()).ok()
     }
 
+    /// Verifies `signature` over `digest`, which the caller computed
+    /// with the algorithm's hash: for a signature made elsewhere over a
+    /// digest this computer holds, as a card signs a TLS challenge.
+    ///
+    /// # Errors
+    /// [`VerifyError::BadIssuerKey`] when the key is not of the
+    /// algorithm's kind, [`VerifyError::Rsa`] or [`VerifyError::Ecdsa`]
+    /// when the digest has the wrong length or the signature does not
+    /// verify.
+    pub fn verify_digest_signature(
+        self,
+        algorithm: MessageSignatureAlgorithm,
+        digest: &[u8],
+        signature: &[u8],
+    ) -> Result<(), VerifyError> {
+        match algorithm {
+            MessageSignatureAlgorithm::RsaPkcs1Sha256 => {
+                let key = extract_rsa_public_key(self.der).ok_or(VerifyError::BadIssuerKey)?;
+                let digest: &[u8; 32] = digest
+                    .try_into()
+                    .map_err(|_| VerifyError::Rsa(RsaVerifyError::BadDigest))?;
+                key.verify_pkcs1v15_sha256_digest(
+                    digest,
+                    &Signature::<RsaPkcs1Sha256>::new(signature.to_vec()),
+                )
+                .map_err(VerifyError::Rsa)
+            }
+            MessageSignatureAlgorithm::RsaPkcs1Sha384 => {
+                let key = extract_rsa_public_key(self.der).ok_or(VerifyError::BadIssuerKey)?;
+                let digest: &[u8; 48] = digest
+                    .try_into()
+                    .map_err(|_| VerifyError::Rsa(RsaVerifyError::BadDigest))?;
+                key.verify_pkcs1v15_sha384_digest(
+                    digest,
+                    &Signature::<RsaPkcs1Sha384>::new(signature.to_vec()),
+                )
+                .map_err(VerifyError::Rsa)
+            }
+            MessageSignatureAlgorithm::RsaPkcs1Sha512 => {
+                let key = extract_rsa_public_key(self.der).ok_or(VerifyError::BadIssuerKey)?;
+                let digest: &[u8; 64] = digest
+                    .try_into()
+                    .map_err(|_| VerifyError::Rsa(RsaVerifyError::BadDigest))?;
+                key.verify_pkcs1v15_sha512_digest(
+                    digest,
+                    &Signature::<RsaPkcs1Sha512>::new(signature.to_vec()),
+                )
+                .map_err(VerifyError::Rsa)
+            }
+            MessageSignatureAlgorithm::RsaPssSha256 => {
+                let key = extract_rsa_public_key(self.der)
+                    .or_else(|| extract_rsa_pss_public_key_with_absent_parameters(self.der))
+                    .ok_or(VerifyError::BadIssuerKey)?;
+                if digest.len() != 32 {
+                    return Err(VerifyError::Rsa(RsaVerifyError::BadDigest));
+                }
+                key.verify_pss_sha256_digest(
+                    digest,
+                    &Signature::<RsaPssSha256>::new(signature.to_vec()),
+                )
+                .map_err(VerifyError::Rsa)
+            }
+            MessageSignatureAlgorithm::EcdsaSha256Raw
+            | MessageSignatureAlgorithm::EcdsaSha384Raw
+            | MessageSignatureAlgorithm::EcdsaSha512Raw => {
+                let (curve, public_key) =
+                    extract_ec_pubkey(self.der).ok_or(VerifyError::BadIssuerKey)?;
+                // Each profile names its curve by the hash it pairs with:
+                // the coordinate width is the field prime's, the raw
+                // signature is two coordinates, the digest the hash's.
+                let (coordinate_len, digest_len) = match algorithm {
+                    MessageSignatureAlgorithm::EcdsaSha256Raw => (32, 32),
+                    MessageSignatureAlgorithm::EcdsaSha384Raw => (48, 48),
+                    _ => (66, 64),
+                };
+                if curve.p.len() != coordinate_len {
+                    return Err(VerifyError::BadIssuerKey);
+                }
+                if signature.len() != 2 * coordinate_len || digest.len() != digest_len {
+                    return Err(VerifyError::Ecdsa(EcdsaError::BadSignature));
+                }
+                let signature = Signature::<EcdsaDer>::from_raw_concatenation(signature)
+                    .map_err(VerifyError::Ecdsa)?;
+                verify_prehashed(&curve, &public_key, &signature, digest)
+                    .map_err(VerifyError::Ecdsa)
+            }
+        }
+    }
+
     /// Verify a message signature under a strictly selected external
     /// signature profile.
     ///

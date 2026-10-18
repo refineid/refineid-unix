@@ -798,6 +798,32 @@ impl RsaPublicKey {
         verify_pkcs1v15(self, SHA256_DIGEST_INFO, digest, signature.as_bytes())
     }
 
+    /// Verifies a PKCS#1 v1.5 signature over a SHA-384 digest the
+    /// caller computed.
+    ///
+    /// # Errors
+    /// [`RsaVerifyError`] when the signature does not verify.
+    pub fn verify_pkcs1v15_sha384_digest(
+        &self,
+        digest: &[u8; 48],
+        signature: &Signature<RsaPkcs1Sha384>,
+    ) -> Result<(), RsaVerifyError> {
+        verify_pkcs1v15(self, SHA384_DIGEST_INFO, digest, signature.as_bytes())
+    }
+
+    /// Verifies a PKCS#1 v1.5 signature over a SHA-512 digest the
+    /// caller computed.
+    ///
+    /// # Errors
+    /// [`RsaVerifyError`] when the signature does not verify.
+    pub fn verify_pkcs1v15_sha512_digest(
+        &self,
+        digest: &[u8; 64],
+        signature: &Signature<RsaPkcs1Sha512>,
+    ) -> Result<(), RsaVerifyError> {
+        verify_pkcs1v15(self, SHA512_DIGEST_INFO, digest, signature.as_bytes())
+    }
+
     /// Verify a PKCS#1 v1.5 signature over `SHA-384(message)`.
     ///
     /// # Errors

@@ -931,6 +931,20 @@ impl RemoteReader {
             .update(pair_id, &mut |record| record.auth_cert = Some(der.to_vec()))
             .map_err(RemoteError::Store)
     }
+
+    /// Drops the cached authentication certificate of `pair_id`, so the
+    /// next session reads the card for it again: for a signature that
+    /// did not verify against the cached certificate, which says the
+    /// card on the phone is not the one cached.
+    ///
+    /// # Errors
+    /// [`RemoteError::Store`] when the record cannot be rewritten.
+    pub fn forget_auth_cert(&mut self, pair_id: PairId) -> Result<(), RemoteError> {
+        self.requester
+            .store_mut()
+            .update(pair_id, &mut |record| record.auth_cert = None)
+            .map_err(RemoteError::Store)
+    }
 }
 
 #[cfg(test)]
