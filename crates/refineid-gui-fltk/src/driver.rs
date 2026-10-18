@@ -21,7 +21,8 @@ use fltk::app::{self, Receiver, Scheme};
 use fltk::browser::HoldBrowser;
 use fltk::button::{Button, CheckButton, RadioRoundButton};
 use fltk::dialog::{FileDialogType, NativeFileChooser, alert, choice2_default};
-use fltk::enums::{Align, Color, ColorDepth, Font, FrameType};
+use fltk::draw;
+use fltk::enums::{Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType, Key};
 use fltk::frame::Frame;
 use fltk::group::{Group, Tabs};
 use fltk::image::RgbImage;
@@ -39,6 +40,7 @@ use refineid_gui_core::model::{SignFormat, TimestampConfig, UiState, UserIntent}
 use refineid_lib_core::apdu::status_word::PinRetries;
 use refineid_lib_core::auth::{PIN_TRY_LIMIT, PinStatus, PukStatus};
 use refineid_lib_core::pin::PinBytes;
+use refineid_rapp_core::offer::{PAIRING_CODE_LENGTH, pairing_code_character};
 
 fn to_pin_bytes(s: &str) -> Option<PinBytes> {
     PinBytes::new(s.as_bytes().to_vec()).ok()
@@ -83,8 +85,8 @@ struct FltkWidgets {
     sign_btn: Button,
     sign_result_frame: Frame,
     pair_code_input: Input,
-    pair_btn: Button,
-    cancel_pair_btn: Button,
+    /// Whether the last rendered state had a pairing ceremony running.
+    pairing_running: bool,
     pair_status_frame: Frame,
     phone_browser: HoldBrowser,
     forget_phone_btn: Button,
@@ -423,17 +425,35 @@ impl FltkDriver {
 
         let mut code_label = Frame::new(50, 110, 170, 32, "Code on the phone:");
         code_label.set_align(Align::Left | Align::Inside);
-        let mut pair_code_input = Input::new(225, 110, 150, 32, "");
-        pair_code_input.set_maximum_size(PAIRING_CODE_INPUT_SIZE);
-        pair_code_input.set_text_font(Font::CourierBold);
-        pair_code_input.set_text_size(18);
-
-        let mut pair_btn = Button::new(390, 110, 110, 32, "Pair");
-        pair_btn.set_color(Color::from_rgb(0, 122, 255));
-        pair_btn.set_label_color(Color::from_rgb(255, 255, 255));
-        pair_btn.set_label_font(Font::HelveticaBold);
-
-        let mut cancel_pair_btn = Button::new(510, 110, 100, 32, "Cancel");
+        // The input reads the keyboard and pastes and draws itself as the
+        // boxes; its cursor stays at the end, so the next character always
+        // lands in the box after the last one.
+        let mut pair_code_input = Input::new(225, 108, code_boxes_width(), CODE_BOX_SIZE, "");
+        pair_code_input.set_frame(FrameType::NoBox);
+        pair_code_input.set_trigger(CallbackTrigger::Changed);
+        pair_code_input.draw(|input| {
+            // Whatever moved the cursor between two draws, the next
+            // character lands after the last one; the position changes
+            // only when something moved it, so this settles at once.
+            let end = input.value().len().try_into().unwrap_or(i32::MAX);
+            if input.position() != end {
+                let _ = input.set_position(end);
+            }
+            draw_code_boxes(input);
+        });
+        pair_code_input.handle(|input, event| match event {
+            Event::Focus | Event::Unfocus => {
+                input.redraw();
+                false
+            }
+            Event::Push => {
+                let _ = input.take_focus();
+                true
+            }
+            Event::Drag | Event::Released => true,
+            Event::KeyDown => CURSOR_KEYS.contains(&app::event_key()),
+            _ => false,
+        });
 
         let mut pair_status_frame = Frame::new(50, 155, 820, 36, "");
         pair_status_frame.set_align(Align::Left | Align::Inside);
@@ -759,19 +779,16 @@ impl FltkDriver {
         }
         {
             let c = Arc::clone(controller);
-            let code = pair_code_input.clone();
-            pair_btn.set_callback(move |_| {
-                let typed = code.value();
-                if typed.trim().is_empty() {
-                    return;
+            pair_code_input.set_callback(move |input| {
+                let kept = kept_code(&input.value());
+                if kept != input.value() {
+                    input.set_value(&kept);
                 }
-                c.handle_intent(UserIntent::StartPairing { code: typed });
-            });
-        }
-        {
-            let c = Arc::clone(controller);
-            cancel_pair_btn.set_callback(move |_| {
-                c.handle_intent(UserIntent::CancelPairing);
+                let _ = input.set_position(kept.len().try_into().unwrap_or(i32::MAX));
+                input.redraw();
+                if kept.len() == PAIRING_CODE_LENGTH {
+                    c.handle_intent(UserIntent::StartPairing { code: kept });
+                }
             });
         }
         {
@@ -822,8 +839,7 @@ impl FltkDriver {
             sign_btn,
             sign_result_frame,
             pair_code_input,
-            pair_btn,
-            cancel_pair_btn,
+            pairing_running: false,
             pair_status_frame,
             phone_browser,
             forget_phone_btn,
@@ -1175,19 +1191,18 @@ impl UiDriver for FltkDriver {
 
         // Tab 4: Phone (RAPP)
         if let Some(ref pairing) = state.pairing {
-            widgets
-                .pair_status_frame
-                .set_label(&format!("{}  {}", pairing.code, pairing.status));
-            widgets.pair_code_input.set_value("");
-            set_active(&mut widgets.pair_btn, false);
+            widgets.pair_status_frame.set_label(&pairing.status);
             set_active(&mut widgets.pair_code_input, false);
-            set_active(&mut widgets.cancel_pair_btn, true);
         } else {
             widgets.pair_status_frame.set_label("");
-            set_active(&mut widgets.pair_btn, true);
             set_active(&mut widgets.pair_code_input, true);
-            set_active(&mut widgets.cancel_pair_btn, false);
+            if widgets.pairing_running {
+                widgets.pair_code_input.set_value("");
+                let _ = widgets.pair_code_input.take_focus();
+            }
         }
+        widgets.pairing_running = state.pairing.is_some();
+        widgets.pair_code_input.redraw();
 
         let lines: Vec<String> = state
             .phones
@@ -1236,9 +1251,91 @@ impl UiDriver for FltkDriver {
     }
 }
 
-/// The most characters a typed pairing code may hold: six characters
-/// with room for the separators and spaces a paste may carry.
-const PAIRING_CODE_INPUT_SIZE: i32 = 16;
+/// The side of one pairing-code box, in pixels.
+const CODE_BOX_SIZE: i32 = 36;
+/// The gap between boxes of one cluster.
+const CODE_BOX_SPACING: i32 = 6;
+/// The gap between the two-character clusters.
+const CODE_GROUP_GAP: i32 = 14;
+/// The characters of one cluster, as the phone shows the code.
+const CODE_GROUP_SIZE: usize = 2;
+/// The background of the cards, drawn behind the boxes.
+const CARD_BACKGROUND: Color = Color::from_rgb(255, 255, 255);
+/// The keys that would move the input's cursor off the end; every other
+/// key reaches the input, and a change puts the cursor back at the end.
+const CURSOR_KEYS: [Key; 8] = [
+    Key::Left,
+    Key::Right,
+    Key::Up,
+    Key::Down,
+    Key::Home,
+    Key::End,
+    Key::PageUp,
+    Key::PageDown,
+];
+
+/// The width of the row of boxes.
+fn code_boxes_width() -> i32 {
+    let boxes = i32::try_from(PAIRING_CODE_LENGTH).unwrap_or(i32::MAX);
+    let groups = i32::try_from(PAIRING_CODE_LENGTH / CODE_GROUP_SIZE).unwrap_or(i32::MAX);
+    boxes * CODE_BOX_SIZE + (boxes - groups) * CODE_BOX_SPACING + (groups - 1) * CODE_GROUP_GAP
+}
+
+/// The left edge of box `index` relative to the row.
+fn code_box_offset(index: usize) -> i32 {
+    let position = i32::try_from(index).unwrap_or(i32::MAX);
+    let group = i32::try_from(index / CODE_GROUP_SIZE).unwrap_or(i32::MAX);
+    position * (CODE_BOX_SIZE + CODE_BOX_SPACING) + group * (CODE_GROUP_GAP - CODE_BOX_SPACING)
+}
+
+/// What a typed value keeps: its code characters, up to the code's
+/// length.
+fn kept_code(typed: &str) -> String {
+    typed
+        .chars()
+        .filter_map(pairing_code_character)
+        .take(PAIRING_CODE_LENGTH)
+        .collect()
+}
+
+/// Draws `input` as one box per code character; the box the next
+/// character lands in carries the accent while the input has focus.
+fn draw_code_boxes(input: &Input) {
+    let code: Vec<char> = input.value().chars().collect();
+    let active = input.active();
+    let focused = input.has_focus();
+    draw::draw_rect_fill(input.x(), input.y(), input.w(), input.h(), CARD_BACKGROUND);
+    let text_color = if active {
+        Color::from_rgb(20, 20, 20)
+    } else {
+        Color::from_rgb(140, 140, 140)
+    };
+    draw::set_font(Font::CourierBold, 20);
+    for index in 0..PAIRING_CODE_LENGTH {
+        let x = input.x() + code_box_offset(index);
+        let y = input.y();
+        let border = if focused && active && index == code.len() {
+            Color::from_rgb(0, 122, 255)
+        } else {
+            Color::from_rgb(190, 190, 190)
+        };
+        draw::draw_rect_with_color(x, y, CODE_BOX_SIZE, CODE_BOX_SIZE, border);
+        if focused && active && index == code.len() {
+            draw::draw_rect_with_color(x + 1, y + 1, CODE_BOX_SIZE - 2, CODE_BOX_SIZE - 2, border);
+        }
+        if let Some(character) = code.get(index) {
+            draw::set_draw_color(text_color);
+            draw::draw_text2(
+                &character.to_string(),
+                x,
+                y,
+                CODE_BOX_SIZE,
+                CODE_BOX_SIZE,
+                Align::Center,
+            );
+        }
+    }
+}
 
 /// The index of the "Forget" button in the forget confirmation.
 const FORGET_CHOICE: i32 = 1;
@@ -1381,11 +1478,33 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_code_keeps_its_code_characters_up_to_the_length() {
+        assert_eq!(kept_code("7k x4-m9"), "7KX4M9");
+        assert_eq!(kept_code("7K X4 M9 extra"), "7KX4M9");
+        assert_eq!(kept_code("7k"), "7K");
+        assert_eq!(kept_code("ü"), "");
+    }
+
+    #[test]
+    fn the_boxes_sit_in_two_character_clusters() {
+        assert_eq!(code_box_offset(0), 0);
+        assert_eq!(code_box_offset(1), CODE_BOX_SIZE + CODE_BOX_SPACING);
+        assert_eq!(
+            code_box_offset(2),
+            2 * CODE_BOX_SIZE + CODE_BOX_SPACING + CODE_GROUP_GAP
+        );
+        assert_eq!(
+            code_boxes_width(),
+            code_box_offset(PAIRING_CODE_LENGTH - 1) + CODE_BOX_SIZE
+        );
+    }
+
+    #[test]
     fn browser_text_escapes_format_characters() {
         assert_eq!(escape_browser_text("a@b\tc"), "a@@b c");
         assert_eq!(
-            escape_browser_text("Alpha Phone (iOS): paired"),
-            "Alpha Phone (iOS): paired"
+            escape_browser_text("Alpha Phone: paired"),
+            "Alpha Phone: paired"
         );
     }
 }

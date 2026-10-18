@@ -18,7 +18,6 @@
 //! consumer that offers the phone's identity holds the session it was
 //! reported on.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::engine::Session;
@@ -41,6 +40,21 @@ use crate::stream::{
 };
 use crate::transport::TcpFrameTransport;
 use refineid_rapp::{DiscoveryKey, RevocationKey, RoutingKey, TransportProfile, WithdrawalKey};
+
+/// The names a phone gives when its system hands the app only the
+/// device type.
+const DEVICE_TYPE_NAMES: [&str; 2] = ["iPhone", "iPad"];
+
+/// The name a custodian is listed under: the one it introduced itself
+/// with, or its host name on the network when the introduction was only
+/// its device type and the host name is known.
+fn custodian_name(introduced: &str, host: &str) -> String {
+    if DEVICE_TYPE_NAMES.contains(&introduced) && !host.is_empty() {
+        host.to_owned()
+    } else {
+        introduced.to_owned()
+    }
+}
 
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
@@ -171,8 +185,6 @@ pub enum RemoteError {
     NotPaired,
     /// No custodian advertised the needed mode before the deadline.
     NotFound,
-    /// The caller cancelled the search for the phone.
-    Cancelled,
     /// The phone announced that it stopped serving the pairing.
     Withdrawn,
     /// The phone announced that it forgot this computer; the pairing is
@@ -195,14 +207,9 @@ pub enum RemoteError {
 impl core::fmt::Display for RemoteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Store(StoreError::SecretsUnavailable) => f.write_str(
-                "the desktop secret store is unavailable: install secret-tool (libsecret) and \
-                 unlock the keyring",
-            ),
             Self::Store(error) => write!(f, "pairing store: {error:?}"),
             Self::NotPaired => f.write_str("no paired phone"),
             Self::NotFound => f.write_str("no phone found on the local network"),
-            Self::Cancelled => f.write_str("pairing cancelled"),
             Self::Withdrawn => f.write_str("the phone turned remote card access off"),
             Self::RevokedByPhone => f.write_str("the phone forgot this computer; pair it again"),
             Self::CardAbsent => f.write_str("the phone has no card on it"),
@@ -300,15 +307,41 @@ pub const fn local_platform() -> &'static str {
     }
 }
 
+/// This computer's host name without its domain, as the phone lists it:
+/// what `uname -n` prints, or `RefineID` when the system has no name of
+/// its own.
+#[must_use]
+pub fn local_host_name() -> String {
+    let printed = std::process::Command::new("uname")
+        .arg("-n")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    let short = printed.trim().split('.').next().unwrap_or("").trim();
+    if short.is_empty()
+        || UNSET_HOST_NAMES
+            .iter()
+            .any(|unset| unset.eq_ignore_ascii_case(short))
+    {
+        "RefineID".to_owned()
+    } else {
+        short.to_owned()
+    }
+}
+
+/// The names a system reports before it has been given one.
+const UNSET_HOST_NAMES: [&str; 2] = ["localhost", "(none)"];
+
 impl RemoteReader {
-    /// Opens the per-user pairing store, introducing this workstation as
-    /// `RefineID <platform>`.
+    /// Opens the per-user pairing store, introducing this workstation by
+    /// its host name and platform.
     ///
     /// # Errors
     /// [`RemoteError::Store`] when the store cannot be opened.
     pub fn open_local() -> Result<Self, RemoteError> {
-        let platform = local_platform();
-        Self::open(&format!("RefineID {platform}"), platform)
+        Self::open(&local_host_name(), local_platform())
     }
 
     /// Opens the per-user pairing store.
@@ -469,38 +502,28 @@ impl RemoteReader {
     }
 
     /// Pairs with the phone showing `code`, browsing for it until
-    /// `discovery_timeout` passes or `cancel` is set. A ceremony that has
-    /// reached the phone runs to its end.
+    /// `discovery_timeout` passes.
     ///
     /// Every profile the code-derived offer names is requested and granted;
     /// the phone decides what it grants and the sets must agree.
     ///
     /// # Errors
     /// [`RemoteError::Pairing`] for a malformed or mistyped code and other
-    /// pairing failures, [`RemoteError::Store`] when the key vault does not
-    /// answer (checked before the phone's code is spent),
-    /// [`RemoteError::Cancelled`] when `cancel` was set before a phone
-    /// answered, and [`RemoteError::NotFound`] when no phone in a pairing
-    /// ceremony answered.
+    /// pairing failures, [`RemoteError::NotFound`] when no phone in a
+    /// pairing ceremony answered, and [`RemoteError::Store`] when the
+    /// record of a completed ceremony cannot be written.
     pub fn pair_with_code(
         &mut self,
         code: &str,
         discovery_timeout: Duration,
-        cancel: &AtomicBool,
     ) -> Result<PairSummary, RemoteError> {
         if crate::offer::normalize_pairing_code(code).is_none() {
             return Err(RemoteError::Pairing(PairingError::InvalidCode));
-        }
-        if !self.requester.store().vault_reachable() {
-            return Err(RemoteError::Store(StoreError::SecretsUnavailable));
         }
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
             for service in browse(DiscoveryMode::Pairing, BROWSE_ROUND) {
-                if cancel.load(Ordering::Acquire) {
-                    return Err(RemoteError::Cancelled);
-                }
                 let Ok(transport) = dial(
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
@@ -514,6 +537,13 @@ impl RemoteReader {
                     .pair_with_code(code, transport, |_, requested| Some(requested.to_vec()))
                 {
                     Ok(pair_id) => {
+                        // The name is for display; a refused rewrite keeps
+                        // the introduced one, the pairing stands either way.
+                        let host = service.host.clone();
+                        let _ = self.requester.store_mut().update(pair_id, &mut |entry| {
+                            entry.peer_display_name =
+                                custodian_name(&entry.peer_display_name, &host);
+                        });
                         return self
                             .pairs()
                             .into_iter()
@@ -528,9 +558,6 @@ impl RemoteReader {
                     Err(error) => last = RemoteError::Pairing(error),
                 }
             }
-        }
-        if cancel.load(Ordering::Acquire) {
-            return Err(RemoteError::Cancelled);
         }
         Err(last)
     }
@@ -770,10 +797,31 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    #[test]
+    fn the_local_host_name_is_short_and_never_empty() {
+        let name = super::local_host_name();
+        assert!(!name.is_empty());
+        assert!(!name.contains('.'));
+    }
+
+    #[test]
+    fn a_device_type_introduction_yields_to_the_host_name() {
+        assert_eq!(
+            super::custodian_name("iPhone", "alpha-phone"),
+            "alpha-phone"
+        );
+        assert_eq!(super::custodian_name("iPhone", ""), "iPhone");
+        assert_eq!(
+            super::custodian_name("Alpha Phone", "Android-3"),
+            "Alpha Phone"
+        );
+    }
+
     fn service(instance: &str, txt: &[(&str, String)]) -> StreamService {
         StreamService {
             instance: instance.to_owned(),
             endpoints: vec!["192.0.2.10:47110".to_owned()],
+            host: String::new(),
             txt: txt
                 .iter()
                 .map(|(key, value)| ((*key).to_owned(), value.clone()))

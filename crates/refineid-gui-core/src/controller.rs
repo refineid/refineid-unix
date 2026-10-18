@@ -21,17 +21,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use refineid_client::card_check::CardCheckReport;
+use refineid_client::card_check::{CardCheckError, CardCheckReport};
 use refineid_client::card_pin::{
     ActivateOptions, ChangePinOptions, PinManageSlot, UnblockPinOptions,
 };
 use refineid_lib_core::auth::{ChangePinOutcome, PinStatus, UnblockOutcome};
-use refineid_lib_core::backend::ReaderFilter;
+use refineid_lib_core::backend::{ReaderFilter, ReaderPickError};
 use refineid_lib_core::identity::render_token_serial;
 use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
 use refineid_lib_core::pkcs15::CardGeneration;
+use refineid_rapp_core::engine::OperationOutcome;
 use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
 use refineid_rapp_core::remote::{PairSummary, RemoteError, RemoteReader};
@@ -66,7 +67,6 @@ pub struct RefineIdController {
     image_cache: Mutex<HashMap<String, CachedImages>>,
     presence_stop: AtomicBool,
     inspection_in_flight: AtomicBool,
-    pairing_cancel: AtomicBool,
     on_state_change: Box<dyn Fn(&UiState) + Send + Sync + 'static>,
 }
 
@@ -89,7 +89,6 @@ impl RefineIdController {
             image_cache: Mutex::new(HashMap::new()),
             presence_stop: AtomicBool::new(false),
             inspection_in_flight: AtomicBool::new(false),
-            pairing_cancel: AtomicBool::new(false),
             on_state_change: Box::new(on_state_change),
         })
     }
@@ -156,7 +155,6 @@ impl RefineIdController {
             UserIntent::SetTimestampConfig(config) => self.set_timestamp_config(config),
             UserIntent::SignDocuments { pin2 } => self.sign_documents(pin2),
             UserIntent::StartPairing { code } => self.start_pairing(&code),
-            UserIntent::CancelPairing => self.cancel_pairing(),
             UserIntent::ForgetPhone(pair_id) => self.forget_phone(pair_id),
         }
     }
@@ -286,9 +284,15 @@ impl RefineIdController {
         let controller = Arc::clone(self);
         let include_phones = self.has_usable_phone();
         thread::spawn(move || {
-            let result = refineid_client::card_manager::inspect_cards(None)
-                .map(|reports| deduplicate_cards(reports, include_phones))
-                .map_err(|e| e.to_string());
+            // No reader, or none with a card, is an empty list, not an error.
+            let result = match refineid_client::card_manager::inspect_cards(None) {
+                Ok(reports) => Ok(reports),
+                Err(CardCheckError::ReaderPick(
+                    ReaderPickError::NoReaders | ReaderPickError::NoCardPresent,
+                )) => Ok(Vec::new()),
+                Err(error) => Err(error.to_string()),
+            }
+            .map(|reports| deduplicate_cards(reports, include_phones));
 
             controller
                 .inspection_in_flight
@@ -733,7 +737,6 @@ impl RefineIdController {
             });
             return;
         };
-        self.pairing_cancel.store(false, Ordering::Release);
         self.update_state(|s| {
             s.pairing = Some(RappPairingState {
                 code: format_pairing_code(&normalized),
@@ -753,19 +756,8 @@ impl RefineIdController {
                     return;
                 }
             };
-            let pair = match reader.pair_with_code(
-                &normalized,
-                PAIRING_DISCOVERY_TIMEOUT,
-                &controller.pairing_cancel,
-            ) {
+            let pair = match reader.pair_with_code(&normalized, PAIRING_DISCOVERY_TIMEOUT) {
                 Ok(pair) => pair,
-                Err(RemoteError::Cancelled) => {
-                    controller.update_state(|s| {
-                        s.pairing = None;
-                        s.status_message = String::new();
-                    });
-                    return;
-                }
                 Err(RemoteError::Pairing(
                     refineid_rapp_core::engine::PairingError::CodeMismatch,
                 )) => {
@@ -800,17 +792,6 @@ impl RefineIdController {
             controller.refresh_cards();
         });
     }
-
-    /// Stops the search for the phone. A ceremony that has reached the
-    /// phone runs to its end, and the display clears when it does.
-    fn cancel_pairing(&self) {
-        self.pairing_cancel.store(true, Ordering::Release);
-        self.update_state(|s| {
-            if let Some(p) = &mut s.pairing {
-                p.status = "Stopping".into();
-            }
-        });
-    }
 }
 
 /// How long pairing browses for the phone showing the code.
@@ -824,6 +805,9 @@ fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String
         Some(RemoteError::CardAbsent) => format!("No card on {phone}"),
         Some(RemoteError::RevokedByPhone) => format!("{phone} forgot this computer; pair again"),
         Some(RemoteError::Withdrawn) => format!("{phone} turned remote card access off"),
+        Some(RemoteError::Outcome(outcome)) if matches!(**outcome, OperationOutcome::Cancelled) => {
+            format!("{phone} ended the read before a card was read")
+        }
         Some(error) => format!("{phone}: {error}"),
     }
 }
@@ -982,6 +966,13 @@ mod tests {
         assert_eq!(
             pairing_outcome_line("Alpha Phone", Some(&RemoteError::CardAbsent)),
             "No card on Alpha Phone"
+        );
+        assert_eq!(
+            pairing_outcome_line(
+                "Alpha Phone",
+                Some(&RemoteError::Outcome(Box::new(OperationOutcome::Cancelled)))
+            ),
+            "Alpha Phone ended the read before a card was read"
         );
         assert_eq!(
             pairing_outcome_line("Alpha Phone", Some(&RemoteError::RevokedByPhone)),

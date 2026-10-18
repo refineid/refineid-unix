@@ -26,9 +26,9 @@ const CODE_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// Applies the section 3.1 canonicalization pipeline.
 ///
-/// Uppercases ASCII letters, strips ASCII whitespace and hyphens, maps the
-/// Crockford aliases `I`/`L` to `1` and `O` to `0`, and accepts the result
-/// only when it is exactly six alphabet characters. Input outside ASCII is
+/// Uppercases ASCII letters, strips ASCII whitespace and hyphens, refuses
+/// the letters the alphabet excludes, and accepts the result only
+/// when it is exactly six alphabet characters. Input outside ASCII is
 /// refused rather than NFKC-normalized; every valid code is ASCII.
 ///
 /// Returns `None` for input that is not a pairing code.
@@ -39,19 +39,26 @@ pub fn normalize_pairing_code(input: &str) -> Option<String> {
         if !character.is_ascii() {
             return None;
         }
-        let upper = character.to_ascii_uppercase();
-        let mapped = match upper {
-            ' ' | '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | '-' => continue,
-            'I' | 'L' => '1',
-            'O' => '0',
-            other => other,
-        };
-        if !CODE_ALPHABET.contains(mapped) {
-            return None;
+        if matches!(
+            character,
+            ' ' | '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | '-'
+        ) {
+            continue;
         }
-        code.push(mapped);
+        code.push(pairing_code_character(character)?);
     }
     (code.len() == PAIRING_CODE_LENGTH).then_some(code)
+}
+
+/// The code character a typed character stands for: its uppercase form
+/// when that is in the alphabet, otherwise `None`.
+#[must_use]
+pub fn pairing_code_character(character: char) -> Option<char> {
+    if !character.is_ascii() {
+        return None;
+    }
+    let upper = character.to_ascii_uppercase();
+    CODE_ALPHABET.contains(upper).then_some(upper)
 }
 
 /// Formats a normalized code in two-character clusters (`7K X4 M9`).
@@ -83,13 +90,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_typed_character_maps_to_its_code_character() {
+        assert_eq!(pairing_code_character('k'), Some('K'));
+        assert_eq!(pairing_code_character('l'), None);
+        assert_eq!(pairing_code_character('O'), None);
+        assert_eq!(pairing_code_character('U'), None);
+        assert_eq!(pairing_code_character(' '), None);
+        assert_eq!(pairing_code_character('ä'), None);
+    }
+
+    #[test]
     fn normalization_follows_section_3_1() {
         assert_eq!(normalize_pairing_code("7kx4m9").as_deref(), Some("7KX4M9"));
         assert_eq!(
             normalize_pairing_code("7K X4-M9").as_deref(),
             Some("7KX4M9")
         );
-        assert_eq!(normalize_pairing_code("ilo123").as_deref(), Some("110123"));
+        for excluded in ["7KX4MI", "7KX4Mi", "7KX4ML", "7KX4Ml", "7KX4MO", "7KX4Mo"] {
+            assert_eq!(normalize_pairing_code(excluded), None, "{excluded}");
+        }
         assert_eq!(normalize_pairing_code("7KX4MU"), None);
         assert_eq!(normalize_pairing_code("7KX4M"), None);
         assert_eq!(normalize_pairing_code("7KX4M99"), None);

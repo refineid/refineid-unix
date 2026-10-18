@@ -313,7 +313,7 @@ Architecture: ${ARCH}
 Multi-Arch: foreign
 Maintainer: Petri Koistinen <petri.koistinen@refineid.fi>
 Depends: ${CLI_SHLIBS}
-Recommends: pcscd, libccid, refineid-pkcs11, libsecret-tools, gnome-keyring | kwalletd6 | keepassxc
+Recommends: pcscd, libccid, refineid-pkcs11
 Homepage: https://github.com/refineid/refineid-unix
 Description: Open-source FINEID command-line tool for Finnish identity cards
  RefineID command-line interface for smart card status inspection, PIN verification
@@ -357,7 +357,7 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: Petri Koistinen <petri.koistinen@refineid.fi>
 Depends: ${GUI_SHLIBS}, refineid-cli (= ${VERSION})
-Recommends: refineid-pkcs11 (= ${VERSION}), libsecret-tools, gnome-keyring | kwalletd6 | keepassxc
+Recommends: refineid-pkcs11 (= ${VERSION})
 Homepage: https://github.com/refineid/refineid-unix
 Description: Graphical user interface for Finnish identity cards
  RefineID graphical desktop application for PIN management, card portrait and

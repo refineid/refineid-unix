@@ -1762,6 +1762,7 @@ dependencies = [
  "refineid-client",
  "refineid-gui-core",
  "refineid-lib-core",
+ "refineid-rapp-core",
  "zeroize",
 ]
 
