@@ -22,7 +22,9 @@ use fltk::browser::HoldBrowser;
 use fltk::button::{Button, CheckButton, RadioRoundButton};
 use fltk::dialog::{FileDialogType, NativeFileChooser, alert, choice2_default};
 use fltk::draw;
-use fltk::enums::{Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType, Key};
+use fltk::enums::{
+    Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType, Key, Shortcut,
+};
 use fltk::frame::Frame;
 use fltk::group::{Group, Tabs};
 use fltk::image::RgbImage;
@@ -431,14 +433,7 @@ impl FltkDriver {
         let mut pair_code_input = Input::new(225, 108, code_boxes_width(), CODE_BOX_SIZE, "");
         pair_code_input.set_frame(FrameType::NoBox);
         pair_code_input.set_trigger(CallbackTrigger::Changed);
-        pair_code_input.draw(|input| {
-            // Whatever moved the cursor, it draws, and types, at the end.
-            let end = input.value().len().try_into().unwrap_or(i32::MAX);
-            if input.position() != end {
-                let _ = input.set_position(end);
-            }
-            draw_code_boxes(input);
-        });
+        pair_code_input.draw(|input| draw_code_boxes(input));
         pair_code_input.handle(|input, event| match event {
             Event::Focus | Event::Unfocus => {
                 input.redraw();
@@ -449,7 +444,7 @@ impl FltkDriver {
                 true
             }
             Event::Drag | Event::Released => true,
-            Event::KeyDown => CURSOR_KEYS.contains(&app::event_key()),
+            Event::KeyDown => !key_reaches_the_code(),
             _ => false,
         });
 
@@ -1259,17 +1254,36 @@ const CODE_GROUP_GAP: i32 = 14;
 const CODE_GROUP_SIZE: usize = 2;
 /// The background of the cards, drawn behind the boxes.
 const CARD_BACKGROUND: Color = Color::from_rgb(255, 255, 255);
-/// The keys that would move the input's cursor off the end.
-const CURSOR_KEYS: [Key; 8] = [
-    Key::Left,
-    Key::Right,
-    Key::Up,
-    Key::Down,
-    Key::Home,
-    Key::End,
-    Key::PageUp,
-    Key::PageDown,
+/// The keys the code input takes besides typed text: deletion, focus
+/// and dismissal.
+const EDITING_KEYS: [Key; 6] = [
+    Key::BackSpace,
+    Key::Delete,
+    Key::Tab,
+    Key::Enter,
+    Key::KPEnter,
+    Key::Escape,
 ];
+
+/// Whether the key event under way reaches the code input: an editing
+/// key, a paste shortcut, or typed text without a command modifier. Every
+/// other key is swallowed, so nothing moves the cursor off the end or
+/// edits the code behind the boxes.
+fn key_reaches_the_code() -> bool {
+    let key = app::event_key();
+    let state = app::event_state();
+    if EDITING_KEYS.contains(&key) {
+        return true;
+    }
+    if key == Key::Insert && state.contains(Shortcut::Shift) {
+        return true;
+    }
+    if state.contains(Shortcut::Ctrl) || state.contains(Shortcut::Meta) {
+        return !state.contains(Shortcut::Alt)
+            && key.to_char().map(|c| c.to_ascii_lowercase()) == Some('v');
+    }
+    !state.contains(Shortcut::Alt) && !app::event_text().is_empty()
+}
 
 /// The width of the row of boxes.
 fn code_boxes_width() -> i32 {

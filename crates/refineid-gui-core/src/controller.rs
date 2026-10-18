@@ -32,6 +32,7 @@ use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
 use refineid_lib_core::pkcs15::CardGeneration;
+use refineid_rapp_core::engine::OperationOutcome;
 use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
 use refineid_rapp_core::remote::{PairSummary, RemoteError, RemoteReader};
@@ -804,6 +805,9 @@ fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String
         Some(RemoteError::CardAbsent) => format!("No card on {phone}"),
         Some(RemoteError::RevokedByPhone) => format!("{phone} forgot this computer; pair again"),
         Some(RemoteError::Withdrawn) => format!("{phone} turned remote card access off"),
+        Some(RemoteError::Outcome(outcome)) if matches!(**outcome, OperationOutcome::Cancelled) => {
+            format!("{phone} ended the read before a card was read")
+        }
         Some(error) => format!("{phone}: {error}"),
     }
 }
@@ -962,6 +966,13 @@ mod tests {
         assert_eq!(
             pairing_outcome_line("Alpha Phone", Some(&RemoteError::CardAbsent)),
             "No card on Alpha Phone"
+        );
+        assert_eq!(
+            pairing_outcome_line(
+                "Alpha Phone",
+                Some(&RemoteError::Outcome(Box::new(OperationOutcome::Cancelled)))
+            ),
+            "Alpha Phone ended the read before a card was read"
         );
         assert_eq!(
             pairing_outcome_line("Alpha Phone", Some(&RemoteError::RevokedByPhone)),

@@ -307,15 +307,32 @@ pub const fn local_platform() -> &'static str {
     }
 }
 
+/// This computer's host name without its domain, as the phone lists it:
+/// what `hostname` prints, or `RefineID` when it prints nothing.
+#[must_use]
+pub fn local_host_name() -> String {
+    let printed = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    let short = printed.trim().split('.').next().unwrap_or("").trim();
+    if short.is_empty() {
+        "RefineID".to_owned()
+    } else {
+        short.to_owned()
+    }
+}
+
 impl RemoteReader {
-    /// Opens the per-user pairing store, introducing this workstation as
-    /// `RefineID <platform>`.
+    /// Opens the per-user pairing store, introducing this workstation by
+    /// its host name and platform.
     ///
     /// # Errors
     /// [`RemoteError::Store`] when the store cannot be opened.
     pub fn open_local() -> Result<Self, RemoteError> {
-        let platform = local_platform();
-        Self::open(&format!("RefineID {platform}"), platform)
+        Self::open(&local_host_name(), local_platform())
     }
 
     /// Opens the per-user pairing store.
@@ -769,6 +786,13 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn the_local_host_name_is_short_and_never_empty() {
+        let name = super::local_host_name();
+        assert!(!name.is_empty());
+        assert!(!name.contains('.'));
     }
 
     #[test]
