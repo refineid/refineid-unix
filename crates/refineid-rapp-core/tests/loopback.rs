@@ -985,7 +985,7 @@ fn a_redelivered_completed_result_is_acknowledged_and_the_session_continues() {
 }
 
 #[test]
-fn first_sequence_violation_revokes_the_pairing() {
+fn a_result_that_does_not_match_its_request_is_refused_and_the_pairing_stands() {
     let mut requester = test_requester();
     let granted = vec![PROFILE_CARD_STATUS.to_owned()];
     let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
@@ -1000,41 +1000,40 @@ fn first_sequence_violation_revokes_the_pairing() {
             operation_id: request.operation_id,
             request_hash: refineid_rapp::RequestHash::from_array([0xee; 32]),
         };
-        let result_msg = TypedMessage::OperationResult(OperationResultMessage::completed(
-            bad_reference,
-            &CardOperationResult::Inspection(CardInspection {
-                answer_to_reset: Vec::new(),
-                pin1_factory: false,
-                pin2_factory: false,
-                pin1_attempts: Some(5),
-                pin2_attempts: Some(5),
-                puk_attempts: None,
-            }),
+        session.send(&TypedMessage::OperationResult(
+            OperationResultMessage::completed(
+                bad_reference,
+                &CardOperationResult::Inspection(CardInspection {
+                    answer_to_reset: Vec::new(),
+                    pin1_factory: false,
+                    pin2_factory: false,
+                    pin1_attempts: Some(5),
+                    pin2_attempts: Some(5),
+                    puk_attempts: None,
+                }),
+            ),
         ));
-        // Send a message with mismatched request_hash: an authenticated protocol violation on the receiver.
-        let f0 = session.endpoint.send(&result_msg).unwrap();
-        session.transport.send_frame(f0.as_bytes()).unwrap();
-        // The requester answers with its best-effort close.
+        let TypedMessage::SessionClose(close) = session.receive() else {
+            panic!("expected the requester's close");
+        };
+        assert_eq!(close.reason, CloseReason::ProtocolViolation);
     });
     let mut session = requester.connect(pair_id, requester_transport).unwrap();
     let outcome = requester
         .execute(&mut session, &CardOperation::InspectCard, 30_000)
         .unwrap();
     proxy.join().unwrap();
-    // An unanswered safe read classifies as cancelled.
-    assert_eq!(outcome, OperationOutcome::Cancelled);
-    // Section 14.6: the first authenticated violation revokes immediately.
+    assert_eq!(outcome, OperationOutcome::Refused);
+    assert_eq!(
+        TestRequester::session_end(&session),
+        Some(SessionEnd::Violation)
+    );
+    // Section 10.1: a message the protocol did not call for closes the
+    // session; only class 4 revokes the pairing.
     let record = requester.store().get(pair_id).unwrap();
-    assert_eq!(record.disposition, PairingDisposition::Revoked);
-    assert!(record.local_private.is_empty());
-    assert!(record.peer_public.is_empty());
-
-    // Revoked keys are never restored (INV-07).
-    let (requester_transport, _other) = MemoryTransport::pair(CANDIDATE, DEADLINE);
-    assert!(matches!(
-        requester.connect(pair_id, requester_transport),
-        Err(SessionError::NotPaired(PairingDisposition::Revoked))
-    ));
+    assert_eq!(record.disposition, PairingDisposition::Paired);
+    assert!(!record.local_private.is_empty());
+    assert!(!record.peer_public.is_empty());
 }
 
 #[test]
