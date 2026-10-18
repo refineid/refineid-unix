@@ -239,6 +239,9 @@ pub enum OperationOutcome {
     CredentialRejected,
     /// Completion cannot be proven; automatic retry is permanently forbidden.
     Ambiguous,
+    /// The phone's answer did not fit the operation: the session closed
+    /// with `protocol_violation`, and the pairing stands.
+    Refused,
 }
 
 /// What ended a session, reported after close.
@@ -252,8 +255,9 @@ pub enum SessionEnd {
     TransportLoss,
     /// A frame failed authenticated decryption.
     IntegrityFailure,
-    /// The peer committed an authenticated protocol violation;
-    /// the pairing was revoked immediately.
+    /// A message of the peer's was refused, or the core found an
+    /// authenticated violation and revoked the pairing; the session closed
+    /// with `protocol_violation`.
     Violation,
 }
 
@@ -836,7 +840,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                 }
                 Ok(ReceiveOutcome::Message(notice)) if session.note(&notice) => {}
                 Ok(ReceiveOutcome::Message(_)) => {
-                    self.handle_violation(session);
+                    Self::refuse_message(session);
                     return Err(SessionError::EngineFault);
                 }
                 Ok(ReceiveOutcome::PairRevoked { .. }) => {
@@ -1035,8 +1039,13 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                                 )
                                 .is_err()
                         {
-                            self.handle_violation(session);
-                            return Ok(self.classify_after_close(operation_id, state));
+                            Self::refuse_message(session);
+                            return Ok(self.refuse_after_close(
+                                operation_id,
+                                operation,
+                                state,
+                                true,
+                            ));
                         }
                         // Every result is journaled first and acknowledged
                         // second, whatever its status (section 8.2 item 5).
@@ -1061,8 +1070,13 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                                     .as_ref()
                                     .map(|response| response.typed_for(operation))
                                 else {
-                                    self.handle_violation(session);
-                                    return Ok(self.classify_after_close(operation_id, state));
+                                    Self::refuse_message(session);
+                                    return Ok(self.refuse_after_close(
+                                        operation_id,
+                                        operation,
+                                        state,
+                                        true,
+                                    ));
                                 };
                                 state = OperationState::Completed;
                                 self.journal_state(operation_id, state, false);
@@ -1132,8 +1146,8 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                     ) => {}
                     notice if session.note(&notice) => {}
                     _ => {
-                        self.handle_violation(session);
-                        return Ok(self.classify_after_close(operation_id, state));
+                        Self::refuse_message(session);
+                        return Ok(self.refuse_after_close(operation_id, operation, state, false));
                     }
                 },
                 ReceiveOutcome::SessionClosed(_) => {
@@ -1187,7 +1201,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                 }
                 TypedMessage::OperationStatus(_) => {}
                 _ => {
-                    self.handle_violation(session);
+                    Self::refuse_message(session);
                     return Err(SessionError::EngineFault);
                 }
             }
@@ -1198,7 +1212,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             self.journal.get(operation_id),
         ) && *hash.as_bytes() != entry.request_hash
         {
-            self.handle_violation(session);
+            Self::refuse_message(session);
             return Err(SessionError::EngineFault);
         }
         let reported_state = report.known.then_some(report.state).flatten();
@@ -1218,15 +1232,15 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             return Ok(reconciliation);
         }
         let TypedMessage::OperationResult(result) = self.receive_on(session)? else {
-            self.handle_violation(session);
+            Self::refuse_message(session);
             return Err(SessionError::EngineFault);
         };
         if result.operation_id != operation_id {
-            self.handle_violation(session);
+            Self::refuse_message(session);
             return Err(SessionError::EngineFault);
         }
         if Some(result.request_hash) != report.request_hash || !result.is_consistent() {
-            self.handle_violation(session);
+            Self::refuse_message(session);
             return Err(SessionError::EngineFault);
         }
         // Every re-delivered result is journaled first and acknowledged
@@ -1410,7 +1424,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
                 Ok(None) => {}
                 Ok(Some(message)) => {
                     if !session.note(&message) {
-                        self.handle_violation(session);
+                        Self::refuse_message(session);
                         break Err(SessionError::EngineFault);
                     }
                 }
@@ -1446,7 +1460,7 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
             }
             let message = self.receive_next(session)?;
             if !session.note(&message) {
-                self.handle_violation(session);
+                Self::refuse_message(session);
                 return Err(SessionError::EngineFault);
             }
         }
@@ -1543,8 +1557,11 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         }
     }
 
-    /// Handles an authenticated protocol violation: revokes pairing and closes session.
-    fn handle_violation<Transport: FrameTransport>(&mut self, session: &mut Session<Transport>) {
+    /// Refuses a message of the peer's that the protocol did not call for
+    /// here: the session closes with `protocol_violation`. The pairing
+    /// stands; only the core's authenticated violations of section 10.1
+    /// class 4 revoke it.
+    fn refuse_message<Transport: FrameTransport>(session: &mut Session<Transport>) {
         let last = session.endpoint.last_received_sequence().unwrap_or(0);
         let close_msg = TypedMessage::SessionClose(SessionCloseMessage {
             reason: CloseReason::ProtocolViolation,
@@ -1553,8 +1570,27 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         if let Ok(frame) = session.endpoint.send(&close_msg) {
             let _ = session.transport.send_frame(frame.as_bytes());
         }
-        self.revoke_pairing(session.pair_id, false);
         finish_close(session, SessionEnd::Violation);
+    }
+
+    /// The outcome of an operation whose message was refused. A safe read
+    /// acts on nothing, so it is refused and journaled as cancelled whatever
+    /// arrived. A consequential operation is ambiguous when a result was
+    /// refused, since a result means the card acted, or when it was already
+    /// committed; before that it is refused and journaled as cancelled.
+    fn refuse_after_close(
+        &mut self,
+        operation_id: OperationId,
+        operation: &CardOperation,
+        state: OperationState,
+        result_refused: bool,
+    ) -> OperationOutcome {
+        if operation.is_consequential() && (result_refused || state == OperationState::Committed) {
+            self.journal_state(operation_id, OperationState::Ambiguous, true);
+            return OperationOutcome::Ambiguous;
+        }
+        self.journal_state(operation_id, OperationState::Cancelled, false);
+        OperationOutcome::Refused
     }
 
     /// Classifies the active operation after the session already closed.
