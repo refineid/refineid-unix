@@ -216,8 +216,8 @@ impl PhoneState {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Paired => "paired",
-            Self::Unconfirmed => "pairing unconfirmed; pair again",
-            Self::ForgottenByPhone => "the phone forgot this computer; pair again",
+            Self::Unconfirmed => "unconfirmed",
+            Self::ForgottenByPhone => "forgotten by the phone",
             Self::Revoked => "revoked",
         }
     }
@@ -274,17 +274,6 @@ impl PairedPhone {
     }
 }
 
-/// The issuance scheme of a card generation, as the card page names it;
-/// none for a generation the card did not reveal.
-#[must_use]
-pub const fn issuance_scheme_label(generation: CardGeneration) -> Option<&'static str> {
-    match generation {
-        CardGeneration::Newer => Some("Current single-use activation scheme"),
-        CardGeneration::Older => Some("Legacy reusable activation scheme"),
-        CardGeneration::Unknown => None,
-    }
-}
-
 /// An immutable snapshot of the user interface state.
 #[derive(Clone, Debug)]
 pub struct UiState {
@@ -300,10 +289,6 @@ pub struct UiState {
     pub selected_card: Option<usize>,
     /// Serial number of selected card.
     pub card_serial: Option<TokenSerial>,
-    /// The card model, from the token label or manufacturer.
-    pub card_model: Option<String>,
-    /// The issuance scheme of the selected card's generation.
-    pub issuance_scheme: Option<&'static str>,
     /// Whether PIN1 has been changed from its factory value.
     pub pin1_changed: Option<bool>,
     /// Whether PIN2 has been changed from its factory value.
@@ -350,10 +335,6 @@ pub struct UiState {
 
     /// Active RAPP phone pairing state.
     pub pairing: Option<RappPairingState>,
-    /// Whether paired phones are used as card readers. Off until the
-    /// user turns it on, except that a workstation that already holds a
-    /// usable pairing starts with it on: pairing was the opt-in.
-    pub remote_reader_enabled: bool,
     /// Every phone this workstation has paired with, newest first.
     pub phones: Vec<PairedPhone>,
 }
@@ -362,13 +343,11 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             window_title: format!("RefineID {}", env!("CARGO_PKG_VERSION")),
-            status_message: "Insert a FINEID card.".into(),
+            status_message: String::new(),
             busy: false,
             cards: Vec::new(),
             selected_card: None,
             card_serial: None,
-            card_model: None,
-            issuance_scheme: None,
             pin1_changed: None,
             pin2_changed: None,
             pin1_status: None,
@@ -390,7 +369,6 @@ impl Default for UiState {
             timestamp_config: TimestampConfig::default(),
             sign_result: None,
             pairing: None,
-            remote_reader_enabled: false,
             phones: Vec::new(),
         }
     }
@@ -455,8 +433,6 @@ pub enum UserIntent {
     },
     /// Cancel active RAPP pairing.
     CancelPairing,
-    /// Use, or stop using, paired phones as card readers.
-    ToggleRemoteReader(bool),
     /// Forget one paired phone.
     ForgetPhone(PairId),
     /// Read the stored pairings again.
@@ -503,10 +479,7 @@ mod tests {
     #[test]
     fn the_phone_line_names_the_phone_and_its_state() {
         let phone = PairedPhone::from_summary(&summary(false, true, false));
-        assert_eq!(
-            phone.line(),
-            "Alpha Phone (Android): pairing unconfirmed; pair again"
-        );
+        assert_eq!(phone.line(), "Alpha Phone (Android): unconfirmed");
         assert!(!phone.state.usable());
         assert!(PhoneState::Paired.usable());
     }

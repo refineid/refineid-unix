@@ -20,7 +20,7 @@ use std::sync::Arc;
 use fltk::app::{self, Receiver, Scheme};
 use fltk::browser::HoldBrowser;
 use fltk::button::{Button, CheckButton, RadioRoundButton};
-use fltk::dialog::{FileDialogType, NativeFileChooser, alert, choice2_default, message};
+use fltk::dialog::{FileDialogType, NativeFileChooser, alert, choice2_default};
 use fltk::enums::{Align, Color, ColorDepth, Font, FrameType};
 use fltk::frame::Frame;
 use fltk::group::{Group, Tabs};
@@ -36,7 +36,8 @@ use refineid_gui_core::driver::UiDriver;
 use refineid_gui_core::error::GuiCoreError;
 use refineid_gui_core::image::RgbaImageBuffer;
 use refineid_gui_core::model::{SignFormat, TimestampConfig, UiState, UserIntent};
-use refineid_lib_core::auth::{PinStatus, PukStatus};
+use refineid_lib_core::apdu::status_word::PinRetries;
+use refineid_lib_core::auth::{PIN_TRY_LIMIT, PinStatus, PukStatus};
 use refineid_lib_core::pin::PinBytes;
 
 fn to_pin_bytes(s: &str) -> Option<PinBytes> {
@@ -58,9 +59,6 @@ struct FltkWidgets {
     card_choice: Choice,
     card_status_badge: Frame,
     holder_name_frame: Frame,
-    holder_sub_frame: Frame,
-    serial_frame: Frame,
-    scheme_frame: Frame,
     pin1_status_frame: Frame,
     pin2_status_frame: Frame,
     puk_status_frame: Frame,
@@ -68,6 +66,9 @@ struct FltkWidgets {
     change_pin2_btn: Button,
     reactivate_btn: Button,
     activate_btn: Button,
+    pin_subtabs: Tabs,
+    tab_change_pin1: Group,
+    tab_activate: Group,
     can_input: Input,
     read_images_btn: Button,
     portrait_frame: Frame,
@@ -81,7 +82,6 @@ struct FltkWidgets {
     format_asice: RadioRoundButton,
     sign_btn: Button,
     sign_result_frame: Frame,
-    remote_toggle: CheckButton,
     pair_code_input: Input,
     pair_btn: Button,
     cancel_pair_btn: Button,
@@ -143,7 +143,7 @@ impl FltkDriver {
         card_choice.set_align(Align::Left);
 
         let mut refresh_btn = Button::new(605, 15, 80, 32, "Refresh");
-        let mut card_status_badge = Frame::new(695, 15, 205, 32, "No Card Detected");
+        let mut card_status_badge = Frame::new(695, 15, 205, 32, "No card");
         card_status_badge.set_frame(FrameType::RFlatBox);
         card_status_badge.set_label_font(Font::HelveticaBold);
         card_status_badge.set_label_size(12);
@@ -166,31 +166,15 @@ impl FltkDriver {
         holder_name_frame.set_label_size(18);
         holder_name_frame.set_align(Align::Left | Align::Inside);
 
-        let mut holder_sub_frame = Frame::new(50, 132, 430, 18, "");
-        holder_sub_frame.set_label_size(12);
-        holder_sub_frame.set_label_color(Color::from_rgb(108, 117, 125));
-        holder_sub_frame.set_align(Align::Left | Align::Inside);
-
-        let mut serial_frame = Frame::new(50, 152, 430, 18, "");
-        serial_frame.set_label_size(11);
-        serial_frame.set_label_color(Color::from_rgb(140, 145, 150));
-        serial_frame.set_align(Align::Left | Align::Inside);
-
-        let mut scheme_frame = Frame::new(50, 170, 430, 18, "");
-        scheme_frame.set_label_size(11);
-        scheme_frame.set_label_color(Color::from_rgb(140, 145, 150));
-        scheme_frame.set_align(Align::Left | Align::Inside);
-
-        let mut pin1_status_frame =
-            Frame::new(490, 108, 380, 24, "Authentication PIN (PIN 1): Unknown");
+        let mut pin1_status_frame = Frame::new(490, 108, 380, 24, PIN1_LABEL);
         pin1_status_frame.set_label_size(12);
         pin1_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut pin2_status_frame = Frame::new(490, 134, 380, 24, "Signing PIN (PIN 2): Unknown");
+        let mut pin2_status_frame = Frame::new(490, 134, 380, 24, PIN2_LABEL);
         pin2_status_frame.set_label_size(12);
         pin2_status_frame.set_align(Align::Left | Align::Inside);
 
-        let mut puk_status_frame = Frame::new(490, 160, 380, 24, "PUK Code: Unknown");
+        let mut puk_status_frame = Frame::new(490, 160, 380, 24, PUK_LABEL);
         puk_status_frame.set_label_size(12);
         puk_status_frame.set_align(Align::Left | Align::Inside);
         hero_card.end();
@@ -338,7 +322,7 @@ impl FltkDriver {
         p_title.set_label_size(14);
         p_title.set_align(Align::Left | Align::Inside);
 
-        let mut portrait_frame = Frame::new(60, 192, 320, 370, "No image loaded");
+        let mut portrait_frame = Frame::new(60, 192, 320, 370, "");
         portrait_frame.set_frame(FrameType::ThinDownBox);
 
         let copy_portrait_btn = Button::new(85, 575, 120, 32, "Copy Photo");
@@ -355,7 +339,7 @@ impl FltkDriver {
         s_title.set_label_size(14);
         s_title.set_align(Align::Left | Align::Inside);
 
-        let mut signature_frame = Frame::new(435, 192, 435, 165, "No signature loaded");
+        let mut signature_frame = Frame::new(435, 192, 435, 165, "");
         signature_frame.set_frame(FrameType::ThinDownBox);
 
         let copy_sig_btn = Button::new(490, 372, 140, 32, "Copy Signature");
@@ -433,29 +417,25 @@ impl FltkDriver {
         let rapp_tab = Group::new(20, 88, 880, 550, "Phone   ");
 
         // Reader card: the opt-in and the code the phone shows
-        let mut reader_card = Group::new(35, 98, 850, 150, "");
+        let mut reader_card = Group::new(35, 98, 850, 110, "");
         reader_card.set_frame(FrameType::RFlatBox);
         reader_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut remote_toggle =
-            CheckButton::new(50, 110, 400, 28, "Use the phone as a card reader");
-        remote_toggle.set_label_size(13);
-
-        let mut code_label = Frame::new(50, 150, 170, 32, "Code on the phone:");
+        let mut code_label = Frame::new(50, 110, 170, 32, "Code on the phone:");
         code_label.set_align(Align::Left | Align::Inside);
-        let mut pair_code_input = Input::new(225, 150, 150, 32, "");
+        let mut pair_code_input = Input::new(225, 110, 150, 32, "");
         pair_code_input.set_maximum_size(PAIRING_CODE_INPUT_SIZE);
         pair_code_input.set_text_font(Font::CourierBold);
         pair_code_input.set_text_size(18);
 
-        let mut pair_btn = Button::new(390, 150, 110, 32, "Pair");
+        let mut pair_btn = Button::new(390, 110, 110, 32, "Pair");
         pair_btn.set_color(Color::from_rgb(0, 122, 255));
         pair_btn.set_label_color(Color::from_rgb(255, 255, 255));
         pair_btn.set_label_font(Font::HelveticaBold);
 
-        let mut cancel_pair_btn = Button::new(510, 150, 100, 32, "Cancel");
+        let mut cancel_pair_btn = Button::new(510, 110, 100, 32, "Cancel");
 
-        let mut pair_status_frame = Frame::new(50, 195, 820, 36, "");
+        let mut pair_status_frame = Frame::new(50, 155, 820, 36, "");
         pair_status_frame.set_align(Align::Left | Align::Inside);
         pair_status_frame.set_label_size(12);
         reader_card.end();
@@ -479,7 +459,7 @@ impl FltkDriver {
         tabs.end();
 
         // Bottom status bar
-        let mut status_frame = Frame::new(20, 642, 880, 24, "Initializing RefineID...");
+        let mut status_frame = Frame::new(20, 642, 880, 24, "");
         status_frame.set_align(Align::Left | Align::Inside);
         status_frame.set_label_size(12);
         status_frame.set_label_color(Color::from_rgb(108, 117, 125));
@@ -779,12 +759,6 @@ impl FltkDriver {
         }
         {
             let c = Arc::clone(controller);
-            remote_toggle.set_callback(move |toggle| {
-                c.handle_intent(UserIntent::ToggleRemoteReader(toggle.value()));
-            });
-        }
-        {
-            let c = Arc::clone(controller);
             let mut code = pair_code_input.clone();
             pair_btn.set_callback(move |_| {
                 let typed = code.value();
@@ -825,9 +799,6 @@ impl FltkDriver {
             card_choice,
             card_status_badge,
             holder_name_frame,
-            holder_sub_frame,
-            serial_frame,
-            scheme_frame,
             pin1_status_frame,
             pin2_status_frame,
             puk_status_frame,
@@ -835,6 +806,9 @@ impl FltkDriver {
             change_pin2_btn,
             reactivate_btn,
             activate_btn,
+            pin_subtabs,
+            tab_change_pin1,
+            tab_activate,
             can_input,
             read_images_btn,
             portrait_frame,
@@ -848,7 +822,6 @@ impl FltkDriver {
             format_asice,
             sign_btn,
             sign_result_frame,
-            remote_toggle,
             pair_code_input,
             pair_btn,
             cancel_pair_btn,
@@ -904,7 +877,6 @@ fn copy_image_to_clipboard() {
             bytes: Cow::Borrowed(portrait.rgba_bytes()),
         };
         if cb.set_image(img_data).is_ok() {
-            message(200, 200, "Portrait image copied to clipboard.");
             return;
         }
     }
@@ -932,11 +904,6 @@ fn save_image_to_file() {
             )
             .is_ok()
             {
-                message(
-                    200,
-                    200,
-                    &format!("Saved portrait to {}", save_path.display()),
-                );
                 return;
             }
         }
@@ -955,7 +922,6 @@ fn copy_sig_to_clipboard() {
             bytes: Cow::Borrowed(sig.rgba_bytes()),
         };
         if cb.set_image(img_data).is_ok() {
-            message(200, 200, "Signature image copied to clipboard.");
             return;
         }
     }
@@ -983,11 +949,6 @@ fn save_sig_to_file() {
             )
             .is_ok()
             {
-                message(
-                    200,
-                    200,
-                    &format!("Saved signature to {}", save_path.display()),
-                );
                 return;
             }
         }
@@ -1040,13 +1001,16 @@ impl UiDriver for FltkDriver {
                 .card_choice
                 .add_choice(&escape_fltk_menu_text(&card.label()));
         }
-        if let Some(idx) = state.selected_card {
-            widgets.card_choice.set_value(idx as i32);
-        }
+        let selected = state
+            .selected_card
+            .and_then(|idx| i32::try_from(idx).ok())
+            .unwrap_or(-1);
+        widgets.card_choice.set_value(selected);
+        widgets.card_choice.redraw();
 
         // Top bar: Card presence badge & Hero Card
         if state.cards.is_empty() {
-            widgets.card_status_badge.set_label("○ No Card");
+            widgets.card_status_badge.set_label("No card");
             widgets
                 .card_status_badge
                 .set_color(Color::from_rgb(238, 240, 242));
@@ -1055,11 +1019,8 @@ impl UiDriver for FltkDriver {
                 .set_label_color(Color::from_rgb(120, 120, 120));
 
             widgets.holder_name_frame.set_label("No card");
-            widgets.holder_sub_frame.set_label("");
-            widgets.serial_frame.set_label("");
-            widgets.scheme_frame.set_label("");
         } else if state.busy {
-            widgets.card_status_badge.set_label("◌ Reading...");
+            widgets.card_status_badge.set_label("Reading");
             widgets
                 .card_status_badge
                 .set_color(Color::from_rgb(254, 247, 224));
@@ -1069,12 +1030,9 @@ impl UiDriver for FltkDriver {
 
             if let Some(card) = state.selected_card.and_then(|i| state.cards.get(i)) {
                 widgets.holder_name_frame.set_label(&card.display_name());
-                widgets
-                    .holder_sub_frame
-                    .set_label(state.card_model.as_deref().unwrap_or(""));
             }
         } else {
-            widgets.card_status_badge.set_label("● Card Ready");
+            widgets.card_status_badge.set_label("Card ready");
             widgets
                 .card_status_badge
                 .set_color(Color::from_rgb(230, 244, 234));
@@ -1084,75 +1042,40 @@ impl UiDriver for FltkDriver {
 
             if let Some(card) = state.selected_card.and_then(|i| state.cards.get(i)) {
                 widgets.holder_name_frame.set_label(&card.display_name());
-                widgets
-                    .holder_sub_frame
-                    .set_label(state.card_model.as_deref().unwrap_or(""));
-                widgets.serial_frame.set_label(&format!(
-                    "Card ID: {}",
-                    state.card_serial.as_deref().unwrap_or("")
-                ));
-                widgets
-                    .scheme_frame
-                    .set_label(state.issuance_scheme.unwrap_or(""));
             }
         }
         widgets.card_status_badge.redraw();
 
         // Tab 1: PIN Status
-        let p1_text = match state.pin1_status {
-            Some(PinStatus::Remaining(retries)) => {
-                let count = retries.get();
-                if retries.is_exhausted() {
-                    "Authentication PIN (PIN 1):  BLOCKED".to_string()
-                } else {
-                    format!("Authentication PIN (PIN 1):  Ready ({count} tries left)")
-                }
-            }
-            Some(PinStatus::Verified) => "Authentication PIN (PIN 1):  Verified".to_string(),
-            Some(PinStatus::Locked) => "Authentication PIN (PIN 1):  BLOCKED".to_string(),
-            Some(PinStatus::NoInfo) => "Authentication PIN (PIN 1):  No retry info".to_string(),
-            Some(PinStatus::Other(sw)) => format!("Authentication PIN (PIN 1):  Status 0x{sw:04X}"),
-            None => "Authentication PIN (PIN 1):  Not Inspected".to_string(),
-        };
+        widgets.pin1_status_frame.set_label(&credential_line(
+            PIN1_LABEL,
+            with_factory_flag(pin_value(state.pin1_status), state.pin1_changed),
+        ));
+        widgets.pin2_status_frame.set_label(&credential_line(
+            PIN2_LABEL,
+            with_factory_flag(pin_value(state.pin2_status), state.pin2_changed),
+        ));
         widgets
-            .pin1_status_frame
-            .set_label(&with_factory_flag(p1_text, state.pin1_changed));
+            .puk_status_frame
+            .set_label(&credential_line(PUK_LABEL, puk_value(state.puk_status)));
 
-        let p2_text = match state.pin2_status {
-            Some(PinStatus::Remaining(retries)) => {
-                let count = retries.get();
-                if retries.is_exhausted() {
-                    "Signing PIN (PIN 2):         BLOCKED".to_string()
-                } else {
-                    format!("Signing PIN (PIN 2):         Ready ({count} tries left)")
-                }
+        // The activation sub-tab exists only for a card that still needs it.
+        let setup_listed =
+            widgets.pin_subtabs.find(&widgets.tab_activate) < widgets.pin_subtabs.children();
+        if state.activation_available && !setup_listed {
+            widgets.pin_subtabs.add(&widgets.tab_activate);
+            widgets.pin_subtabs.redraw();
+        } else if !state.activation_available && setup_listed {
+            let showing_setup = widgets
+                .pin_subtabs
+                .value()
+                .is_some_and(|tab| tab.is_same(&widgets.tab_activate));
+            widgets.pin_subtabs.remove(&widgets.tab_activate);
+            if showing_setup {
+                let _ = widgets.pin_subtabs.set_value(&widgets.tab_change_pin1);
             }
-            Some(PinStatus::Verified) => "Signing PIN (PIN 2):         Verified".to_string(),
-            Some(PinStatus::Locked) => "Signing PIN (PIN 2):         BLOCKED".to_string(),
-            Some(PinStatus::NoInfo) => "Signing PIN (PIN 2):         No retry info".to_string(),
-            Some(PinStatus::Other(sw)) => format!("Signing PIN (PIN 2):         Status 0x{sw:04X}"),
-            None => "Signing PIN (PIN 2):         Not Inspected".to_string(),
-        };
-        widgets
-            .pin2_status_frame
-            .set_label(&with_factory_flag(p2_text, state.pin2_changed));
-
-        let puk_text = match state.puk_status {
-            Some(PukStatus::Remaining(retries)) => {
-                let count = retries.get();
-                if retries.is_exhausted() {
-                    "PUK Code:                    BLOCKED".to_string()
-                } else {
-                    format!("PUK Code:                    Ready ({count} tries left)")
-                }
-            }
-            Some(PukStatus::Locked) => "PUK Code:                    BLOCKED".to_string(),
-            Some(PukStatus::Invalidated) => "PUK Code:                    Invalidated".to_string(),
-            Some(PukStatus::NoInfo) => "PUK Code:                    No retry info".to_string(),
-            Some(PukStatus::Other(sw)) => format!("PUK Code:                    Status 0x{sw:04X}"),
-            None => "PUK Code:                    Unknown".to_string(),
-        };
-        widgets.puk_status_frame.set_label(&puk_text);
+            widgets.pin_subtabs.redraw();
+        }
 
         set_active(
             &mut widgets.change_pin1_btn,
@@ -1196,7 +1119,7 @@ impl UiDriver for FltkDriver {
                 set_active(&mut widgets.save_portrait_btn, true);
             } else {
                 widgets.portrait_frame.set_image(None::<RgbImage>);
-                widgets.portrait_frame.set_label("No image loaded");
+                widgets.portrait_frame.set_label("");
                 set_active(&mut widgets.copy_portrait_btn, false);
                 set_active(&mut widgets.save_portrait_btn, false);
             }
@@ -1219,7 +1142,7 @@ impl UiDriver for FltkDriver {
                 set_active(&mut widgets.save_sig_btn, true);
             } else {
                 widgets.signature_frame.set_image(None::<RgbImage>);
-                widgets.signature_frame.set_label("No signature loaded");
+                widgets.signature_frame.set_label("");
                 set_active(&mut widgets.copy_sig_btn, false);
                 set_active(&mut widgets.save_sig_btn, false);
             }
@@ -1252,7 +1175,6 @@ impl UiDriver for FltkDriver {
         }
 
         // Tab 4: Phone (RAPP)
-        widgets.remote_toggle.set_value(state.remote_reader_enabled);
         if let Some(ref pairing) = state.pairing {
             widgets
                 .pair_status_frame
@@ -1309,11 +1231,61 @@ const PAIRING_CODE_INPUT_SIZE: i32 = 8;
 const FORGET_CHOICE: i32 = 1;
 
 /// A PIN status line with the factory-value flag the card reported.
-fn with_factory_flag(line: String, changed: Option<bool>) -> String {
-    match changed {
-        Some(true) => format!("{line}; changed from factory value"),
-        Some(false) => format!("{line}; still at factory value"),
-        None => line,
+const PIN1_LABEL: &str = "Authentication PIN (PIN 1)";
+const PIN2_LABEL: &str = "Signing PIN (PIN 2)";
+const PUK_LABEL: &str = "PUK";
+
+/// A credential line: the label alone while the value is in its normal
+/// state, otherwise the label and the value.
+fn credential_line(label: &str, value: String) -> String {
+    if value.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label}: {value}")
+    }
+}
+
+/// What a PIN's counter says: nothing at the try limit, the tries left
+/// below it, and the blocked or unknown state otherwise.
+fn pin_value(status: Option<PinStatus>) -> String {
+    match status {
+        Some(PinStatus::Remaining(retries)) => tries_left(retries),
+        Some(PinStatus::Locked) => "blocked".to_owned(),
+        Some(PinStatus::NoInfo) => "no retry count".to_owned(),
+        Some(PinStatus::Other(sw)) => format!("status {sw:04X}"),
+        Some(PinStatus::Verified) | None => String::new(),
+    }
+}
+
+/// What the PUK's counter says, by the same rule as [`pin_value`].
+fn puk_value(status: Option<PukStatus>) -> String {
+    match status {
+        Some(PukStatus::Remaining(retries)) => tries_left(retries),
+        Some(PukStatus::Locked) => "blocked".to_owned(),
+        Some(PukStatus::Invalidated) => "invalidated".to_owned(),
+        Some(PukStatus::NoInfo) => "no retry count".to_owned(),
+        Some(PukStatus::Other(sw)) => format!("status {sw:04X}"),
+        None => String::new(),
+    }
+}
+
+fn tries_left(retries: PinRetries) -> String {
+    let count = retries.get();
+    if retries.is_exhausted() {
+        "blocked".to_owned()
+    } else if count < PIN_TRY_LIMIT {
+        format!("{count} of {PIN_TRY_LIMIT} tries left")
+    } else {
+        String::new()
+    }
+}
+
+/// Appends the factory-value flag to a credential value.
+fn with_factory_flag(value: String, changed: Option<bool>) -> String {
+    match (changed, value.is_empty()) {
+        (Some(false), true) => "factory value".to_owned(),
+        (Some(false), false) => format!("{value}; factory value"),
+        (Some(true) | None, _) => value,
     }
 }
 
@@ -1343,8 +1315,8 @@ mod tests {
     #[test]
     fn test_escape_fltk_menu_text() {
         assert_eq!(
-            escape_fltk_menu_text("KOISTINEN PETRI / Alcor Reader / CardOS"),
-            "KOISTINEN PETRI \\/ Alcor Reader \\/ CardOS"
+            escape_fltk_menu_text("ALPHA HOLDER / Alcor Reader / CardOS"),
+            "ALPHA HOLDER \\/ Alcor Reader \\/ CardOS"
         );
         assert_eq!(
             escape_fltk_menu_text("R&D / Test_Case"),
@@ -1356,12 +1328,42 @@ mod tests {
     #[test]
     fn factory_flag_follows_the_card() {
         assert_eq!(
-            with_factory_flag("PIN 1: Ready".to_owned(), Some(false)),
-            "PIN 1: Ready; still at factory value"
+            with_factory_flag(String::new(), Some(false)),
+            "factory value"
         );
         assert_eq!(
-            with_factory_flag("PIN 1: Ready".to_owned(), None),
-            "PIN 1: Ready"
+            with_factory_flag("blocked".to_owned(), Some(false)),
+            "blocked; factory value"
+        );
+        assert_eq!(with_factory_flag(String::new(), Some(true)), "");
+        assert_eq!(with_factory_flag(String::new(), None), "");
+    }
+
+    #[test]
+    fn a_credential_line_is_silent_in_its_normal_state() {
+        let full = PinRetries::from_nibble(PIN_TRY_LIMIT).expect("retry nibble");
+        let spent = PinRetries::from_nibble(PIN_TRY_LIMIT - 1).expect("retry nibble");
+        let none = PinRetries::from_nibble(0).expect("retry nibble");
+        assert_eq!(
+            credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(full)))),
+            "PIN 1"
+        );
+        assert_eq!(
+            credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(spent)))),
+            "PIN 1: 4 of 5 tries left"
+        );
+        assert_eq!(
+            credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(none)))),
+            "PIN 1: blocked"
+        );
+        assert_eq!(
+            credential_line("PIN 1", pin_value(Some(PinStatus::Verified))),
+            "PIN 1"
+        );
+        assert_eq!(credential_line("PUK", puk_value(None)), "PUK");
+        assert_eq!(
+            credential_line("PUK", puk_value(Some(PukStatus::Locked))),
+            "PUK: blocked"
         );
     }
 

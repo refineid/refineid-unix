@@ -40,7 +40,6 @@ use crate::error::GuiCoreError;
 use crate::image::{RgbaImageBuffer, decode_document_image};
 use crate::model::{
     ManagedCard, PairedPhone, RappPairingState, SignFormat, TimestampConfig, UiState, UserIntent,
-    issuance_scheme_label,
 };
 
 const DENIED_PINS: &[&[u8]] = &[
@@ -51,6 +50,12 @@ const DENIED_PINS: &[&[u8]] = &[
 const CARD_PRESENCE_WAIT: Duration = Duration::from_secs(30);
 const CARD_PRESENCE_SETTLE: Duration = Duration::from_millis(300);
 const CARD_PRESENCE_ERROR_BACKOFF: Duration = Duration::from_secs(5);
+/// How many times an inspection that finds no card is repeated while a
+/// reader still reports one: a freshly inserted card answers its first
+/// commands only once the reader has powered it.
+const CARD_SETTLE_RETRIES: u32 = 5;
+/// The wait before each repeated inspection, doubling every time.
+const CARD_SETTLE_FIRST_RETRY: Duration = Duration::from_millis(400);
 
 /// Cached document images (portrait, signature).
 pub type CachedImages = (Option<Arc<RgbaImageBuffer>>, Option<Arc<RgbaImageBuffer>>);
@@ -107,12 +112,10 @@ impl RefineIdController {
 
     /// Start the background card presence monitor and inspect cards.
     ///
-    /// The stored pairings are read first: a workstation that already
-    /// holds a usable pairing starts with the phone reader on.
+    /// The stored pairings are read first: their cards are listed
+    /// beside the local readers.
     pub fn start(self: &Arc<Self>) {
         self.refresh_phones();
-        let has_usable_phone = self.state().phones.iter().any(|phone| phone.state.usable());
-        self.update_state(|state| state.remote_reader_enabled = has_usable_phone);
         self.refresh_cards();
 
         let controller = Arc::clone(self);
@@ -152,7 +155,6 @@ impl RefineIdController {
             UserIntent::SignDocuments { pin2 } => self.sign_documents(pin2),
             UserIntent::StartPairing { code } => self.start_pairing(&code),
             UserIntent::CancelPairing => self.cancel_pairing(),
-            UserIntent::ToggleRemoteReader(enabled) => self.toggle_remote_reader(enabled),
             UserIntent::ForgetPhone(pair_id) => self.forget_phone(pair_id),
             UserIntent::RefreshPhones => self.refresh_phones(),
         }
@@ -172,14 +174,10 @@ impl RefineIdController {
         self.update_state(|state| state.phones = phones);
     }
 
-    fn toggle_remote_reader(self: &Arc<Self>, enabled: bool) {
-        self.update_state(|state| {
-            state.remote_reader_enabled = enabled;
-            if !enabled {
-                state.pairing = None;
-            }
-        });
-        self.refresh_cards();
+    /// Whether a paired phone can serve its card: the phone list is
+    /// consulted only while such a pairing exists.
+    fn has_usable_phone(&self) -> bool {
+        self.state().phones.iter().any(|phone| phone.state.usable())
     }
 
     fn forget_phone(self: &Arc<Self>, pair_id: PairId) {
@@ -193,12 +191,23 @@ impl RefineIdController {
         let outcome = RemoteReader::open_local().and_then(|mut reader| reader.remove(pair_id));
         self.update_state(|state| {
             state.status_message = match &outcome {
-                Ok(()) => format!("Forgot {name}."),
+                Ok(()) => String::new(),
                 Err(error) => format!("Could not forget {name}: {error}"),
             };
         });
         self.refresh_phones();
         self.refresh_cards();
+    }
+
+    /// Keeps the selection on a card that is still listed: the same
+    /// index when it exists, otherwise the last card, otherwise none.
+    fn reselect_card(&self) {
+        let (selected, count) = {
+            let state = self.state();
+            (state.selected_card, state.cards.len())
+        };
+        let index = selected.unwrap_or(0).min(count.saturating_sub(1));
+        self.select_card(index);
     }
 
     fn select_card(&self, index: usize) {
@@ -207,16 +216,6 @@ impl RefineIdController {
                 state.selected_card = Some(index);
                 let card = &state.cards[index];
                 state.card_serial = card.report.token_info.serial_number_hex.clone();
-                state.card_model = card
-                    .report
-                    .token_info
-                    .label
-                    .clone()
-                    .or_else(|| card.report.token_info.manufacturer_id.clone());
-                state.issuance_scheme = card
-                    .activation_context
-                    .as_ref()
-                    .and_then(|ctx| issuance_scheme_label(ctx.generation));
                 state.pin1_changed = card.report.pin1_changed;
                 state.pin2_changed = card.report.pin2_changed;
                 state.pin1_status = card.report.pin1;
@@ -251,8 +250,6 @@ impl RefineIdController {
             } else {
                 state.selected_card = None;
                 state.card_serial = None;
-                state.card_model = None;
-                state.issuance_scheme = None;
                 state.pin1_changed = None;
                 state.pin2_changed = None;
                 state.pin1_status = None;
@@ -279,7 +276,7 @@ impl RefineIdController {
         });
 
         let controller = Arc::clone(self);
-        let include_phones = self.state().remote_reader_enabled;
+        let include_phones = self.has_usable_phone();
         thread::spawn(move || {
             let result = refineid_client::card_manager::inspect_cards(None)
                 .map(|reports| deduplicate_cards(reports, include_phones))
@@ -293,16 +290,9 @@ impl RefineIdController {
                     controller.update_state(|state| {
                         state.busy = false;
                         state.cards = cards;
-                        state.status_message = if state.cards.is_empty() {
-                            "No FINEID card is present.".into()
-                        } else {
-                            String::new()
-                        };
+                        state.status_message = String::new();
                     });
-                    if !controller.state().cards.is_empty() {
-                        let selected = controller.state().selected_card.unwrap_or(0);
-                        controller.select_card(selected);
-                    }
+                    controller.reselect_card();
                 }
                 Err(err) => {
                     controller.update_state(|state| {
@@ -324,22 +314,10 @@ impl RefineIdController {
                     thread::sleep(CARD_PRESENCE_SETTLE);
                     baseline = refineid_lib_pcsc::presence_signature().unwrap_or(baseline);
                     if !self.presence_stop.load(Ordering::Acquire) {
-                        let include_phones = self.state().remote_reader_enabled;
-                        let result = refineid_client::card_manager::inspect_cards(None)
-                            .map(|reports| deduplicate_cards(reports, include_phones));
-                        if let Ok(cards) = result {
-                            self.update_state(|state| {
-                                state.cards = cards;
-                                if state.cards.is_empty() {
-                                    state.selected_card = None;
-                                    state.status_message = "No FINEID card is present.".into();
-                                }
-                            });
-                            if !self.state().cards.is_empty() {
-                                let selected = self.state().selected_card.unwrap_or(0);
-                                self.select_card(selected);
-                            }
-                        }
+                        let include_phones = self.has_usable_phone();
+                        let cards = self.inspect_until_settled(&baseline, include_phones);
+                        self.update_state(|state| state.cards = cards);
+                        self.reselect_card();
                     }
                 }
                 Ok(false) => {}
@@ -347,6 +325,32 @@ impl RefineIdController {
                     thread::sleep(CARD_PRESENCE_ERROR_BACKOFF);
                 }
             }
+        }
+    }
+
+    /// Inspects the readers, repeating while a reader reports a card that
+    /// the inspection did not yet find, so a card still powering up is
+    /// read once it answers.
+    fn inspect_until_settled(
+        &self,
+        signature: &[(String, bool)],
+        include_phones: bool,
+    ) -> Vec<ManagedCard> {
+        let mut wait = CARD_SETTLE_FIRST_RETRY;
+        let mut attempt = 0;
+        loop {
+            let cards = refineid_client::card_manager::inspect_cards(None)
+                .map(|reports| deduplicate_cards(reports, include_phones))
+                .unwrap_or_default();
+            if inspection_settled(signature, cards.iter().any(|card| !is_phone_card(card)))
+                || attempt >= CARD_SETTLE_RETRIES
+                || self.presence_stop.load(Ordering::Acquire)
+            {
+                return cards;
+            }
+            attempt += 1;
+            thread::sleep(wait);
+            wait = wait.saturating_mul(2);
         }
     }
 
@@ -401,17 +405,10 @@ impl RefineIdController {
 
             controller.update_state(|s| {
                 s.busy = false;
-                match res {
-                    Ok(report) => {
-                        s.status_message = format!(
-                            "Card activated. PIN1: {:?}; PIN2: {:?}",
-                            report.pin1_outcome, report.pin2_outcome
-                        );
-                    }
-                    Err(err) => {
-                        s.status_message = format!("Card activation failed: {err}");
-                    }
-                }
+                s.status_message = match res {
+                    Ok(_) => String::new(),
+                    Err(err) => format!("Card activation failed: {err}"),
+                };
             });
             controller.refresh_cards();
         });
@@ -462,7 +459,7 @@ impl RefineIdController {
                 s.busy = false;
                 match res {
                     Ok(report) if report.outcome == ChangePinOutcome::Ok => {
-                        s.status_message = format!("{} changed successfully.", slot.label());
+                        s.status_message = String::new();
                     }
                     Ok(report) => {
                         s.status_message =
@@ -523,7 +520,7 @@ impl RefineIdController {
                 s.busy = false;
                 match res {
                     Ok(report) if report.outcome == UnblockOutcome::Ok => {
-                        s.status_message = format!("{} reactivated successfully.", slot.label());
+                        s.status_message = String::new();
                     }
                     Ok(report) => {
                         s.status_message = format!("Reactivation rejected: {:?}", report.outcome);
@@ -583,7 +580,7 @@ impl RefineIdController {
                     Ok((p, sig)) => {
                         s.portrait = p.clone();
                         s.signature = sig.clone();
-                        s.status_message = "Card portrait and signature loaded.".into();
+                        s.status_message = String::new();
                         let mut cache = controller.image_cache.lock().expect("mutex lock");
                         cache.insert(card_key, (p, sig));
                     }
@@ -702,16 +699,12 @@ impl RefineIdController {
             controller.update_state(|s| {
                 s.busy = false;
                 let successes = results.iter().filter(|r| r.is_ok()).count();
-                if successes == results.len() {
-                    s.status_message = format!("Successfully signed {successes} document(s).");
-                    s.sign_result = Some(format!("Signed {successes} file(s)."));
-                } else {
-                    s.status_message = format!(
-                        "Signed {successes}/{} document(s) with errors.",
-                        results.len()
-                    );
-                    s.sign_result = Some("Signing failed for some documents.".to_string());
-                }
+                let failures: Vec<String> = results
+                    .iter()
+                    .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
+                    .collect();
+                s.status_message = failures.join("; ");
+                s.sign_result = Some(format!("Signed {successes} of {}", results.len()));
             });
         });
     }
@@ -721,15 +714,14 @@ impl RefineIdController {
     fn start_pairing(self: &Arc<Self>, code: &str) {
         let Some(normalized) = normalize_pairing_code(code) else {
             self.update_state(|s| {
-                s.status_message = "That is not the code your phone shows.".into();
+                s.status_message = "The code does not match the phone".into();
             });
             return;
         };
         self.update_state(|s| {
-            s.remote_reader_enabled = true;
             s.pairing = Some(RappPairingState {
                 code: format_pairing_code(&normalized),
-                status: "Looking for your phone on the local network...".into(),
+                status: "Looking for the phone".into(),
             });
         });
 
@@ -752,7 +744,7 @@ impl RefineIdController {
                 )) => {
                     controller.update_state(|s| {
                         s.pairing = None;
-                        s.status_message = "The code does not match the one on your phone.".into();
+                        s.status_message = "The code does not match the phone".into();
                     });
                     return;
                 }
@@ -767,7 +759,7 @@ impl RefineIdController {
 
             controller.update_state(|s| {
                 if let Some(p) = &mut s.pairing {
-                    p.status = "Paired. Reading the card...".into();
+                    p.status = "Reading the card".into();
                 }
             });
             let phone = pair.peer_display_name.clone();
@@ -785,7 +777,7 @@ impl RefineIdController {
     fn cancel_pairing(&self) {
         self.update_state(|s| {
             s.pairing = None;
-            s.status_message = "Pairing cancelled.".into();
+            s.status_message = String::new();
         });
     }
 }
@@ -793,18 +785,31 @@ impl RefineIdController {
 /// How long pairing browses for the phone showing the code.
 const PAIRING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The status line after a pairing, from how the first card read ended.
+/// The status line after a pairing: nothing when the card was read,
+/// otherwise what stands between the user and the card.
 fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String {
     match read_error {
-        None => format!("Paired with {phone}."),
-        Some(RemoteError::CardAbsent) => format!("Paired with {phone}. No card on the phone."),
-        Some(RemoteError::RevokedByPhone) => format!("{phone} forgot this computer; pair again."),
-        Some(RemoteError::Withdrawn) => {
-            format!("Paired with {phone}. The phone turned remote card access off.")
-        }
-        Some(error) => format!("Paired with {phone}. The card was not read: {error}"),
+        None => String::new(),
+        Some(RemoteError::CardAbsent) => format!("No card on {phone}"),
+        Some(RemoteError::RevokedByPhone) => format!("{phone} forgot this computer; pair again"),
+        Some(RemoteError::Withdrawn) => format!("{phone} turned remote card access off"),
+        Some(error) => format!("{phone}: {error}"),
     }
 }
+
+/// Whether an inspection agrees with the presence signature: either a
+/// local card was found, or no reader reports one.
+fn inspection_settled(signature: &[(String, bool)], found_local_card: bool) -> bool {
+    found_local_card || !signature.iter().any(|(_, present)| *present)
+}
+
+/// Whether a managed card is served by a paired phone rather than a reader.
+fn is_phone_card(card: &ManagedCard) -> bool {
+    card.report.reader.starts_with(PHONE_READER_PREFIX)
+}
+
+/// The reader name prefix of a card served by a paired phone.
+const PHONE_READER_PREFIX: &str = "Mobile: ";
 
 fn validate_gui_pin(pin: &PinBytes, label: &str, minimum_length: usize) -> Result<(), String> {
     let bytes = pin.as_bytes();
@@ -874,7 +879,7 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
             {
                 let view = owned_cert.view();
                 let dev_name = pair.peer_display_name;
-                let reader = format!("Mobile: {dev_name}");
+                let reader = format!("{PHONE_READER_PREFIX}{dev_name}");
                 let serial = owned_cert.serial().to_string();
                 let token_info = refineid_lib_core::pkcs15::TokenInfo {
                     serial_number_hex: Some(refineid_lib_core::identity::TokenSerial::new(serial)),
@@ -939,19 +944,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pairing_line_names_the_phone_and_the_card() {
-        assert_eq!(
-            pairing_outcome_line("Alpha Phone", None),
-            "Paired with Alpha Phone."
-        );
+    fn the_pairing_line_says_only_what_stands_in_the_way() {
+        assert_eq!(pairing_outcome_line("Alpha Phone", None), "");
         assert_eq!(
             pairing_outcome_line("Alpha Phone", Some(&RemoteError::CardAbsent)),
-            "Paired with Alpha Phone. No card on the phone."
+            "No card on Alpha Phone"
         );
         assert_eq!(
             pairing_outcome_line("Alpha Phone", Some(&RemoteError::RevokedByPhone)),
-            "Alpha Phone forgot this computer; pair again."
+            "Alpha Phone forgot this computer; pair again"
         );
+    }
+
+    #[test]
+    fn an_inspection_settles_when_it_agrees_with_the_readers() {
+        let card_in_reader = vec![("Reader".to_owned(), true)];
+        let empty_reader = vec![("Reader".to_owned(), false)];
+        assert!(inspection_settled(&card_in_reader, true));
+        assert!(!inspection_settled(&card_in_reader, false));
+        assert!(inspection_settled(&empty_reader, false));
+        assert!(inspection_settled(&[], false));
     }
 
     #[test]
