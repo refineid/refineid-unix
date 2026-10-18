@@ -675,13 +675,21 @@ impl RemoteReader {
             .get(pair_id)
             .map_err(|_| RemoteError::NotPaired)?;
         let keys = PairingKeys::derive(record)?;
-        // The holder of the session learns of the phone's announcements
-        // itself; an observer records nothing while it holds.
-        let _lock = take_lock(&session_lock_path(
-            self.requester.store().directory(),
-            pair_id,
-        ))?;
-        Ok(!self.sessions_for(pair_id, &keys)?.is_empty())
+        // The listening needs no lock; recording the phone's word does,
+        // and the holder of the session hears the phone itself, so an
+        // observer that cannot take the lock records nothing.
+        match sessions_for(&keys, browse_stream_services(BROWSE_ROUND)) {
+            Err(RemoteError::RevokedByPhone) => {
+                let _lock = take_lock(&session_lock_path(
+                    self.requester.store().directory(),
+                    pair_id,
+                ))?;
+                self.requester.revoke_announced_by_peer(pair_id);
+                Err(RemoteError::RevokedByPhone)
+            }
+            Ok(services) => Ok(!services.is_empty()),
+            Err(error) => Err(error),
+        }
     }
 
     /// The session custodians worth dialing for `pair_id`, applying the
@@ -1009,16 +1017,15 @@ mod tests {
     }
 
     #[test]
-    fn observing_stands_aside_for_a_session_holder_and_names_an_unknown_pairing() {
+    fn observing_listens_without_the_lock_and_names_an_unknown_pairing() {
         let directory = scratch();
         let mut reader = reader_with_pairing(&directory);
         let pair_id = PairId::from_array(PAIR_ID);
         let held = SessionLock::acquire(&session_lock_path(&directory, pair_id)).unwrap();
-        // The session's holder hears the phone itself; an observer stands
-        // aside while the lock is held.
-        assert_eq!(reader.observe(pair_id).err(), Some(RemoteError::Busy));
+        // Listening takes no lock: with the session held elsewhere and no
+        // phone announcing this pairing on the test network, not seen.
+        assert_eq!(reader.observe(pair_id), Ok(false));
         drop(held);
-        // No phone announces this pairing on the test network: not seen.
         assert_eq!(reader.observe(pair_id), Ok(false));
         assert_eq!(
             reader.observe(PairId::from_array([9; 16])).err(),
