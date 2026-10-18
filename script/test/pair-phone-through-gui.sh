@@ -40,13 +40,20 @@ trap 'rm -rf "$work"' EXIT
 
 say() { printf '%s %s\n' "$(date -u '+%H:%M:%S')" "$*"; }
 
+# Launches the phone in the mode that prints its code and writes the
+# code to $work/code; the launch keeps running until the ceremony ends.
 phone_offer() {
+    : > "$work/offer.log"
     xcrun devicectl device process launch --device "$udid" --console \
-        --terminate-existing "$bundle" --offer-remote-reader > "$work/offer.log" 2>&1 &
+        --terminate-existing "$bundle" --offer-remote-reader \
+        < /dev/null > "$work/offer.log" 2>&1 &
     waited=0
     while [ "$waited" -lt "$code_wait_seconds" ]; do
-        code=$(sed -n 's/^offer-remote-reader: offer \([0-9A-Z]\{6\}\)$/\1/p' "$work/offer.log" | tail -n 1)
-        [ -n "$code" ] && { printf '%s\n' "$code"; return 0; }
+        tr -d '\r' < "$work/offer.log" | grep -o 'offer-remote-reader: offer [0-9A-Z]\{6\}' \
+            | tail -n 1 | sed 's/.* //' > "$work/code"
+        if [ -s "$work/code" ]; then
+            return 0
+        fi
         sleep 1
         waited=$((waited + 1))
     done
@@ -83,36 +90,58 @@ refineid pairs 2>/dev/null
 EOS
 }
 
+# The pairing identifiers the host lists.
+pair_ids() {
+    host_pairs | sed -n 's/^      Pair ID: *//p'
+}
+
+# The listing's entry, name line and certificate line joined, of `pair_id`.
+entry_of() {
+    host_pairs | awk -v id="$1" '
+        /^  \[/ { name = $0; next }
+        /Pair ID:/ { found = ($NF == id); next }
+        found && /Cert cache:/ { print name " " $0; exit }'
+}
+
+# Waits until a pairing not in `known` exists whose entry matches `pattern`,
+# and prints its identifier.
 wait_for() {
-    pattern=$1
-    seconds=$2
+    known=$1
+    pattern=$2
+    seconds=$3
     waited=0
     while [ "$waited" -lt "$seconds" ]; do
-        if host_pairs | grep -q "$pattern"; then
-            return 0
-        fi
+        for id in $(pair_ids); do
+            case " $known " in *" $id "*) continue ;; esac
+            if entry_of "$id" | grep -q "$pattern"; then
+                printf '%s\n' "$id"
+                return 0
+            fi
+        done
         sleep 3
         waited=$((waited + 3))
     done
     return 1
 }
 
+known=$(pair_ids | tr '\n' ' ')
 say "asking the phone for a code"
-code=$(phone_offer)
+phone_offer
+code=$(cat "$work/code")
 say "code shown; typing it into the host's boxes"
 host_type_code "$code"
 
 say "waiting for the pairing on the host"
-if ! wait_for '^  \[1\] [^-]*$' "$pair_wait_seconds"; then
+if ! new_id=$(wait_for "$known" '^  \[[0-9]*\] [^ ]* ([A-Za-z]*) ' "$pair_wait_seconds"); then
     say "FAIL: no usable pairing within ${pair_wait_seconds} s"
     host_pairs
     exit 1
 fi
-say "paired; the phone serves again"
+say "paired as $new_id; the phone serves again"
 phone_serve
 
 say "waiting for the certificate read through the phone"
-if ! wait_for 'Cert cache: Cached' "$read_wait_seconds"; then
+if ! wait_for "$known" '^  \[[0-9]*\] [^ ]* ([A-Za-z]*) .*Cert cache: Cached' "$read_wait_seconds" > /dev/null; then
     say "FAIL: the certificate was not read within ${read_wait_seconds} s"
     host_pairs
     exit 1
