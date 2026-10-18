@@ -156,7 +156,6 @@ impl RefineIdController {
             UserIntent::StartPairing { code } => self.start_pairing(&code),
             UserIntent::CancelPairing => self.cancel_pairing(),
             UserIntent::ForgetPhone(pair_id) => self.forget_phone(pair_id),
-            UserIntent::RefreshPhones => self.refresh_phones(),
         }
     }
 
@@ -199,14 +198,21 @@ impl RefineIdController {
         self.refresh_cards();
     }
 
-    /// Keeps the selection on a card that is still listed: the same
-    /// index when it exists, otherwise the last card, otherwise none.
-    fn reselect_card(&self) {
-        let (selected, count) = {
+    /// Replaces the listed cards and keeps the selection on the card that
+    /// was selected when it is still listed, otherwise on the same index,
+    /// otherwise on the last card, otherwise on none.
+    fn replace_cards(&self, cards: Vec<ManagedCard>) {
+        let index = {
             let state = self.state();
-            (state.selected_card, state.cards.len())
+            let selected = state.selected_card;
+            let previous = selected
+                .and_then(|index| state.cards.get(index))
+                .map(ManagedCard::key);
+            previous
+                .and_then(|key| cards.iter().position(|card| card.key() == key))
+                .unwrap_or_else(|| selected.unwrap_or(0).min(cards.len().saturating_sub(1)))
         };
-        let index = selected.unwrap_or(0).min(count.saturating_sub(1));
+        self.update_state(|state| state.cards = cards);
         self.select_card(index);
     }
 
@@ -287,12 +293,8 @@ impl RefineIdController {
                 .store(false, Ordering::Release);
             match result {
                 Ok(cards) => {
-                    controller.update_state(|state| {
-                        state.busy = false;
-                        state.cards = cards;
-                        state.status_message = String::new();
-                    });
-                    controller.reselect_card();
+                    controller.update_state(|state| state.busy = false);
+                    controller.replace_cards(cards);
                 }
                 Err(err) => {
                     controller.update_state(|state| {
@@ -316,8 +318,7 @@ impl RefineIdController {
                     if !self.presence_stop.load(Ordering::Acquire) {
                         let include_phones = self.has_usable_phone();
                         let cards = self.inspect_until_settled(&baseline, include_phones);
-                        self.update_state(|state| state.cards = cards);
-                        self.reselect_card();
+                        self.replace_cards(cards);
                     }
                 }
                 Ok(false) => {}
@@ -330,7 +331,8 @@ impl RefineIdController {
 
     /// Inspects the readers, repeating while a reader reports a card that
     /// the inspection did not yet find, so a card still powering up is
-    /// read once it answers.
+    /// read once it answers. The repetition stops when the readers'
+    /// report changes; the presence monitor picks that change up.
     fn inspect_until_settled(
         &self,
         signature: &[(String, bool)],
@@ -351,6 +353,9 @@ impl RefineIdController {
             attempt += 1;
             thread::sleep(wait);
             wait = wait.saturating_mul(2);
+            if refineid_lib_pcsc::presence_signature().is_ok_and(|now| now != signature) {
+                return cards;
+            }
         }
     }
 
@@ -710,8 +715,11 @@ impl RefineIdController {
     }
 
     /// Pairs with the phone showing `code` (RAPP v26.10.18: the phone shows
-    /// the code and this workstation types it).
+    /// the code and this workstation types it). One ceremony runs at a time.
     fn start_pairing(self: &Arc<Self>, code: &str) {
+        if self.state().pairing.is_some() {
+            return;
+        }
         let Some(normalized) = normalize_pairing_code(code) else {
             self.update_state(|s| {
                 s.status_message = "The code does not match the phone".into();
@@ -774,6 +782,8 @@ impl RefineIdController {
         });
     }
 
+    /// Clears the pairing display. A ceremony under way ends at the phone,
+    /// and its outcome is applied when it does.
     fn cancel_pairing(&self) {
         self.update_state(|s| {
             s.pairing = None;

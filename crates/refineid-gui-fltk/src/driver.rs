@@ -759,14 +759,13 @@ impl FltkDriver {
         }
         {
             let c = Arc::clone(controller);
-            let mut code = pair_code_input.clone();
+            let code = pair_code_input.clone();
             pair_btn.set_callback(move |_| {
                 let typed = code.value();
                 if typed.trim().is_empty() {
                     return;
                 }
                 c.handle_intent(UserIntent::StartPairing { code: typed });
-                code.set_value("");
             });
         }
         {
@@ -1071,6 +1070,7 @@ impl UiDriver for FltkDriver {
                 .value()
                 .is_some_and(|tab| tab.is_same(&widgets.tab_activate));
             widgets.pin_subtabs.remove(&widgets.tab_activate);
+            widgets.tab_activate.hide();
             if showing_setup {
                 let _ = widgets.pin_subtabs.set_value(&widgets.tab_change_pin1);
             }
@@ -1179,6 +1179,7 @@ impl UiDriver for FltkDriver {
             widgets
                 .pair_status_frame
                 .set_label(&format!("{}  {}", pairing.code, pairing.status));
+            widgets.pair_code_input.set_value("");
             set_active(&mut widgets.pair_btn, false);
             set_active(&mut widgets.pair_code_input, false);
             set_active(&mut widgets.cancel_pair_btn, true);
@@ -1189,17 +1190,30 @@ impl UiDriver for FltkDriver {
             set_active(&mut widgets.cancel_pair_btn, false);
         }
 
-        let selected_phone = widgets.phone_browser.value();
-        widgets.phone_browser.clear();
-        for phone in &state.phones {
-            widgets
-                .phone_browser
-                .add(&escape_browser_text(&phone.line()));
+        let lines: Vec<String> = state
+            .phones
+            .iter()
+            .map(|phone| escape_browser_text(&phone.line()))
+            .collect();
+        let listed = (1..=widgets.phone_browser.size())
+            .map(|row| widgets.phone_browser.text(row).unwrap_or_default());
+        if listed.ne(lines.iter().cloned()) {
+            let selected_phone = widgets.phone_browser.value();
+            widgets.phone_browser.clear();
+            for line in &lines {
+                widgets.phone_browser.add(line);
+            }
+            if selected_phone >= 1 && selected_phone <= widgets.phone_browser.size() {
+                widgets.phone_browser.select(selected_phone);
+            }
         }
-        if selected_phone >= 1 && selected_phone <= widgets.phone_browser.size() {
-            widgets.phone_browser.select(selected_phone);
+        if widgets.phone_browser.value() < 1 && widgets.phone_browser.size() >= 1 {
+            widgets.phone_browser.select(1);
         }
-        set_active(&mut widgets.forget_phone_btn, !state.phones.is_empty());
+        set_active(
+            &mut widgets.forget_phone_btn,
+            widgets.phone_browser.value() >= 1,
+        );
     }
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
@@ -1224,8 +1238,8 @@ impl UiDriver for FltkDriver {
 }
 
 /// The most characters a typed pairing code may hold: six characters
-/// with the two spaces the phone shows between its clusters.
-const PAIRING_CODE_INPUT_SIZE: i32 = 8;
+/// with room for the separators and spaces a paste may carry.
+const PAIRING_CODE_INPUT_SIZE: i32 = 16;
 
 /// The index of the "Forget" button in the forget confirmation.
 const FORGET_CHOICE: i32 = 1;

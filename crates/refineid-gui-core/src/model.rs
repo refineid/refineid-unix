@@ -427,8 +427,6 @@ pub enum UserIntent {
     CancelPairing,
     /// Forget one paired phone.
     ForgetPhone(PairId),
-    /// Read the stored pairings again.
-    RefreshPhones,
 }
 
 #[cfg(test)]
