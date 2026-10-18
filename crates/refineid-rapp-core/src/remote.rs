@@ -207,10 +207,6 @@ pub enum RemoteError {
 impl core::fmt::Display for RemoteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Store(StoreError::SecretsUnavailable) => f.write_str(
-                "the desktop secret store is unavailable: install secret-tool (libsecret) and \
-                 unlock the keyring",
-            ),
             Self::Store(error) => write!(f, "pairing store: {error:?}"),
             Self::NotPaired => f.write_str("no paired phone"),
             Self::NotFound => f.write_str("no phone found on the local network"),
@@ -487,10 +483,8 @@ impl RemoteReader {
     ///
     /// # Errors
     /// [`RemoteError::Pairing`] for a malformed or mistyped code and other
-    /// pairing failures, [`RemoteError::Store`] when the key vault does not
-    /// answer (checked before the phone's code is spent), and
-    /// [`RemoteError::NotFound`] when no phone in a pairing ceremony
-    /// answered.
+    /// pairing failures, and [`RemoteError::NotFound`] when no phone in a
+    /// pairing ceremony answered.
     pub fn pair_with_code(
         &mut self,
         code: &str,
@@ -498,9 +492,6 @@ impl RemoteReader {
     ) -> Result<PairSummary, RemoteError> {
         if crate::offer::normalize_pairing_code(code).is_none() {
             return Err(RemoteError::Pairing(PairingError::InvalidCode));
-        }
-        if !self.requester.store().vault_reachable() {
-            return Err(RemoteError::Store(StoreError::SecretsUnavailable));
         }
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;

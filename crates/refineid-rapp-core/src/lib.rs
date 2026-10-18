@@ -12,7 +12,6 @@ pub mod engine;
 pub mod file_journal;
 pub mod file_store;
 pub mod ids;
-pub mod key_vault;
 pub mod message;
 pub mod offer;
 pub mod operations;

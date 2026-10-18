@@ -8,7 +8,7 @@ otherwise.
 
 ```sh
 pkg install pcsc-lite acsccid libccid pcsc-tools \
-    avahi-app nss_mdns libsecret gnome-keyring \
+    avahi-app nss_mdns \
     rust git pkgconf cmake ninja evdev-proto \
     p11-kit nss firefox chromium
 ```
@@ -158,26 +158,9 @@ FreeBSD names only the proxy.
 
 ## 7. Pairing a phone
 
-Each pairing's private key is kept in the desktop's Secret Service
-(`secret-tool` from `libsecret`), so a provider must run in the session:
-`gnome-keyring` is the one installed above. Its autostart entries are
-for GNOME only, so on Xfce the display manager starts it through PAM
-and unlocks the login keyring with the login password. Append to
-`/usr/local/etc/pam.d/lightdm`:
-
-```
-auth      optional  /usr/local/lib/pam_gnome_keyring.so
-session   optional  /usr/local/lib/pam_gnome_keyring.so auto_start
-```
-
-The login keyring is created at the next login when none exists; a
-keyring with another password asks for it on first use. Pairing refuses
-to start when the service does not answer, before the phone's code is
-spent.
-
-The RefineID desktop application and `refineid pair` must run inside the
-desktop session (with `DBUS_SESSION_BUS_ADDRESS` set), not over a plain
-SSH login, for the Secret Service to be reachable.
+Each pairing is one owner-only file (mode `0600` in a `0700` directory)
+under `~/.config/refineid/rapp-pairs`, holding the pairing's private key
+with its record, as `~/.ssh` holds a private key.
 
 With remote access on in the phone's RefineID and the phone on the same
 network:
