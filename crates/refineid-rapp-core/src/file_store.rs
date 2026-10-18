@@ -362,14 +362,10 @@ mod tests {
         let mut awaiting = record(14);
         awaiting.disposition = PairingDisposition::Unconfirmed;
         store.insert(awaiting).unwrap();
-        assert_eq!(
-            store
-                .get(PairId::from_array([14; 16]))
-                .unwrap()
-                .local_private
-                .as_slice(),
-            [0x11; 32]
-        );
+        let on_disk = FilePairingStore::open(&directory).unwrap();
+        let loaded = on_disk.get(PairId::from_array([14; 16])).unwrap();
+        assert_eq!(loaded.disposition, PairingDisposition::Unconfirmed);
+        assert_eq!(loaded.local_private.as_slice(), [0x11; 32]);
         store
             .update(PairId::from_array([14; 16]), &mut |entry| {
                 entry.disposition = PairingDisposition::Paired;
