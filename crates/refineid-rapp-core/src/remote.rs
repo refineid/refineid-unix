@@ -483,8 +483,9 @@ impl RemoteReader {
     ///
     /// # Errors
     /// [`RemoteError::Pairing`] for a malformed or mistyped code and other
-    /// pairing failures, and [`RemoteError::NotFound`] when no phone in a
-    /// pairing ceremony answered.
+    /// pairing failures, [`RemoteError::NotFound`] when no phone in a
+    /// pairing ceremony answered, and [`RemoteError::Store`] when the
+    /// record of a completed ceremony cannot be written.
     pub fn pair_with_code(
         &mut self,
         code: &str,

@@ -94,7 +94,9 @@ impl core::error::Error for PairingCodecError {}
 /// and never log it.
 #[must_use]
 pub fn encode_pairing_record(record: &PairingRecord) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::new());
+    // Sized once, so the key bytes are copied into one buffer and no
+    // discarded reallocation keeps them.
+    let mut out = Zeroizing::new(Vec::with_capacity(encoded_record_size(record)));
     out.extend_from_slice(PAIRING_BLOB_MAGIC);
     out.push(PAIRING_BLOB_VERSION);
     out.extend_from_slice(record.pair_id.as_bytes());
@@ -120,6 +122,36 @@ pub fn encode_pairing_record(record: &PairingRecord) -> Zeroizing<Vec<u8>> {
     put_optional_bytes(&mut out, record.root_ca.as_deref());
     put_optional_bytes(&mut out, record.intermediate_ca.as_deref());
     out
+}
+
+/// The size of `record`'s encoding, counted field by field.
+fn encoded_record_size(record: &PairingRecord) -> usize {
+    const LENGTH_PREFIX: usize = 4;
+    const OPTIONAL_FLAG: usize = 1;
+    let bytes = |field: &[u8]| LENGTH_PREFIX + field.len();
+    let optional = |field: Option<&[u8]>| OPTIONAL_FLAG + field.map_or(0, bytes);
+    PAIRING_BLOB_MAGIC.len()
+        + 1
+        + record.pair_id.as_bytes().len()
+        + record.grants_hash.len()
+        + 1
+        + 1
+        + size_of_val(&record.candidate_failures)
+        + bytes(&record.local_private)
+        + bytes(&record.local_public)
+        + bytes(&record.peer_public)
+        + LENGTH_PREFIX
+        + record
+            .granted_profiles
+            .iter()
+            .map(|profile| bytes(profile.as_bytes()))
+            .sum::<usize>()
+        + bytes(record.peer_display_name.as_bytes())
+        + bytes(record.peer_platform.as_bytes())
+        + optional(record.auth_cert.as_deref())
+        + optional(record.signature_cert.as_deref())
+        + optional(record.root_ca.as_deref())
+        + optional(record.intermediate_ca.as_deref())
 }
 
 /// The pair identifier of a pairing-record blob written by an earlier
@@ -433,6 +465,14 @@ mod tests {
         assert_eq!(left.signature_cert, right.signature_cert);
         assert_eq!(left.root_ca, right.root_ca);
         assert_eq!(left.intermediate_ca, right.intermediate_ca);
+    }
+
+    #[test]
+    fn the_encoder_sizes_its_buffer_once() {
+        let record = sample();
+        let encoded = encode_pairing_record(&record);
+        assert_eq!(encoded.len(), super::encoded_record_size(&record));
+        assert_eq!(encoded.capacity(), encoded.len());
     }
 
     #[test]
