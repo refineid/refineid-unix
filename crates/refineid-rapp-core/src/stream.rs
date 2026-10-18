@@ -13,6 +13,7 @@
 //! stored state (specification section 10.1, class 1).
 
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -357,8 +358,7 @@ const SRV_FIXED_BYTES: usize = 6;
 /// Largest mDNS response the browser reads.
 const MDNS_RESPONSE_BYTES: usize = 4096;
 /// The mDNS IPv4 group and port (RFC 6762 section 3).
-const MDNS_GROUP: std::net::SocketAddrV4 =
-    std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(224, 0, 0, 251), 5353);
+const MDNS_GROUP: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), 5353);
 /// Poll interval while waiting for answers.
 const MDNS_POLL: Duration = Duration::from_millis(250);
 
@@ -366,9 +366,9 @@ const MDNS_POLL: Duration = Duration::from_millis(250);
 #[derive(Debug, Default)]
 struct MdnsRecords {
     instances: Vec<String>,
-    services: BTreeMap<String, (u16, String, Option<std::net::Ipv4Addr>)>,
+    services: BTreeMap<String, (u16, String, Option<Ipv4Addr>)>,
     texts: BTreeMap<String, Vec<(String, String)>>,
-    addresses: BTreeMap<String, std::net::Ipv4Addr>,
+    addresses: BTreeMap<String, Ipv4Addr>,
 }
 
 impl MdnsRecords {
@@ -423,11 +423,7 @@ fn host_label(host: &str) -> String {
 const LOCAL_DOMAIN: &str = ".local";
 
 /// Parses one mDNS response into `records`; malformed input is ignored.
-fn parse_mdns_response(
-    data: &[u8],
-    responder: Option<std::net::Ipv4Addr>,
-    records: &mut MdnsRecords,
-) {
+fn parse_mdns_response(data: &[u8], responder: Option<Ipv4Addr>, records: &mut MdnsRecords) {
     if data.len() < DNS_HEADER_BYTES {
         return;
     }
@@ -477,10 +473,9 @@ fn parse_mdns_response(
                 records.texts.insert(name, parse_txt(rdata));
             }
             RR_TYPE_A if rdata.len() == 4 => {
-                records.addresses.insert(
-                    name,
-                    std::net::Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]),
-                );
+                records
+                    .addresses
+                    .insert(name, Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
             }
             _ => {}
         }
@@ -514,10 +509,24 @@ fn parse_txt(rdata: &[u8]) -> Vec<(String, String)> {
 /// Browses `_refineid-stream._tcp.local.` for `timeout` and returns every
 /// advertised custodian, with the TXT entries it published.
 ///
+/// The query goes to the mDNS group and, directly, to each of `remembered`:
+/// the addresses a phone answered from before. A wireless network delivers
+/// multicast to a phone unreliably; a query to the phone's own address is
+/// answered whenever it is reachable at all.
+///
 /// The query asks for unicast answers from an ephemeral port (RFC 6762
 /// section 5.4), so it works beside a system mDNS responder.
 #[must_use]
-pub fn browse_stream_services(timeout: Duration) -> Vec<StreamService> {
+pub fn browse_stream_services(timeout: Duration, remembered: &[Ipv4Addr]) -> Vec<StreamService> {
+    let responders: Vec<SocketAddrV4> = remembered
+        .iter()
+        .map(|address| SocketAddrV4::new(*address, MDNS_GROUP.port()))
+        .collect();
+    browse_responders(timeout, &responders)
+}
+
+/// [`browse_stream_services`], asking the mDNS group and `responders`.
+fn browse_responders(timeout: Duration, responders: &[SocketAddrV4]) -> Vec<StreamService> {
     use std::net::UdpSocket;
     use std::time::Instant;
 
@@ -539,7 +548,11 @@ pub fn browse_stream_services(timeout: Duration) -> Vec<StreamService> {
     query.extend_from_slice(&RR_TYPE_PTR.to_be_bytes());
     // Class IN with the unicast-response bit.
     query.extend_from_slice(&0x8001u16.to_be_bytes());
-    if socket.send_to(&query, MDNS_GROUP).is_err() {
+    let mut asked = false;
+    for responder in core::iter::once(&MDNS_GROUP).chain(responders) {
+        asked |= socket.send_to(&query, responder).is_ok();
+    }
+    if !asked {
         return Vec::new();
     }
 
@@ -563,7 +576,7 @@ pub fn browse_stream_services(timeout: Duration) -> Vec<StreamService> {
 /// endpoint.
 #[must_use]
 pub fn browse(mode: DiscoveryMode, timeout: Duration) -> Vec<StreamService> {
-    browse_stream_services(timeout)
+    browse_stream_services(timeout, &[])
         .into_iter()
         .filter(|service| service.advertises(mode))
         .collect()
@@ -706,6 +719,46 @@ mod tests {
         packet.extend(record(&full, super::RR_TYPE_TXT, &txt_rdata));
         packet.extend(record(&host, super::RR_TYPE_A, &[192, 0, 2, 10]));
         packet
+    }
+
+    /// A responder on the loopback answers the direct query, as the phone
+    /// answers one sent to its own address when multicast never arrives.
+    #[test]
+    fn a_remembered_responder_is_asked_directly() {
+        use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+        let responder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = responder.local_addr().unwrap().port();
+        let answering = std::thread::spawn(move || {
+            let mut query = [0u8; 512];
+            let (_, asker) = responder.recv_from(&mut query).unwrap();
+            responder
+                .send_to(
+                    &response("refineid-0b9e44d1", &["v=1", "mode=session"]),
+                    asker,
+                )
+                .unwrap();
+        });
+        let services = super::browse_responders(
+            Duration::from_millis(600),
+            &[SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)],
+        );
+        answering.join().unwrap();
+        // The multicast query reaches the real network too; the loopback
+        // responder's instance is counted alone.
+        assert_eq!(
+            services
+                .iter()
+                .filter(|service| service.instance == INSTANCE)
+                .count(),
+            1
+        );
+        let found = services
+            .iter()
+            .find(|service| service.instance == INSTANCE)
+            .expect("the direct answer names the custodian");
+        assert!(found.endpoints.contains(&"192.0.2.10:47110".to_owned()));
+        assert!(found.advertises(DiscoveryMode::Session));
     }
 
     #[test]

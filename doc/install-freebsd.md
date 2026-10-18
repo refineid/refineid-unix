@@ -57,6 +57,11 @@ and in `/etc/nsswitch.conf`: `hosts: files mdns dns`. A phone advertises
 `_refineid-stream._tcp` only while its remote access is on;
 `avahi-browse -t -r _refineid-stream._tcp` shows it.
 
+RefineID sends its own mDNS query and does not depend on Avahi for the
+phone. A wireless network delivers multicast to a phone unreliably, so
+the query also goes directly to the addresses the phone last answered
+from, kept beside the pairing record in `~/.config/refineid/rapp-pairs`.
+
 If local unbound forwards to a router that drops DNSSEC data, every
 lookup answers SERVFAIL and pkg cannot resolve its mirrors; a file
 `/var/unbound/conf.d/no-dnssec.conf` with `module-config: "iterator"`
