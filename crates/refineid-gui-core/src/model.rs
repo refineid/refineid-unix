@@ -38,32 +38,36 @@ pub struct ManagedCard {
     pub activation_context: Option<ActivationCardContext>,
 }
 
+/// The common name without the trailing identifier.
+///
+/// A citizen certificate's subject common name is the surname, the
+/// given names and the identifier, in that order (FINEID S2 §6.3.6.1).
+/// The name shown is the common name as the card carries it, less
+/// that last token when it equals the identifier.
+fn holder_name(common_name: &str, peuin: Option<&str>) -> String {
+    let trimmed = common_name.trim_end();
+    peuin
+        .and_then(|id| trimmed.strip_suffix(id))
+        .and_then(|rest| rest.strip_suffix(' '))
+        .map_or(trimmed, str::trim_end)
+        .to_owned()
+}
+
 impl ManagedCard {
     /// Person name string.
     pub fn person_name(&self) -> String {
         self.report.identity.person_string()
     }
 
-    /// The cardholder line: the certificate subject's common name as
-    /// the card carries it, or the person string when the certificate
-    /// was not read.
+    /// The cardholder line: the certificate subject's common name
+    /// without the identifier it ends with, or the person string when
+    /// the certificate was not read.
     pub fn display_name(&self) -> String {
-        self.report
-            .identity
-            .common_name
-            .as_ref()
-            .map_or_else(|| self.person_name(), |cn| cn.as_str().to_owned())
-    }
-
-    /// Display label for card selector tabs / dropdowns.
-    pub fn label(&self) -> String {
-        let reader_short = condense_reader_name(&self.report.reader);
-        let name = self.person_name();
-        if name.is_empty() {
-            reader_short
-        } else {
-            format!("{name} ({reader_short})")
-        }
+        let identity = &self.report.identity;
+        identity.common_name.as_ref().map_or_else(
+            || self.person_name(),
+            |cn| holder_name(cn.as_str(), identity.peuin.as_ref().map(AsRef::as_ref)),
+        )
     }
 
     /// Card key for cache lookup.
@@ -121,25 +125,6 @@ impl ManagedCard {
     }
 }
 
-/// Condense a PC/SC reader name for display.
-pub fn condense_reader_name(reader: &str) -> String {
-    let mut name = reader.trim().to_owned();
-    if let (Some(open), Some(close)) = (name.find('['), name.rfind(']'))
-        && open < close
-    {
-        let inner = name[open + 1..close].trim().to_lowercase();
-        let outer = format!("{} {}", &name[..open], &name[close + 1..]).to_lowercase();
-        if !inner.is_empty() && outer.contains(&inner) {
-            name.replace_range(open..=close, "");
-        }
-    }
-    let mut words: Vec<&str> = name.split_whitespace().collect();
-    if words.ends_with(&["00", "00"]) {
-        words.truncate(words.len() - 2);
-    }
-    words.join(" ")
-}
-
 /// Supported signing output formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignFormat {
@@ -158,27 +143,6 @@ impl From<SignFormat> for Format {
     }
 }
 
-/// Timestamp authority configuration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TimestampConfig {
-    /// Hostname and path of RFC 3161 timestamp endpoint.
-    pub host_path: String,
-    /// Optional HTTP basic authentication username.
-    pub username: Option<String>,
-    /// Optional HTTP basic authentication password.
-    pub password: Option<String>,
-}
-
-impl Default for TimestampConfig {
-    fn default() -> Self {
-        Self {
-            host_path: "timestamp.sectigo.com/qualified".into(),
-            username: None,
-            password: None,
-        }
-    }
-}
-
 /// Active RAPP phone pairing state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RappPairingState {
@@ -188,80 +152,30 @@ pub struct RappPairingState {
     pub status: String,
 }
 
-/// What a stored pairing with a phone is to the user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PhoneState {
-    /// The pairing opens sessions.
-    Paired,
-    /// Stored before the phone confirmed its own storage; it opens no
-    /// session until pairing runs again.
-    Unconfirmed,
-    /// The phone forgot this computer or rejected the credential.
-    ForgottenByPhone,
-    /// Revoked on this computer.
-    Revoked,
-}
-
-impl PhoneState {
-    /// The state as the phone list shows it.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Paired => "paired",
-            Self::Unconfirmed => "unconfirmed",
-            Self::ForgottenByPhone => "forgotten by the phone",
-            Self::Revoked => "revoked",
-        }
-    }
-
-    /// Whether a pairing in this state can serve a card.
-    #[must_use]
-    pub const fn usable(self) -> bool {
-        matches!(self, Self::Paired)
-    }
-}
-
-/// One phone this workstation has paired with.
+/// The paired phone, as its stored pairing describes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairedPhone {
     /// The pair identifier.
     pub pair_id: PairId,
-    /// The name the phone introduced itself with.
+    /// The name the phone is listed under.
     pub name: String,
     /// The platform the phone introduced itself with.
     pub platform: String,
-    /// The pairing's state.
-    pub state: PhoneState,
     /// Whether the phone's authentication certificate is cached.
     pub certificate_cached: bool,
 }
 
 impl PairedPhone {
-    /// The phone as its stored pairing describes it.
+    /// The phone of a pairing that can open a session; `None` for a
+    /// pairing that cannot.
     #[must_use]
-    pub fn from_summary(summary: &PairSummary) -> Self {
-        let state = if summary.forgotten_by_phone {
-            PhoneState::ForgottenByPhone
-        } else if summary.revoked {
-            PhoneState::Revoked
-        } else if summary.unconfirmed {
-            PhoneState::Unconfirmed
-        } else {
-            PhoneState::Paired
-        };
-        Self {
+    pub fn from_summary(summary: &PairSummary) -> Option<Self> {
+        summary.usable().then(|| Self {
             pair_id: summary.pair_id,
             name: summary.peer_display_name.clone(),
             platform: summary.peer_platform.clone(),
             certificate_cached: summary.auth_cert.is_some(),
-            state,
-        }
-    }
-
-    /// The one line the phone list shows for this phone.
-    #[must_use]
-    pub fn line(&self) -> String {
-        format!("{}: {}", self.name, self.state.label())
+        })
     }
 }
 
@@ -319,15 +233,13 @@ pub struct UiState {
     pub pdf_documents: Vec<PathBuf>,
     /// Active signature format.
     pub sign_format: SignFormat,
-    /// Active timestamp server configuration.
-    pub timestamp_config: TimestampConfig,
     /// Outcome of the last signing operation.
     pub sign_result: Option<String>,
 
     /// Active RAPP phone pairing state.
     pub pairing: Option<RappPairingState>,
-    /// Every phone this workstation has paired with, newest first.
-    pub phones: Vec<PairedPhone>,
+    /// The paired phone, while one is paired.
+    pub phone: Option<PairedPhone>,
 }
 
 impl Default for UiState {
@@ -357,10 +269,9 @@ impl Default for UiState {
             signature: None,
             pdf_documents: Vec::new(),
             sign_format: SignFormat::Pades,
-            timestamp_config: TimestampConfig::default(),
             sign_result: None,
             pairing: None,
-            phones: Vec::new(),
+            phone: None,
         }
     }
 }
@@ -368,10 +279,6 @@ impl Default for UiState {
 /// High-level user actions dispatched from the presentation driver to the controller.
 #[derive(Debug)]
 pub enum UserIntent {
-    /// Select a card by index.
-    SelectCard(usize),
-    /// Request immediate card re-inspection.
-    RefreshCards,
     /// Factory activation for new cards.
     ActivateCard {
         /// Activation code bytes.
@@ -410,8 +317,6 @@ pub enum UserIntent {
     ClearDocuments,
     /// Set signing format (PAdES or ASiC-E).
     SetSignFormat(SignFormat),
-    /// Update timestamp configuration.
-    SetTimestampConfig(TimestampConfig),
     /// Sign all queued documents.
     SignDocuments {
         /// Qualified signature PIN2 bytes.
@@ -422,8 +327,8 @@ pub enum UserIntent {
         /// The code as the user typed it.
         code: String,
     },
-    /// Forget one paired phone.
-    ForgetPhone(PairId),
+    /// Forget the paired phone.
+    ForgetPhone,
 }
 
 #[cfg(test)]
@@ -444,30 +349,29 @@ mod tests {
     }
 
     #[test]
-    fn a_pairing_maps_to_one_state() {
+    fn the_holder_name_drops_the_identifier_the_common_name_ends_with() {
         assert_eq!(
-            PairedPhone::from_summary(&summary(false, false, false)).state,
-            PhoneState::Paired
+            holder_name("Tormanen Paivi 12345678N", Some("12345678N")),
+            "Tormanen Paivi"
         );
         assert_eq!(
-            PairedPhone::from_summary(&summary(false, true, false)).state,
-            PhoneState::Unconfirmed
+            holder_name("Tormanen Paivi 12345678N", None),
+            "Tormanen Paivi 12345678N"
         );
         assert_eq!(
-            PairedPhone::from_summary(&summary(true, false, true)).state,
-            PhoneState::ForgottenByPhone
+            holder_name("Tormanen Paivi", Some("12345678N")),
+            "Tormanen Paivi"
         );
-        assert_eq!(
-            PairedPhone::from_summary(&summary(true, false, false)).state,
-            PhoneState::Revoked
-        );
+        assert_eq!(holder_name("12345678N", Some("12345678N")), "12345678N");
     }
 
     #[test]
-    fn the_phone_line_names_the_phone_and_its_state() {
-        let phone = PairedPhone::from_summary(&summary(false, true, false));
-        assert_eq!(phone.line(), "Alpha Phone: unconfirmed");
-        assert!(!phone.state.usable());
-        assert!(PhoneState::Paired.usable());
+    fn only_a_usable_pairing_is_a_phone() {
+        let phone = PairedPhone::from_summary(&summary(false, false, false)).expect("phone");
+        assert_eq!(phone.name, "Alpha Phone");
+        assert!(!phone.certificate_cached);
+        assert!(PairedPhone::from_summary(&summary(false, true, false)).is_none());
+        assert!(PairedPhone::from_summary(&summary(true, false, true)).is_none());
+        assert!(PairedPhone::from_summary(&summary(true, false, false)).is_none());
     }
 }

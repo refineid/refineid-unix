@@ -17,8 +17,9 @@
 # with nobody typing: the phone, on USB to the Mac this runs on, is
 # launched in the mode that prints its pairing code; the host's window
 # is opened on the Phone tab and the code is typed into its boxes; the
-# stored pairing and the certificate read through the phone are then
-# checked on the host.
+# host forgets its phone first, since the boxes show only then; the new
+# pairing, which is then the host's one phone, and the certificate read
+# through the phone are then checked on the host.
 #
 # usage: script/test/pair-phone-through-gui.sh <ssh host> <phone udid> [display]
 #
@@ -103,45 +104,50 @@ refineid pairs 2>/dev/null
 EOS
 }
 
-# The pairing identifiers in a listing.
-pair_ids() {
-    sed -n 's/^      Pair ID: *//p'
+# Forgets the host's phone, so that the window shows the code boxes.
+host_forget() {
+    host_sh <<'EOS'
+refineid unpair >/dev/null 2>&1 || true
+EOS
 }
 
-# The listing's entry of `pair_id` as one line: its name line and its
-# certificate line.
-entry_of() {
-    awk -v id="$1" '
-        /^  \[/ { name = $0; next }
-        /Pair ID:/ { found = ($NF == id); next }
-        found && /Cert cache:/ { print name " " $0; exit }'
+# The identifier of the paired phone in a listing; the listing names
+# the one phone that is paired, or none.
+pair_id() {
+    sed -n 's/^  Pair ID: *//p'
 }
 
-# Waits until a pairing not in `known` exists whose entry matches
-# `wanted` and not `unwanted`, and prints its identifier.
+# The listing's entry as one line: the phone's line and its certificate
+# line.
+entry() {
+    awk '
+        /^Phone:/ { phone = $0; next }
+        /^  Cert cache:/ { print phone " " $0; exit }'
+}
+
+# Waits until the paired phone is not `known` and its entry matches
+# `wanted`, and prints its identifier.
 wait_for() {
     known=$1
     wanted=$2
-    unwanted=$3
-    seconds=$4
+    seconds=$3
     waited=0
     while [ "$waited" -lt "$seconds" ]; do
         host_pairs > "$work/listing"
-        for id in $(pair_ids < "$work/listing"); do
-            case " $known " in *" $id "*) continue ;; esac
-            if entry_of "$id" < "$work/listing" | grep -q "$wanted" \
-                && ! entry_of "$id" < "$work/listing" | grep -q "$unwanted"; then
-                printf '%s\n' "$id"
-                return 0
-            fi
-        done
+        id=$(pair_id < "$work/listing")
+        if [ -n "$id" ] && [ "$id" != "$known" ] \
+            && entry < "$work/listing" | grep -q "$wanted"; then
+            printf '%s\n' "$id"
+            return 0
+        fi
         sleep 3
         waited=$((waited + 3))
     done
     return 1
 }
 
-known=$(host_pairs | pair_ids | tr '\n' ' ')
+known=$(host_pairs | pair_id)
+host_forget
 say "asking the phone for a code"
 phone_offer
 code=$(cat "$work/code")
@@ -149,7 +155,7 @@ say "code shown; typing it into the host's boxes"
 host_type_code "$code"
 
 say "waiting for the pairing on the host"
-if ! new_id=$(wait_for "$known" '^  \[[0-9]*\] ' ' -- ' "$pair_wait_seconds"); then
+if ! new_id=$(wait_for "$known" '^Phone: ' "$pair_wait_seconds"); then
     say "FAIL: no usable pairing within ${pair_wait_seconds} s"
     host_pairs
     exit 1
@@ -158,7 +164,7 @@ say "paired as $new_id; the phone serves again"
 phone_serve
 
 say "waiting for the certificate read through the phone"
-if ! wait_for "$known" 'Cert cache: Cached' ' -- ' "$read_wait_seconds" > /dev/null; then
+if ! wait_for "$known" 'Cert cache: Cached' "$read_wait_seconds" > /dev/null; then
     say "FAIL: the certificate was not read within ${read_wait_seconds} s"
     host_pairs
     exit 1

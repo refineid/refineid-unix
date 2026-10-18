@@ -168,29 +168,31 @@ pub trait UiDriver: Send + 'static {
 - `pin_status: BTreeMap<PinManageSlot, PinStatus>` (retry counters, blocked flags)
 - `portrait: Option<Arc<DocumentImage>>` and `signature: Option<Arc<DocumentImage>>`
 - `signing_queue: Vec<PathBuf>`
-- `phones: Vec<PairedPhone>` (every stored pairing with its name, platform and state: paired, unconfirmed, forgotten by the phone, revoked)
+- `phone: Option<PairedPhone>` (the paired phone: its name, platform and whether its certificate is cached)
 - `pin1_changed`, `pin2_changed` (whether a PIN still holds its factory value)
 - `pairing: Option<RappPairingState>` (the typed code and the status line while the ceremony runs)
 - `busy_message: Option<String>`
 - `status_banner: Option<StatusBanner>`
 
 #### Intent Emitted by Driver (`UserIntent`)
-- `SelectCard(usize)`
 - `ChangePin { slot: PinManageSlot, old_pin: PinBytes, new_pin: PinBytes }`
 - `ReactivatePin { puk: PukBytes, new_pin1: PinBytes, new_pin2: PinBytes }`
 - `LoadPortrait { can: PinBytes }`
 - `QueueDocuments(Vec<PathBuf>)` and `ClearDocuments`
-- `ExecuteSign { pin2: PinBytes, format: SignFormat, timestamp_config: TimestampConfig }`
+- `ExecuteSign { pin2: PinBytes, format: SignFormat }`
 - `StartPairing { code }`
-- `ForgetPhone(PairId)`
+- `ForgetPhone`
 
 ### 4.3 Workstation UX Hygiene Contract
 
 In accordance with [RAPP Transport and Discovery Hierarchy Specification](../../refineid-core/docs/protocols/rapp-transport-and-discovery-hierarchy.md):
 1. **Local Card Reader Default**: Out of the box, the controller interfaces exclusively with local smart cards via `pcscd`. No background radio polling, mDNS queries, or network sockets are active.
 2. **Pairing Is the Decision**: Typing the code a phone shows is the decision to use that phone as a card reader; forgetting the last pairing is the decision to stop. There is no separate switch.
-3. **Outbound Discovery**: The workstation browses for phones only while a pairing ceremony runs, and dials a paired phone only while at least one usable pairing exists. Cards served by phones are listed only then.
-4. **Values and Controls Only**: The window shows labels, values, button titles, and the text a failed action needs. A value in its normal state carries no text: a PIN at its try limit shows no count, an activated card shows no activation tab, and an idle window has an empty status line.
+3. **Outbound Discovery**: The workstation browses for phones only while a pairing ceremony runs, and dials the paired phone only while the pairing is usable. The card served by the phone is listed only then.
+4. **Values and Controls Only**: The window shows labels, values, button titles, and the text a failed action needs. A value in its normal state carries no text: a PIN at its try limit shows no count, an activated card shows no activation tab, and an idle window has an empty status line. There is no card selector, no refresh button and no card presence badge: the holder's name on the Identity tab is the card.
+5. **One Phone per Computer**: The requester keeps one usable pairing. Pairing a phone revokes every earlier pairing, whose records stay as tombstones for the revocation announcements and are not shown. The Phone tab shows the paired phone's row with a trash icon that forgets it, or the code boxes while no phone is paired.
+6. **The Local Card Wins**: With a card in a local reader and a phone paired, the local card is the card in use; the phone's card is used while no local card is present.
+7. **Tab Order**: Identity, PINs, Sign, Phone; the window opens on Identity, or on Phone with the code boxes focused when launched with `--pair`.
 
 ### Phase 1: Unify with Core & Bring in RAPP with CPace PAKE
 - Update `Cargo.toml` to depend on modular `refineid-core` components (`refineid-rapp`, `refineid-sign`, `refineid-emrtd`, `refineid-pcsc`).

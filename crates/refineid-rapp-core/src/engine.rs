@@ -1507,6 +1507,12 @@ impl<Store: PairingStore, Journal: OperationJournal> Requester<Store, Journal> {
         self.revoke_pairing(pair_id, true);
     }
 
+    /// Revokes a pairing this computer gives up (section 4.6): the keys
+    /// go, and the record stays as the tombstone the announcements need.
+    pub fn revoke_locally(&mut self, pair_id: PairId) {
+        self.revoke_pairing(pair_id, false);
+    }
+
     /// How the session ended, once closed.
     pub const fn session_end<Transport: FrameTransport>(
         session: &Session<Transport>,
