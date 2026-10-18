@@ -1,6 +1,6 @@
 [package]
 name = "refineid-unix-pkcs11"
-description = "PKCS#11 v2.40 cdylib module for FINEID (wrapping refineid-core)."
+description = "PKCS#11 v2.40 module for FINEID: local readers through refineid-core, and the paired phone as a slot."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,6 +21,9 @@ name = "refineid_pkcs11"
 
 [dependencies]
 refineid-pkcs11.workspace = true
+refineid-rapp.workspace = true
+refineid-rapp-core.workspace = true
+refineid-remote.workspace = true
 
 [dev-dependencies]
 refineid-lib-core.workspace = true

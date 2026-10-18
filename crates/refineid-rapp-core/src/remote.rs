@@ -397,6 +397,24 @@ impl RemoteReader {
         Self::open(&local_host_name(), local_platform())
     }
 
+    /// Opens the default stores as this computer without sweeping the
+    /// pairing store, for a program that reads the records another
+    /// program keeps.
+    ///
+    /// # Errors
+    /// [`RemoteError::Store`] when a store cannot be opened.
+    pub fn open_local_without_sweep() -> Result<Self, RemoteError> {
+        let store = FilePairingStore::open_without_sweep(&FilePairingStore::default_directory())
+            .map_err(RemoteError::Store)?;
+        let journal = FileOperationJournal::open_default().map_err(RemoteError::Store)?;
+        Ok(Self::with_stores(
+            &local_host_name(),
+            local_platform(),
+            store,
+            journal,
+        ))
+    }
+
     /// Opens the per-user pairing store.
     ///
     /// # Errors
@@ -806,6 +824,14 @@ impl RemoteReader {
     pub fn close_session(&mut self, mut session: RemoteSession) {
         self.requester
             .disconnect(&mut session.session, CloseReason::Complete);
+    }
+
+    /// Closes `session` telling the phone the pairing was revoked here
+    /// (RAPP v26.10.18 section 4.6 item 1), for a session holder that
+    /// finds the record forgotten by another program on this computer.
+    pub fn close_session_revoked(&mut self, mut session: RemoteSession) {
+        self.requester
+            .disconnect(&mut session.session, CloseReason::PairingRevoked);
     }
 
     /// Runs one operation against the phone holding `pair_id`, or the
