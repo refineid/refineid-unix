@@ -97,6 +97,9 @@ struct FltkWidgets {
 pub struct FltkDriver {
     app: app::App,
     state_rx: Receiver<UiState>,
+    /// Whether the window opens on the Phone tab with the code boxes
+    /// focused, for a pairing driven from the keyboard alone.
+    opens_on_phone_tab: bool,
     widgets: Option<FltkWidgets>,
     cached_portrait: Option<Arc<RgbaImageBuffer>>,
     cached_signature: Option<Arc<RgbaImageBuffer>>,
@@ -114,6 +117,11 @@ impl std::fmt::Debug for FltkDriver {
 pub type StateChangeCallback = Box<dyn Fn(&UiState) + Send + Sync + 'static>;
 
 impl FltkDriver {
+    /// Opens the window on the Phone tab with the code boxes focused.
+    pub fn open_on_phone_tab(&mut self) {
+        self.opens_on_phone_tab = true;
+    }
+
     /// Create a new FLTK driver and its state notification callback.
     pub fn create() -> (Self, StateChangeCallback) {
         let app = app::App::default().with_scheme(Scheme::Gtk);
@@ -128,6 +136,7 @@ impl FltkDriver {
         let driver = Self {
             app,
             state_rx,
+            opens_on_phone_tab: false,
             widgets: None,
             cached_portrait: None,
             cached_signature: None,
@@ -151,7 +160,7 @@ impl FltkDriver {
         card_status_badge.set_label_size(12);
 
         // Main Tabs
-        let tabs = Tabs::new(20, 58, 880, 580, "");
+        let mut tabs = Tabs::new(20, 58, 880, 580, "");
 
         // ---------------------------------------------------------------------
         // TAB 1: Card & PIN Management
@@ -477,6 +486,10 @@ impl FltkDriver {
 
         rapp_tab.end();
         tabs.end();
+        if self.opens_on_phone_tab {
+            let _ = tabs.set_value(&rapp_tab);
+            let _ = pair_code_input.take_focus();
+        }
 
         // Bottom status bar
         let mut status_frame = Frame::new(20, 642, 880, 24, "");
