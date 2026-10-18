@@ -320,7 +320,11 @@ pub fn local_host_name() -> String {
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default();
     let short = printed.trim().split('.').next().unwrap_or("").trim();
-    if short.is_empty() || UNSET_HOST_NAMES.contains(&short) {
+    if short.is_empty()
+        || UNSET_HOST_NAMES
+            .iter()
+            .any(|unset| unset.eq_ignore_ascii_case(short))
+    {
         "RefineID".to_owned()
     } else {
         short.to_owned()

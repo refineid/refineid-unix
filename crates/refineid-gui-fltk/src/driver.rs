@@ -431,7 +431,16 @@ impl FltkDriver {
         let mut pair_code_input = Input::new(225, 108, code_boxes_width(), CODE_BOX_SIZE, "");
         pair_code_input.set_frame(FrameType::NoBox);
         pair_code_input.set_trigger(CallbackTrigger::Changed);
-        pair_code_input.draw(|input| draw_code_boxes(input));
+        pair_code_input.draw(|input| {
+            // Whatever moved the cursor between two draws, the next
+            // character lands after the last one; the position changes
+            // only when something moved it, so this settles at once.
+            let end = input.value().len().try_into().unwrap_or(i32::MAX);
+            if input.position() != end {
+                let _ = input.set_position(end);
+            }
+            draw_code_boxes(input);
+        });
         pair_code_input.handle(|input, event| match event {
             Event::Focus | Event::Unfocus => {
                 input.redraw();
