@@ -1495,14 +1495,11 @@ impl<'a> SpkiDer<'a> {
                 // allows. The raw signature is two coordinates of the
                 // field prime's width.
                 let digest_len = match algorithm {
-                    MessageSignatureAlgorithm::EcdsaSha256Raw => 32,
-                    MessageSignatureAlgorithm::EcdsaSha384Raw => 48,
-                    _ => 64,
+                    MessageSignatureAlgorithm::EcdsaSha256Raw => crate::sign::SHA256_DIGEST_LEN,
+                    MessageSignatureAlgorithm::EcdsaSha384Raw => crate::sign::SHA384_DIGEST_LEN,
+                    _ => crate::sign::SHA512_DIGEST_LEN,
                 };
                 let coordinate_len = curve.p.len();
-                if !matches!(coordinate_len, 32 | 48 | 66) {
-                    return Err(VerifyError::BadIssuerKey);
-                }
                 if signature.len() != 2 * coordinate_len || digest.len() != digest_len {
                     return Err(VerifyError::Ecdsa(EcdsaError::BadSignature));
                 }
