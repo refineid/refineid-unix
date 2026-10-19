@@ -128,6 +128,9 @@ pub const SHA256_DIGEST_LEN: usize = 32;
 /// SHA-384 digest size: 48 bytes.
 pub const SHA384_DIGEST_LEN: usize = 48;
 
+/// SHA-512 digest size: 64 bytes.
+pub const SHA512_DIGEST_LEN: usize = 64;
+
 /// Sign-path errors.
 #[derive(Debug)]
 pub enum SignError<TE> {
