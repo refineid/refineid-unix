@@ -277,9 +277,9 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
         // browser that was given no certificate once keeps resuming that
         // handshake and never asks again.
         shared.publish(Some(offer(slot, &phone, shared, phone.auth_cert.clone())));
-        // A request that arrives during this dial is seen after it: a
-        // dial that fails is then tried once more at once, and paused
-        // after only when no further request came.
+        // A request that woke the pause has this dial; one that arrives
+        // during the dial makes a failed dial try once more at once,
+        // and the pause follows only when no request arrived.
         shared.wanted.store(false, Ordering::Release);
         match reader.open_session(Some(phone.pair_id), DIAL_TIMEOUT) {
             Ok(session) => match hold(shared, requests, &mut reader, session, &phone, slot) {

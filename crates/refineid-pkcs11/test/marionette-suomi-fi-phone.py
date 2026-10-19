@@ -60,29 +60,25 @@ class Marionette:
 
 
 def accept_chooser(stop):
-    """Presses Return on the certificate chooser whenever it appears.
+    """Answers the certificate chooser with its default button.
 
-    The chooser is a Firefox dialog window; any visible Firefox window
-    that is not a browser window is taken for it.
+    Firefox draws the chooser inside the browser window, so there is no
+    dialog window to find: the browser window is brought to the front
+    and Return is pressed through XTEST, which reaches the dialog while
+    it has the focus and does nothing to a page that has none.
     """
     while not stop.is_set():
-        time.sleep(0.3)
+        time.sleep(1.5)
         try:
             found = subprocess.run(
                 ["xdotool", "search", "--onlyvisible", "--class", "firefox"],
                 capture_output=True, text=True, check=False,
             ).stdout.split()
-            for wid in found:
-                name = subprocess.run(
-                    ["xdotool", "getwindowname", wid], capture_output=True, text=True, check=False,
-                ).stdout.strip()
-                if not name or name.endswith("Mozilla Firefox"):
-                    continue
+            for wid in found[:1]:
                 subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=False)
-                time.sleep(0.3)
-                subprocess.run(["xdotool", "key", "--window", wid, "Return"], check=False)
-                print(f"[{time.strftime('%H:%M:%S')}] accepted '{name}'")
-                time.sleep(2)
+                time.sleep(0.2)
+                subprocess.run(["xdotool", "key", "--clearmodifiers", "Return"], check=False)
+                print(f"[{time.strftime('%H:%M:%S')}] pressed Return in the browser window")
         except OSError:
             pass
 
@@ -106,7 +102,6 @@ def main():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     stop = threading.Event()
-    threading.Thread(target=accept_chooser, args=(stop,), daemon=True).start()
     m = None
     try:
         m = Marionette()
@@ -127,12 +122,24 @@ def main():
         time.sleep(1)
         print("[*] card prompt:", m.run(
             "const f = document.querySelector('#login-form'); if (f) { f.submit(); return 'submitted'; } return null;"))
+        stop = threading.Event()
+        threading.Thread(target=accept_chooser, args=(stop,), daemon=True).start()
         started = time.time()
-        while time.time() - started < 90:
+        while time.time() - started < 120:
             time.sleep(2)
             url = m.cmd("WebDriver:GetCurrentURL")["value"]
             title = m.cmd("WebDriver:GetTitle")["value"]
             print(f"    [{time.time()-started:4.0f}s] {url[:90]} | {title[:50]}")
+            if "kortti." not in url:
+                stop.set()
+            if "/idp/profile/SAML2" in url:
+                # The card authenticated; the identity provider asks once
+                # whether to carry the identity to the service.
+                hit = m.run("const b = document.querySelector('#continue-button');"
+                            " if (b) { b.click(); return 'continued'; } return null;")
+                if hit:
+                    print(f"[*] {hit}")
+                continue
             if "suomi.fi" in url and "tunnist" not in url and "etusivu" not in url:
                 text = re.sub(r"<[^>]+>", " ", m.cmd("WebDriver:GetPageSource")["value"])
                 text = re.sub(r"\s+", " ", text)
@@ -142,7 +149,7 @@ def main():
             if "Problem loading" in title:
                 print("[-] the browser reports a load problem")
                 return 1
-        print("[-] no landing within 90 s")
+        print("[-] no landing within 120 s")
         return 1
     finally:
         stop.set()
