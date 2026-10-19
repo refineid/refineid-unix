@@ -140,7 +140,7 @@ def main():
                 if hit:
                     print(f"[*] {hit}")
                 continue
-            if "suomi.fi" in url and "tunnist" not in url and "etusivu" not in url:
+            if url.startswith("https://www.suomi.fi/") and "/etusivu" not in url.split("?")[0]:
                 text = re.sub(r"<[^>]+>", " ", m.cmd("WebDriver:GetPageSource")["value"])
                 text = re.sub(r"\s+", " ", text)
                 print(f"[+] logged in at {url}")
