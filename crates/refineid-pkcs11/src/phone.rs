@@ -259,18 +259,15 @@ fn computer_context() -> DisplayText {
 fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
     while !shared.stopped() {
         let Ok(mut reader) = RemoteReader::open_local_without_sweep() else {
-            shared.publish(None);
-            pause(shared, UNPAIRED_PAUSE);
+            unpaired(shared, requests);
             continue;
         };
         let Some(phone) = reader.phone() else {
-            shared.publish(None);
-            pause(shared, UNPAIRED_PAUSE);
+            unpaired(shared, requests);
             continue;
         };
         let Some(slot) = slot_id(&phone) else {
-            shared.publish(None);
-            pause(shared, UNPAIRED_PAUSE);
+            unpaired(shared, requests);
             continue;
         };
         // The slot stands while the pairing does, and so does its token
@@ -280,6 +277,9 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
         // browser that was given no certificate once keeps resuming that
         // handshake and never asks again.
         shared.publish(Some(offer(slot, &phone, shared, phone.auth_cert.clone())));
+        // A request that arrives during this dial is seen after it: a
+        // dial that fails is then tried once more at once, and paused
+        // after only when no further request came.
         shared.wanted.store(false, Ordering::Release);
         match reader.open_session(Some(phone.pair_id), DIAL_TIMEOUT) {
             Ok(session) => match hold(shared, requests, &mut reader, session, &phone, slot) {
@@ -289,10 +289,22 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
                 After::Withdraw => shared.publish(Some(offer(slot, &phone, shared, None))),
             },
             Err(RemoteError::Busy) => pause(shared, BUSY_PAUSE),
+            Err(_) if shared.wanted() => {}
             Err(_) => pause(shared, REDIAL_PAUSE),
         }
     }
     shared.publish(None);
+}
+
+/// No pairing to serve: the slot goes, requests that wait are told the
+/// token is withdrawn, and the thread pauses before looking again.
+fn unpaired(shared: &Shared, requests: &Receiver<SignRequest>) {
+    shared.publish(None);
+    shared.wanted.store(false, Ordering::Release);
+    while let Ok(request) = requests.try_recv() {
+        let _ = request.reply.send(Err(RemoteSignError::Withdrawn));
+    }
+    pause(shared, UNPAIRED_PAUSE);
 }
 
 /// What the token does once a held session has ended.
@@ -571,7 +583,7 @@ fn slot_id(phone: &PairSummary) -> Option<RemoteSlotId> {
 }
 
 /// Sleeps for `duration` in short steps, so a stop is seen promptly and
-/// a request that arrives meanwhile ends the pause at once.
+/// a request that arrives meanwhile ends the pause within one step.
 fn pause(shared: &Shared, duration: Duration) {
     const STEP: Duration = Duration::from_millis(250);
     let mut left = duration;
