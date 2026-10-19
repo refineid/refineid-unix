@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use refineid_lib_core::x509::{MessageSignatureAlgorithm, OwnedCert};
 use refineid_pkcs11::remote::{
@@ -72,7 +72,15 @@ struct SignRequest {
     request: SignatureRequest,
     context: DisplayText,
     deadline: Duration,
+    asked_at: Instant,
     reply: SyncSender<Result<Vec<u8>, RemoteSignError>>,
+}
+
+impl SignRequest {
+    /// Whether the browser has stopped waiting for the answer.
+    fn expired(&self) -> bool {
+        self.asked_at.elapsed() >= self.deadline
+    }
 }
 
 /// What the session thread shares with the module's calls.
@@ -80,6 +88,9 @@ struct Shared {
     offer: Mutex<Option<RemoteOffer>>,
     requests: Mutex<Option<Sender<SignRequest>>>,
     stop: AtomicBool,
+    /// A request is waiting while no session is held: the thread dials
+    /// at once instead of pausing out its round.
+    wanted: AtomicBool,
     context: DisplayText,
     spoken: (Mutex<bool>, Condvar),
 }
@@ -106,6 +117,10 @@ impl Shared {
 
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+
+    fn wanted(&self) -> bool {
+        self.wanted.load(Ordering::Acquire)
     }
 }
 
@@ -139,6 +154,7 @@ impl PhoneSource {
                 offer: Mutex::new(None),
                 requests: Mutex::new(None),
                 stop: AtomicBool::new(false),
+                wanted: AtomicBool::new(false),
                 context: computer_context(),
                 spoken: (Mutex::new(false), Condvar::new()),
             }),
@@ -192,12 +208,14 @@ impl RemoteTokenSource for PhoneSource {
             .ok()
             .and_then(|requests| requests.clone())
             .ok_or(RemoteSignError::Unreachable)?;
+        self.shared.wanted.store(true, Ordering::Release);
         sender
             .send(SignRequest {
                 pair_id: *pair_id,
                 request: request.clone(),
                 context: context.clone(),
                 deadline,
+                asked_at: Instant::now(),
                 reply,
             })
             .map_err(|_| RemoteSignError::Unreachable)?;
@@ -255,16 +273,34 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
             pause(shared, UNPAIRED_PAUSE);
             continue;
         };
-        // The slot stands while the pairing does; its token comes with
-        // the session.
-        shared.publish(Some(offer(slot, &phone, shared, None)));
+        // The slot stands while the pairing does, and so does its token
+        // when the record carries the certificate: a browser that asks
+        // before the session is open is given the identity, and its
+        // signature waits for the phone within the browser's deadline. A
+        // browser that was given no certificate once keeps resuming that
+        // handshake and never asks again.
+        shared.publish(Some(offer(slot, &phone, shared, phone.auth_cert.clone())));
+        shared.wanted.store(false, Ordering::Release);
         match reader.open_session(Some(phone.pair_id), DIAL_TIMEOUT) {
-            Ok(session) => hold(shared, requests, &mut reader, session, &phone, slot),
+            Ok(session) => match hold(shared, requests, &mut reader, session, &phone, slot) {
+                After::Keep(certificate) => {
+                    shared.publish(Some(offer(slot, &phone, shared, Some(certificate))));
+                }
+                After::Withdraw => shared.publish(Some(offer(slot, &phone, shared, None))),
+            },
             Err(RemoteError::Busy) => pause(shared, BUSY_PAUSE),
             Err(_) => pause(shared, REDIAL_PAUSE),
         }
     }
     shared.publish(None);
+}
+
+/// What the token does once a held session has ended.
+enum After {
+    /// The token stays, on this certificate, until the next session.
+    Keep(Vec<u8>),
+    /// The token goes until a session reads the card again.
+    Withdraw,
 }
 
 /// The phone's slot, with its token when a certificate was read on the
@@ -292,7 +328,7 @@ fn hold(
     mut session: RemoteSession,
     phone: &PairSummary,
     slot: RemoteSlotId,
-) {
+) -> After {
     // The certificate comes from the record; the card is read for it
     // once, when no program has cached it yet.
     let certificate = match phone.auth_cert.clone() {
@@ -302,17 +338,21 @@ fn hold(
             Err(_) => {
                 reader.close_session(session);
                 pause(shared, REDIAL_PAUSE);
-                return;
+                return After::Withdraw;
             }
         },
     };
     shared.publish(Some(offer(slot, phone, shared, Some(certificate.clone()))));
+    let mut after = After::Keep(certificate.clone());
     loop {
         if shared.stopped() {
             reader.close_session(session);
             break;
         }
         match requests.recv_timeout(PING_INTERVAL) {
+            // The browser gave up while the session was being opened;
+            // the card is not asked for a signature nobody will read.
+            Ok(request) if request.expired() => {}
             Ok(request) if request.pair_id != slot => {
                 let _ = request.reply.send(Err(RemoteSignError::Withdrawn));
             }
@@ -334,6 +374,7 @@ fn hold(
                         let _ = request.reply.send(Err(RemoteSignError::Ambiguous));
                         let _ = reader.forget_auth_cert(phone.pair_id);
                         reader.close_session(session);
+                        after = After::Withdraw;
                         break;
                     }
                     Err(Failure::Sign(error)) => {
@@ -354,6 +395,7 @@ fn hold(
                     RecordState::Usable | RecordState::Unreadable => {}
                     RecordState::Gone => {
                         reader.close_session_revoked(session);
+                        after = After::Withdraw;
                         break;
                     }
                 }
@@ -368,7 +410,7 @@ fn hold(
             }
         }
     }
-    shared.publish(Some(offer(slot, phone, shared, None)));
+    after
 }
 
 /// What the record another program keeps says about the held pairing.
@@ -528,11 +570,12 @@ fn slot_id(phone: &PairSummary) -> Option<RemoteSlotId> {
     RemoteSlotId::parse(&phone.pair_id_hex()).ok()
 }
 
-/// Sleeps for `duration` in short steps so a stop is seen promptly.
+/// Sleeps for `duration` in short steps, so a stop is seen promptly and
+/// a request that arrives meanwhile ends the pause at once.
 fn pause(shared: &Shared, duration: Duration) {
     const STEP: Duration = Duration::from_millis(250);
     let mut left = duration;
-    while !left.is_zero() && !shared.stopped() {
+    while !left.is_zero() && !shared.stopped() && !shared.wanted() {
         let step = left.min(STEP);
         thread::sleep(step);
         left -= step;
@@ -644,14 +687,15 @@ mod tests {
             offer: Mutex::new(None),
             requests: Mutex::new(None),
             stop: AtomicBool::new(false),
+            wanted: AtomicBool::new(false),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
         };
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         shared.await_first_word(Duration::from_millis(50));
         assert!(started.elapsed() >= Duration::from_millis(50));
         shared.publish(None);
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         shared.await_first_word(Duration::from_secs(5));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
@@ -692,6 +736,21 @@ mod tests {
             message_algorithm(RemoteSignatureAlgorithm::EcdsaSha384),
             Some(MessageSignatureAlgorithm::EcdsaSha384Raw)
         );
+    }
+
+    #[test]
+    fn a_request_ends_the_pause_at_once() {
+        let shared = Shared {
+            offer: Mutex::new(None),
+            requests: Mutex::new(None),
+            stop: AtomicBool::new(false),
+            wanted: AtomicBool::new(true),
+            context: computer_context(),
+            spoken: (Mutex::new(false), Condvar::new()),
+        };
+        let started = Instant::now();
+        pause(&shared, Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
