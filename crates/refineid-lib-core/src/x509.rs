@@ -1488,15 +1488,19 @@ impl<'a> SpkiDer<'a> {
             | MessageSignatureAlgorithm::EcdsaSha512Raw => {
                 let (curve, public_key) =
                     extract_ec_pubkey(self.der).ok_or(VerifyError::BadIssuerKey)?;
-                // Each profile names its curve by the hash it pairs with:
-                // the coordinate width is the field prime's, the raw
-                // signature is two coordinates, the digest the hash's.
-                let (coordinate_len, digest_len) = match algorithm {
-                    MessageSignatureAlgorithm::EcdsaSha256Raw => (32, 32),
-                    MessageSignatureAlgorithm::EcdsaSha384Raw => (48, 48),
-                    _ => (66, 64),
+                // The profile names the hash; the key names the curve, and
+                // the two are independent: TLS pairs a P-256 key with
+                // SHA-384 as readily as with SHA-256, and the verifier
+                // takes the digest's leftmost bits as the curve's order
+                // allows. The raw signature is two coordinates of the
+                // field prime's width.
+                let digest_len = match algorithm {
+                    MessageSignatureAlgorithm::EcdsaSha256Raw => 32,
+                    MessageSignatureAlgorithm::EcdsaSha384Raw => 48,
+                    _ => 64,
                 };
-                if curve.p.len() != coordinate_len {
+                let coordinate_len = curve.p.len();
+                if !matches!(coordinate_len, 32 | 48 | 66) {
                     return Err(VerifyError::BadIssuerKey);
                 }
                 if signature.len() != 2 * coordinate_len || digest.len() != digest_len {
