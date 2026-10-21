@@ -153,25 +153,12 @@ craneLib.buildPackage (
 
       # Desktop entry + icon for the GUI. The visible name is "RefineID";
       # the binary is refineid-gui so it does not collide with the
-      # `refineid` CLI on PATH.
+      # `refineid` CLI on PATH. Exec=refineid-gui resolves through PATH
+      # so running desktop sessions launch the current system generation.
       mkdir -p $out/share/applications $out/share/icons/hicolor/scalable/apps
       cp crates/refineid-gui/assets/app-icon.svg \
         $out/share/icons/hicolor/scalable/apps/refineid.svg
-      cat > $out/share/applications/refineid.desktop <<EOF
-      [Desktop Entry]
-      Type=Application
-      Name=RefineID
-      GenericName=Identity card tool
-      GenericName[fi]=Henkilökorttityökalu
-      Comment=Finnish identity card: PIN management, portrait and signature, document signing
-      Comment[fi]=Suomalainen henkilökortti: PIN-hallinta, kuva ja allekirjoitus, asiakirjan allekirjoitus
-      Exec=$out/bin/refineid-gui
-      Icon=refineid
-      Terminal=false
-      Categories=Utility;Security;System;
-      Keywords=FINEID;smartcard;PIN;identity;signing;
-      Keywords[fi]=FINEID;sirukortti;älykortti;PIN;henkilökortti;allekirjoitus;
-      EOF
+      cp packaging/refineid.desktop $out/share/applications/refineid.desktop
     '';
 
     meta = {
