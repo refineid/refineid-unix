@@ -162,12 +162,15 @@ craneLib.buildPackage (
       Type=Application
       Name=RefineID
       GenericName=Identity card tool
+      GenericName[fi]=Henkilökorttityökalu
       Comment=Finnish identity card: PIN management, portrait and signature, document signing
+      Comment[fi]=Suomalainen henkilökortti: PIN-hallinta, kuva ja allekirjoitus, asiakirjan allekirjoitus
       Exec=$out/bin/refineid-gui
       Icon=refineid
       Terminal=false
-      Categories=Utility;Security;
+      Categories=Utility;Security;System;
       Keywords=FINEID;smartcard;PIN;identity;signing;
+      Keywords[fi]=FINEID;sirukortti;älykortti;PIN;henkilökortti;allekirjoitus;
       EOF
     '';
 
