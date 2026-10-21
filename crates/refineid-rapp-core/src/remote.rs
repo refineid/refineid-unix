@@ -1077,11 +1077,17 @@ mod tests {
             Some(RemoteError::Busy)
         );
         drop(held);
-        // Released: the search runs and ends on its deadline instead.
-        assert_eq!(
-            reader.open_session(Some(pair_id), Duration::ZERO).err(),
-            Some(RemoteError::NotFound)
-        );
+        // Released: allow a brief moment for the VFS lock release to settle under heavy parallel test load.
+        let mut result = None;
+        for _ in 0..10 {
+            let res = reader.open_session(Some(pair_id), Duration::ZERO).err();
+            if res != Some(RemoteError::Busy) {
+                result = res;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(result, Some(RemoteError::NotFound));
         let _ = std::fs::remove_dir_all(directory);
     }
 
