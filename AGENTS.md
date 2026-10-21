@@ -12,11 +12,8 @@
 - RULE #3: STRICT PRIVACY & TEST FIXTURE ANONYMIZATION.
   NEVER copy live environment or ambient hardware data into source code, test
   fixtures, documentation, or commit messages.
-  - No real smart card readers, USB PnP strings, or vendor names (e.g. Alcor,
-    Identiv, Omnikey, ACS, SCM, etc.): strictly use generic synthetic names
-    like `"Synthetic Card Reader"` or `"Test Reader"`.
-  - No real smart card ATR bytes or historical bytes from physical cards:
-    strictly use synthetic dummy ATRs like `"3b00"`.
+  - No real smart card readers or card ATRs: strictly use generic synthetic
+    names (`Synthetic Card Reader`) and synthetic dummy ATRs (`3b00`).
   - No real MAC addresses: use synthetic locally administered addresses (`02:00:00:00:00:01`).
   - No real LAN/WAN IPs: strictly use RFC 5737 documentation ranges (`192.0.2.0/24`,
     `198.51.100.0/24`, `203.0.113.0/24`) and RFC 3849 IPv6 (`2001:db8::/32`).
