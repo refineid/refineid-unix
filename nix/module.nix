@@ -47,6 +47,17 @@ in
     # The PC/SC smart-card daemon (with the CCID reader driver).
     services.pcscd.enable = true;
 
+    # Allow local users to access the PC/SC daemon without polkit authentication prompts,
+    # enabling browser PKCS#11 modules (Firefox, Chrome) and CLI tools to access card readers.
+    security.polkit.extraConfig = ''
+      polkit.addRule(function(action, subject) {
+        if (action.id == "org.debian.pcsc-lite.access_pcsc" ||
+            action.id == "org.debian.pcsc-lite.access_card") {
+          return polkit.Result.YES;
+        }
+      });
+    '';
+
     # System-wide p11-kit registration: OpenSSL (pkcs11-provider),
     # GnuTLS, and OpenSSH discover the card through p11-kit.
     environment.etc."pkcs11/modules/refineid.module".source =
