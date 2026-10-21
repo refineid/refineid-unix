@@ -59,5 +59,29 @@ in
         "RefineID" = "${cfg.package}/lib/librefineid_pkcs11.so";
       };
     };
+
+    # Reload running desktop environments' application caches upon system activation,
+    # so newly installed or upgraded RefineID appears immediately in menus without
+    # requiring user logout or manual panel restarts.
+    system.activationScripts.refineid-desktop = lib.stringAfter [ "etc" ] ''
+      # Update desktop database for the system profile
+      if [ -d /run/current-system/sw/share/applications ]; then
+        ${pkgs.desktop-file-utils}/bin/update-desktop-database -q /run/current-system/sw/share/applications 2>/dev/null || true
+      fi
+
+      # Refresh running XFCE panels for active user sessions so in-memory menu caches
+      # pick up the new or updated .desktop entries immediately.
+      for pid in $( ${pkgs.procps}/bin/pgrep -f 'xfce4-panel' 2>/dev/null | grep -v 'wrapper' || true ); do
+        if [ -r "/proc/$pid/environ" ]; then
+          uid=$(stat -c '%u' "/proc/$pid" 2>/dev/null || continue)
+          user=$(id -nu "$uid" 2>/dev/null || continue)
+          display=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^DISPLAY=' | cut -d= -f2-)
+          bus="/run/user/$uid/bus"
+          if [ -n "$display" ] && [ -e "$bus" ]; then
+            su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' xfce4-panel -r" 2>/dev/null || true
+          fi
+        fi
+      done
+    '';
   };
 }

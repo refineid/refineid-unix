@@ -67,6 +67,12 @@ rebuild:
 sudo NIX_CONFIG="tarball-ttl = 0" nixos-rebuild switch
 ```
 
+For automated deployment and verification (locally or over SSH):
+
+```sh
+script/deploy-nixos.sh [TARGET]
+```
+
 `tarball-ttl = 0` makes Nix fetch the current revision; without it a
 rebuild reuses a revision fetched within the last hour. Only the
 RefineID crates recompile on an update -- the dependency build is
@@ -309,9 +315,10 @@ and a card-login site will prompt for the certificate and PIN 1.
 ## Troubleshooting
 
 - **RefineID does not appear in the application menu immediately after `nixos-rebuild switch`.**
-  Running desktop environments (such as XFCE or GNOME) cache desktop entries from
-  the start of the session. Either log out and log back in, or reload the desktop panel
-  (for XFCE, run `xfce4-panel -r`, or start `xfce4-panel &` if the panel is stopped).
+  The RefineID NixOS module automatically runs desktop database updates and reloads
+  running XFCE panels during `nixos-rebuild switch`. If using a non-standard desktop
+  environment or window manager that caches menus in RAM, reload the panel or log
+  out and back in.
 - **Dependency build says a crate requires a newer `rustc`.**
   Update the RefineID source input to include the pinned-toolchain
   configuration. Installing Rust with rustup or in

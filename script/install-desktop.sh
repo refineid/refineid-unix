@@ -124,6 +124,23 @@ if [ -z "$DESTDIR" ]; then
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" || true
     fi
+
+    # Refresh running XFCE panels so in-memory menu caches pick up changes immediately.
+    for pid in $(pgrep -f 'xfce4-panel' 2>/dev/null | grep -v 'wrapper' || true); do
+        if [ -r "/proc/$pid/environ" ]; then
+            uid=$(stat -c '%u' "/proc/$pid" 2>/dev/null || continue)
+            user=$(id -nu "$uid" 2>/dev/null || continue)
+            display=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^DISPLAY=' | cut -d= -f2-)
+            bus="/run/user/$uid/bus"
+            if [ -n "$display" ] && [ -e "$bus" ]; then
+                if [ "$(id -u)" -eq 0 ] && [ "$uid" -ne 0 ]; then
+                    su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' xfce4-panel -r" 2>/dev/null || true
+                elif [ "$uid" -eq "$(id -u)" ]; then
+                    DISPLAY="$display" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" xfce4-panel -r 2>/dev/null || true
+                fi
+            fi
+        fi
+    done
 fi
 
 if [ "$OPENBOX_MENU" -eq 1 ]; then
