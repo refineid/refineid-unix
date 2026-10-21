@@ -11,11 +11,11 @@
   test PINs or card secrets.
 - RULE #3: STRICT PRIVACY & TEST FIXTURE ANONYMIZATION.
   NEVER copy live environment or ambient hardware data into source code, test
-  fixtures, documentation, or commit messages.
+  fixtures, or commit messages.
   - No real smart card readers or card ATRs: strictly use generic synthetic
     names (`Synthetic Card Reader`) and synthetic dummy ATRs (`3b00`).
   - No real MAC addresses: use synthetic locally administered addresses (`02:00:00:00:00:01`).
-  - No real LAN/WAN IPs: strictly use RFC 5737 documentation ranges (`192.0.2.0/24`,
+  - No real LAN/WAN IPs: strictly use reserved ranges (`192.0.2.0/24`,
     `198.51.100.0/24`, `203.0.113.0/24`) and RFC 3849 IPv6 (`2001:db8::/32`).
   - No live hostnames, SSIDs, user home paths, or hardware serial numbers:
     use generic identifiers (`eth0`, `wlan0`, `example.com`, `custodian-1`).
