@@ -33,13 +33,26 @@
 - Verify from specifications, don't wild guess.
   `doc/references.md` indexes which one governs what.
   Cite what a source proves, and say what it does not.
-- Never put a git worktree under `/tmp`. It is cleared on reboot and
-  takes the branch's only checkout with it. Keep worktrees beside the
-  repository.
 - Less is more. Terse is better.
 - When stuck, research with fellow AI available.
 - If something is not working, it is by default a bug in code,
   not a feature of the platform.
+
+## Worktree policy
+
+- Reading does not require a worktree; writing does. The main checkout is
+  never edited directly. Before writing code or modifying files for any task,
+  create a dedicated git worktree strictly under `~/src/wt/`
+  (e.g., `~/src/wt/refineid-unix-<topic>`) on an `agent/<topic>` branch. Never
+  work directly on `main` or modify files in the main checkout.
+- All agent worktrees MUST live strictly under `~/src/wt/`, never loose beside
+  repositories in `~/src/`.
+- Never put a git worktree under `/tmp`. It is cleared on reboot and takes the
+  branch's only checkout with it.
+- One task, one worktree, one branch (`agent/<topic>`), one pull request per branch.
+- Run `script/agent-housekeeping.sh` when starting and keep the house clean.
+- Merge the pull request after mandatory local verification and review pass,
+  then remove the worktree and branch and fast-forward `main`.
 
 ## Source comments
 
