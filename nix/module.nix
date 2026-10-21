@@ -64,10 +64,11 @@ in
       "${cfg.package}/share/p11-kit/modules/refineid.module";
 
     # Firefox does not consult p11-kit on NixOS; the enterprise
-    # policy loads the module directly.
+    # policy loads the module directly. Use the stable system-profile
+    # path so existing registrations survive updates and garbage collection.
     programs.firefox.policies = lib.mkIf cfg.firefoxIntegration {
       SecurityDevices.Add = {
-        "RefineID" = "${cfg.package}/lib/librefineid_pkcs11.so";
+        "RefineID" = "/run/current-system/sw/lib/librefineid_pkcs11.so";
       };
     };
 
@@ -79,6 +80,14 @@ in
       if [ -d /run/current-system/sw/share/applications ]; then
         ${pkgs.desktop-file-utils}/bin/update-desktop-database -q /run/current-system/sw/share/applications 2>/dev/null || true
       fi
+
+      # Migrate any existing Firefox profile pkcs11 registrations pointing to
+      # transient /nix/store paths to the stable system-wide path.
+      for p11_file in /home/*/.config/mozilla/firefox/*/pkcs11.txt /home/*/.mozilla/firefox/*/pkcs11.txt; do
+        if [ -f "$p11_file" ]; then
+          ${pkgs.gnused}/bin/sed -i 's|library=/nix/store/[^/]*-refineid-[^/]*/lib/librefineid_pkcs11.so|library=/run/current-system/sw/lib/librefineid_pkcs11.so|g' "$p11_file" 2>/dev/null || true
+        fi
+      done
 
       # Refresh running XFCE panels for active user sessions so in-memory menu caches
       # pick up the new or updated .desktop entries immediately.
