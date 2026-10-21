@@ -308,6 +308,10 @@ and a card-login site will prompt for the certificate and PIN 1.
 
 ## Troubleshooting
 
+- **RefineID does not appear in the application menu immediately after `nixos-rebuild switch`.**
+  Running desktop environments (such as XFCE or GNOME) cache desktop entries from
+  the start of the session. Either log out and log back in, or reload the desktop panel
+  (for XFCE, run `xfce4-panel -r`, or start `xfce4-panel &` if the panel is stopped).
 - **Dependency build says a crate requires a newer `rustc`.**
   Update the RefineID source input to include the pinned-toolchain
   configuration. Installing Rust with rustup or in
