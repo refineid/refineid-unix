@@ -126,17 +126,21 @@ if [ -z "$DESTDIR" ]; then
     fi
 
     # Refresh running XFCE panels so in-memory menu caches pick up changes immediately.
-    for pid in $(pgrep -f 'xfce4-panel' 2>/dev/null | grep -v 'wrapper' || true); do
-        if [ -r "/proc/$pid/environ" ]; then
-            uid=$(stat -c '%u' "/proc/$pid" 2>/dev/null || continue)
+    for session_pid in $(pgrep -f '[x]fce4-session' 2>/dev/null || true); do
+        if [ -r "/proc/$session_pid/environ" ]; then
+            uid=$(stat -c '%u' "/proc/$session_pid" 2>/dev/null || continue)
             user=$(id -nu "$uid" 2>/dev/null || continue)
-            display=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^DISPLAY=' | cut -d= -f2-)
+            display=$(tr '\0' '\n' < "/proc/$session_pid/environ" 2>/dev/null | grep '^DISPLAY=' | cut -d= -f2-)
             bus="/run/user/$uid/bus"
             if [ -n "$display" ] && [ -e "$bus" ]; then
+                action="xfce4-panel -r"
+                if ! pgrep -u "$user" -f '[x]fce4-panel' >/dev/null 2>&1; then
+                    action="nohup xfce4-panel >/dev/null 2>&1 &"
+                fi
                 if [ "$(id -u)" -eq 0 ] && [ "$uid" -ne 0 ]; then
-                    su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' xfce4-panel -r" 2>/dev/null || true
+                    su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' $action" 2>/dev/null || true
                 elif [ "$uid" -eq "$(id -u)" ]; then
-                    DISPLAY="$display" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" xfce4-panel -r 2>/dev/null || true
+                    DISPLAY="$display" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" sh -c "$action" 2>/dev/null || true
                 fi
             fi
         fi

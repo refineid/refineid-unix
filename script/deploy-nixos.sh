@@ -31,10 +31,12 @@ cd "$(dirname "$0")/.."
 EXPECTED_VERSION="$(cat VERSION 2>/dev/null || true)"
 TARGET="${1:-}"
 
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+
 if [ -z "$TARGET" ]; then
     if [ -f /etc/NIXOS ]; then
         TARGET="local"
-    elif ssh -o BatchMode=yes -o ConnectTimeout=2 root@nix "true" 2>/dev/null; then
+    elif ssh $SSH_OPTS root@nix "true" 2>/dev/null; then
         TARGET="root@nix"
     else
         echo "error: no target specified and neither local NixOS nor root@nix is reachable" >&2
@@ -47,7 +49,16 @@ run_cmd() {
     if [ "$TARGET" = "local" ]; then
         sh -c "$1"
     else
-        ssh "$TARGET" "$1"
+        # Retry up to 5 times to handle transient SSH disconnects during unit reloads
+        attempts=0
+        while [ "$attempts" -lt 5 ]; do
+            if ssh $SSH_OPTS "$TARGET" "$1"; then
+                return 0
+            fi
+            attempts=$((attempts + 1))
+            sleep 2
+        done
+        return 1
     fi
 }
 
@@ -58,8 +69,11 @@ echo "-> Rebuilding NixOS system..."
 if [ "$TARGET" = "local" ]; then
     sudo NIX_CONFIG="tarball-ttl = 0" nixos-rebuild switch
 else
-    ssh "$TARGET" 'NIX_CONFIG="tarball-ttl = 0" nixos-rebuild switch'
+    ssh $SSH_OPTS "$TARGET" 'NIX_CONFIG="tarball-ttl = 0" nixos-rebuild switch'
 fi
+
+# Allow unit reloads to settle
+sleep 2
 
 # 2. Terminate any stale running refineid-gui process so old memory instances are cleared
 echo "-> Checking for stale running refineid-gui processes..."
@@ -96,15 +110,20 @@ fi
 # 6. Verify and refresh running desktop panels
 echo "-> Verifying running desktop panels..."
 run_cmd '
-for pid in $(pgrep -f "xfce4-panel" 2>/dev/null | grep -v "wrapper" || true); do
-    if [ -r "/proc/$pid/environ" ]; then
-        uid=$(stat -c "%u" "/proc/$pid" 2>/dev/null || continue)
+for session_pid in $(pgrep -f "[x]fce4-session" 2>/dev/null || true); do
+    if [ -r "/proc/$session_pid/environ" ]; then
+        uid=$(stat -c "%u" "/proc/$session_pid" 2>/dev/null || continue)
         user=$(id -nu "$uid" 2>/dev/null || continue)
-        display=$(tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | grep "^DISPLAY=" | cut -d= -f2-)
+        display=$(tr "\0" "\n" < "/proc/$session_pid/environ" 2>/dev/null | grep "^DISPLAY=" | cut -d= -f2-)
         bus="/run/user/$uid/bus"
         if [ -n "$display" ] && [ -e "$bus" ]; then
-            echo "   Reloading panel PID $pid for user $user on $display..."
-            su - "$user" -c "DISPLAY=\"$display\" DBUS_SESSION_BUS_ADDRESS=\"unix:path=$bus\" xfce4-panel -r" 2>/dev/null || true
+            if pgrep -u "$user" -f "[x]fce4-panel" >/dev/null 2>&1; then
+                echo "   Reloading panel for $user on $display..."
+                su - "$user" -c "DISPLAY=\"$display\" DBUS_SESSION_BUS_ADDRESS=\"unix:path=$bus\" xfce4-panel -r" 2>/dev/null || true
+            else
+                echo "   Starting panel for $user on $display..."
+                su - "$user" -c "DISPLAY=\"$display\" DBUS_SESSION_BUS_ADDRESS=\"unix:path=$bus\" nohup xfce4-panel >/dev/null 2>&1 &" 2>/dev/null || true
+            fi
         fi
     fi
 done
