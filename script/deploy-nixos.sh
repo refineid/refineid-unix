@@ -43,6 +43,8 @@ if [ -z "$TARGET" ]; then
         echo "usage: $0 [TARGET]" >&2
         exit 1
     fi
+elif [ "$TARGET" != "local" ] && [ "$TARGET" = "${TARGET#*@}" ]; then
+    TARGET="root@$TARGET"
 fi
 
 run_cmd() {
