@@ -222,6 +222,14 @@ pub struct UiState {
     /// Whether the card model supports digital signatures.
     pub signature_supported: bool,
 
+    /// Whether at least one physical smart card is present in an attached card reader.
+    /// When true, the physical card reader overrides RAPP, and the Phone page/tab is suppressed.
+    pub has_local_card: bool,
+    /// Whether the currently selected card is hosted on a local PC/SC reader.
+    /// When false (e.g. remote phone over RAPP), photo loading via local CAN is unavailable
+    /// and credentials must be handled directly on the phone.
+    pub selected_card_is_local: bool,
+
     /// Entered 6-digit Card Access Number.
     pub can_text: String,
     /// Decoded card portrait image.
@@ -264,6 +272,8 @@ impl Default for UiState {
             pin2_unblock_available: false,
             unblock_uses_activation_code: false,
             signature_supported: false,
+            has_local_card: false,
+            selected_card_is_local: false,
             can_text: String::new(),
             portrait: None,
             signature: None,

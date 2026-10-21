@@ -134,11 +134,17 @@ impl RefineIdController {
     /// authentication certificate when none is cached yet and the phone
     /// is on the network; and re-reads the pairing record, which another
     /// program on this computer may have rewritten.
+    ///
+    /// When a physical card reader with an inserted card is connected, the local
+    /// card reader overrides RAPP completely, and phone polling is suppressed.
     fn run_phone_watch(self: &Arc<Self>) {
         while !self.presence_stop.load(Ordering::Acquire) {
-            // The round stands aside while the user pairs: that writes the
-            // record itself and refreshes the screen after.
-            if self.state().pairing.is_none() {
+            let local_card_present = self.state().has_local_card
+                || refineid_lib_pcsc::presence_signature()
+                    .is_ok_and(|sig| sig.iter().any(|(_, present)| *present));
+
+            // The round stands aside while the user pairs or while a local card is connected.
+            if !local_card_present && self.state().pairing.is_none() {
                 self.refresh_phones();
                 let phone = self
                     .state()
@@ -235,7 +241,13 @@ impl RefineIdController {
             .position(|card| !card.report.reader.starts_with(PHONE_READER_PREFIX))
             .or_else(|| (!cards.is_empty()).then_some(0))
             .unwrap_or(0);
-        self.update_state(|state| state.cards = cards);
+        let has_local_card = cards
+            .iter()
+            .any(|card| !card.report.reader.starts_with(PHONE_READER_PREFIX));
+        self.update_state(|state| {
+            state.has_local_card = has_local_card;
+            state.cards = cards;
+        });
         self.select_card(index);
     }
 
@@ -244,27 +256,37 @@ impl RefineIdController {
             if index < state.cards.len() {
                 state.selected_card = Some(index);
                 let card = &state.cards[index];
+                let is_local = !card.report.reader.starts_with(PHONE_READER_PREFIX);
+                state.selected_card_is_local = is_local;
                 state.card_serial = card.report.token_info.serial_number_hex.clone();
                 state.pin1_changed = card.report.pin1_changed;
                 state.pin2_changed = card.report.pin2_changed;
                 state.pin1_status = card.report.pin1;
                 state.pin2_status = card.report.pin2;
                 state.puk_status = card.report.puk;
-                state.pin1_change_available = card.pin_change_available(card.report.pin1.as_ref());
-                state.pin2_change_available = card.pin_change_available(card.report.pin2.as_ref());
-                state.activation_available = card.activation_available();
-                state.legacy_activation = card.legacy_activation_required();
-                let (p1_rec, p2_rec) = card.recovery_availability();
+                state.pin1_change_available =
+                    is_local && card.pin_change_available(card.report.pin1.as_ref());
+                state.pin2_change_available =
+                    is_local && card.pin_change_available(card.report.pin2.as_ref());
+                state.activation_available = is_local && card.activation_available();
+                state.legacy_activation = is_local && card.legacy_activation_required();
+                let (p1_rec, p2_rec) = if is_local {
+                    card.recovery_availability()
+                } else {
+                    (false, false)
+                };
                 state.pin1_unblock_available = p1_rec;
                 state.pin2_unblock_available = p2_rec;
-                state.unblock_uses_activation_code = card
-                    .activation_context
-                    .as_ref()
-                    .is_some_and(|ctx| ctx.generation == CardGeneration::Older);
-                state.signature_supported = card
-                    .activation_context
-                    .as_ref()
-                    .is_some_and(|ctx| ctx.generation == CardGeneration::Newer);
+                state.unblock_uses_activation_code = is_local
+                    && card
+                        .activation_context
+                        .as_ref()
+                        .is_some_and(|ctx| ctx.generation == CardGeneration::Older);
+                state.signature_supported = is_local
+                    && card
+                        .activation_context
+                        .as_ref()
+                        .is_some_and(|ctx| ctx.generation == CardGeneration::Newer);
 
                 // Look up cached images
                 let key = card.key();
@@ -278,12 +300,21 @@ impl RefineIdController {
                 }
             } else {
                 state.selected_card = None;
+                state.selected_card_is_local = false;
                 state.card_serial = None;
                 state.pin1_changed = None;
                 state.pin2_changed = None;
                 state.pin1_status = None;
                 state.pin2_status = None;
                 state.puk_status = None;
+                state.pin1_change_available = false;
+                state.pin2_change_available = false;
+                state.activation_available = false;
+                state.legacy_activation = false;
+                state.pin1_unblock_available = false;
+                state.pin2_unblock_available = false;
+                state.unblock_uses_activation_code = false;
+                state.signature_supported = false;
                 state.portrait = None;
                 state.signature = None;
             }
@@ -305,24 +336,30 @@ impl RefineIdController {
         });
 
         let controller = Arc::clone(self);
-        let include_phones = self.has_usable_phone();
         thread::spawn(move || {
             // No reader, or none with a card, is an empty list, not an error.
-            let result = match refineid_client::card_manager::inspect_cards(None) {
+            let reports = match refineid_client::card_manager::inspect_cards(None) {
                 Ok(reports) => Ok(reports),
                 Err(CardCheckError::ReaderPick(
                     ReaderPickError::NoReaders | ReaderPickError::NoCardPresent,
                 )) => Ok(Vec::new()),
                 Err(error) => Err(error.to_string()),
-            }
-            .map(|reports| deduplicate_cards(reports, include_phones));
+            };
 
             controller
                 .inspection_in_flight
                 .store(false, Ordering::Release);
-            match result {
-                Ok(cards) => {
-                    controller.update_state(|state| state.busy = false);
+            match reports {
+                Ok(reports) => {
+                    let has_local_card = !reports.is_empty();
+                    // A physical card reader when connected with a card overrides RAPP.
+                    // Phones are only included when no local card is present.
+                    let include_phones = !has_local_card && controller.has_usable_phone();
+                    let cards = deduplicate_cards(reports, include_phones);
+                    controller.update_state(|state| {
+                        state.busy = false;
+                        state.has_local_card = has_local_card;
+                    });
                     controller.replace_cards(cards);
                 }
                 Err(err) => {
@@ -330,6 +367,8 @@ impl RefineIdController {
                         state.busy = false;
                         state.cards.clear();
                         state.selected_card = None;
+                        state.has_local_card = false;
+                        state.selected_card_is_local = false;
                         state.status_message = format!("Card inspection error: {err}");
                     });
                 }
@@ -345,7 +384,8 @@ impl RefineIdController {
                     thread::sleep(CARD_PRESENCE_SETTLE);
                     baseline = refineid_lib_pcsc::presence_signature().unwrap_or(baseline);
                     if !self.presence_stop.load(Ordering::Acquire) {
-                        let include_phones = self.has_usable_phone();
+                        let local_card_present = baseline.iter().any(|(_, present)| *present);
+                        let include_phones = !local_card_present && self.has_usable_phone();
                         let cards = self.inspect_until_settled(&baseline, include_phones);
                         self.replace_cards(cards);
                     }
@@ -574,14 +614,28 @@ impl RefineIdController {
     }
 
     fn load_images(self: &Arc<Self>, can: PinBytes) {
-        let (reader, card_key) = {
+        let (reader, card_key, is_local) = {
             let state = self.state();
             let Some(card) = state.selected_card.and_then(|idx| state.cards.get(idx)) else {
                 self.update_state(|s| s.status_message = "No card selected.".into());
                 return;
             };
-            (card.report.reader.clone(), card.key())
+            (
+                card.report.reader.clone(),
+                card.key(),
+                !card.report.reader.starts_with(PHONE_READER_PREFIX),
+            )
         };
+
+        if !is_local {
+            self.update_state(|s| {
+                s.can_text.clear();
+                s.status_message =
+                    "CAN cannot be sent over RAPP. Manage credentials directly on your phone."
+                        .into();
+            });
+            return;
+        }
 
         self.update_state(|s| s.busy = true);
         let controller = Arc::clone(self);
@@ -615,6 +669,7 @@ impl RefineIdController {
 
             controller.update_state(|s| {
                 s.busy = false;
+                s.can_text.clear();
                 match res {
                     Ok((p, sig)) => {
                         s.portrait = p.clone();
@@ -910,8 +965,10 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
         }
     }
 
-    // Include paired phones whose authentication certificate is cached.
+    // Include paired phones only when no local physical card is present.
+    // An attached card reader with an inserted card overrides RAPP.
     if include_phones
+        && cards.is_empty()
         && let Ok(reader) = RemoteReader::open_local()
         && let Some(pair) = reader.phone()
     {
@@ -1012,6 +1069,39 @@ mod tests {
         assert!(!inspection_settled(&[], &["Reader"]));
         assert!(!inspection_settled(&two_readers, &["Reader"]));
         assert!(inspection_settled(&two_readers, &["Second", "Reader"]));
+    }
+
+    #[test]
+    fn connected_card_reader_overrides_rapp_in_card_deduplication() {
+        let physical_report = CardCheckReport {
+            reader: "Synthetic Card Reader".to_owned(),
+            identity: refineid_lib_core::identity::CredentialIdentity::new(),
+            atr_hex: "3b00".to_owned(),
+            token_info: refineid_lib_core::pkcs15::TokenInfo::default(),
+            card_access: refineid_lib_core::card_access::CardAccess::default(),
+            certs: Vec::new(),
+            pin_reference_scheme: refineid_lib_core::auth::PinReferenceScheme::Citizen,
+            pin1: Some(PinStatus::Verified),
+            pin2: Some(PinStatus::Verified),
+            puk: None,
+            pin1_policy: None,
+            pin2_policy: None,
+            puk_policy: None,
+            pin1_changed: Some(true),
+            pin2_changed: Some(true),
+            emrtd: None,
+            emrtd_error: None,
+            dsc_csca_check: None,
+        };
+
+        // When a physical card is present, phone is never added even if include_phones is true
+        let cards = deduplicate_cards(vec![physical_report], true);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].report.reader, "Synthetic Card Reader");
+
+        // When no physical card is present and include_phones is false, cards is empty
+        let empty_cards = deduplicate_cards(Vec::new(), false);
+        assert!(empty_cards.is_empty());
     }
 
     #[test]
