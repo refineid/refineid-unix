@@ -46,7 +46,7 @@ fltk = "1.5.23"
 # lists, validator APIs). `ring` rather than the default aws-lc-rs:
 # ring builds with cc alone where aws-lc-rs wants cmake, so the build
 # needs neither a C++ toolchain nor a system OpenSSL.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 # SHA-256 digests; HMAC; hex encoding for diagnostic output.
 sha2 = "0.11"
