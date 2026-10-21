@@ -1,13 +1,16 @@
 [Desktop Entry]
 Type=Application
 Name=RefineID
-GenericName=Identity card tool
-GenericName[fi]=Henkilökorttityökalu
-Comment=Finnish identity card: PIN management, portrait and signature, document signing
-Comment[fi]=Suomalainen henkilökortti: PIN-hallinta, kuva ja allekirjoitus, asiakirjan allekirjoitus
+GenericName=Identity card reader and signing tool
+GenericName[fi]=Henkilökortinlukija ja allekirjoitustyökalu
+GenericName[sv]=Identitetskortläsare och underskriftsverktyg
+Comment=Authenticate and sign with your identity card.
+Comment[fi]=Tunnistaudu ja allekirjoita henkilökortilla.
+Comment[sv]=Identifiera dig och underteckna med identitetskortet.
 Exec=refineid-gui
 Icon=refineid
 Terminal=false
 Categories=Utility;Security;System;
 Keywords=FINEID;smartcard;PIN;identity;signing;
 Keywords[fi]=FINEID;sirukortti;älykortti;PIN;henkilökortti;allekirjoitus;
+Keywords[sv]=FINEID;smartkort;PIN;identitetskort;underskrift;
