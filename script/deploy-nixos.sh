@@ -119,13 +119,8 @@ for session_pid in $(pgrep -f "[x]fce4-session" 2>/dev/null || true); do
         display=$(tr "\0" "\n" < "/proc/$session_pid/environ" 2>/dev/null | grep "^DISPLAY=" | cut -d= -f2-)
         bus="/run/user/$uid/bus"
         if [ -n "$display" ] && [ -e "$bus" ]; then
-            if pgrep -u "$user" -f "[x]fce4-panel" >/dev/null 2>&1; then
-                echo "   Reloading panel for $user on $display..."
-                su - "$user" -c "DISPLAY=\"$display\" DBUS_SESSION_BUS_ADDRESS=\"unix:path=$bus\" xfce4-panel -r" 2>/dev/null || true
-            else
-                echo "   Starting panel for $user on $display..."
-                su - "$user" -c "DISPLAY=\"$display\" DBUS_SESSION_BUS_ADDRESS=\"unix:path=$bus\" nohup xfce4-panel >/dev/null 2>&1 &" 2>/dev/null || true
-            fi
+            echo "   Restarting panel for $user on $display..."
+            su - "$user" -c "DISPLAY=\"$display\" DBUS_SESSION_BUS_ADDRESS=\"unix:path=$bus\" pkill -u \"$user\" -x xfce4-panel 2>/dev/null || true; sleep 1; nohup xfce4-panel >/dev/null 2>&1 &" 2>/dev/null || true
         fi
     fi
 done

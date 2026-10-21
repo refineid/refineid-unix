@@ -98,11 +98,7 @@ in
           display=$(tr '\0' '\n' < "/proc/$session_pid/environ" 2>/dev/null | grep '^DISPLAY=' | cut -d= -f2-)
           bus="/run/user/$uid/bus"
           if [ -n "$display" ] && [ -e "$bus" ]; then
-            if ${pkgs.procps}/bin/pgrep -u "$user" -f '[x]fce4-panel' >/dev/null 2>&1; then
-              su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' xfce4-panel -r" 2>/dev/null || true
-            else
-              su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' nohup xfce4-panel >/dev/null 2>&1 &" 2>/dev/null || true
-            fi
+            su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' ${pkgs.procps}/bin/pkill -u '$user' -x xfce4-panel 2>/dev/null || true; sleep 1; nohup xfce4-panel >/dev/null 2>&1 &" 2>/dev/null || true
           fi
         fi
       done
