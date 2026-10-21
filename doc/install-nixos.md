@@ -53,9 +53,7 @@ then run:
 sudo nixos-rebuild switch
 ```
 
-The `NIX_CONFIG` prefix is needed only on the first rebuild: `getFlake`
-requires flakes, and the config line enabling them has not taken
-effect yet. One rebuild later the system has the `refineid` CLI, the
+One rebuild later the system has the `refineid` CLI, the
 GUI (in the application menu as "RefineID"), pcscd with the CCID
 driver, the PKCS#11 module registered for p11-kit consumers, and
 Firefox card login. Plug in a reader and run `refineid card`.
@@ -291,16 +289,17 @@ low.
 Reader and card visible:
 
 ```sh
-pcsc_scan                # should show your reader, and the card when inserted
-refineid card            # full readout: identity, certs, PIN counters
+# pcsc_scan shows your reader, and the card when inserted (via nix run or local install):
+nix run nixpkgs#pcsc-tools -- pcsc_scan    # or: pcsc_scan
+refineid card                              # full readout: identity, certs, PIN counters
 ```
 
 PKCS#11 module answers:
 
 ```sh
 # single-user install: ~/.nix-profile/lib/librefineid_pkcs11.so
-pkcs11-tool --module /run/current-system/sw/lib/librefineid_pkcs11.so -L
-p11-kit list-modules     # shows refineid when the p11-kit config is active
+nix run nixpkgs#opensc -- pkcs11-tool --module /run/current-system/sw/lib/librefineid_pkcs11.so -L
+nix run nixpkgs#p11-kit -- p11-kit list-modules   # shows refineid when the p11-kit config is active
 ```
 
 Firefox: with the card inserted, Settings > Privacy & Security >
