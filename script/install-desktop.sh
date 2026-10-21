@@ -133,14 +133,11 @@ if [ -z "$DESTDIR" ]; then
             display=$(tr '\0' '\n' < "/proc/$session_pid/environ" 2>/dev/null | grep '^DISPLAY=' | cut -d= -f2-)
             bus="/run/user/$uid/bus"
             if [ -n "$display" ] && [ -e "$bus" ]; then
-                action="xfce4-panel -r"
-                if ! pgrep -u "$user" -f '[x]fce4-panel' >/dev/null 2>&1; then
-                    action="nohup xfce4-panel >/dev/null 2>&1 &"
-                fi
+                cmd="pkill -u '$user' -x xfce4-panel 2>/dev/null || true; sleep 1; nohup xfce4-panel >/dev/null 2>&1 &"
                 if [ "$(id -u)" -eq 0 ] && [ "$uid" -ne 0 ]; then
-                    su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' $action" 2>/dev/null || true
+                    su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' $cmd" 2>/dev/null || true
                 elif [ "$uid" -eq "$(id -u)" ]; then
-                    DISPLAY="$display" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" sh -c "$action" 2>/dev/null || true
+                    DISPLAY="$display" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" sh -c "$cmd" 2>/dev/null || true
                 fi
             fi
         fi
