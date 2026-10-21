@@ -25,7 +25,15 @@
   # Windowing stack and libraries for the GUI.
   libxkbcommon,
   wayland,
-  xorg,
+  libx11,
+  libxext,
+  libxinerama,
+  libxcursor,
+  libxrender,
+  libxfixes,
+  libxft,
+  libxi,
+  libxrandr,
 }:
 
 let
@@ -70,15 +78,15 @@ let
       pango
       cairo
       gsettings-desktop-schemas
-      xorg.libX11
-      xorg.libXext
-      xorg.libXinerama
-      xorg.libXcursor
-      xorg.libXrender
-      xorg.libXfixes
-      xorg.libXft
-      xorg.libXi
-      xorg.libXrandr
+      libx11
+      libxext
+      libxinerama
+      libxcursor
+      libxrender
+      libxfixes
+      libxft
+      libxi
+      libxrandr
       libxkbcommon
       wayland
     ];
@@ -102,15 +110,15 @@ craneLib.buildPackage (
     runtimeLibs = lib.makeLibraryPath [
       libxkbcommon
       wayland
-      xorg.libX11
-      xorg.libXext
-      xorg.libXinerama
-      xorg.libXcursor
-      xorg.libXrender
-      xorg.libXfixes
-      xorg.libXft
-      xorg.libXi
-      xorg.libXrandr
+      libx11
+      libxext
+      libxinerama
+      libxcursor
+      libxrender
+      libxfixes
+      libxft
+      libxi
+      libxrandr
       pango
       cairo
       fontconfig

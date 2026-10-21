@@ -22,15 +22,15 @@ pkgs.mkShell {
       libxkbcommon
       wayland
       gtk3
-      xorg.libX11
-      xorg.libXext
-      xorg.libXinerama
-      xorg.libXcursor
-      xorg.libXrender
-      xorg.libXfixes
-      xorg.libXft
-      xorg.libXi
-      xorg.libXrandr
+      libx11
+      libxext
+      libxinerama
+      libxcursor
+      libxrender
+      libxfixes
+      libxft
+      libxi
+      libxrandr
       pango
       cairo
       fontconfig
