@@ -9,6 +9,14 @@
   PIN lengths, or development PIN role identifiers in log sinks, audit records, or
   error strings. Only static specification policy bounds may be reported. Never commit
   test PINs or card secrets.
+- RULE #3: STRICT PRIVACY & TEST FIXTURE ANONYMIZATION.
+  NEVER copy live environment or ambient hardware data into source code, test
+  fixtures, documentation, or commit messages.
+  - No real MAC addresses: use synthetic locally administered addresses (`02:00:00:00:00:01`).
+  - No real LAN/WAN IPs: strictly use RFC 5737 documentation ranges (`192.0.2.0/24`,
+    `198.51.100.0/24`, `203.0.113.0/24`) and RFC 3849 IPv6 (`2001:db8::/32`).
+  - No live hostnames, SSIDs, user home paths, or hardware serial numbers:
+    use generic identifiers (`eth0`, `wlan0`, `example.com`, `custodian-1`).
 - Please No AI attribution spam in commits.
   No `Co-authored-by` / `Signed-off-by` / `Reviewed-by`
   or any AI-naming trailer; subject + body only. 
@@ -29,7 +37,6 @@
   takes the branch's only checkout with it. Keep worktrees beside the
   repository.
 - Less is more. Terse is better.
-- Do not leak personal or private information in commits.
 - When stuck, research with fellow AI available.
 - If something is not working, it is by default a bug in code,
   not a feature of the platform.

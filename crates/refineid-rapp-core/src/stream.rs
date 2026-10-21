@@ -506,19 +506,77 @@ fn parse_txt(rdata: &[u8]) -> Vec<(String, String)> {
     entries
 }
 
+/// Extracts IPv4 addresses of resolved neighbors from `/proc/net/arp` format.
+#[must_use]
+pub fn parse_arp_table(content: &str) -> Vec<Ipv4Addr> {
+    let mut neighbors = Vec::new();
+    for line in content.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let Some(ip_str) = fields.next() else {
+            continue;
+        };
+        let Some(_hw_type) = fields.next() else {
+            continue;
+        };
+        let Some(flags_str) = fields.next() else {
+            continue;
+        };
+        let Some(hw_addr) = fields.next() else {
+            continue;
+        };
+
+        if flags_str == "0x0" || flags_str == "0x00" || hw_addr == "00:00:00:00:00:00" {
+            continue;
+        }
+
+        if let Ok(ip) = ip_str.parse::<Ipv4Addr>()
+            && !ip.is_loopback()
+            && !ip.is_multicast()
+            && !ip.is_broadcast()
+            && !ip.is_unspecified()
+            && !ip.is_link_local()
+            && !neighbors.contains(&ip)
+        {
+            neighbors.push(ip);
+        }
+    }
+    neighbors
+}
+
+/// Discovers active local IPv4 neighbors on the host's subnet.
+///
+/// Inspects the Linux kernel ARP table (`/proc/net/arp`). In virtualized
+/// environments (such as bridged VMs over Wi-Fi) or Wi-Fi networks with multicast
+/// suppression, multicast queries never leave the air interface, but direct unicast
+/// queries to active ARP neighbors reach the custodian directly.
+#[must_use]
+pub fn local_neighbors() -> Vec<Ipv4Addr> {
+    if let Ok(content) = std::fs::read_to_string("/proc/net/arp") {
+        return parse_arp_table(&content);
+    }
+    Vec::new()
+}
+
 /// Browses `_refineid-stream._tcp.local.` for `timeout` and returns every
 /// advertised custodian, with the TXT entries it published.
 ///
-/// The query goes to the mDNS group and, directly, to each of `remembered`:
-/// the addresses a phone answered from before. A wireless network delivers
-/// multicast to a phone unreliably; a query to the phone's own address is
-/// answered whenever it is reachable at all.
+/// The query goes to the mDNS group and, directly, to each of `remembered`
+/// as well as active local neighbors discovered from the host's ARP table.
+/// A wireless network delivers multicast to a phone unreliably (and bridged
+/// VMs on Wi-Fi drop multicast altogether); queries to known or active neighbor
+/// addresses are answered whenever the phone is reachable at all.
 ///
 /// The query asks for unicast answers from an ephemeral port (RFC 6762
 /// section 5.4), so it works beside a system mDNS responder.
 #[must_use]
 pub fn browse_stream_services(timeout: Duration, remembered: &[Ipv4Addr]) -> Vec<StreamService> {
-    let responders: Vec<SocketAddrV4> = remembered
+    let mut targets: Vec<Ipv4Addr> = remembered.to_vec();
+    for neighbor in local_neighbors() {
+        if !targets.contains(&neighbor) {
+            targets.push(neighbor);
+        }
+    }
+    let responders: Vec<SocketAddrV4> = targets
         .iter()
         .map(|address| SocketAddrV4::new(*address, MDNS_GROUP.port()))
         .collect();
@@ -999,5 +1057,30 @@ mod tests {
         };
         assert!(!moved.withdraws(&key, now));
         assert!(!session_service(None).withdraws(&key, now));
+    }
+
+    #[test]
+    fn parse_arp_table_extracts_valid_neighbors_and_ignores_incomplete() {
+        let sample = "\
+IP address       HW type     Flags       HW address            Mask     Device
+192.0.2.10       0x1         0x2         02:00:00:00:00:01     *        eth0
+192.0.2.20       0x1         0x2         02:00:00:00:00:02     *        eth0
+192.0.2.30       0x1         0x2         02:00:00:00:00:03     *        eth0
+192.0.2.99       0x1         0x0         00:00:00:00:00:00     *        eth0
+127.0.0.1        0x1         0x2         02:00:00:00:00:00     *        lo
+224.0.0.251      0x1         0x2         01:00:5e:00:00:fb     *        eth0
+192.0.2.1        0x1         0x2         02:00:00:00:00:04     *        eth0
+192.0.2.1        0x1         0x2         02:00:00:00:00:04     *        eth0
+";
+        let parsed = super::parse_arp_table(sample);
+        assert_eq!(
+            parsed,
+            vec![
+                std::net::Ipv4Addr::new(192, 0, 2, 10),
+                std::net::Ipv4Addr::new(192, 0, 2, 20),
+                std::net::Ipv4Addr::new(192, 0, 2, 30),
+                std::net::Ipv4Addr::new(192, 0, 2, 1),
+            ]
+        );
     }
 }
