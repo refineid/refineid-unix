@@ -1099,23 +1099,17 @@ mod tests {
             first.open_session(Some(pair_id), Duration::from_secs(1))
         });
         searching.recv().unwrap();
-        // The second reader, asking during that search, is told the phone
-        // is busy. The lock is taken a moment after the start signal, so
-        // the ask is repeated until it meets the search, within a bound
-        // well inside the search.
-        let bound = std::time::Instant::now() + Duration::from_millis(800);
-        let mut seen = None;
-        while std::time::Instant::now() < bound {
-            match second.open_session(Some(pair_id), Duration::ZERO) {
-                Err(RemoteError::Busy) => {
-                    seen = Some(RemoteError::Busy);
-                    break;
-                }
-                other => seen = other.err(),
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        // The second reader asks during the search and is told the phone is
+        // busy. Wait until the searcher has acquired the session lock before
+        // opening the contending session.
+        let lock_path = session_lock_path(&directory, pair_id);
+        while SessionLock::acquire(&lock_path).is_ok() {
+            std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(seen, Some(RemoteError::Busy));
+        assert_eq!(
+            second.open_session(Some(pair_id), Duration::ZERO).err(),
+            Some(RemoteError::Busy)
+        );
         assert_eq!(searcher.join().unwrap().err(), Some(RemoteError::NotFound));
         assert_eq!(
             second.open_session(Some(pair_id), Duration::ZERO).err(),

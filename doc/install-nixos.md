@@ -17,12 +17,22 @@ RefineID crates.
 
 ## Fresh machine, shortest path (not recommended)
 
-Add to `/etc/nixos/configuration.nix`:
+Nix flakes with Git dependencies require `git` on the host during evaluation.
+On a fresh NixOS install where `git` is not yet installed, enable `git` and flakes first:
+
+```nix
+  programs.git.enable = true;
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+```
+
+and activate them with `sudo nixos-rebuild switch`.
+
+Once `git` and flakes are active, add RefineID to `/etc/nixos/configuration.nix`:
 
 ```nix
   imports = [
     ./hardware-configuration.nix
-    ((builtins.getFlake "github:RefineID/RefineID-Unix").nixosModules.default)
+    ((builtins.getFlake "github:refineid/refineid-unix").nixosModules.default)
   ];
   programs.refineid.enable = true;
   nix.settings = {
@@ -40,7 +50,7 @@ so add it only if it is missing.
 then run:
 
 ```sh
-sudo NIX_CONFIG="experimental-features = nix-command flakes" nixos-rebuild switch
+sudo nixos-rebuild switch
 ```
 
 The `NIX_CONFIG` prefix is needed only on the first rebuild: `getFlake`
@@ -94,7 +104,7 @@ Add the input and the module to your system flake:
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     refineid = {
-      url = "github:RefineID/RefineID-Unix";
+      url = "github:refineid/refineid-unix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -175,7 +185,7 @@ or from a shell:
 ```sh
 modutil -dbdir sql:$HOME/.mozilla/firefox/<profile> \
         -add RefineID \
-        -libfile "$(nix build github:RefineID/RefineID-Unix --print-out-paths --no-link)/lib/librefineid_pkcs11.so"
+        -libfile "$(nix build github:refineid/refineid-unix --print-out-paths --no-link)/lib/librefineid_pkcs11.so"
 ```
 
 ## 2. Single-user install (manual Firefox setup)
@@ -196,7 +206,7 @@ rest lives in that user's profile. In `/etc/nixos/configuration.nix`:
 then, as the user:
 
 ```sh
-nix profile add github:RefineID/RefineID-Unix
+nix profile add github:refineid/refineid-unix
 ```
 
 That user gets the `refineid` CLI and the GUI, application-menu
