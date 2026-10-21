@@ -21,6 +21,7 @@ name = "refineid_pkcs11"
 
 [dependencies]
 refineid-lib-core.workspace = true
+refineid-lib-pcsc.workspace = true
 refineid-pkcs11.workspace = true
 refineid-rapp.workspace = true
 refineid-rapp-core.workspace = true

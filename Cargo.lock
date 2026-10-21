@@ -1909,6 +1909,7 @@ version = "26.10.21"
 dependencies = [
  "libc",
  "refineid-lib-core",
+ "refineid-lib-pcsc",
  "refineid-pkcs11",
  "refineid-rapp",
  "refineid-rapp-core",

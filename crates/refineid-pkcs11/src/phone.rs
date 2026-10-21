@@ -258,6 +258,16 @@ fn computer_context() -> DisplayText {
 /// hold, answer.
 fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
     while !shared.stopped() {
+        // A connected card reader with a card overrides RAPP.
+        // When a physical card is present in an attached reader, withdraw the phone slot.
+        if refineid_lib_pcsc::presence_signature()
+            .is_ok_and(|sig| sig.iter().any(|(_, present)| *present))
+        {
+            unpaired(shared, requests);
+            pause(shared, REDIAL_PAUSE);
+            continue;
+        }
+
         let Ok(mut reader) = RemoteReader::open_local_without_sweep() else {
             unpaired(shared, requests);
             continue;

@@ -58,6 +58,10 @@ fn set_active<W: WidgetExt>(w: &mut W, active: bool) {
 #[derive(Clone, Debug)]
 struct FltkWidgets {
     window: Window,
+    tabs: Tabs,
+    pace_tab: Group,
+    can_bar: Group,
+    rapp_tab: Group,
     holder_name_frame: Frame,
     pin1_status_frame: Frame,
     pin2_status_frame: Frame,
@@ -180,7 +184,7 @@ impl FltkDriver {
         let mut can_input = Input::new(265, 153, 90, 30, "");
         can_input.set_maximum_size(6);
 
-        let mut read_images_btn = Button::new(370, 153, 140, 30, "Load Photos");
+        let mut read_images_btn = Button::new(370, 153, 140, 30, "Load Photo");
         read_images_btn.set_color(Color::from_rgb(0, 122, 255));
         read_images_btn.set_label_color(Color::from_rgb(255, 255, 255));
         read_images_btn.set_label_font(Font::HelveticaBold);
@@ -775,6 +779,10 @@ impl FltkDriver {
 
         self.widgets = Some(FltkWidgets {
             window,
+            tabs,
+            pace_tab,
+            can_bar,
+            rapp_tab,
             holder_name_frame,
             pin1_status_frame,
             pin2_status_frame,
@@ -1029,11 +1037,24 @@ impl UiDriver for FltkDriver {
         );
 
         // Tab 1: Identity & PACE
-        set_active(
-            &mut widgets.read_images_btn,
-            !state.busy && state.selected_card.is_some(),
-        );
-        if !state.can_text.is_empty() && widgets.can_input.value().is_empty() {
+        if !state.selected_card_is_local {
+            if widgets.can_bar.visible() {
+                widgets.can_bar.hide();
+                widgets.pace_tab.redraw();
+            }
+        } else {
+            if !widgets.can_bar.visible() {
+                widgets.can_bar.show();
+                widgets.pace_tab.redraw();
+            }
+            set_active(
+                &mut widgets.read_images_btn,
+                !state.busy && state.selected_card.is_some(),
+            );
+        }
+        if state.can_text.is_empty() && !state.busy && !widgets.can_input.value().is_empty() {
+            widgets.can_input.set_value("");
+        } else if !state.can_text.is_empty() && widgets.can_input.value().is_empty() {
             widgets.can_input.set_value(&state.can_text);
         }
 
@@ -1109,36 +1130,55 @@ impl UiDriver for FltkDriver {
         }
 
         // Tab 4: Phone (RAPP)
-        if let Some(ref pairing) = state.pairing {
-            widgets.pair_status_frame.set_label(&pairing.status);
-            set_active(&mut widgets.pair_code_input, false);
+        if state.has_local_card {
+            if widgets.rapp_tab.visible() {
+                let showing_phone = widgets
+                    .tabs
+                    .value()
+                    .is_some_and(|tab| tab.is_same(&widgets.rapp_tab));
+                widgets.rapp_tab.hide();
+                if showing_phone {
+                    let _ = widgets.tabs.set_value(&widgets.pace_tab);
+                }
+                widgets.tabs.redraw();
+            }
         } else {
-            widgets.pair_status_frame.set_label("");
-            set_active(&mut widgets.pair_code_input, true);
-            if widgets.pairing_running {
-                widgets.pair_code_input.set_value("");
-                let _ = widgets.pair_code_input.take_focus();
+            if !widgets.rapp_tab.visible() {
+                widgets.rapp_tab.show();
+                widgets.tabs.redraw();
             }
-        }
-        widgets.pairing_running = state.pairing.is_some();
-        widgets.pair_code_input.redraw();
 
-        if let Some(ref phone) = state.phone {
-            widgets.phone_name_frame.set_label(&phone.name);
-            widgets
-                .phone_state_frame
-                .set_label(if phone.certificate_cached {
-                    &phone.platform
-                } else {
-                    "Reading the card"
-                });
-            if !widgets.phone_card.visible() {
-                widgets.reader_card.hide();
-                widgets.phone_card.show();
+            if let Some(ref pairing) = state.pairing {
+                widgets.pair_status_frame.set_label(&pairing.status);
+                set_active(&mut widgets.pair_code_input, false);
+            } else {
+                widgets.pair_status_frame.set_label("");
+                set_active(&mut widgets.pair_code_input, true);
+                if widgets.pairing_running {
+                    widgets.pair_code_input.set_value("");
+                    let _ = widgets.pair_code_input.take_focus();
+                }
             }
-        } else if !widgets.reader_card.visible() {
-            widgets.phone_card.hide();
-            widgets.reader_card.show();
+            widgets.pairing_running = state.pairing.is_some();
+            widgets.pair_code_input.redraw();
+
+            if let Some(ref phone) = state.phone {
+                widgets.phone_name_frame.set_label(&phone.name);
+                widgets
+                    .phone_state_frame
+                    .set_label(if phone.certificate_cached {
+                        &phone.platform
+                    } else {
+                        "Reading the card"
+                    });
+                if !widgets.phone_card.visible() {
+                    widgets.reader_card.hide();
+                    widgets.phone_card.show();
+                }
+            } else if !widgets.reader_card.visible() {
+                widgets.phone_card.hide();
+                widgets.reader_card.show();
+            }
         }
     }
 
