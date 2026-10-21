@@ -77,7 +77,7 @@ sleep 2
 
 # 2. Terminate any stale running refineid-gui process so old memory instances are cleared
 echo "-> Checking for stale running refineid-gui processes..."
-run_cmd 'pkill -f "refineid-gui" 2>/dev/null || true'
+run_cmd 'pkill -f "[r]efineid-gui" 2>/dev/null || true'
 
 # 3. Verify desktop entry
 echo "-> Verifying /run/current-system/sw/share/applications/refineid.desktop..."
