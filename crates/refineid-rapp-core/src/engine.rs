@@ -791,9 +791,36 @@ impl<Store: PairingStore> Requester<Store> {
         session: &mut Session<Transport>,
         wait: Duration,
     ) -> Result<bool, SessionError> {
+        self.await_card(session, wait, |session| {
+            session.card_present() == Some(true)
+        })
+    }
+
+    /// Waits up to `wait` for the custodian's first card report, present or
+    /// absent, which it sends right after `session.ready` (section 8.4 item
+    /// 1), serving the session meanwhile. Returns whether one arrived.
+    ///
+    /// # Errors
+    /// As [`Self::service`].
+    pub fn await_card_report<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+        wait: Duration,
+    ) -> Result<bool, SessionError> {
+        self.await_card(session, wait, |session| session.card_status().is_some())
+    }
+
+    /// Serves `session` until `reported` holds of it or `wait` passes;
+    /// whether it held.
+    fn await_card<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+        wait: Duration,
+        reported: impl Fn(&Session<Transport>) -> bool,
+    ) -> Result<bool, SessionError> {
         let deadline = Instant::now() + wait;
         loop {
-            if session.card_present() == Some(true) {
+            if reported(session) {
                 return Ok(true);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());

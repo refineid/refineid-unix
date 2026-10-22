@@ -77,6 +77,15 @@ const CARD_REPORT_WAIT: Duration = Duration::from_secs(5);
 /// (section 8.1 item 2).
 const OPERATION_LIFETIME: Duration = Duration::from_millis(120_000);
 
+/// What a new session waits for before it is handed over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardWait {
+    /// A card the phone can serve, within the discovery time.
+    Present,
+    /// The phone's first card report, present or absent.
+    Report,
+}
+
 /// The keys one stored pairing uses to find and reach its custodian.
 struct PairingKeys {
     discovery: DiscoveryKey,
@@ -712,6 +721,34 @@ impl RemoteReader {
         pair_id: Option<PairId>,
         discovery_timeout: Duration,
     ) -> Result<RemoteSession, RemoteError> {
+        self.establish(pair_id, discovery_timeout, CardWait::Present)
+    }
+
+    /// Opens a session to the phone holding `pair_id`, browsing until
+    /// `discovery_timeout` passes, and returns it once the phone has
+    /// reported its card, present or absent (section 8.4 item 1): for a
+    /// holder that keeps the session open while the phone is in sight and
+    /// follows its card reports (section 8.3).
+    ///
+    /// # Errors
+    /// As [`Self::open_session`], and [`RemoteError::CardAbsent`] when the
+    /// phone reports nothing of its card.
+    pub fn dial_session(
+        &mut self,
+        pair_id: PairId,
+        discovery_timeout: Duration,
+    ) -> Result<RemoteSession, RemoteError> {
+        self.establish(Some(pair_id), discovery_timeout, CardWait::Report)
+    }
+
+    /// Browses, dials and connects to the phone holding `pair_id`, or the
+    /// selected pairing when `None`, and waits for its card as `wait` says.
+    fn establish(
+        &mut self,
+        pair_id: Option<PairId>,
+        discovery_timeout: Duration,
+        wait: CardWait,
+    ) -> Result<RemoteSession, RemoteError> {
         let pair_id = match pair_id {
             Some(pair_id) => pair_id,
             None => self.phone().ok_or(RemoteError::NotPaired)?.pair_id,
@@ -756,10 +793,18 @@ impl RemoteReader {
                         continue;
                     }
                 };
-                let wait = deadline
-                    .saturating_duration_since(Instant::now())
-                    .max(CARD_REPORT_WAIT);
-                match self.requester.await_card_present(&mut session, wait) {
+                let reported = match wait {
+                    CardWait::Present => self.requester.await_card_present(
+                        &mut session,
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(CARD_REPORT_WAIT),
+                    ),
+                    CardWait::Report => self
+                        .requester
+                        .await_card_report(&mut session, CARD_REPORT_WAIT),
+                };
+                match reported {
                     Ok(true) => {
                         return Ok(RemoteSession {
                             session,

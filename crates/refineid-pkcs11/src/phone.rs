@@ -112,12 +112,22 @@ struct Offering {
 /// The certificate the token stands on, and how long it stands.
 struct Token {
     certificate: Vec<u8>,
+    /// The card the certificate is the authentication certificate of.
+    fingerprint: CertificateFingerprint,
     /// `None` while a session reports the card present; otherwise when
     /// the token goes unless a session confirms the card first.
     until: Option<Instant>,
 }
 
 impl Token {
+    fn new(certificate: Vec<u8>, until: Option<Instant>) -> Self {
+        Self {
+            fingerprint: CertificateFingerprint::of_certificate(&certificate),
+            certificate,
+            until,
+        }
+    }
+
     fn stands_at(&self, now: Instant) -> bool {
         self.until.is_none_or(|until| now < until)
     }
@@ -131,10 +141,8 @@ impl Offering {
         Self {
             slot,
             label,
-            token: cached.map(|certificate| Token {
-                certificate,
-                until: Some(now + IDENTITY_OFFER_GRACE),
-            }),
+            token: cached
+                .map(|certificate| Token::new(certificate, Some(now + IDENTITY_OFFER_GRACE))),
         }
     }
 
@@ -154,10 +162,16 @@ impl Offering {
     /// A session confirmed `certificate` as the card's: the token stands
     /// on it while the session reports the card present.
     fn confirmed(&mut self, certificate: Vec<u8>) {
-        self.token = Some(Token {
-            certificate,
-            until: None,
-        });
+        self.token = Some(Token::new(certificate, None));
+    }
+
+    /// Whether the token stands on a card other than the one `reported`
+    /// as present: a different card, which withdraws it at once (section
+    /// 8.4 item 3).
+    fn stands_on_another_card(&self, reported: CertificateFingerprint) -> bool {
+        self.token
+            .as_ref()
+            .is_some_and(|token| token.fingerprint != reported)
     }
 
     /// A session reports the confirmed card present again.
@@ -218,11 +232,26 @@ impl Shared {
     /// keeps its token as it stands, so a new dial never extends the
     /// grace; another pairing's slot starts afresh from its cached
     /// certificate.
-    fn serve_pairing(&self, slot: RemoteSlotId, label: String, cached: Option<Vec<u8>>) {
+    fn serve_pairing(
+        &self,
+        slot: RemoteSlotId,
+        label: String,
+        cached: Option<Vec<u8>>,
+        now: Instant,
+    ) {
         self.offering(|offering| match offering {
             Some(current) if current.slot == slot => current.label = label,
-            _ => *offering = Some(Offering::new(slot, label, cached, Instant::now())),
+            _ => *offering = Some(Offering::new(slot, label, cached, now)),
         });
+    }
+
+    /// Whether the offered token stands on a card other than `reported`.
+    fn offers_another_card(&self, reported: CertificateFingerprint) -> bool {
+        self.offer.lock().is_ok_and(|offering| {
+            offering
+                .as_ref()
+                .is_some_and(|offering| offering.stands_on_another_card(reported))
+        })
     }
 
     /// Applies one token event to the offered slot.
@@ -396,8 +425,10 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
             continue;
         }
 
+        // A store that cannot be read just now says nothing of the
+        // pairing: the offering and its grace stand as they are.
         let Ok(mut reader) = RemoteReader::open_local_without_sweep() else {
-            unpaired(shared, requests);
+            pause(shared, UNPAIRED_PAUSE);
             continue;
         };
         let Some(phone) = reader.phone() else {
@@ -420,6 +451,7 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
             slot,
             phone.peer_display_name.clone(),
             phone.auth_cert.clone(),
+            Instant::now(),
         );
         // A phone this computer forgot is told so on a session of its own
         // when it is in sight (section 4.6 item 2).
@@ -428,12 +460,18 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
         // during the dial makes a failed dial try once more at once,
         // and the pause follows only when no request arrived.
         shared.wanted.store(false, Ordering::Release);
-        match reader.open_session(Some(phone.pair_id), DIAL_TIMEOUT) {
+        match reader.dial_session(phone.pair_id, DIAL_TIMEOUT) {
             Ok(session) => match hold(shared, requests, &mut reader, session, &phone, slot) {
                 After::Grace => shared.token(|offering| offering.unconfirmed(Instant::now())),
                 After::Withdraw => shared.token(Offering::withdrawn),
             },
             Err(RemoteError::Busy) => pause(shared, BUSY_PAUSE),
+            // The phone announced that it stopped serving: its presence
+            // goes at once (section 4.5 item 6).
+            Err(RemoteError::Withdrawn) => {
+                shared.token(Offering::withdrawn);
+                pause(shared, REDIAL_PAUSE);
+            }
             Err(_) if shared.wanted() => {}
             Err(_) => pause(shared, REDIAL_PAUSE),
         }
@@ -460,8 +498,55 @@ enum After {
     Withdraw,
 }
 
-/// Keeps `session` while the record stays usable, answering the browser's
-/// requests on it and serving it between them.
+/// What the phone's latest card report means to the held session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardEvent {
+    /// The phone holds no card: the grace runs (section 8.4 item 3).
+    Absent,
+    /// The phone holds the card this session confirmed.
+    Confirmed,
+    /// The phone holds a card this session has not confirmed.
+    Unconfirmed(CertificateFingerprint),
+}
+
+/// The event the phone's `reported` card is to a session that confirmed
+/// the card `confirmed`, if any.
+fn card_event(
+    reported: Option<CertificateFingerprint>,
+    confirmed: Option<CertificateFingerprint>,
+) -> CardEvent {
+    match reported {
+        None => CardEvent::Absent,
+        Some(fingerprint) if confirmed == Some(fingerprint) => CardEvent::Confirmed,
+        Some(fingerprint) => CardEvent::Unconfirmed(fingerprint),
+    }
+}
+
+/// A certificate confirmed on the held session, and the card it belongs
+/// to.
+struct Confirmed {
+    certificate: Vec<u8>,
+    fingerprint: CertificateFingerprint,
+}
+
+/// How a confirmation that read nothing leaves the held session: on, or
+/// ended as `After` says.
+fn ended_by(error: &RemoteError) -> Option<After> {
+    match error {
+        // The phone forgot this computer or stopped serving: its
+        // presence goes at once (sections 4.6 item 4 and 4.5 item 6).
+        RemoteError::RevokedByPhone | RemoteError::Withdrawn => Some(After::Withdraw),
+        RemoteError::Session(_) => Some(After::Grace),
+        // A read that failed, a card that went or changed meanwhile, or a
+        // cache that was not written: the session stays, the grace runs,
+        // and the next report the phone sends is followed.
+        _ => None,
+    }
+}
+
+/// Keeps `session` while the record stays usable and the phone in sight,
+/// following the phone's card reports, answering the browser's requests
+/// on it and serving it between them (sections 8.3 and 8.4).
 fn hold(
     shared: &Shared,
     requests: &Receiver<SignRequest>,
@@ -470,23 +555,58 @@ fn hold(
     phone: &PairSummary,
     slot: RemoteSlotId,
 ) -> After {
-    // The identity is the one whose fingerprint the phone reports on this
-    // session (section 8.4 item 2): the cached certificate when it is that
-    // one, and otherwise the card's, read once and cached.
-    let (mut certificate, mut confirmed) = match confirm(reader, &mut session) {
-        Some(confirmed) => confirmed,
-        None => {
-            reader.close_session(session);
-            pause(shared, REDIAL_PAUSE);
-            return After::Withdraw;
-        }
-    };
-    shared.token(|offering| offering.confirmed(certificate.clone()));
+    let mut confirmed: Option<Confirmed> = None;
+    // The card a confirmation was last tried for: a failed read is not
+    // tried again until the phone reports a card anew.
+    let mut tried: Option<CertificateFingerprint> = None;
     let mut record_checked = Instant::now();
     loop {
         if shared.stopped() {
             reader.close_session(session);
             return After::Grace;
+        }
+        let event = card_event(
+            session.card_fingerprint(),
+            confirmed.as_ref().map(|card| card.fingerprint),
+        );
+        match event {
+            CardEvent::Absent => {
+                tried = None;
+                shared.token(|offering| offering.unconfirmed(Instant::now()));
+            }
+            CardEvent::Confirmed => shared.token(Offering::present),
+            CardEvent::Unconfirmed(reported) => {
+                confirmed = None;
+                // Another card than the token stands on withdraws it at
+                // once; the card's own certificate brings it back.
+                if shared.offers_another_card(reported) {
+                    shared.token(Offering::withdrawn);
+                } else {
+                    shared.token(|offering| offering.unconfirmed(Instant::now()));
+                }
+                if tried != Some(reported) {
+                    tried = Some(reported);
+                    // The identity is the one whose fingerprint the phone
+                    // reports (section 8.4 item 2): the cached certificate
+                    // when it is that one, otherwise the card's, read once
+                    // and cached.
+                    match reader.confirmed_auth_cert(&mut session) {
+                        Ok(certificate) => {
+                            confirmed = Some(Confirmed {
+                                fingerprint: CertificateFingerprint::of_certificate(&certificate),
+                                certificate: certificate.clone(),
+                            });
+                            shared.token(|offering| offering.confirmed(certificate));
+                        }
+                        Err(error) => {
+                            if let Some(after) = ended_by(&error) {
+                                reader.close_session(session);
+                                return after;
+                            }
+                        }
+                    }
+                }
+            }
         }
         match requests.recv_timeout(SERVICE_STEP) {
             // The browser gave up while the session was being opened;
@@ -495,34 +615,52 @@ fn hold(
             Ok(request) if request.pair_id != slot => {
                 let _ = request.reply.send(Err(RemoteSignError::Withdrawn));
             }
-            Ok(request) => {
-                let signed = sign(reader, &mut session, &request);
-                match checked(signed, &certificate, &request.request) {
-                    Ok(signature) => {
-                        let _ = request.reply.send(Ok(signature));
-                    }
-                    // A signature the cached certificate does not verify
-                    // says the card on the phone is not the one cached:
-                    // the token goes, the cache goes, and the next session
-                    // reads the card again.
-                    Err(Failure::Mismatch) => {
-                        let _ = request.reply.send(Err(RemoteSignError::Ambiguous));
-                        let _ = reader.forget_auth_cert(phone.pair_id);
-                        reader.close_session(session);
-                        return After::Withdraw;
-                    }
-                    Err(Failure::Sign(error)) => {
-                        let _ = request.reply.send(Err(error));
-                        if matches!(
-                            error,
-                            RemoteSignError::Unreachable | RemoteSignError::Withdrawn
-                        ) {
+            Ok(request) => match &confirmed {
+                // No card this session confirmed: absence, or a card whose
+                // certificate could not be read.
+                None => {
+                    let error = if session.card_present() {
+                        RemoteSignError::Ambiguous
+                    } else {
+                        RemoteSignError::CardAbsent
+                    };
+                    let _ = request.reply.send(Err(error));
+                }
+                Some(card) => {
+                    let signed = sign(reader, &mut session, &request);
+                    match checked(signed, &card.certificate, &request.request) {
+                        Ok(signature) => {
+                            let _ = request.reply.send(Ok(signature));
+                        }
+                        // A signature the confirmed certificate does not
+                        // verify says the card on the phone is not the one
+                        // cached: the token goes, the cache goes, and the
+                        // next session reads the card again.
+                        Err(Failure::Mismatch) => {
+                            let _ = request.reply.send(Err(RemoteSignError::Ambiguous));
+                            let _ = reader.forget_auth_cert(phone.pair_id);
                             reader.close_session(session);
-                            return After::Grace;
+                            return After::Withdraw;
+                        }
+                        Err(Failure::Sign(error)) => {
+                            let _ = request.reply.send(Err(error));
+                            match error {
+                                // The phone stopped serving or forgot this
+                                // computer: its presence goes at once.
+                                RemoteSignError::Withdrawn => {
+                                    reader.close_session(session);
+                                    return After::Withdraw;
+                                }
+                                RemoteSignError::Unreachable => {
+                                    reader.close_session(session);
+                                    return After::Grace;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
-            }
+            },
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 reader.close_session(session);
@@ -545,40 +683,12 @@ fn hold(
         }
         match reader.service(&mut session, SERVICE_STEP) {
             Ok(()) => {}
-            // The phone forgot this computer: the pairing and its token go.
-            Err(RemoteError::RevokedByPhone) => return After::Withdraw,
+            // The phone forgot this computer or stopped serving: the
+            // token goes at once (sections 4.6 item 4 and 4.5 item 6).
+            Err(RemoteError::RevokedByPhone | RemoteError::Withdrawn) => return After::Withdraw,
             Err(_) => return After::Grace,
         }
-        match session.card_fingerprint() {
-            Some(reported) if reported == confirmed => shared.token(Offering::present),
-            // The phone serves another card: the identity offered goes at
-            // once, and comes back on the card's certificate once it is
-            // read and confirmed.
-            Some(_) => {
-                shared.token(Offering::withdrawn);
-                let Some((read, fingerprint)) = confirm(reader, &mut session) else {
-                    reader.close_session(session);
-                    return After::Withdraw;
-                };
-                certificate = read;
-                confirmed = fingerprint;
-                shared.token(|offering| offering.confirmed(certificate.clone()));
-            }
-            // A report of absence is no other card: the grace runs.
-            None => shared.token(|offering| offering.unconfirmed(Instant::now())),
-        }
     }
-}
-
-/// The certificate of the card the phone reports on `session`, with the
-/// fingerprint the phone confirmed it by.
-fn confirm(
-    reader: &mut RemoteReader,
-    session: &mut RemoteSession,
-) -> Option<(Vec<u8>, CertificateFingerprint)> {
-    let certificate = reader.confirmed_auth_cert(session).ok()?;
-    let fingerprint = CertificateFingerprint::of_certificate(&certificate);
-    Some((certificate, fingerprint))
 }
 
 /// What the record another program keeps says of the held pairing.
@@ -950,32 +1060,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_new_dial_never_extends_the_grace() {
-        let shared = Shared {
+    fn shared() -> Shared {
+        Shared {
             offer: Mutex::new(None),
             requests: Mutex::new(None),
             stop: AtomicBool::new(false),
             wanted: AtomicBool::new(false),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
-        };
+        }
+    }
+
+    /// When the offered token goes, if it is on a grace.
+    fn deadline(shared: &Shared) -> Option<Instant> {
+        shared
+            .offer
+            .lock()
+            .expect("offer")
+            .as_ref()
+            .and_then(|offering| offering.token.as_ref())
+            .and_then(|token| token.until)
+    }
+
+    #[test]
+    fn a_new_dial_never_extends_the_grace() {
+        let shared = shared();
+        let start = Instant::now();
+        // A session confirmed the card and then ended: the grace runs.
+        shared.serve_pairing(the_slot(), "Alpha Phone".to_owned(), None, start);
+        shared.token(|offering| offering.confirmed(CERTIFICATE.to_vec()));
+        shared.token(|offering| offering.unconfirmed(start));
+        let running = deadline(&shared);
+        assert_eq!(running, Some(start + IDENTITY_OFFER_GRACE));
+        // The next round of the thread serves the same pairing and dials
+        // again, the record still caching the certificate: the deadline
+        // stays, and so does a session that ends again.
         shared.serve_pairing(
             the_slot(),
             "Alpha Phone".to_owned(),
             Some(CERTIFICATE.to_vec()),
+            start + WITHIN_GRACE,
         );
+        shared.token(|offering| offering.unconfirmed(start + WITHIN_GRACE));
+        assert_eq!(deadline(&shared), running);
+        // A token withdrawn at once stays withdrawn over a new round.
         shared.token(Offering::withdrawn);
-        // The next round of the thread serves the same pairing: the token
-        // stays withdrawn although the record still caches a certificate.
         shared.serve_pairing(
             the_slot(),
             "Alpha Phone".to_owned(),
             Some(CERTIFICATE.to_vec()),
+            start + WITHIN_GRACE,
         );
         let offered = shared.offer.lock().expect("offer");
         let offering = offered.as_ref().expect("the slot stands");
-        assert_eq!(certificate_at(offering, Instant::now()), None);
+        assert_eq!(certificate_at(offering, start + WITHIN_GRACE), None);
+    }
+
+    #[test]
+    fn absence_at_session_start_keeps_the_offer_for_the_grace_and_a_report_confirms_it() {
+        let shared = shared();
+        let start = Instant::now();
+        let fingerprint = CertificateFingerprint::of_certificate(CERTIFICATE);
+        shared.serve_pairing(
+            the_slot(),
+            "Alpha Phone".to_owned(),
+            Some(CERTIFICATE.to_vec()),
+            start,
+        );
+        // The session opens with the phone reporting no card: absence is
+        // no other card, so the token stays on the grace it started with.
+        assert_eq!(card_event(None, None), CardEvent::Absent);
+        shared.token(|offering| offering.unconfirmed(start + WITHIN_GRACE));
+        assert_eq!(deadline(&shared), Some(start + IDENTITY_OFFER_GRACE));
+        assert!(!shared.offers_another_card(fingerprint));
+        // The phone then reports the card: the session confirms it, and
+        // the token stands while the card is reported present.
+        assert_eq!(
+            card_event(Some(fingerprint), None),
+            CardEvent::Unconfirmed(fingerprint)
+        );
+        shared.token(|offering| offering.confirmed(CERTIFICATE.to_vec()));
+        assert_eq!(
+            card_event(Some(fingerprint), Some(fingerprint)),
+            CardEvent::Confirmed
+        );
+        assert_eq!(deadline(&shared), None);
+        // Another card reported present stands against the token.
+        assert!(
+            shared.offers_another_card(CertificateFingerprint::of_certificate(OTHER_CERTIFICATE))
+        );
     }
 
     #[test]

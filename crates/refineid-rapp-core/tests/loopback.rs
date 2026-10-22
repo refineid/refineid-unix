@@ -581,6 +581,11 @@ fn a_wait_for_a_card_that_runs_out_leaves_the_session_open() {
         custodian.receive_close();
     });
     let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    // The phone's first report is absence: a report all the same.
+    assert_eq!(
+        requester.await_card_report(&mut session, SHORT_WAIT),
+        Ok(true)
+    );
     // The wait runs out before the phone reports a card; the session is
     // neither closed nor marked lost.
     assert_eq!(
