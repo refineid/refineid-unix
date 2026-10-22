@@ -25,7 +25,7 @@ pub(crate) const PAIRING_BLOB_MAGIC: &[u8] = b"RAPP-pair-record";
 
 /// The one encoding revision this build reads and writes. Records of earlier
 /// revisions belong to earlier protocol versions and are re-paired.
-pub(crate) const PAIRING_BLOB_VERSION: u8 = 8;
+pub(crate) const PAIRING_BLOB_VERSION: u8 = 9;
 
 /// Bytes of a length prefix: a big-endian `u32`.
 const LENGTH_PREFIX_BYTES: usize = 4;
@@ -101,12 +101,10 @@ pub fn encode_pairing_record(
     let pairing =
         Zeroizing::new(encode_pair_record(record.pairing()).map_err(PairingCodecError::Pairing)?);
     let peer = record.peer();
-    let failures = record.candidate_failures().to_be_bytes();
     let size = PAIRING_BLOB_MAGIC.len()
         + VERSION_BYTES
         + LENGTH_PREFIX_BYTES
         + pairing.len()
-        + failures.len()
         + LENGTH_PREFIX_BYTES
         + peer.display_name.len()
         + LENGTH_PREFIX_BYTES
@@ -122,7 +120,6 @@ pub fn encode_pairing_record(
     out.extend_from_slice(PAIRING_BLOB_MAGIC);
     out.push(PAIRING_BLOB_VERSION);
     put_bytes(&mut out, &pairing)?;
-    out.extend_from_slice(&failures);
     put_bytes(&mut out, peer.display_name.as_bytes())?;
     put_bytes(&mut out, peer.platform.as_bytes())?;
     match record.auth_cert() {
@@ -165,7 +162,6 @@ pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecE
     }
     let pairing =
         decode_pair_record(reader.take_length_prefixed()?).map_err(PairingCodecError::Pairing)?;
-    let candidate_failures = u32::from_be_bytes(reader.take_array()?);
     let peer = PeerIntroduction {
         display_name: reader.take_text()?,
         platform: reader.take_text()?,
@@ -178,7 +174,6 @@ pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecE
     reader.finish()?;
     Ok(PairingRecord::new(pairing, peer)
         .map_err(PairingCodecError::Record)?
-        .with_candidate_failures(candidate_failures)
         .with_auth_cert(auth_cert))
 }
 
@@ -267,8 +262,6 @@ mod tests {
     const PAIR_ID: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-7";
     /// When the forgotten fixture's user forgot it.
     const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
-    /// The re-pairing hint the fixture carries.
-    const FAILURES: u32 = 2;
     /// A synthetic authentication certificate.
     const CERTIFICATE: &[u8] = b"synthetic authentication certificate";
     /// The first encoding revision.
@@ -290,7 +283,6 @@ mod tests {
             },
         )
         .unwrap()
-        .with_candidate_failures(FAILURES)
         .with_auth_cert(Some(CERTIFICATE.to_vec()))
     }
 
@@ -312,7 +304,6 @@ mod tests {
             right.pairing().forgotten_at_ms()
         );
         assert_eq!(left.peer(), right.peer());
-        assert_eq!(left.candidate_failures(), right.candidate_failures());
         assert_eq!(left.auth_cert(), right.auth_cert());
     }
 

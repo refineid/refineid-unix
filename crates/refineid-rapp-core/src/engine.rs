@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use crate::ids::{OperationId, PairId, RandomIdExt};
-use crate::limits;
 use crate::message::{CardStatusMessage, CloseReason, ResultError, ResultStatus};
 use crate::offer::{OfferError, PairingOffer};
 use crate::operations::{CardOperation, CardOperationResult, OperationError};
@@ -128,13 +127,9 @@ pub enum SessionError {
     UnknownPairing,
     /// The stored pairing's state opens no such session.
     NotPaired(PairingState),
-    /// The session handshake failed. When `suggest_repairing` is true,
-    /// three consecutive candidates failed authentication and re-pairing
-    /// should be suggested without touching stored keys.
-    HandshakeFailed {
-        /// Whether the consecutive-failure threshold was reached.
-        suggest_repairing: bool,
-    },
+    /// The session handshake failed before authentication: the
+    /// connection closed and nothing stored changed (section 10.1 item 1).
+    HandshakeFailed,
     /// The transport failed, or thirty seconds passed without a message
     /// from the phone (section 8.3).
     Transport(TransportError),
@@ -153,13 +148,7 @@ impl core::fmt::Display for SessionError {
         match self {
             Self::UnknownPairing => f.write_str("unknown pairing"),
             Self::NotPaired(d) => write!(f, "pairing not usable ({d:?})"),
-            Self::HandshakeFailed { suggest_repairing } => {
-                if *suggest_repairing {
-                    f.write_str("handshake failed (repairing recommended)")
-                } else {
-                    f.write_str("handshake failed")
-                }
-            }
+            Self::HandshakeFailed => f.write_str("handshake failed"),
             Self::Transport(e) => write!(f, "transport error: {e:?}"),
             Self::Violation => f.write_str("the phone's message was not understood"),
             Self::ClosedByPeer(reason) => write!(f, "session closed by peer: {reason:?}"),
@@ -680,9 +669,6 @@ impl<Store: PairingStore> Requester<Store> {
         let endpoint = authentication
             .into_established()
             .map_err(|_| SessionError::EngineFault)?;
-        let _ = self.store.update(pair_id, &mut |record| {
-            Some(record.with_authenticated_candidate())
-        });
         let started = Instant::now();
         Ok(Session {
             transport,
@@ -730,8 +716,8 @@ impl<Store: PairingStore> Requester<Store> {
     }
 
     /// Runs the `Noise_KK` handshake for `pair_id` as initiator and enters
-    /// the authentication phase. A handshake that fails counts toward the
-    /// re-pairing hint.
+    /// the authentication phase. A handshake that fails changes nothing
+    /// stored (section 10.1 item 1).
     fn authenticate<Transport: FrameTransport>(
         &mut self,
         pair_id: PairId,
@@ -760,15 +746,9 @@ impl<Store: PairingStore> Requester<Store> {
         let answer = transport.receive_frame().map_err(SessionError::Transport)?;
         let answer = BinaryFrame::reconstruct(answer)
             .map_err(|_| SessionError::Transport(TransportError::Failed))?;
-        if handshake.read_message(&answer).is_err() {
-            let _ = self
-                .store
-                .update(pair_id, &mut |record| Some(record.with_failed_candidate()));
-            let suggest_repairing = self.store.get(pair_id).is_ok_and(|record| {
-                record.candidate_failures() >= limits::CANDIDATE_FAILURE_HINT_THRESHOLD
-            });
-            return Err(SessionError::HandshakeFailed { suggest_repairing });
-        }
+        handshake
+            .read_message(&answer)
+            .map_err(|_| SessionError::HandshakeFailed)?;
         if !handshake.is_complete() {
             return Err(SessionError::EngineFault);
         }

@@ -48,9 +48,4 @@ pub mod limits {
 
     /// Pairing-offer lifetime in milliseconds (`OFFER_TTL_MS`).
     pub const OFFER_TTL_MS: u64 = refineid_rapp::OFFER_TTL_MS;
-
-    /// Consecutive failed session-candidate authentications after which
-    /// re-pairing is suggested, stored keys untouched.
-    pub const CANDIDATE_FAILURE_HINT_THRESHOLD: u32 =
-        refineid_rapp::CANDIDATE_FAILURE_HINT_THRESHOLD as u32;
 }
