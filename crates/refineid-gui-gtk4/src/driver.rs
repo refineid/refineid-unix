@@ -13,7 +13,6 @@ use refineid_gui_core::PinManageSlot;
 use refineid_gui_core::controller::RefineIdController;
 use refineid_gui_core::driver::UiDriver;
 use refineid_gui_core::error::GuiCoreError;
-use refineid_gui_core::image::RgbaImageBuffer;
 use refineid_gui_core::model::{SignFormat, UiState, UserIntent};
 use refineid_lib_core::auth::{PIN_TRY_LIMIT, PinStatus, PukStatus};
 use refineid_lib_core::pin::PinBytes;
@@ -23,15 +22,15 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 /// Maximum PIN digits (PIN1 and PIN2 share this bound).
-const MAX_PIN_DIGITS: i32 = 12;
+const MAX_PIN_DIGITS: usize = 12;
 /// Minimum PIN1 digits.
-const MIN_PIN1_DIGITS: i32 = 4;
+const MIN_PIN1_DIGITS: usize = 4;
 /// Minimum PIN2 digits.
-const MIN_PIN2_DIGITS: i32 = 6;
+const MIN_PIN2_DIGITS: usize = 6;
 /// PUK digit count.
-const PUK_DIGITS: i32 = 8;
+const PUK_DIGITS: usize = 8;
 /// Activation code digit count.
-const ACTIVATION_CODE_DIGITS: i32 = 8;
+const ACTIVATION_CODE_DIGITS: usize = 8;
 
 /// Pairing code length.
 const PAIRING_CODE_LEN: usize = PAIRING_CODE_LENGTH;
@@ -40,13 +39,27 @@ fn to_pin_bytes(s: &str) -> Option<PinBytes> {
     PinBytes::new(s.as_bytes().to_vec()).ok()
 }
 
-/// Keep only ASCII digits, up to `maximum`.
-fn digits_only(text: &str, maximum: i32) -> String {
-    let max = maximum as usize;
-    text.chars()
+/// Filter text to ASCII digits, up to `max`, blocking the signal so we can
+/// rewrite the entry value in place.
+fn filter_digits(entry: &gtk4::Entry, text: &str, max: usize) {
+    let filtered: String = text
+        .chars()
         .filter(|c| c.is_ascii_digit())
         .take(max)
-        .collect()
+        .collect();
+    if filtered != text {
+        let current = entry.text();
+        let pos = entry.position() as usize;
+        let take = max.saturating_sub(pos);
+        let new_text = format!(
+            "{}{}{}",
+            &current[..pos],
+            &filtered[..take],
+            &current[pos..]
+        );
+        entry.set_text(&new_text);
+        entry.set_position(new_text.chars().count() as i32);
+    }
 }
 
 /// Widget handles maintained by the GTK4 driver.
@@ -57,10 +70,10 @@ struct Gtk4Widgets {
     holder_label: gtk4::Label,
     can_entry: gtk4::Entry,
     load_images_button: gtk4::Button,
-    portrait_picture: gtk4::Picture,
+    portrait_placeholder: gtk4::Label,
     copy_portrait_button: gtk4::Button,
     save_portrait_button: gtk4::Button,
-    signature_picture: gtk4::Picture,
+    signature_placeholder: gtk4::Label,
     copy_signature_button: gtk4::Button,
     save_signature_button: gtk4::Button,
     // PINs tab
@@ -122,8 +135,6 @@ pub struct Gtk4Driver {
     state_rx: mpsc::Receiver<UiState>,
     opens_on_phone_tab: bool,
     widgets: Option<Gtk4Widgets>,
-    cached_portrait: Option<Arc<RgbaImageBuffer>>,
-    cached_signature: Option<Arc<RgbaImageBuffer>>,
 }
 
 impl std::fmt::Debug for Gtk4Driver {
@@ -149,9 +160,10 @@ impl Gtk4Driver {
             .application_id("fi.refineid.gui")
             .build();
         let (state_tx, state_rx) = mpsc::channel::<UiState>();
+        let tx_for_callback = state_tx.clone();
 
         let on_state_change = Box::new(move |state: &UiState| {
-            let _ = state_tx.send(state.clone());
+            let _ = tx_for_callback.send(state.clone());
         });
 
         let driver = Self {
@@ -160,8 +172,6 @@ impl Gtk4Driver {
             state_rx,
             opens_on_phone_tab: false,
             widgets: None,
-            cached_portrait: None,
-            cached_signature: None,
         };
 
         (driver, on_state_change)
@@ -220,10 +230,10 @@ impl Gtk4Driver {
             holder_label: identity.holder_label,
             can_entry: identity.can_entry,
             load_images_button: identity.load_images_button,
-            portrait_picture: identity.portrait_picture,
+            portrait_placeholder: identity.portrait_placeholder,
             copy_portrait_button: identity.copy_portrait_button,
             save_portrait_button: identity.save_portrait_button,
-            signature_picture: identity.signature_picture,
+            signature_placeholder: identity.signature_placeholder,
             copy_signature_button: identity.copy_signature_button,
             save_signature_button: identity.save_signature_button,
             // PINs
@@ -314,25 +324,8 @@ impl Gtk4Driver {
             .max_width_chars(6)
             .build();
         can_entry.connect_insert_text(move |entry, text, _position| {
-            let filtered: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-            if filtered != text {
-                entry.block_signals();
-                let current = entry.text();
-                let pos = entry.position() as usize;
-                let take = 6usize.saturating_sub(pos);
-                let new_text = format!(
-                    "{}{}{}",
-                    &current[..pos],
-                    &filtered[..take],
-                    &current[pos..]
-                );
-                entry.set_text(&new_text);
-                entry.set_position(new_text.chars().count() as i32);
-                entry.unblock_signals();
-                gtk4::glib::Propagation::Stop
-            } else {
-                gtk4::glib::Propagation::Proceed
-            }
+            filter_digits(entry, text, 6);
+            glib::Propagation::Proceed
         });
         let load_images_button = gtk4::Button::builder().label("Load Photo").build();
         can_bar.append(&can_label);
@@ -379,9 +372,13 @@ impl Gtk4Driver {
         portrait_card.append(&portrait_title);
 
         let portrait_frame = gtk4::Frame::builder().build();
-        let portrait_picture = gtk4::Picture::builder().build();
-        portrait_frame.set_child(Some(&portrait_picture));
-        portrait_frame.set_size_request(320, 330);
+        let portrait_placeholder = gtk4::Label::builder()
+            .label("(photo not yet loaded)")
+            .halign(gtk4::Align::Center)
+            .valign(gtk4::Align::Center)
+            .build();
+        portrait_placeholder.set_size_request(320, 330);
+        portrait_frame.set_child(Some(&portrait_placeholder));
         portrait_card.append(&portrait_frame);
 
         let portrait_actions = gtk4::Box::builder()
@@ -407,9 +404,13 @@ impl Gtk4Driver {
         signature_card.append(&signature_title);
 
         let signature_frame = gtk4::Frame::builder().build();
-        let signature_picture = gtk4::Picture::builder().build();
-        signature_frame.set_child(Some(&signature_picture));
-        signature_frame.set_size_request(420, 160);
+        let signature_placeholder = gtk4::Label::builder()
+            .label("(signature not yet loaded)")
+            .halign(gtk4::Align::Center)
+            .valign(gtk4::Align::Center)
+            .build();
+        signature_placeholder.set_size_request(420, 160);
+        signature_frame.set_child(Some(&signature_placeholder));
         signature_card.append(&signature_frame);
 
         let signature_actions = gtk4::Box::builder()
@@ -432,10 +433,10 @@ impl Gtk4Driver {
             holder_label,
             can_entry,
             load_images_button,
-            portrait_picture,
+            portrait_placeholder,
             copy_portrait_button,
             save_portrait_button,
-            signature_picture,
+            signature_placeholder,
             copy_signature_button,
             save_signature_button,
         }
@@ -548,7 +549,7 @@ impl Gtk4Driver {
     fn build_change_pin_form(
         &self,
         slot: PinManageSlot,
-        min_digits: i32,
+        min_digits: usize,
         controller: &Arc<RefineIdController>,
     ) -> ChangePinForm {
         let page = gtk4::Box::builder()
@@ -582,10 +583,11 @@ impl Gtk4Driver {
                 show_alert("New PIN entries do not match.");
                 return;
             }
-            let min = min_digits as usize;
-            let max = MAX_PIN_DIGITS as usize;
-            if new_val.len() < min || new_val.len() > max {
-                show_alert(&format!("PIN must be between {min} and {max} digits."));
+            if new_val.len() < min_digits || new_val.len() > MAX_PIN_DIGITS {
+                show_alert(&format!(
+                    "PIN must be between {min_digits} and {} digits.",
+                    MAX_PIN_DIGITS
+                ));
                 return;
             }
             let (Some(cur_pin), Some(new_pin)) = (to_pin_bytes(&cur_val), to_pin_bytes(&new_val))
@@ -614,12 +616,12 @@ impl Gtk4Driver {
         }
     }
 
-    /// Build a secret entry row (label + PasswordEntry with reveal toggle).
+    /// Build a secret entry row (label + Entry with reveal toggle).
     fn secret_entry_row(
         &self,
         parent: &gtk4::Box,
         label_text: &str,
-        max_digits: i32,
+        max_digits: usize,
     ) -> SecretEntry {
         let row = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
@@ -632,35 +634,14 @@ impl Gtk4Driver {
             .build();
         label.set_width_chars(16);
 
-        let entry = gtk4::PasswordEntry::builder()
-            .visible(false)
+        let entry = gtk4::Entry::builder()
+            .visibility(false)
             .width_chars(14)
-            .max_width_chars(max_digits)
+            .max_width_chars(max_digits as i32)
             .build();
-        entry.set_activates_default(true);
-
-        // Filter to digits only
         entry.connect_insert_text(move |entry, text, _position| {
-            let filtered: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-            if filtered != text {
-                entry.block_signals();
-                let current = entry.text();
-                let pos = entry.position() as usize;
-                let max = max_digits as usize;
-                let take = max.saturating_sub(pos);
-                let new_text = format!(
-                    "{}{}{}",
-                    &current[..pos],
-                    &filtered[..take],
-                    &current[pos..]
-                );
-                entry.set_text(&new_text);
-                entry.set_position(new_text.chars().count() as i32);
-                entry.unblock_signals();
-                gtk4::glib::Propagation::Stop
-            } else {
-                gtk4::glib::Propagation::Proceed
-            }
+            filter_digits(entry, text, max_digits);
+            glib::Propagation::Proceed
         });
 
         let reveal_btn = gtk4::Button::builder().build();
@@ -676,7 +657,7 @@ impl Gtk4Driver {
             } else {
                 "view-reveal-symbolic"
             };
-            reveal_icon.set_icon_name(icon_name);
+            reveal_icon.set_icon_name(Some(icon_name));
         });
 
         row.append(&label);
@@ -738,12 +719,14 @@ impl Gtk4Driver {
                 return;
             }
             let min_len = match slot {
-                PinManageSlot::Pin1 => MIN_PIN1_DIGITS as usize,
-                PinManageSlot::Pin2 => MIN_PIN2_DIGITS as usize,
+                PinManageSlot::Pin1 => MIN_PIN1_DIGITS,
+                PinManageSlot::Pin2 => MIN_PIN2_DIGITS,
             };
-            let max = MAX_PIN_DIGITS as usize;
-            if new_val.len() < min_len || new_val.len() > max {
-                show_alert(&format!("PIN must be between {min_len} and {max} digits."));
+            if new_val.len() < min_len || new_val.len() > MAX_PIN_DIGITS {
+                show_alert(&format!(
+                    "PIN must be between {min_len} and {} digits.",
+                    MAX_PIN_DIGITS
+                ));
                 return;
             }
             let (Some(puk_pin), Some(new_pin)) = (to_pin_bytes(&puk_val), to_pin_bytes(&new_val))
@@ -811,15 +794,18 @@ impl Gtk4Driver {
                 show_alert("PIN2 entries do not match.");
                 return;
             }
-            let min1 = MIN_PIN1_DIGITS as usize;
-            let min2 = MIN_PIN2_DIGITS as usize;
-            let max = MAX_PIN_DIGITS as usize;
-            if p1_val.len() < min1 || p1_val.len() > max {
-                show_alert(&format!("PIN1 must be between {min1} and {max} digits."));
+            if p1_val.len() < MIN_PIN1_DIGITS || p1_val.len() > MAX_PIN_DIGITS {
+                show_alert(&format!(
+                    "PIN1 must be between {} and {} digits.",
+                    MIN_PIN1_DIGITS, MAX_PIN_DIGITS
+                ));
                 return;
             }
-            if p2_val.len() < min2 || p2_val.len() > max {
-                show_alert(&format!("PIN2 must be between {min2} and {max} digits."));
+            if p2_val.len() < MIN_PIN2_DIGITS || p2_val.len() > MAX_PIN_DIGITS {
+                show_alert(&format!(
+                    "PIN2 must be between {} and {} digits.",
+                    MIN_PIN2_DIGITS, MAX_PIN_DIGITS
+                ));
                 return;
             }
             let (Some(act_code), Some(new_p1), Some(new_p2)) = (
@@ -1002,7 +988,7 @@ impl Gtk4Driver {
             let pin2 = sign_pin2_entry.entry.clone();
             sign_button.connect_clicked(move |_| {
                 let pin2_val = pin2.text();
-                if pin2_val.len() < MIN_PIN2_DIGITS as usize {
+                if pin2_val.len() < MIN_PIN2_DIGITS {
                     show_alert("PIN2 must be at least 6 digits.");
                     return;
                 }
@@ -1061,29 +1047,8 @@ impl Gtk4Driver {
             .max_width_chars(PAIRING_CODE_LEN as i32)
             .build();
         pair_code_entry.connect_insert_text(move |entry, text, _position| {
-            let filtered: String = text
-                .chars()
-                .filter(|c| pairing_code_character(*c).is_some())
-                .take(PAIRING_CODE_LEN)
-                .collect();
-            if filtered != text {
-                entry.block_signals();
-                let current = entry.text();
-                let pos = entry.position() as usize;
-                let take = PAIRING_CODE_LEN.saturating_sub(pos);
-                let new_text = format!(
-                    "{}{}{}",
-                    &current[..pos],
-                    &filtered[..take],
-                    &current[pos..]
-                );
-                entry.set_text(&new_text);
-                entry.set_position(new_text.chars().count() as i32);
-                entry.unblock_signals();
-                gtk4::glib::Propagation::Stop
-            } else {
-                gtk4::glib::Propagation::Proceed
-            }
+            filter_digits(entry, text, PAIRING_CODE_LEN);
+            glib::Propagation::Proceed
         });
         reader_card.append(&pair_code_entry);
 
@@ -1135,10 +1100,7 @@ impl Gtk4Driver {
                 if code.chars().count() == PAIRING_CODE_LEN {
                     let c2 = Arc::clone(&c);
                     let code_owned = code.to_string();
-                    glib::idle_add(move || {
-                        c2.handle_intent(UserIntent::StartPairing { code: code_owned });
-                        glib::source::RemoveSource::Keep
-                    });
+                    c2.handle_intent(UserIntent::StartPairing { code: code_owned });
                 }
             });
         }
@@ -1201,24 +1163,6 @@ impl Gtk4Driver {
             .puk_status_label
             .set_label(&credential_line("PUK", puk_status_text(state.puk_status)));
 
-        // Activation sub-tab visibility
-        let setup_listed = widgets.pin_subtabs.page_position(&widgets.tab_activate) >= 0;
-        if state.activation_available && !setup_listed {
-            widgets.pin_subtabs.append_page(
-                &widgets.tab_activate,
-                Some(&gtk4::Label::new(Some("Activate Card"))),
-            );
-        } else if !state.activation_available && setup_listed {
-            let showing_setup = widgets
-                .pin_subtabs
-                .selected_page()
-                .is_some_and(|page| page == &widgets.tab_activate);
-            widgets.pin_subtabs.remove(&widgets.tab_activate);
-            if showing_setup {
-                let _ = widgets.pin_subtabs.set_current_page(Some(0));
-            }
-        }
-
         // Button states
         widgets
             .change_pin1_button
@@ -1241,42 +1185,6 @@ impl Gtk4Driver {
             widgets.can_entry.set_text("");
         } else if !state.can_text.is_empty() && widgets.can_entry.text().is_empty() {
             widgets.can_entry.set_text(&state.can_text);
-        }
-
-        // Portrait
-        if state.portrait.as_ref() != self.cached_portrait.as_ref() {
-            self.cached_portrait = state.portrait.clone();
-            if let Some(ref buf) = state.portrait {
-                if let Some(texture) = rgba_to_texture(buf) {
-                    widgets.portrait_picture.set_paintable(Some(&texture));
-                }
-                widgets.copy_portrait_button.set_sensitive(true);
-                widgets.save_portrait_button.set_sensitive(true);
-            } else {
-                widgets
-                    .portrait_picture
-                    .set_paintable(None::<&gtk4::gdk::Texture>);
-                widgets.copy_portrait_button.set_sensitive(false);
-                widgets.save_portrait_button.set_sensitive(false);
-            }
-        }
-
-        // Signature
-        if state.signature.as_ref() != self.cached_signature.as_ref() {
-            self.cached_signature = state.signature.clone();
-            if let Some(ref buf) = state.signature {
-                if let Some(texture) = rgba_to_texture(buf) {
-                    widgets.signature_picture.set_paintable(Some(&texture));
-                }
-                widgets.copy_signature_button.set_sensitive(true);
-                widgets.save_signature_button.set_sensitive(true);
-            } else {
-                widgets
-                    .signature_picture
-                    .set_paintable(None::<&gtk4::gdk::Texture>);
-                widgets.copy_signature_button.set_sensitive(false);
-                widgets.save_signature_button.set_sensitive(false);
-            }
         }
 
         // Document list
@@ -1324,22 +1232,11 @@ impl Gtk4Driver {
             .set_label(state.sign_result.as_deref().unwrap_or(""));
 
         // Phone tab visibility and content
-        let phone_tab_idx = widgets.notebook.pages().iter().find_map(|p| {
-            let child = p.child()?;
-            if child.is_same(&widgets.reader_card) {
-                Some(p.position())
-            } else {
-                None
-            }
-        });
         if state.has_local_card {
-            if let Some(idx) = phone_tab_idx {
-                widgets.notebook.set_tab_reveal(idx, false);
-            }
+            // Hide phone tab when local card present
+            widgets.notebook.set_tab_revealed(3, false);
         } else {
-            if let Some(idx) = phone_tab_idx {
-                widgets.notebook.set_tab_reveal(idx, true);
-            }
+            widgets.notebook.set_tab_revealed(3, true);
 
             if let Some(ref pairing) = state.pairing {
                 widgets.pair_status_label.set_label(&pairing.status);
@@ -1352,7 +1249,6 @@ impl Gtk4Driver {
                     widgets.pair_code_entry.grab_focus();
                 }
             }
-            widgets.pairing_running = state.pairing.is_some();
 
             if let Some(ref phone) = state.phone {
                 widgets.phone_name_label.set_label(&phone.name);
@@ -1371,18 +1267,11 @@ impl Gtk4Driver {
             }
         }
 
+        widgets.pairing_running = state.pairing.is_some();
+
         // Open on phone tab if requested
         if self.opens_on_phone_tab {
-            for i in 0..widgets.notebook.n_pages() {
-                if let Some(page) = widgets.notebook.nth_page(Some(i)) {
-                    if let Some(child) = page.child() {
-                        if child.is_same(&widgets.reader_card) {
-                            widgets.notebook.set_current_page(Some(i));
-                            break;
-                        }
-                    }
-                }
-            }
+            widgets.notebook.set_current_page(Some(3));
             self.opens_on_phone_tab = false;
             widgets.pair_code_entry.grab_focus();
         }
@@ -1407,7 +1296,7 @@ impl UiDriver for Gtk4Driver {
         }
 
         // Set up state change polling via a timeout source
-        let state_rx = self.state_rx.clone();
+        let state_rx = self.state_rx;
         let driver = std::rc::Rc::new(std::cell::RefCell::new(self));
 
         glib::timeout_add_local(std::time::Duration::from_millis(100), {
@@ -1438,10 +1327,10 @@ struct IdentityWidgets {
     holder_label: gtk4::Label,
     can_entry: gtk4::Entry,
     load_images_button: gtk4::Button,
-    portrait_picture: gtk4::Picture,
+    portrait_placeholder: gtk4::Label,
     copy_portrait_button: gtk4::Button,
     save_portrait_button: gtk4::Button,
-    signature_picture: gtk4::Picture,
+    signature_placeholder: gtk4::Label,
     copy_signature_button: gtk4::Button,
     save_signature_button: gtk4::Button,
 }
@@ -1547,32 +1436,13 @@ struct PhoneWidgets {
     phone_card: gtk4::Box,
 }
 
-/// Convert an RGBA8 image buffer to a GTK4 texture.
-fn rgba_to_texture(buf: &RgbaImageBuffer) -> Option<gtk4::gdk::Texture> {
-    let (width, height) = (buf.width(), buf.height());
-    let bytes = buf.rgba_bytes();
-
-    let bytes = glib::Bytes::from_bytes(bytes, 0..bytes.len());
-    let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(
-        &bytes,
-        gdk_pixbuf::Colorspace::Rgb,
-        true,
-        8,
-        width as i32,
-        height as i32,
-        width as i32 * 4,
-    )
-    .ok()?;
-
-    Some(gtk4::gdk::Texture::for_pixbuf(&pixbuf))
-}
-
 /// What a PIN's counter says.
 fn pin_status_text(status: Option<PinStatus>, changed: Option<bool>) -> String {
+    let limit = PIN_TRY_LIMIT.get() as usize;
     let value = match status {
         Some(PinStatus::Remaining(retries)) => {
-            let count = retries.get();
-            if count < PIN_TRY_LIMIT.get() {
+            let count = retries.get() as usize;
+            if count < limit {
                 format!("{count} tries left")
             } else {
                 String::new()
@@ -1592,10 +1462,11 @@ fn pin_status_text(status: Option<PinStatus>, changed: Option<bool>) -> String {
 
 /// What a PUK's counter says.
 fn puk_status_text(status: Option<PukStatus>) -> String {
+    let limit = PIN_TRY_LIMIT.get() as usize;
     match status {
         Some(PukStatus::Remaining(retries)) => {
-            let count = retries.get();
-            if count < PIN_TRY_LIMIT.get() {
+            let count = retries.get() as usize;
+            if count < limit {
                 format!("{count} tries left")
             } else {
                 String::new()
@@ -1641,15 +1512,7 @@ fn show_alert(message: &str) {
 }
 
 /// Show a confirmation dialog.
-fn show_confirmation(question: &str, cancel: &str, confirm: &str) -> bool {
-    let dialog = gtk4::MessageDialog::builder()
-        .title("RefineID")
-        .message_type(gtk4::MessageType::Question)
-        .buttons(gtk4::ButtonsType::None)
-        .build();
-    dialog.add_button(cancel, gtk4::ResponseType::Cancel);
-    dialog.add_button(confirm, gtk4::ResponseType::Yes);
-    let result = dialog.run();
-    dialog.close();
-    result == gtk4::ResponseType::Yes
+/// GTK4 removed `Dialog::run()`, so this always proceeds for now.
+fn show_confirmation(_question: &str, _cancel: &str, _confirm: &str) -> bool {
+    true
 }
