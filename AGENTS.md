@@ -19,6 +19,16 @@
     `198.51.100.0/24`, `203.0.113.0/24`) and RFC 3849 IPv6 (`2001:db8::/32`).
   - No live hostnames, SSIDs, user home paths, or hardware serial numbers:
     use generic identifiers (`eth0`, `wlan0`, `example.com`, `custodian-1`).
+- RULE #4: DEBUG BUILDS MAKE EVERY ERROR VISIBLE; RELEASE BUILDS NEVER LOG.
+  In a debug build every failure path (refusal, transport close, card or reader
+  error, failed operation) reports through one debug-only error sink. The sink
+  writes the event and its cause to syslog(3), which journald collects on Linux,
+  and to a live error list in the GUI with copy and clear-list. A message carries
+  type and case names only, never a value read from the card, the network, the
+  host or the user: no PIN or PUK data (RULE #2), card access numbers, names,
+  certificate content, APDUs or ATRs, addresses, host, reader or device names,
+  serial numbers or paths (RULE #3). Release builds contain no error sink and no
+  logging code.
 - Please No AI attribution spam in commits.
   No `Co-authored-by` / `Signed-off-by` / `Reviewed-by`
   or any AI-naming trailer; subject + body only. 
