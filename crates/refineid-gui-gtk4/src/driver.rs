@@ -356,7 +356,6 @@ impl Gtk4Driver {
 
         let portrait_frame = gtk4::Frame::builder().build();
         let portrait_picture = gtk4::Picture::builder().build();
-        portrait_picture.set_content_fit(gtk4::ContentFit::Contain);
         portrait_frame.set_child(Some(&portrait_picture));
         portrait_frame.set_size_request(320, 330);
         portrait_card.append(&portrait_frame);
@@ -385,7 +384,6 @@ impl Gtk4Driver {
 
         let signature_frame = gtk4::Frame::builder().build();
         let signature_picture = gtk4::Picture::builder().build();
-        signature_picture.set_content_fit(gtk4::ContentFit::Contain);
         signature_frame.set_child(Some(&signature_picture));
         signature_frame.set_size_request(420, 160);
         signature_card.append(&signature_frame);
