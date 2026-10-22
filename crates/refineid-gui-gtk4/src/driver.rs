@@ -417,6 +417,7 @@ impl Gtk4Driver {
         let widgets = Self::build_ui(app, &controller_clone);
 
         // Show the window
+        widgets.window.show();
         widgets.window.present();
 
         // Apply initial state
