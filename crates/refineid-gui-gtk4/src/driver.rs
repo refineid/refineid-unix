@@ -310,9 +310,9 @@ impl Gtk4Driver {
                 ));
                 entry.set_position(pos + filtered.chars().count());
                 entry.unblock_signals();
-                glib::signal::Inhibit(true)
+                glib::Propagation::Stop
             } else {
-                glib::signal::Inhibit(false)
+                glib::Propagation::Proceed
             }
         });
         let load_images_button = gtk4::Button::builder().label("Load Photo").build();
@@ -623,9 +623,9 @@ impl Gtk4Driver {
                 entry.set_text(&new_text);
                 entry.set_position(new_text.chars().count());
                 entry.unblock_signals();
-                glib::signal::Inhibit(true)
+                glib::Propagation::Stop
             } else {
-                glib::signal::Inhibit(false)
+                glib::Propagation::Proceed
             }
         });
 
@@ -1064,9 +1064,9 @@ impl Gtk4Driver {
                 entry.set_text(&new_text);
                 entry.set_position(new_text.chars().count());
                 entry.unblock_signals();
-                glib::signal::Inhibit(true)
+                glib::Propagation::Stop
             } else {
-                glib::signal::Inhibit(false)
+                glib::Propagation::Proceed
             }
         });
         reader_card.append(&pair_code_entry);
