@@ -446,7 +446,7 @@ impl Gtk4Driver {
                 }
             ",
         );
-        if let Ok(display) = gtk4::gdk::Display::default() {
+        if let Some(display) = gtk4::gdk::Display::default() {
             gtk4::style_context_add_provider_for_display(
                 &display,
                 &css_provider,
@@ -568,7 +568,7 @@ impl Gtk4Driver {
 
         // Apply initial state
         let initial_state = controller.state();
-        render_state(&widgets, &initial_state);
+        widgets.apply_state(&initial_state);
 
         // Open on phone tab if requested
         if opens_on_phone_tab {
@@ -583,7 +583,7 @@ impl Gtk4Driver {
         glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
             let state = controller.state();
             driver2.borrow_mut().apply_state(&state);
-            glib::Continue(true)
+            glib::ControlFlow::Continue
         });
 
         // Poll the channel too
@@ -592,7 +592,7 @@ impl Gtk4Driver {
             while let Ok(state) = state_rx.try_recv() {
                 driver3.borrow_mut().apply_state(&state);
             }
-            glib::Continue(true)
+            glib::ControlFlow::Continue
         });
     }
 }
@@ -612,12 +612,7 @@ impl UiDriver for Gtk4Driver {
         let opens_on_phone_tab = self.opens_on_phone_tab;
 
         application.connect_activate(move |app| {
-            Self::run_ui(
-                app,
-                Arc::clone(&controller),
-                state_rx.clone(),
-                opens_on_phone_tab,
-            );
+            Self::run_ui(app, Arc::clone(&controller), state_rx, opens_on_phone_tab);
         });
 
         application.run();
