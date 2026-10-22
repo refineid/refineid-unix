@@ -1639,7 +1639,7 @@ impl CodeBoxes {
         container.append(&entry);
 
         Self {
-            container_widget,
+            container_widget: container,
             boxes,
             entry,
             length,
