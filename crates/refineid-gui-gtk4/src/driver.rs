@@ -183,9 +183,8 @@ impl Gtk4Driver {
 
         // Load CSS for code boxes and other styling.
         let css_provider = gtk4::CssProvider::new();
-        css_provider
-            .load_from_data(
-                b"
+        css_provider.load_from_data(
+            "
                 .code-box {
                     border: 2px solid #cccccc;
                     border-radius: 8px;
@@ -206,8 +205,7 @@ impl Gtk4Driver {
                     color: #333333;
                 }
             ",
-            )
-            .ok();
+        );
         gtk4::StyleContext::add_provider_for_display(
             &gtk4::gdk::Display::default().expect("no display"),
             &css_provider,
@@ -1641,7 +1639,7 @@ impl CodeBoxes {
         container.append(&entry);
 
         Self {
-            container_widget,
+            container,
             boxes,
             entry,
             length,
@@ -1677,19 +1675,12 @@ impl CodeBoxes {
 
     /// Return the current code text.
     fn text(&self) -> String {
-        self.entry.text()
+        self.entry.text().to_string()
     }
 
     /// Clear the entry and redraw.
     fn clear(&self) {
         self.entry.set_text("");
         self.render("");
-    }
-
-    /// The container widget.
-    fn container(&self) -> &gtk4::Box {
-        // The entry is appended to the same container as the boxes.
-        // We need access to the parent. Store it instead.
-        unreachable!()
     }
 }
