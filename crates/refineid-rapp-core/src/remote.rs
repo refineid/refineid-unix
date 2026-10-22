@@ -33,7 +33,7 @@ use crate::engine::{
 };
 use crate::file_store::FilePairingStore;
 use crate::ids::{CertificateFingerprint, PairId};
-use crate::message::{CardStatusMessage, CloseReason};
+use crate::message::{CardPresence, CardReader, CardStatusMessage, CloseReason};
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
 use crate::session_lock::{LockError, SessionLock, ceremony_lock_path, session_lock_path};
 use crate::store::{PairingRecord, PairingStore, PeerIntroduction, StoreError};
@@ -220,10 +220,38 @@ where
     Transport: FrameTransport,
 {
     if session.card_present() != Some(true) {
-        return Err(RemoteError::CardAbsent);
+        return Err(RemoteError::CardAbsent(CardRequest::of(
+            session.card_status(),
+        )));
     }
     let outcome = requester.execute(session, operation, lifetime_ms(lifetime));
     operation_result(outcome, ended_by(session.end()))
+}
+
+/// Where the user is asked to give the phone its card (RAPP v26.10.22
+/// section 8.4 item 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardRequest {
+    /// Into the phone's card reader: the phone's latest `card.status`
+    /// reports the card absent and a reader attached.
+    InPhoneReader,
+    /// To the phone itself, in every other case.
+    ToPhone,
+}
+
+impl CardRequest {
+    /// The request the latest `card.status` on an open session calls for;
+    /// a session whose phone has reported nothing asks at the phone.
+    #[must_use]
+    pub const fn of(status: Option<CardStatusMessage>) -> Self {
+        match status {
+            Some(CardStatusMessage {
+                card: CardPresence::Absent,
+                reader: CardReader::Attached,
+            }) => Self::InPhoneReader,
+            _ => Self::ToPhone,
+        }
+    }
 }
 
 /// Why a remote reader call ended without its answer.
@@ -240,8 +268,9 @@ pub enum RemoteError {
     /// The phone told this computer that it forgot it; the pairing is
     /// revoked here and the user pairs again.
     RevokedByPhone,
-    /// The phone opened the session but reports no card it can serve.
-    CardAbsent,
+    /// The phone opened the session but reports no card it can serve;
+    /// where the user is asked to give it the card.
+    CardAbsent(CardRequest),
     /// The certificate read from the card is not the one the phone
     /// reports serving: the card changed during the read.
     CardChanged,
@@ -269,7 +298,12 @@ impl core::fmt::Display for RemoteError {
             Self::NotFound => f.write_str("no phone found on the local network"),
             Self::Withdrawn => f.write_str("the phone turned remote card access off"),
             Self::RevokedByPhone => f.write_str("the phone forgot this computer; pair it again"),
-            Self::CardAbsent => f.write_str("the phone has no card on it"),
+            Self::CardAbsent(CardRequest::InPhoneReader) => {
+                f.write_str("the phone has no card; insert the card into the phone's card reader")
+            }
+            Self::CardAbsent(CardRequest::ToPhone) => {
+                f.write_str("the phone has no card; present the card to the phone")
+            }
             Self::CardChanged => f.write_str("the card on the phone changed; try again"),
             Self::RandomUnavailable => f.write_str("the system random source failed"),
             Self::Pairing(error) => write!(f, "pairing: {error}"),
@@ -365,9 +399,23 @@ impl RemoteSession {
     #[must_use]
     pub const fn card_fingerprint(&self) -> Option<CertificateFingerprint> {
         match self.session.card_status() {
-            Some(CardStatusMessage::Present(fingerprint)) => Some(fingerprint),
-            Some(CardStatusMessage::Absent) | None => None,
+            Some(CardStatusMessage {
+                card: CardPresence::Present(fingerprint),
+                ..
+            }) => Some(fingerprint),
+            Some(CardStatusMessage {
+                card: CardPresence::Absent,
+                ..
+            })
+            | None => None,
         }
+    }
+
+    /// Where the user is asked to give the phone its card, by the phone's
+    /// latest report on this session (section 8.4 item 6).
+    #[must_use]
+    pub const fn card_request(&self) -> CardRequest {
+        CardRequest::of(self.session.card_status())
     }
 
     /// The pairing this session serves.
@@ -812,8 +860,9 @@ impl RemoteReader {
                         });
                     }
                     Ok(false) => {
+                        let request = CardRequest::of(session.card_status());
                         self.requester.disconnect(&mut session, CloseReason::Normal);
-                        return Err(RemoteError::CardAbsent);
+                        return Err(RemoteError::CardAbsent(request));
                     }
                     Err(
                         error @ SessionError::ClosedByPeer(
@@ -947,7 +996,9 @@ impl RemoteReader {
         &mut self,
         session: &mut RemoteSession,
     ) -> Result<Vec<u8>, RemoteError> {
-        let reported = session.card_fingerprint().ok_or(RemoteError::CardAbsent)?;
+        let reported = session
+            .card_fingerprint()
+            .ok_or_else(|| RemoteError::CardAbsent(session.card_request()))?;
         let pair_id = session.pair_id();
         let cached = self
             .requester
@@ -1014,7 +1065,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AdmissionError, CardOperationResult, OperationOutcome, PairingKeys, RemoteError,
+        AdmissionError, CardOperationResult, CardPresence, CardReader, CardRequest,
+        CardStatusMessage, CertificateFingerprint, OperationOutcome, PairingKeys, RemoteError,
         RemoteReader, StreamService, current_time_ms, lifetime_ms, operation_result, sessions_for,
         unix_seconds,
     };
@@ -1047,6 +1099,43 @@ mod tests {
     /// A lifetime of a millisecond and a half, sent as one millisecond.
     const SUB_MILLISECOND_MICROS: u64 = 1_500;
     const SUB_MILLISECOND_MS: u64 = 1;
+
+    #[test]
+    fn the_phones_reader_is_named_only_for_an_absent_card_beside_an_attached_reader() {
+        let present = CardPresence::Present(CertificateFingerprint::of_certificate(CERTIFICATE));
+        for (card, reader, request) in [
+            (
+                CardPresence::Absent,
+                CardReader::Attached,
+                CardRequest::InPhoneReader,
+            ),
+            (
+                CardPresence::Absent,
+                CardReader::Absent,
+                CardRequest::ToPhone,
+            ),
+            (present, CardReader::Attached, CardRequest::ToPhone),
+            (present, CardReader::Absent, CardRequest::ToPhone),
+        ] {
+            assert_eq!(
+                CardRequest::of(Some(CardStatusMessage { card, reader })),
+                request
+            );
+        }
+        assert_eq!(CardRequest::of(None), CardRequest::ToPhone);
+    }
+
+    #[test]
+    fn an_absent_card_is_asked_for_where_the_phone_can_take_it() {
+        assert_eq!(
+            RemoteError::CardAbsent(CardRequest::InPhoneReader).to_string(),
+            "the phone has no card; insert the card into the phone's card reader"
+        );
+        assert_eq!(
+            RemoteError::CardAbsent(CardRequest::ToPhone).to_string(),
+            "the phone has no card; present the card to the phone"
+        );
+    }
 
     fn scratch() -> std::path::PathBuf {
         let suffix = getrandom::u64().unwrap();

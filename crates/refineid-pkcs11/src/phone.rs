@@ -826,7 +826,7 @@ const fn signature_algorithm(algorithm: RemoteSignatureAlgorithm) -> SignatureAl
 /// The module's view of a failed request.
 fn sign_error(error: &RemoteError) -> RemoteSignError {
     match error {
-        RemoteError::CardAbsent | RemoteError::CardChanged => RemoteSignError::CardAbsent,
+        RemoteError::CardAbsent(_) | RemoteError::CardChanged => RemoteSignError::CardAbsent,
         RemoteError::Withdrawn | RemoteError::RevokedByPhone => RemoteSignError::Withdrawn,
         RemoteError::Outcome(outcome) => outcome_error(outcome),
         _ => RemoteSignError::Unreachable,
@@ -882,6 +882,7 @@ fn pause(shared: &Shared, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refineid_rapp_core::remote::CardRequest;
 
     const DIGEST_SHA384_LEN: usize = 48;
 
@@ -912,7 +913,7 @@ mod tests {
     #[test]
     fn every_phone_answer_maps_to_a_module_error() {
         assert_eq!(
-            sign_error(&RemoteError::CardAbsent),
+            sign_error(&RemoteError::CardAbsent(CardRequest::ToPhone)),
             RemoteSignError::CardAbsent
         );
         assert_eq!(
