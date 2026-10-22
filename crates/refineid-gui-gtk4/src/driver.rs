@@ -927,24 +927,25 @@ impl Gtk4Driver {
         {
             let c = Arc::clone(controller);
             add_document_button.connect_clicked(move |_| {
-                let file_dialog = gtk4::FileDialog::builder()
+                let dialog = gtk4::FileChooserDialog::builder()
                     .title("Select PDF Documents")
+                    .action(gtk4::FileChooserAction::Open)
+                    .modal(true)
                     .build();
-                let filters = gtk4::FileFilter::new();
-                filters.set_name(Some("PDF Documents"));
-                filters.add_pattern("*.pdf");
-                let filters_list = gtk4::FileFilterList::new();
-                filters_list.append(&filters);
-                file_dialog.set_filters(&filters_list);
-                file_dialog.select_multiple_files(None, None, move |result| {
-                    if let Ok(files) = result {
-                        let paths: Vec<std::path::PathBuf> =
-                            files.iter().filter_map(|f| f.path()).collect();
-                        if !paths.is_empty() {
-                            c.handle_intent(UserIntent::AddDocuments(paths));
-                        }
+                dialog.set_select_multiple(true);
+                let filter = gtk4::FileFilter::new();
+                filter.set_name(Some("PDF Documents"));
+                filter.add_pattern("*.pdf");
+                dialog.add_filter(&filter);
+                if dialog.run() == gtk4::ResponseType::Accept {
+                    let files = dialog.files();
+                    let paths: Vec<std::path::PathBuf> =
+                        files.iter().filter_map(|f| f.path()).collect();
+                    if !paths.is_empty() {
+                        c.handle_intent(UserIntent::AddDocuments(paths));
                     }
-                });
+                }
+                dialog.close();
             });
         }
         {
