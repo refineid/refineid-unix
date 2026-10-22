@@ -181,6 +181,10 @@ impl Gtk4Driver {
         // Initialize GTK before creating any widgets.
         gtk4::init().expect("failed to initialize GTK");
 
+        // Register the application so the startup signal is emitted
+        // before we create any windows.
+        let _ = self.application.register();
+
         let window = gtk4::ApplicationWindow::builder()
             .application(&self.application)
             .default_width(920)
