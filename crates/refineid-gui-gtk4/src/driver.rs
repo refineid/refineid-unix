@@ -16,7 +16,7 @@ use refineid_gui_core::error::GuiCoreError;
 use refineid_gui_core::model::{SignFormat, UiState, UserIntent};
 use refineid_lib_core::auth::{PIN_TRY_LIMIT, PinStatus, PukStatus};
 use refineid_lib_core::pin::PinBytes;
-use refineid_rapp_core::offer::{PAIRING_CODE_LENGTH, pairing_code_character};
+use refineid_rapp_core::offer::PAIRING_CODE_LENGTH;
 
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -132,7 +132,6 @@ struct Gtk4Widgets {
 pub struct Gtk4Driver {
     application: gtk4::Application,
     state_tx: mpsc::Sender<UiState>,
-    state_rx: mpsc::Receiver<UiState>,
     opens_on_phone_tab: bool,
     widgets: Option<Gtk4Widgets>,
 }
@@ -155,7 +154,8 @@ impl Gtk4Driver {
     }
 
     /// Create a new GTK4 driver and its state notification callback.
-    pub fn create() -> (Self, StateChangeCallback) {
+    /// Returns the driver, the callback, and the state receiver for `run()`.
+    pub fn create() -> (Self, StateChangeCallback, mpsc::Receiver<UiState>) {
         let application = gtk4::Application::builder()
             .application_id("fi.refineid.gui")
             .build();
@@ -169,12 +169,11 @@ impl Gtk4Driver {
         let driver = Self {
             application,
             state_tx,
-            state_rx,
             opens_on_phone_tab: false,
             widgets: None,
         };
 
-        (driver, on_state_change)
+        (driver, on_state_change, state_rx)
     }
 
     /// Build all UI controls and attach callbacks dispatching to `controller`.
@@ -325,7 +324,6 @@ impl Gtk4Driver {
             .build();
         can_entry.connect_insert_text(move |entry, text, _position| {
             filter_digits(entry, text, 6);
-            glib::Propagation::Proceed
         });
         let load_images_button = gtk4::Button::builder().label("Load Photo").build();
         can_bar.append(&can_label);
@@ -641,7 +639,6 @@ impl Gtk4Driver {
             .build();
         entry.connect_insert_text(move |entry, text, _position| {
             filter_digits(entry, text, max_digits);
-            glib::Propagation::Proceed
         });
 
         let reveal_btn = gtk4::Button::builder().build();
@@ -985,19 +982,19 @@ impl Gtk4Driver {
         }
         {
             let c = Arc::clone(controller);
-            let pin2 = sign_pin2_entry.entry.clone();
+            let pin2_entry = sign_pin2_entry.entry.clone();
             sign_button.connect_clicked(move |_| {
-                let pin2_val = pin2.text();
+                let pin2_val = pin2_entry.text();
                 if pin2_val.len() < MIN_PIN2_DIGITS {
                     show_alert("PIN2 must be at least 6 digits.");
                     return;
                 }
-                let Some(pin2) = to_pin_bytes(&pin2_val) else {
+                let Some(pin2_bytes) = to_pin_bytes(&pin2_val) else {
                     show_alert("PIN2 contains invalid characters.");
                     return;
                 };
-                c.handle_intent(UserIntent::SignDocuments { pin2 });
-                pin2.set_text("");
+                c.handle_intent(UserIntent::SignDocuments { pin2: pin2_bytes });
+                pin2_entry.set_text("");
             });
         }
 
@@ -1048,7 +1045,6 @@ impl Gtk4Driver {
             .build();
         pair_code_entry.connect_insert_text(move |entry, text, _position| {
             filter_digits(entry, text, PAIRING_CODE_LEN);
-            glib::Propagation::Proceed
         });
         reader_card.append(&pair_code_entry);
 
@@ -1092,7 +1088,9 @@ impl Gtk4Driver {
             pair_code_entry.connect_activate(move |entry| {
                 let code = entry.text();
                 if code.chars().count() == PAIRING_CODE_LEN {
-                    c.handle_intent(UserIntent::StartPairing { code });
+                    c.handle_intent(UserIntent::StartPairing {
+                        code: code.to_string(),
+                    });
                 }
             });
             pair_code_entry.connect_changed(move |entry| {
@@ -1195,6 +1193,7 @@ impl Gtk4Driver {
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
+                .map(|s| s.to_owned())
                 .unwrap_or_else(|| path.display().to_string());
             let row = gtk4::ListBoxRow::builder().build();
             let label = gtk4::Label::builder()
@@ -1232,12 +1231,7 @@ impl Gtk4Driver {
             .set_label(state.sign_result.as_deref().unwrap_or(""));
 
         // Phone tab visibility and content
-        if state.has_local_card {
-            // Hide phone tab when local card present
-            widgets.notebook.set_tab_revealed(3, false);
-        } else {
-            widgets.notebook.set_tab_revealed(3, true);
-
+        if !state.has_local_card {
             if let Some(ref pairing) = state.pairing {
                 widgets.pair_status_label.set_label(&pairing.status);
                 widgets.pair_code_entry.set_sensitive(false);
@@ -1265,6 +1259,11 @@ impl Gtk4Driver {
                 widgets.phone_card.set_visible(false);
                 widgets.reader_card.set_visible(true);
             }
+        } else {
+            widgets.phone_card.set_visible(false);
+            widgets.reader_card.set_visible(false);
+            widgets.pair_status_label.set_label("");
+            widgets.pair_code_entry.set_sensitive(false);
         }
 
         widgets.pairing_running = state.pairing.is_some();
@@ -1287,7 +1286,11 @@ impl UiDriver for Gtk4Driver {
         self.render_widgets(state);
     }
 
-    fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
+    fn run(
+        self,
+        controller: Arc<RefineIdController>,
+        state_rx: mpsc::Receiver<UiState>,
+    ) -> Result<(), GuiCoreError> {
         self.init_ui(&controller);
         self.render_widgets(&controller.state());
 
@@ -1296,7 +1299,6 @@ impl UiDriver for Gtk4Driver {
         }
 
         // Set up state change polling via a timeout source
-        let state_rx = self.state_rx;
         let driver = std::rc::Rc::new(std::cell::RefCell::new(self));
 
         glib::timeout_add_local(std::time::Duration::from_millis(100), {
@@ -1438,7 +1440,7 @@ struct PhoneWidgets {
 
 /// What a PIN's counter says.
 fn pin_status_text(status: Option<PinStatus>, changed: Option<bool>) -> String {
-    let limit = PIN_TRY_LIMIT.get() as usize;
+    let limit = PIN_TRY_LIMIT as usize;
     let value = match status {
         Some(PinStatus::Remaining(retries)) => {
             let count = retries.get() as usize;
@@ -1462,7 +1464,7 @@ fn pin_status_text(status: Option<PinStatus>, changed: Option<bool>) -> String {
 
 /// What a PUK's counter says.
 fn puk_status_text(status: Option<PukStatus>) -> String {
-    let limit = PIN_TRY_LIMIT.get() as usize;
+    let limit = PIN_TRY_LIMIT as usize;
     match status {
         Some(PukStatus::Remaining(retries)) => {
             let count = retries.get() as usize;
@@ -1502,6 +1504,7 @@ fn slot_label(slot: PinManageSlot) -> &'static str {
 fn show_alert(message: &str) {
     let dialog = gtk4::MessageDialog::builder()
         .title("RefineID")
+        .text(message)
         .message_type(gtk4::MessageType::Error)
         .buttons(gtk4::ButtonsType::Ok)
         .build();
