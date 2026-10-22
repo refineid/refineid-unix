@@ -424,9 +424,16 @@ fn hold(
         }
         if record_checked.elapsed() >= RECORD_CHECK_INTERVAL {
             record_checked = Instant::now();
-            if forgotten_here(phone.pair_id) {
-                reader.revoke_in_session(session);
-                return After::Withdraw;
+            match held_record(phone.pair_id) {
+                HeldRecord::Usable | HeldRecord::Unreadable => {}
+                HeldRecord::Forgotten => {
+                    reader.revoke_in_session(session);
+                    return After::Withdraw;
+                }
+                HeldRecord::Gone => {
+                    reader.close_session(session);
+                    return After::Withdraw;
+                }
             }
         }
         match reader.service(&mut session, SERVICE_STEP) {
@@ -467,18 +474,37 @@ fn confirm(
     Some((certificate, fingerprint))
 }
 
-/// Whether this computer's user forgot the held pairing, as the record
-/// another program keeps says (RAPP v26.10.21 section 4.6): forgotten
-/// here, or superseded by a new pairing. Only that word revokes; a store
-/// that cannot be read, or a record that does not decode, concludes
-/// nothing (section 10.1).
-fn forgotten_here(pair_id: PairId) -> bool {
-    RemoteReader::open_local_without_sweep().is_ok_and(|reader| {
-        reader
-            .pairs()
-            .iter()
-            .any(|pair| pair.pair_id == pair_id && pair.state == PairingState::Revoking)
-    })
+/// What the record another program keeps says of the held pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldRecord {
+    /// The record still names the pairing as usable.
+    Usable,
+    /// This computer's user forgot the pairing, or a new pairing
+    /// superseded it (RAPP v26.10.21 section 4.6): the phone is told.
+    Forgotten,
+    /// The store reads but holds no usable record of the pairing: the
+    /// record is gone or no longer decodes. That is no forget, so the
+    /// session closes without the revocation notice (section 10.1).
+    Gone,
+    /// The store cannot be read just now; nothing is concluded.
+    Unreadable,
+}
+
+/// The held pairing as the record another program keeps says.
+fn held_record(pair_id: PairId) -> HeldRecord {
+    let Ok(reader) = RemoteReader::open_local_without_sweep() else {
+        return HeldRecord::Unreadable;
+    };
+    let state = reader
+        .pairs()
+        .into_iter()
+        .find(|pair| pair.pair_id == pair_id)
+        .map(|pair| pair.state);
+    match state {
+        Some(PairingState::PairedDisconnected) => HeldRecord::Usable,
+        Some(PairingState::Revoking) => HeldRecord::Forgotten,
+        _ => HeldRecord::Gone,
+    }
 }
 
 /// Why a request yielded no signature for the browser.

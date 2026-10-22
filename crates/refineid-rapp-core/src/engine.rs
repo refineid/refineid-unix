@@ -840,9 +840,10 @@ impl<Store: PairingStore> Requester<Store> {
 
     /// Tells the custodian on `session` that this computer forgot the
     /// pairing (section 4.6 item 1): sends `session.close` with reason
-    /// `pairing_revoked` and closes the session. Once the close is sent, a
-    /// forgotten record's key is destroyed; a session that already ended
-    /// leaves the record for the next session's notice.
+    /// `pairing_revoked` and closes the session. Once the close is sent,
+    /// the key of a record the store durably holds as forgotten is
+    /// destroyed (item 3); a session that already ended leaves the record
+    /// for the next session's notice.
     pub fn revoke_in_session<Transport: FrameTransport>(
         &mut self,
         session: &mut Session<Transport>,
@@ -858,12 +859,10 @@ impl<Store: PairingStore> Requester<Store> {
             linger(&mut session.transport);
         }
         session.finish(SessionEnd::LocalClose);
-        let forgotten = self
-            .store
-            .get(session.pair_id)
-            .is_ok_and(|record| record.state() == PairingState::Revoking);
-        if sent && forgotten {
-            let _ = self.store.remove(session.pair_id);
+        if sent {
+            let _ = self.store.update(session.pair_id, &mut |record| {
+                (record.state() != PairingState::Revoking).then_some(record)
+            });
         }
     }
 
@@ -1085,13 +1084,12 @@ impl<Store: PairingStore> Requester<Store> {
     /// [`StoreError`] when no record names `pair_id` or the store refuses
     /// the write.
     pub fn forget(&mut self, pair_id: PairId, now_ms: u64) -> Result<(), StoreError> {
-        match self.store.get(pair_id)?.state() {
-            PairingState::PairedDisconnected => self
-                .store
-                .update(pair_id, &mut |record| Some(record.forgotten(now_ms))),
-            PairingState::Revoking => Ok(()),
-            _ => self.store.remove(pair_id),
-        }
+        self.store
+            .update(pair_id, &mut |record| match record.state() {
+                PairingState::PairedDisconnected => Some(record.forgotten(now_ms)),
+                PairingState::Revoking => Some(record),
+                _ => None,
+            })
     }
 
     /// Destroys, untold, every forgotten pairing whose key has waited the
@@ -1102,18 +1100,25 @@ impl<Store: PairingStore> Requester<Store> {
         self.remove_where(|record| record.pairing().revocation_notice_expired(now_ms))
     }
 
-    /// Removes every record `doomed` names, its key with it; returns how
-    /// many went.
+    /// Removes every record `doomed` names, as the store durably holds it,
+    /// its key with it; returns how many went.
     fn remove_where(&mut self, doomed: impl Fn(&PairingRecord) -> bool) -> usize {
-        let pair_ids: Vec<PairId> = self
+        let candidates: Vec<PairId> = self
             .store
             .pair_ids()
             .into_iter()
             .filter(|pair_id| self.store.get(*pair_id).is_ok_and(&doomed))
             .collect();
-        pair_ids
+        candidates
             .into_iter()
-            .filter(|pair_id| self.store.remove(*pair_id).is_ok())
+            .filter(|pair_id| {
+                let mut removed = false;
+                let _ = self.store.update(*pair_id, &mut |record| {
+                    removed = doomed(&record);
+                    (!removed).then_some(record)
+                });
+                removed
+            })
             .count()
     }
 

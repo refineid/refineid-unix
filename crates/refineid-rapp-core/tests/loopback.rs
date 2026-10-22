@@ -36,6 +36,7 @@ use refineid_rapp_core::engine::{
     OperationOutcome, PairingError, Requester, RequesterConfig, Session, SessionEnd, SessionError,
     current_time_ms,
 };
+use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::profiles::{
     PROFILE_AUTHENTICATION, PROFILE_CARD_STATUS, PROFILE_DOCUMENT_SIGNING,
 };
@@ -150,12 +151,17 @@ impl PairingStore for HaltingStore {
 }
 
 fn test_requester() -> TestRequester {
+    requester_over(MemoryPairingStore::new())
+}
+
+/// A requester engine over `store`.
+fn requester_over<Store: PairingStore>(store: Store) -> Requester<Store> {
     Requester::new(
         RequesterConfig {
             display_name: "Workstation".into(),
             platform: "Linux".into(),
         },
-        MemoryPairingStore::new(),
+        store,
     )
 }
 
@@ -413,8 +419,8 @@ fn paired<Store: PairingStore>(
 
 /// Opens a session with the custodian thread running `script` on its
 /// half, and waits for the custodian's first card report.
-fn connected<F>(
-    requester: &mut TestRequester,
+fn connected<Store: PairingStore, F>(
+    requester: &mut Requester<Store>,
     pair_id: PairId,
     record: PairRecord,
     script: F,
@@ -652,6 +658,51 @@ fn a_pairing_forgotten_during_a_session_is_closed_on_it() {
     proxy.join().unwrap();
     assert_eq!(session.end(), Some(SessionEnd::LocalClose));
     assert!(requester.store().get(pair_id).is_err());
+}
+
+#[test]
+fn a_pairing_another_program_forgot_during_a_session_loses_its_key_file_with_the_close() {
+    let directory = std::env::temp_dir().join(format!(
+        "refineid-rapp-loopback-{:x}",
+        getrandom::u64().unwrap()
+    ));
+    let mut requester = requester_over(FilePairingStore::open(&directory).unwrap());
+    let (pair_id, proxy_pairing) = paired(&mut requester, &[ProfileName::CardStatus]);
+    let (mut session, proxy) =
+        connected(&mut requester, pair_id, proxy_pairing, |mut custodian| {
+            assert_eq!(custodian.receive_close(), CloseReason::PairingRevoked);
+        });
+    // Another program on this computer forgets the phone while this one
+    // holds the session; this program's copy of the record still reads
+    // usable.
+    FilePairingStore::open(&directory)
+        .unwrap()
+        .update(pair_id, &mut |record| {
+            Some(record.forgotten(current_time_ms()))
+        })
+        .unwrap();
+    assert_eq!(
+        requester.store().get(pair_id).unwrap().state(),
+        PairingState::PairedDisconnected
+    );
+    requester.revoke_in_session(&mut session);
+    proxy.join().unwrap();
+    // Section 4.6 item 3: the key is destroyed once the close is sent,
+    // file and all.
+    assert!(requester.store().get(pair_id).is_err());
+    assert!(
+        FilePairingStore::open(&directory)
+            .unwrap()
+            .pair_ids()
+            .is_empty()
+    );
+    let leftover_records = std::fs::read_dir(&directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pair"))
+        .count();
+    assert_eq!(leftover_records, 0);
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]

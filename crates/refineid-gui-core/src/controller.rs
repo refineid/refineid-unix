@@ -883,12 +883,12 @@ fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String
         Some(RemoteError::RevokedByPhone) => format!("{phone} forgot this computer; pair again"),
         Some(RemoteError::Withdrawn) => format!("{phone} turned remote card access off"),
         Some(RemoteError::Outcome(outcome))
-            if matches!(
-                **outcome,
-                OperationOutcome::Cancelled(_) | OperationOutcome::Lost
-            ) =>
+            if matches!(**outcome, OperationOutcome::Cancelled(_)) =>
         {
             format!("{phone} ended the read before a card was read")
+        }
+        Some(RemoteError::Outcome(outcome)) if matches!(**outcome, OperationOutcome::Lost) => {
+            format!("The connection to {phone} ended before the card was read")
         }
         Some(RemoteError::Outcome(outcome)) if matches!(**outcome, OperationOutcome::Refused) => {
             format!("{phone}'s message was not understood")
@@ -1035,6 +1035,7 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refineid_rapp_core::message::ResultError;
 
     #[test]
     fn the_pairing_line_says_only_what_stands_in_the_way() {
@@ -1046,9 +1047,18 @@ mod tests {
         assert_eq!(
             pairing_outcome_line(
                 "Alpha Phone",
-                Some(&RemoteError::Outcome(Box::new(OperationOutcome::Lost)))
+                Some(&RemoteError::Outcome(Box::new(
+                    OperationOutcome::Cancelled(ResultError::OperationExpired)
+                )))
             ),
             "Alpha Phone ended the read before a card was read"
+        );
+        assert_eq!(
+            pairing_outcome_line(
+                "Alpha Phone",
+                Some(&RemoteError::Outcome(Box::new(OperationOutcome::Lost)))
+            ),
+            "The connection to Alpha Phone ended before the card was read"
         );
         assert_eq!(
             pairing_outcome_line(

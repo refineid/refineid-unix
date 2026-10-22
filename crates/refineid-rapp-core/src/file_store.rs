@@ -224,7 +224,12 @@ impl PairingStore for FilePairingStore {
                 if record.pair_id() != pair_id {
                     return Some(record);
                 }
-                let durable = match change(record) {
+                // Another program may have rewritten or removed the file
+                // since this store read it: the change applies to the
+                // record as the disk holds it now, and a record the disk
+                // no longer holds readably is gone.
+                let current = read_record(directory, pair_id)?;
+                let durable = match change(current) {
                     Some(next) => write_record(directory, &next).map(|()| Some(next)),
                     None => delete_record(directory, pair_id).map(|()| None),
                 };
@@ -372,11 +377,15 @@ mod tests {
         let pair_id = PairId::from_array(FIRST);
         let mut store = FilePairingStore::open(&directory).unwrap();
         store.insert(record(pair_id)).unwrap();
-        std::fs::write(directory.join("garbage.pair"), b"not a record").unwrap();
+        let garbage = directory.join("garbage.pair");
+        std::fs::write(&garbage, b"not a record").unwrap();
         store.remove(pair_id).unwrap();
         assert!(!path_for(&directory, pair_id).exists());
         let reopened = FilePairingStore::open(&directory).unwrap();
         assert!(reopened.pair_ids().is_empty());
+        // A file that is no record of any revision is skipped, never
+        // deleted.
+        assert!(garbage.exists());
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

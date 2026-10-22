@@ -226,6 +226,9 @@ pub trait PairingStore {
 
     /// Replaces one record by what `change` makes of it, atomically: its
     /// successor, or nothing, which removes the record and its key.
+    /// `change` is given the record as the store durably holds it now,
+    /// which another program sharing the store may have rewritten since
+    /// this one read it.
     ///
     /// # Errors
     ///
