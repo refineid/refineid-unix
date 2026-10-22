@@ -19,22 +19,25 @@
     reason = "tests panic to fail; documenting each panic adds nothing"
 )]
 
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use refineid_rapp::{
-    BinaryFrame, CardInspection, CardKeyProfile as KeyProfile, CardOperation, CardOperationResult,
-    CardPresence, CardReader, CardStatusMessage, CertificateFingerprint, CloseReason,
-    CpaceKc2Responder, DEFAULT_OPERATION_LIFETIME_MS, EndpointRole, EstablishedSessionRuntime,
-    LIVENESS_CHALLENGE_SIZE, LIVENESS_PING_AFTER_SILENCE_MS, OperationId, OperationRequest,
-    OperationResultMessage, PairId, PairRecord, PairingHandshake, PairingOffer, PairingState,
-    PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage, ProxyDispatch, ProxyFailure,
-    ProxyOperationEngine, REVOCATION_NOTICE_MS, ResultError, RuntimePoll, RuntimeReceive,
-    SESSION_READY_NONCE_SIZE, SessionHandshake, SignatureAlgorithm, TransportProfile, TypedMessage,
-    UserApproval, generate_pair_key_material, standard_pairing_context_v2,
+    BinaryFrame, CPACE_ATTEMPT_WINDOW_MS, CardInspection, CardKeyProfile as KeyProfile,
+    CardOperation, CardOperationResult, CardPresence, CardReader, CardStatusMessage,
+    CertificateFingerprint, CloseReason, CpaceKc2Responder, DEFAULT_OPERATION_LIFETIME_MS,
+    EndpointRole, EstablishedSessionRuntime, LIVENESS_CHALLENGE_SIZE,
+    LIVENESS_PING_AFTER_SILENCE_MS, OFFER_ID_SIZE, OfferId, OperationId, OperationRequest,
+    OperationResultMessage, PAIRING_CANDIDATES_MAX, PairId, PairRecord, PairingHandshake,
+    PairingOffer, PairingState, PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage,
+    ProxyDispatch, ProxyFailure, ProxyOperationEngine, REVOCATION_NOTICE_MS, ResultError,
+    RuntimePoll, RuntimeReceive, SESSION_READY_NONCE_SIZE, SessionHandshake, SignatureAlgorithm,
+    TransportProfile, TypedMessage, UserApproval, generate_pair_key_material,
+    standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
-    OperationOutcome, PairingError, Requester, RequesterConfig, Session, SessionEnd, SessionError,
-    current_time_ms,
+    OpenedConnection, OperationOutcome, PairingCandidateSource, PairingError, PairingSearchError,
+    Requester, RequesterConfig, Session, SessionEnd, SessionError, current_time_ms, read_offer,
 };
 use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::profiles::{
@@ -42,7 +45,7 @@ use refineid_rapp_core::profiles::{
 };
 use refineid_rapp_core::remote::{CardRequest, RemoteError, execute_on_session};
 use refineid_rapp_core::store::{MemoryPairingStore, PairingRecord, PairingStore, StoreError};
-use refineid_rapp_core::transport::{FrameTransport, MemoryTransport};
+use refineid_rapp_core::transport::{FrameTransport, MemoryTransport, TransportError};
 
 /// A generous deadline for scripted exchanges.
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -52,6 +55,15 @@ const CANDIDATE: &str = "loopback-1";
 const SESSION_START_MS: u64 = 1_000_000;
 /// The code the scripted custodian shows.
 const SHOWN_CODE: &str = "7KX4M9";
+/// The code another phone in pairing mode shows.
+const OTHER_CODE: &str = "7KX4MA";
+/// The offer one custodian serves on each endpoint it is found on.
+const SHARED_OFFER_ID: [u8; OFFER_ID_SIZE] = *b"synthetic offer of one custodian";
+/// The endpoint of the second scripted custodian a search finds.
+const SECOND_ENDPOINT: usize = 1;
+/// How long a scripted custodian waits for the requester while it tries
+/// another custodian first: longer than the attempt deadline.
+const OUTLASTS_ATTEMPT: Duration = Duration::from_secs(10);
 /// Uniform bytes a `CPace` scalar is drawn from (section 6.1.1).
 const CPACE_SCALAR_ENTROPY_BYTES: usize = 64;
 /// Fixed custodian scalar entropy for the scripted exchange.
@@ -96,10 +108,15 @@ const SHORT_WAIT: Duration = Duration::from_millis(100);
 /// The custodian's random stream offer and its bootstrap bytes (section
 /// 4.2), and the CPace context it binds.
 fn custodian_offer() -> (PairingOffer, Vec<u8>, Vec<u8>) {
-    let mut offer_id = [0_u8; refineid_rapp::OFFER_ID_SIZE];
+    let mut offer_id = [0_u8; OFFER_ID_SIZE];
     getrandom::fill(&mut offer_id).unwrap();
+    custodian_offer_with(OfferId::from_array(offer_id))
+}
+
+/// As [`custodian_offer`], under `offer_id`.
+fn custodian_offer_with(offer_id: OfferId) -> (PairingOffer, Vec<u8>, Vec<u8>) {
     let offer = PairingOffer::create(
-        refineid_rapp::OfferId::from_array(offer_id),
+        offer_id,
         vec![
             PROFILE_CARD_STATUS.to_owned(),
             PROFILE_AUTHENTICATION.to_owned(),
@@ -448,11 +465,15 @@ fn paired<Store: PairingStore>(
 ) -> (PairId, PairRecord) {
     let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || proxy_pair(proxy_transport, SHOWN_CODE));
-    let pair_id = requester
-        .pair_with_code("7k x4-m9", requester_transport, |peer, _requested| {
-            assert_eq!(peer.display_name, "Phone");
-            Some(granted.to_vec())
-        })
+    let (pair_id, ()) = requester
+        .pair_with_code(
+            "7k x4-m9",
+            &mut OpenedConnection::new(requester_transport),
+            |peer, _requested| {
+                assert_eq!(peer.display_name, "Phone");
+                Some(granted.to_vec())
+            },
+        )
         .unwrap();
     let proxy_record = proxy.join().unwrap();
     assert_eq!(proxy_record.pair_id(), pair_id);
@@ -466,7 +487,7 @@ fn connected<Store: PairingStore, F>(
     pair_id: PairId,
     record: PairRecord,
     script: F,
-) -> (Session<MemoryTransport>, std::thread::JoinHandle<()>)
+) -> (Session<MemoryTransport>, JoinHandle<()>)
 where
     F: FnOnce(Custodian<MemoryTransport>) + Send + 'static,
 {
@@ -500,11 +521,18 @@ fn a_custodian_that_never_confirms_its_storage_leaves_no_record() {
     let proxy = std::thread::spawn(move || {
         proxy_pair_confirming(proxy_transport, SHOWN_CODE, StorageConfirmation::Silent)
     });
-    let outcome = requester.pair_with_code(SHOWN_CODE, requester_transport, |_, requested| {
-        Some(requested.to_vec())
-    });
+    let outcome = requester.pair_with_code(
+        SHOWN_CODE,
+        &mut OpenedConnection::new(requester_transport),
+        |_, requested| Some(requested.to_vec()),
+    );
     assert!(proxy.join().unwrap().is_none());
-    assert_eq!(outcome, Err(PairingError::StorageUnconfirmed));
+    assert_eq!(
+        outcome,
+        Err(PairingSearchError::Ceremony(
+            PairingError::StorageUnconfirmed
+        ))
+    );
     // Section 4.3 item 4: the record stored here is revoked, its key
     // destroyed at once.
     assert!(requester.store().pair_ids().is_empty());
@@ -526,11 +554,18 @@ fn an_unconfirmed_record_found_at_start_up_is_revoked() {
     // The computer stops after storing its record, before the record of a
     // pairing the phone never confirmed could go: it stays unconfirmed.
     requester.store_mut().halted = true;
-    let outcome = requester.pair_with_code(SHOWN_CODE, requester_transport, |_, requested| {
-        Some(requested.to_vec())
-    });
+    let outcome = requester.pair_with_code(
+        SHOWN_CODE,
+        &mut OpenedConnection::new(requester_transport),
+        |_, requested| Some(requested.to_vec()),
+    );
     assert!(proxy.join().unwrap().is_none());
-    assert_eq!(outcome, Err(PairingError::StorageUnconfirmed));
+    assert_eq!(
+        outcome,
+        Err(PairingSearchError::Ceremony(
+            PairingError::StorageUnconfirmed
+        ))
+    );
     let pair_ids = requester.store().pair_ids();
     let [pair_id] = pair_ids.as_slice() else {
         panic!("one unconfirmed record");
@@ -818,11 +853,13 @@ fn a_mistyped_code_fails_at_the_custodian_tag_and_stores_nothing() {
         // The requester refuses T_B and never answers with T_A.
         assert!(proxy_transport.receive_frame().is_err());
     });
-    let outcome = requester.pair_with_code("7KX4MA", requester_transport, |_, _| {
-        panic!("an unauthenticated attempt must never reach confirmation")
-    });
+    let outcome = requester.pair_with_code(
+        OTHER_CODE,
+        &mut OpenedConnection::new(requester_transport),
+        |_, _| panic!("an unauthenticated attempt must never reach confirmation"),
+    );
     proxy.join().unwrap();
-    assert_eq!(outcome, Err(PairingError::CodeMismatch));
+    assert_eq!(outcome, Err(PairingSearchError::NotAccepted));
     assert!(requester.store().pair_ids().is_empty());
 }
 
@@ -831,10 +868,10 @@ fn an_offer_without_the_connection_transport_is_refused_before_cpace() {
     let mut requester = test_requester();
     let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || {
-        let mut offer_id = [0_u8; refineid_rapp::OFFER_ID_SIZE];
+        let mut offer_id = [0_u8; OFFER_ID_SIZE];
         getrandom::fill(&mut offer_id).unwrap();
         let ble_only = PairingOffer::create(
-            refineid_rapp::OfferId::from_array(offer_id),
+            OfferId::from_array(offer_id),
             vec![PROFILE_AUTHENTICATION.to_owned()],
             &[TransportProfile::Ble],
         )
@@ -845,16 +882,15 @@ fn an_offer_without_the_connection_transport_is_refused_before_cpace() {
         // The requester refuses the offer and never sends Y_A.
         assert!(proxy_transport.receive_frame().is_err());
     });
-    let outcome = requester.pair_with_code(SHOWN_CODE, requester_transport, |_, _| {
-        panic!("a refused offer must never reach confirmation")
-    });
-    proxy.join().unwrap();
-    assert_eq!(
-        outcome,
-        Err(PairingError::Offer(
-            refineid_rapp::PairingOfferError::TransportNotOffered
-        ))
+    let outcome = requester.pair_with_code(
+        SHOWN_CODE,
+        &mut OpenedConnection::new(requester_transport),
+        |_, _| panic!("a refused offer must never reach confirmation"),
     );
+    proxy.join().unwrap();
+    // A custodian whose offer is refused is not tried (section 4.2, "Trying
+    // Each Custodian in Pairing Mode" item 2).
+    assert_eq!(outcome, Err(PairingSearchError::NoneInPairingMode));
     assert!(requester.store().pair_ids().is_empty());
 }
 
@@ -862,9 +898,211 @@ fn an_offer_without_the_connection_transport_is_refused_before_cpace() {
 fn input_that_is_not_a_code_never_touches_the_transport() {
     let mut requester = test_requester();
     let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
-    let outcome = requester.pair_with_code("7KX4MU", requester_transport, |_, _| None);
-    assert_eq!(outcome, Err(PairingError::InvalidCode));
+    let outcome = requester.pair_with_code(
+        "7KX4MU",
+        &mut OpenedConnection::new(requester_transport),
+        |_, _| None,
+    );
+    assert_eq!(outcome, Err(PairingSearchError::InvalidCode));
     assert!(proxy_transport.receive_frame().is_err());
+}
+
+/// What a scripted custodian does on its half of one pairing connection.
+type CustodianScript = Box<dyn FnOnce(MemoryTransport) + Send>;
+
+/// Custodians in pairing mode at scripted endpoints, all found in the
+/// first discovery round: endpoint `n` is the `n`-th connection.
+struct ScriptedCustodians {
+    connections: Vec<Option<MemoryTransport>>,
+    discovered: bool,
+    opened: usize,
+}
+
+impl PairingCandidateSource for ScriptedCustodians {
+    type Endpoint = usize;
+    type Transport = MemoryTransport;
+
+    fn discover(&mut self) -> Option<Vec<usize>> {
+        (!std::mem::replace(&mut self.discovered, true))
+            .then(|| (0..self.connections.len()).collect())
+    }
+
+    fn open(&mut self, endpoint: &usize) -> Option<(MemoryTransport, PairingOffer)> {
+        let mut transport = self.connections.get_mut(*endpoint)?.take()?;
+        self.opened += 1;
+        let offer = read_offer(&mut transport).ok()?;
+        Some((transport, offer))
+    }
+}
+
+/// One scripted endpoint per script, each custodian on its own thread.
+fn scripted(scripts: Vec<CustodianScript>) -> (ScriptedCustodians, Vec<JoinHandle<()>>) {
+    let mut connections = Vec::new();
+    let mut custodians = Vec::new();
+    for script in scripts {
+        let (requester_side, custodian_side) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+        connections.push(Some(requester_side));
+        custodians.push(std::thread::spawn(move || script(custodian_side)));
+    }
+    let source = ScriptedCustodians {
+        connections,
+        discovered: false,
+        opened: 0,
+    };
+    (source, custodians)
+}
+
+fn join(custodians: Vec<JoinHandle<()>>) {
+    for custodian in custodians {
+        custodian.join().unwrap();
+    }
+}
+
+/// A custodian showing `shown_code` and serving `offer`: it answers `CPace`
+/// step 1, and the requester, refusing its `T_B`, closes the connection.
+fn refusing_custodian(
+    mut transport: MemoryTransport,
+    (offer, bootstrap, context): (PairingOffer, Vec<u8>, Vec<u8>),
+    shown_code: &str,
+) {
+    transport.send_frame(&bootstrap).unwrap();
+    let step_one = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
+    let (step_two, _waiting) = CpaceKc2Responder::process_step1_frame(
+        shown_code,
+        &context,
+        &offer.offer_id,
+        &step_one,
+        &CUSTODIAN_ENTROPY,
+    )
+    .unwrap();
+    transport.send_frame(step_two.as_bytes()).unwrap();
+    assert_eq!(transport.receive_frame(), Err(TransportError::Eof));
+}
+
+/// A custodian showing another code, as a script.
+fn refusing() -> CustodianScript {
+    Box::new(|transport| refusing_custodian(transport, custodian_offer(), OTHER_CODE))
+}
+
+/// The custodian showing the code, as a script that waits out the tries
+/// of the custodians before it.
+fn accepting() -> CustodianScript {
+    Box::new(|mut transport| {
+        transport.set_receive_deadline(OUTLASTS_ATTEMPT).unwrap();
+        proxy_pair(transport, SHOWN_CODE);
+    })
+}
+
+/// A custodian serving `bootstrap` whose connection the requester closes
+/// without sending `CPace` step 1.
+fn untried_custodian(mut transport: MemoryTransport, bootstrap: &[u8]) {
+    transport.send_frame(bootstrap).unwrap();
+    assert_eq!(transport.receive_frame(), Err(TransportError::Eof));
+}
+
+#[test]
+fn a_refusal_moves_on_to_the_phone_that_shows_the_code() {
+    let mut requester = test_requester();
+    let (mut custodians, threads) = scripted(vec![refusing(), accepting()]);
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |peer, requested| {
+        assert_eq!(peer.display_name, "Phone");
+        Some(requested.to_vec())
+    });
+    join(threads);
+    let (pair_id, endpoint) = outcome.unwrap();
+    assert_eq!(endpoint, SECOND_ENDPOINT);
+    assert_eq!(
+        requester.store().get(pair_id).unwrap().state(),
+        PairingState::PairedDisconnected
+    );
+}
+
+#[test]
+fn the_code_is_not_accepted_only_after_every_phone_refused_it() {
+    let mut requester = test_requester();
+    let (mut custodians, threads) = scripted(vec![refusing(), refusing()]);
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |_, _| {
+        panic!("no phone showing another code reaches confirmation")
+    });
+    join(threads);
+    assert_eq!(outcome, Err(PairingSearchError::NotAccepted));
+    assert_eq!(custodians.opened, custodians.connections.len());
+    assert_eq!(
+        PairingSearchError::NotAccepted.to_string(),
+        "the code was not accepted"
+    );
+    assert!(requester.store().pair_ids().is_empty());
+}
+
+#[test]
+fn a_phone_found_on_two_endpoints_receives_one_guess() {
+    let mut requester = test_requester();
+    let offer = custodian_offer_with(OfferId::from_array(SHARED_OFFER_ID));
+    let bootstrap = offer.1.clone();
+    let (mut custodians, threads) = scripted(vec![
+        Box::new(move |transport| refusing_custodian(transport, offer, OTHER_CODE)),
+        Box::new(move |transport| untried_custodian(transport, &bootstrap)),
+    ]);
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |_, _| {
+        panic!("a refused phone never reaches confirmation")
+    });
+    join(threads);
+    assert_eq!(outcome, Err(PairingSearchError::NotAccepted));
+}
+
+#[test]
+fn a_phone_silent_past_the_attempt_deadline_is_passed_over() {
+    let mut requester = test_requester();
+    let silent: CustodianScript = Box::new(|mut transport| {
+        let (_offer, bootstrap, _context) = custodian_offer();
+        transport.set_receive_deadline(OUTLASTS_ATTEMPT).unwrap();
+        transport.send_frame(&bootstrap).unwrap();
+        assert!(transport.receive_frame().is_ok());
+        assert_eq!(transport.receive_frame(), Err(TransportError::Eof));
+    });
+    let (mut custodians, threads) = scripted(vec![silent, accepting()]);
+    let started = Instant::now();
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |_, requested| {
+        Some(requested.to_vec())
+    });
+    join(threads);
+    assert_eq!(outcome.map(|(_, endpoint)| endpoint), Ok(SECOND_ENDPOINT));
+    assert!(started.elapsed() >= Duration::from_millis(CPACE_ATTEMPT_WINDOW_MS));
+}
+
+#[test]
+fn a_search_opens_at_most_the_limit_of_connections() {
+    let mut requester = test_requester();
+    let mut scripts: Vec<CustodianScript> =
+        (0..PAIRING_CANDIDATES_MAX).map(|_| refusing()).collect();
+    scripts.push(Box::new(drop));
+    let (mut custodians, threads) = scripted(scripts);
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |_, _| {
+        panic!("no phone showing another code reaches confirmation")
+    });
+    join(threads);
+    assert_eq!(outcome, Err(PairingSearchError::NotAccepted));
+    assert_eq!(custodians.opened, PAIRING_CANDIDATES_MAX);
+}
+
+#[test]
+fn a_search_that_tried_no_phone_finds_none_in_pairing_mode() {
+    let mut requester = test_requester();
+    let (mut nobody, _) = scripted(Vec::new());
+    assert_eq!(
+        requester.pair_with_code(SHOWN_CODE, &mut nobody, |_, _| None),
+        Err(PairingSearchError::NoneInPairingMode)
+    );
+    let (mut offerless, threads) = scripted(vec![Box::new(drop)]);
+    assert_eq!(
+        requester.pair_with_code(SHOWN_CODE, &mut offerless, |_, _| None),
+        Err(PairingSearchError::NoneInPairingMode)
+    );
+    join(threads);
+    assert_eq!(
+        PairingSearchError::NoneInPairingMode.to_string(),
+        "no phone in pairing mode was found"
+    );
 }
 
 #[test]
@@ -1241,8 +1479,12 @@ fn stream_pairing_and_session_route_only_by_their_preambles() {
         &RoutingPreamble::Pairing,
     )
     .unwrap();
-    let pair_id = requester
-        .pair_with_code(SHOWN_CODE, pairing, |_, requested| Some(requested.to_vec()))
+    let (pair_id, ()) = requester
+        .pair_with_code(
+            SHOWN_CODE,
+            &mut OpenedConnection::new(pairing),
+            |_, requested| Some(requested.to_vec()),
+        )
         .unwrap();
     let routing = RoutingKey::derive(requester.store().get(pair_id).unwrap().pairing())
         .unwrap()

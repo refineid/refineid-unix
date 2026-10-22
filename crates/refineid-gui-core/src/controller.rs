@@ -33,7 +33,7 @@ use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
 use refineid_lib_core::pkcs15::CardGeneration;
-use refineid_rapp_core::engine::OperationOutcome;
+use refineid_rapp_core::engine::{OperationOutcome, PairingSearchError};
 
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
 use refineid_rapp_core::remote::{CardRequest, RemoteError, RemoteReader};
@@ -831,19 +831,10 @@ impl RefineIdController {
             };
             let pair = match reader.pair_with_code(&normalized, PAIRING_DISCOVERY_TIMEOUT) {
                 Ok(pair) => pair,
-                Err(RemoteError::Pairing(
-                    refineid_rapp_core::engine::PairingError::CodeMismatch,
-                )) => {
-                    controller.update_state(|s| {
-                        s.pairing = None;
-                        s.status_message = "The code does not match the phone".into();
-                    });
-                    return;
-                }
                 Err(e) => {
                     controller.update_state(|s| {
                         s.pairing = None;
-                        s.status_message = format!("Pairing failed: {e}");
+                        s.status_message = pairing_failure_line(&e);
                     });
                     return;
                 }
@@ -873,6 +864,18 @@ const PAIRING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const CERTIFICATE_FETCH_TIMEOUT: Duration = Duration::from_secs(6);
 /// The pause between rounds of certificate fetches.
 const PHONE_WATCH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The status line after a typed code paired with no phone. It names no
+/// phone: none has authenticated itself before a code is accepted.
+fn pairing_failure_line(error: &RemoteError) -> String {
+    match error {
+        RemoteError::Pairing(PairingSearchError::NotAccepted) => "The code was not accepted".into(),
+        RemoteError::Pairing(PairingSearchError::NoneInPairingMode) => {
+            "No phone in pairing mode was found".into()
+        }
+        error => format!("Pairing failed: {error}"),
+    }
+}
 
 /// The status line after a pairing: nothing when the card was read,
 /// otherwise what stands between the user and the card.
@@ -1085,6 +1088,22 @@ mod tests {
         assert_eq!(
             pairing_outcome_line("Alpha Phone", Some(&RemoteError::RevokedByPhone)),
             "Alpha Phone forgot this computer; pair again"
+        );
+    }
+
+    #[test]
+    fn a_failed_pairing_names_no_phone() {
+        assert_eq!(
+            pairing_failure_line(&RemoteError::Pairing(PairingSearchError::NotAccepted)),
+            "The code was not accepted"
+        );
+        assert_eq!(
+            pairing_failure_line(&RemoteError::Pairing(PairingSearchError::NoneInPairingMode)),
+            "No phone in pairing mode was found"
+        );
+        assert_eq!(
+            pairing_failure_line(&RemoteError::Busy),
+            "Pairing failed: the phone session is held by another program on this computer"
         );
     }
 

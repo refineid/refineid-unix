@@ -1,11 +1,12 @@
 //! The requester engine: the workstation side of RAPP v26.10.22.
 //!
 //! The engine drives pairing, sessions, and operations through the
-//! canonical protocol boundaries of `refineid_rapp`: the session handshake
-//! and the custodian's `session.ready` (section 7.1 item 5), the liveness
-//! rule of section 8.3, the requester operation engine of section 8, and
-//! the revocation of section 4.6. Nothing of an operation outlives its
-//! session: a lost result is asked for again as a new operation.
+//! canonical protocol boundaries of `refineid_rapp`: the tries of a typed
+//! code across the custodians in pairing mode (section 4.2), the session
+//! handshake and the custodian's `session.ready` (section 7.1 item 5), the
+//! liveness rule of section 8.3, the requester operation engine of section
+//! 8, and the revocation of section 4.6. Nothing of an operation outlives
+//! its session: a lost result is asked for again as a new operation.
 //!
 //! The engine is blocking and synchronous: the PKCS#11 module, TLS client,
 //! CLI, and GUI call it from their own threads.
@@ -21,11 +22,11 @@ use crate::operations::{CardOperation, CardOperationResult, OperationError};
 use crate::store::{PairingRecord, PairingStore, PeerIntroduction, RecordError, StoreError};
 use crate::transport::{BinaryFrame, FrameTransport, TransportError};
 use refineid_rapp::{
-    ActivePairing, EndpointRole, EstablishedSessionRuntime, ExplicitUserIntent, OperationRequest,
-    OperationViolation, PairingHandshake, PairingState, PairingStorage, PingChallenge, ProfileName,
-    ReadyOutcome, RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RuntimePoll,
-    RuntimeReceive, SessionAuthentication, SessionHandshake, TransportProfile,
-    generate_pair_key_material,
+    ActivePairing, EndpointRole, EstablishedSessionRuntime, ExplicitUserIntent, NextCandidate,
+    OperationRequest, OperationViolation, PairingCandidates, PairingHandshake, PairingSecret,
+    PairingState, PairingStorage, PingChallenge, ProfileName, ReadyOutcome, RequesterDispatch,
+    RequesterEngineError, RequesterOperationEngine, RuntimePoll, RuntimeReceive,
+    SessionAuthentication, SessionHandshake, TransportProfile, generate_pair_key_material,
 };
 
 /// How long one receive waits before the liveness clock is read again: a
@@ -51,7 +52,12 @@ pub struct RequesterConfig {
 /// order).
 const CPACE_SCALAR_ENTROPY_BYTES: usize = 64;
 
-/// Why pairing did not produce a stored record.
+/// How long a custodian's `CPace` step 2 may take to arrive after step 1:
+/// the attempt deadline (section 3.3 item 3; section 4.2, "Trying Each
+/// Custodian in Pairing Mode" item 4).
+const CPACE_STEP_TWO_WAIT: Duration = Duration::from_millis(refineid_rapp::CPACE_ATTEMPT_WINDOW_MS);
+
+/// Why one pairing connection did not produce a stored record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairingError {
     /// The offer failed its structural rules.
@@ -60,10 +66,8 @@ pub enum PairingError {
     KeyGeneration,
     /// The handshake failed.
     HandshakeFailed,
-    /// The input is not a six-character pairing code (section 3.1).
-    InvalidCode,
-    /// The custodian's confirmation tag did not verify: the code typed here
-    /// differs from the one the custodian shows.
+    /// The custodian's confirmation tag did not verify: it does not show
+    /// the code typed here.
     CodeMismatch,
     /// The transport failed during pairing.
     Transport(TransportError),
@@ -100,8 +104,7 @@ impl core::fmt::Display for PairingError {
             Self::Offer(e) => write!(f, "pairing offer error: {e}"),
             Self::KeyGeneration => f.write_str("key generation failed"),
             Self::HandshakeFailed => f.write_str("handshake failed"),
-            Self::InvalidCode => f.write_str("not a pairing code"),
-            Self::CodeMismatch => f.write_str("pairing code does not match the phone"),
+            Self::CodeMismatch => f.write_str("the phone does not show the code"),
             Self::Transport(e) => write!(f, "transport error: {e:?}"),
             Self::ParameterMismatch => f.write_str("parameter mismatch"),
             Self::ProtocolViolation => f.write_str("protocol violation"),
@@ -119,6 +122,109 @@ impl core::fmt::Display for PairingError {
 }
 
 impl core::error::Error for PairingError {}
+
+/// Why a typed code paired with no custodian (RAPP v26.10.22 section 4.2,
+/// "Trying Each Custodian in Pairing Mode").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairingSearchError {
+    /// The input is not a six-character pairing code (section 3.1); no
+    /// custodian was tried.
+    InvalidCode,
+    /// No custodian in pairing mode was tried before the search ended.
+    NoneInPairingMode,
+    /// Every custodian tried refused the code (item 6); the report names
+    /// none of them.
+    NotAccepted,
+    /// A custodian proved it holds the code, and the ceremony with it then
+    /// failed (section 3.3 item 7).
+    Ceremony(PairingError),
+}
+
+impl core::fmt::Display for PairingSearchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidCode => f.write_str("not a pairing code"),
+            Self::NoneInPairingMode => f.write_str("no phone in pairing mode was found"),
+            Self::NotAccepted => f.write_str("the code was not accepted"),
+            Self::Ceremony(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl core::error::Error for PairingSearchError {}
+
+/// Where a requester finds the custodians a typed code is tried with.
+///
+/// A source names the endpoints it finds in pairing mode and opens a
+/// pairing connection to one (RAPP v26.10.22 section 4.2, "Trying Each
+/// Custodian in Pairing Mode").
+pub trait PairingCandidateSource {
+    /// How the source names an endpoint it found.
+    type Endpoint: Clone + PartialEq;
+    /// The connection a pairing runs over.
+    type Transport: FrameTransport;
+
+    /// One discovery round: the endpoints found in pairing mode now, or
+    /// `None` once the search is over.
+    fn discover(&mut self) -> Option<Vec<Self::Endpoint>>;
+
+    /// Opens a pairing connection to `endpoint`, past its `"pairing"`
+    /// routing preamble, and reads the offer it serves (section 4.2 step
+    /// 1); `None` when no connection opens or it serves no offer this
+    /// requester can use.
+    fn open(&mut self, endpoint: &Self::Endpoint) -> Option<(Self::Transport, PairingOffer)>;
+}
+
+/// A pairing connection the caller already opened, as the one custodian a
+/// code is tried with.
+#[derive(Debug)]
+pub struct OpenedConnection<Transport>(Option<Transport>);
+
+impl<Transport> OpenedConnection<Transport> {
+    /// The connection `transport`, past its `"pairing"` routing preamble.
+    pub const fn new(transport: Transport) -> Self {
+        Self(Some(transport))
+    }
+}
+
+impl<Transport: FrameTransport> PairingCandidateSource for OpenedConnection<Transport> {
+    type Endpoint = ();
+    type Transport = Transport;
+
+    fn discover(&mut self) -> Option<Vec<()>> {
+        self.0.is_some().then(|| vec![()])
+    }
+
+    fn open(&mut self, _endpoint: &()) -> Option<(Transport, PairingOffer)> {
+        let mut transport = self.0.take()?;
+        let offer = read_offer(&mut transport).ok()?;
+        Some((transport, offer))
+    }
+}
+
+/// Reads the offer a custodian serves as its first frame on a pairing
+/// connection, for the connection's transport profile (section 4.2 step 1).
+///
+/// # Errors
+/// [`PairingError::Transport`] when no frame arrives, and
+/// [`PairingError::Offer`] when the frame is not an offer this connection
+/// can bind.
+pub fn read_offer<Transport: FrameTransport>(
+    transport: &mut Transport,
+) -> Result<PairingOffer, PairingError> {
+    let profile = TransportProfile::parse(transport.profile())
+        .ok_or(PairingError::Offer(OfferError::InvalidTransport))?;
+    let bootstrap = transport.receive_frame().map_err(PairingError::Transport)?;
+    crate::offer::offer_from_bootstrap(&bootstrap, profile).map_err(PairingError::Offer)
+}
+
+/// A custodian's proof that it holds the code: its `CPace` step 2 verified,
+/// with the step 3 that answers it and the key both sides derived.
+struct CodeConfirmed {
+    candidate_id: String,
+    step_three: BinaryFrame,
+    pairing_secret: PairingSecret,
+}
 
 /// Why a session could not be opened or continued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,38 +433,79 @@ impl<Store: PairingStore> Requester<Store> {
         &mut self.store
     }
 
-    /// Pairs with the custodian showing `code`, as the requester (RAPP
-    /// v26.10.22 sections 3, 4.2 and 6).
+    /// Pairs with the custodian showing `code`, trying in turn each
+    /// custodian `source` finds in pairing mode (RAPP v26.10.22 sections 3,
+    /// 4.2 and 6), and returns the pairing with the endpoint it was made
+    /// on.
     ///
-    /// The transport is already past its `"pairing"` routing preamble. The
-    /// custodian's first frame is its offer (section 4.2); the requester
-    /// binds the offer's entry for the connection's transport profile, sends
-    /// `Y_A`, verifies the custodian's `Y_B || T_B`, answers with `T_A`, and
-    /// hands the `CPace` key to `Noise_XXpsk3`; the pairing hello and
-    /// confirmation follow inside that channel. `confirm` sees the
-    /// custodian's introduction and returns the profiles to grant, or `None`
-    /// to refuse.
+    /// One pairing connection is open at a time, each endpoint is opened at
+    /// most once, and at most [`refineid_rapp::PAIRING_CANDIDATES_MAX`] are
+    /// opened. The offer a connection serves is admitted before `CPace` step
+    /// 1, so a custodian found on two endpoints receives one guess. On an
+    /// admitted offer the requester binds the entry for the connection's
+    /// transport profile, sends `Y_A`, and verifies the custodian's
+    /// `Y_B || T_B`. A connection that serves no usable offer, closes,
+    /// sends no step 2 within the attempt deadline, or whose `T_B` does not
+    /// verify moves the search on. A verified `T_B` ends it: the requester
+    /// answers with `T_A` and hands the `CPace` key to `Noise_XXpsk3`, and
+    /// the pairing hello and confirmation follow inside that channel.
+    /// `confirm` sees the custodian's introduction and returns the profiles
+    /// to grant, or `None` to refuse.
     ///
     /// # Errors
-    /// [`PairingError::InvalidCode`] for input that is not a pairing code,
-    /// [`PairingError::Offer`] for a bootstrap that is not a usable offer,
-    /// [`PairingError::CodeMismatch`] when the custodian's confirmation tag
-    /// does not verify (a mistyped code), and the other [`PairingError`]
-    /// variants on handshake, deadline, transport, or grant failures.
-    pub fn pair_with_code<Transport: FrameTransport>(
+    /// [`PairingSearchError::InvalidCode`] for input that is not a pairing
+    /// code, [`PairingSearchError::NoneInPairingMode`] when the search ends
+    /// with no custodian tried, [`PairingSearchError::NotAccepted`] when
+    /// every custodian tried refused the code, and
+    /// [`PairingSearchError::Ceremony`] when the custodian holding the code
+    /// fails the handshake, a deadline, the grants, or the storage.
+    pub fn pair_with_code<Source: PairingCandidateSource>(
         &mut self,
         code: &str,
-        mut transport: Transport,
+        source: &mut Source,
         confirm: impl FnOnce(&PeerIntroduction, &[ProfileName]) -> Option<Vec<ProfileName>>,
-    ) -> Result<PairId, PairingError> {
-        let normalized = crate::offer::normalize_pairing_code(code)
+    ) -> Result<(PairId, Source::Endpoint), PairingSearchError> {
+        let code = crate::offer::normalize_pairing_code(code)
             .map(Zeroizing::new)
-            .ok_or(PairingError::InvalidCode)?;
+            .ok_or(PairingSearchError::InvalidCode)?;
+        let mut candidates = PairingCandidates::new();
+        loop {
+            let Some(endpoint) = candidates.next_endpoint().ok().flatten().cloned() else {
+                let found = source
+                    .discover()
+                    .ok_or(PairingSearchError::NoneInPairingMode)?;
+                for endpoint in found {
+                    candidates.found(endpoint);
+                }
+                continue;
+            };
+            if let Some((mut transport, offer)) = source.open(&endpoint)
+                && candidates.begin_try(&offer).is_ok()
+                && let Ok(confirmed) = Self::offer_code(&code, &offer, &mut transport)
+            {
+                let _ = candidates.accepted();
+                return self
+                    .finish_pairing(offer, &confirmed, transport, confirm)
+                    .map(|pair_id| (pair_id, endpoint))
+                    .map_err(PairingSearchError::Ceremony);
+            }
+            if candidates.closed() == Ok(NextCandidate::NotAccepted) {
+                return Err(PairingSearchError::NotAccepted);
+            }
+        }
+    }
+
+    /// Runs `CPace` with `code` on `offer` up to the custodian's proof that
+    /// it holds the code: binds the offer's entry for the connection's
+    /// transport profile, sends `Y_A`, and verifies the custodian's
+    /// `Y_B || T_B`, which must arrive within the attempt deadline.
+    fn offer_code<Transport: FrameTransport>(
+        code: &str,
+        offer: &PairingOffer,
+        transport: &mut Transport,
+    ) -> Result<CodeConfirmed, PairingError> {
         let profile = TransportProfile::parse(transport.profile())
             .ok_or(PairingError::Offer(OfferError::InvalidTransport))?;
-        let bootstrap = transport.receive_frame().map_err(PairingError::Transport)?;
-        let offer =
-            crate::offer::offer_from_bootstrap(&bootstrap, profile).map_err(PairingError::Offer)?;
         let candidate_id = offer
             .entry(profile)
             .map(|entry| entry.candidate_id.clone())
@@ -372,7 +519,7 @@ impl<Store: PairingStore> Requester<Store> {
         let mut entropy = Zeroizing::new([0_u8; CPACE_SCALAR_ENTROPY_BYTES]);
         getrandom::fill(entropy.as_mut()).map_err(|_| PairingError::KeyGeneration)?;
         let (initiator, step_one) =
-            refineid_rapp::CpaceKc2Initiator::new(&normalized, &context, &offer.offer_id, &entropy)
+            refineid_rapp::CpaceKc2Initiator::new(code, &context, &offer.offer_id, &entropy)
                 .map_err(|_| PairingError::HandshakeFailed)?;
         drop(entropy);
 
@@ -381,9 +528,15 @@ impl<Store: PairingStore> Requester<Store> {
         transport
             .send_frame(step_one_frame.as_bytes())
             .map_err(PairingError::Transport)?;
-        let step_two = transport.receive_frame().map_err(PairingError::Transport)?;
-        let step_two =
-            BinaryFrame::reconstruct(step_two).map_err(|_| PairingError::HandshakeFailed)?;
+        let waited = transport
+            .set_receive_deadline(CPACE_STEP_TWO_WAIT)
+            .map_err(PairingError::Transport)?;
+        let step_two = transport.receive_frame();
+        transport
+            .set_receive_deadline(waited)
+            .map_err(PairingError::Transport)?;
+        let step_two = BinaryFrame::reconstruct(step_two.map_err(PairingError::Transport)?)
+            .map_err(|_| PairingError::HandshakeFailed)?;
         let (step_three, pairing_secret) =
             initiator
                 .process_step2_frame(&step_two)
@@ -393,8 +546,24 @@ impl<Store: PairingStore> Requester<Store> {
                     }
                     _ => PairingError::HandshakeFailed,
                 })?;
+        Ok(CodeConfirmed {
+            candidate_id,
+            step_three,
+            pairing_secret,
+        })
+    }
+
+    /// Answers the custodian that proved it holds the code with `T_A`, then
+    /// runs the pairing to its stored record.
+    fn finish_pairing<Transport: FrameTransport>(
+        &mut self,
+        offer: PairingOffer,
+        confirmed: &CodeConfirmed,
+        mut transport: Transport,
+        confirm: impl FnOnce(&PeerIntroduction, &[ProfileName]) -> Option<Vec<ProfileName>>,
+    ) -> Result<PairId, PairingError> {
         transport
-            .send_frame(step_three.as_bytes())
+            .send_frame(confirmed.step_three.as_bytes())
             .map_err(PairingError::Transport)?;
         let handshake_deadline = PhaseDeadline::after(refineid_rapp::POST_PAKE_HANDSHAKE_MS);
 
@@ -407,8 +576,8 @@ impl<Store: PairingStore> Requester<Store> {
             .collect();
         self.complete_pairing(
             offer,
-            &candidate_id,
-            &pairing_secret,
+            &confirmed.candidate_id,
+            &confirmed.pairing_secret,
             &requested,
             transport,
             handshake_deadline,
@@ -430,7 +599,7 @@ impl<Store: PairingStore> Requester<Store> {
         &mut self,
         offer: PairingOffer,
         candidate_id: &str,
-        pairing_secret: &refineid_rapp::PairingSecret,
+        pairing_secret: &PairingSecret,
         requested_profiles: &[ProfileName],
         mut transport: Transport,
         handshake_deadline: PhaseDeadline,
