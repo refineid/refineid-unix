@@ -1,9 +1,10 @@
 //! Remote Authorization Proxy Protocol (RAPP) requester core.
 //!
-//! This crate implements the requester role of RAPP v26.10.21 for Unix
+//! This crate implements the requester role of RAPP v26.10.22 for Unix
 //! workstations: the workstation asks for typed credential operations, and
-//! the custodian — the holder's phone — presents consent, talks to the
-//! identity card, and returns only the profile-defined result.
+//! the custodian — the holder's phone — takes the PIN on its own screen,
+//! talks to the identity card, and returns only the profile-defined
+//! result.
 //!
 //! Protocol primitives, Noise cryptography, and canonical framing are provided
 //! by `refineid_rapp`.
@@ -24,7 +25,7 @@ pub mod stream;
 pub mod transport;
 
 /// The wire version of RAPP from canonical core.
-pub const WIRE_VERSION: (u16, u16, u16) = refineid_rapp::WIRE_VERSION_V26_10_21;
+pub const WIRE_VERSION: (u16, u16, u16) = refineid_rapp::WIRE_VERSION_V26_10_22;
 
 /// The mandatory pairing handshake construction.
 pub const PAIRING_SUITE: &str = refineid_rapp::MANDATORY_PAIRING_SUITE;

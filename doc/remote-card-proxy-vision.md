@@ -91,7 +91,7 @@ Pairing establishes cryptographic association between the Unix workstation and t
    * In `refineid-gui` (or CLI `refineid pair`), the user turns on "Remote Phone Reader" and selects the discovered phone.
    * Desktop prompts for the 6-character code displayed on the phone.
 3. **Mutual Authentication (`CPaceRistretto255` KC2 + `Noise_XXpsk3`)**:
-   * The 6-character code is upper-cased; the letters `I`, `L`, `O` and `U` are not in the alphabet and a code carrying one is refused (RAPP v26.10.21 section 3.1).
+   * The 6-character code is upper-cased; the letters `I`, `L`, `O` and `U` are not in the alphabet and a code carrying one is refused (RAPP v26.10.22 section 3.1).
    * PAKE exchange (`CPaceRistretto255`) mutually authenticates both endpoints and derives a 256-bit PSK.
    * `Noise_XXpsk3` performs authenticated key exchange, binding the handshake to canonical offer hashes.
    * Both devices exchange and authenticate static Curve25519 public keys.
@@ -110,9 +110,9 @@ Once paired, routine authentication requires zero re-pairing:
 
 1. **One slot for the paired phone**:
    * `librefineid_pkcs11.so` reads the pairing record the desktop application or the CLI keeps, without sweeping it, and raises one slot, "RefineID Remote" with the phone's name, for the one phone paired with this computer.
-   * A thread inside the module holds the session: it dials while the record is usable, and keeps the session while the phone reports a card. The pairing's lock file keeps the module, the desktop application and the CLI from two sessions under one static key; the loser reports the phone as in use.
+   * A thread inside the module holds the session: it dials while the record is usable and the phone is in sight, and keeps the session open while it is, answering pings and reading the phone's card reports. The pairing's lock file keeps the module, the desktop application and the CLI from two sessions under one static key; the loser reports the phone as in use.
 2. **The token is the card on the phone**:
-   * The token "Phone (PIN 1)" carries the authentication certificate the pairing record caches, read from the card once when no program has cached it yet. It stands on that certificate while the pairing does, before and between sessions: a browser given no certificate at its first handshake keeps resuming that handshake and never asks again, so the identity is offered from the record and a signature asked before the session is open waits for the phone within the browser's deadline, which wakes the dial at once. The phone prompts for the card when none lies on it. The phone does nothing for the slot but answer pings, and a card other than the cached one fails at the signature, where PACE runs against the stored access number.
+   * The token "Phone (PIN 1)" carries the authentication certificate the pairing record caches, which a session confirmed by the fingerprint the phone reports for its card, and which is read from the card afresh when no program has cached it or the phone reports another card. It stands on that certificate before and between sessions (RAPP v26.10.22 section 8.4 item 3): a browser given no certificate at its first handshake keeps resuming that handshake and never asks again, so the identity is offered from the record, and a signature asked before the session is open wakes the dial and waits for the phone within the browser's deadline. The token goes when, for 120 seconds, no session has reported the card present; at once when the pairing is forgotten or revoked, or a session reports another card. A report of absence starts the 120 seconds and is never taken for another card, and an operation the card did not answer is a failed operation, not absence. The phone does nothing for the slot but answer pings.
    * NSS reads `CKA_VALUE`, `CKA_ISSUER`, `CKA_SUBJECT` and the CA certificates from the module's memory; enumeration never dials.
    * `C_Login` reads no PIN: the token declares a protected authentication path, and succeeds only while the token is present.
 3. **Sign request dispatch**:

@@ -13,14 +13,14 @@
 //!
 //! The phone's word on the pairing comes only inside a session: a close
 //! carrying `pairing_revoked` revokes the pairing here at once (RAPP
-//! v26.10.21 section 4.6 item 4). A pairing forgotten here is told to the
+//! v26.10.22 section 4.6 item 4). A pairing forgotten here is told to the
 //! phone the same way, by the session that holds it or as the first
 //! message of the next one (items 1 and 2).
 //!
-//! An open session reports whether the phone can serve a card and which
-//! (section 8.4); an operation is sent only on a session that reports one,
-//! and the phone's identity is offered only with a certificate whose
-//! fingerprint the phone confirmed on the session that offers it.
+//! An open session reports which card the phone holds, if any (section
+//! 8.4); an operation is sent only on a session that reports one, and the
+//! phone's identity is offered only on a certificate whose fingerprint the
+//! phone confirmed on a session.
 
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
@@ -700,8 +700,6 @@ impl RemoteReader {
     /// first reports no card is given the rest of `discovery_timeout` to
     /// report one, so a card tapped after the dial still serves.
     ///
-    /// A consumer that offers the phone's identity keeps the session for
-    /// as long as it offers it: the offer is withdrawn with the session.
     /// The pairing's lock is held from here until the session is dropped,
     /// so one program at a time on this computer holds the phone.
     ///

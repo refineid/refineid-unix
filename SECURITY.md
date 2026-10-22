@@ -36,7 +36,10 @@ RAPP must absolutely deny and preclude all attempts to transport PIN codes
 anywhere:
 
 - The protocol wire format has no field or message for PIN codes.
-- PIN1 remains in protected on-device cache on the phone.
+- PIN1 is asked once on the phone and held only in its memory, never in its
+  storage, until the card leaves, the card rejects it, the holder clears it,
+  or the app or the phone restarts.
+- PIN2 is asked on the phone for every signature or batch and never held.
 - PIN2 prompts appear exclusively on the mobile device screen.
 - The host computer operates via a protected authentication path
   (`CKF_PROTECTED_AUTHENTICATION_PATH`) without any PIN prompts or transport.
