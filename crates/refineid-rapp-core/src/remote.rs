@@ -13,14 +13,14 @@
 //!
 //! The phone's word on the pairing comes only inside a session: a close
 //! carrying `pairing_revoked` revokes the pairing here at once (RAPP
-//! v26.10.21 section 4.6 item 4). A pairing forgotten here is told to the
+//! v26.10.22 section 4.6 item 4). A pairing forgotten here is told to the
 //! phone the same way, by the session that holds it or as the first
 //! message of the next one (items 1 and 2).
 //!
-//! An open session reports whether the phone can serve a card and which
-//! (section 8.4); an operation is sent only on a session that reports one,
-//! and the phone's identity is offered only with a certificate whose
-//! fingerprint the phone confirmed on the session that offers it.
+//! An open session reports which card the phone holds, if any (section
+//! 8.4); an operation is sent only on a session that reports one, and the
+//! phone's identity is offered only on a certificate whose fingerprint the
+//! phone confirmed on a session.
 
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
@@ -76,6 +76,15 @@ const CARD_REPORT_WAIT: Duration = Duration::from_secs(5);
 /// The lifetime each request asks for unless the caller bounds it
 /// (section 8.1 item 2).
 const OPERATION_LIFETIME: Duration = Duration::from_millis(120_000);
+
+/// What a new session waits for before it is handed over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardWait {
+    /// A card the phone can serve, within the discovery time.
+    Present,
+    /// The phone's first card report, present or absent.
+    Report,
+}
 
 /// The keys one stored pairing uses to find and reach its custodian.
 struct PairingKeys {
@@ -700,8 +709,6 @@ impl RemoteReader {
     /// first reports no card is given the rest of `discovery_timeout` to
     /// report one, so a card tapped after the dial still serves.
     ///
-    /// A consumer that offers the phone's identity keeps the session for
-    /// as long as it offers it: the offer is withdrawn with the session.
     /// The pairing's lock is held from here until the session is dropped,
     /// so one program at a time on this computer holds the phone.
     ///
@@ -713,6 +720,34 @@ impl RemoteReader {
         &mut self,
         pair_id: Option<PairId>,
         discovery_timeout: Duration,
+    ) -> Result<RemoteSession, RemoteError> {
+        self.establish(pair_id, discovery_timeout, CardWait::Present)
+    }
+
+    /// Opens a session to the phone holding `pair_id`, browsing until
+    /// `discovery_timeout` passes, and returns it once the phone has
+    /// reported its card, present or absent (section 8.4 item 1): for a
+    /// holder that keeps the session open while the phone is in sight and
+    /// follows its card reports (section 8.3).
+    ///
+    /// # Errors
+    /// As [`Self::open_session`], and [`RemoteError::CardAbsent`] when the
+    /// phone reports nothing of its card.
+    pub fn dial_session(
+        &mut self,
+        pair_id: PairId,
+        discovery_timeout: Duration,
+    ) -> Result<RemoteSession, RemoteError> {
+        self.establish(Some(pair_id), discovery_timeout, CardWait::Report)
+    }
+
+    /// Browses, dials and connects to the phone holding `pair_id`, or the
+    /// selected pairing when `None`, and waits for its card as `wait` says.
+    fn establish(
+        &mut self,
+        pair_id: Option<PairId>,
+        discovery_timeout: Duration,
+        wait: CardWait,
     ) -> Result<RemoteSession, RemoteError> {
         let pair_id = match pair_id {
             Some(pair_id) => pair_id,
@@ -758,10 +793,18 @@ impl RemoteReader {
                         continue;
                     }
                 };
-                let wait = deadline
-                    .saturating_duration_since(Instant::now())
-                    .max(CARD_REPORT_WAIT);
-                match self.requester.await_card_present(&mut session, wait) {
+                let reported = match wait {
+                    CardWait::Present => self.requester.await_card_present(
+                        &mut session,
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(CARD_REPORT_WAIT),
+                    ),
+                    CardWait::Report => self
+                        .requester
+                        .await_card_report(&mut session, CARD_REPORT_WAIT),
+                };
+                match reported {
                     Ok(true) => {
                         return Ok(RemoteSession {
                             session,

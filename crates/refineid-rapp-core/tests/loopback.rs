@@ -3,7 +3,7 @@
 //!
 //! The custodian here is test scaffolding, not a product: the real
 //! custodians are the holder's phones. It speaks the exact wire of RAPP
-//! v26.10.21 so the requester is exercised end to end - code pairing
+//! v26.10.22 so the requester is exercised end to end - code pairing
 //! through `CPace` KC2 and `Noise_XXpsk3` with grant agreement, `Noise_KK`
 //! sessions opened by the custodian's `session.ready`, card reports with
 //! the certificate fingerprint, operations and their results, the
@@ -380,9 +380,10 @@ impl<T: FrameTransport> Custodian<T> {
         self.send_dispatch(finished);
     }
 
-    /// Takes an admitted consequential request to the holder's consent and
-    /// reports the view on screen.
-    fn show_consent(&mut self, request: &OperationRequest) {
+    /// Takes an admitted consequential request to the holder's PIN prompt,
+    /// which is the holder's consent (section 8.2 item 3), and reports the
+    /// prompt on screen.
+    fn show_pin_prompt(&mut self, request: &OperationRequest) {
         let dispatch = self
             .operations
             .prerequisites_complete(
@@ -580,6 +581,11 @@ fn a_wait_for_a_card_that_runs_out_leaves_the_session_open() {
         custodian.receive_close();
     });
     let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    // The phone's first report is absence: a report all the same.
+    assert_eq!(
+        requester.await_card_report(&mut session, SHORT_WAIT),
+        Ok(true)
+    );
     // The wait runs out before the phone reports a card; the session is
     // neither closed nor marked lost.
     assert_eq!(
@@ -850,7 +856,7 @@ fn input_that_is_not_a_code_never_touches_the_transport() {
 }
 
 #[test]
-fn card_inspection_completes_as_a_read_without_consent() {
+fn card_inspection_completes_as_a_read_without_a_prompt() {
     let mut requester = test_requester();
     let granted = [ProfileName::CardStatus];
     let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
@@ -872,7 +878,7 @@ fn card_inspection_completes_as_a_read_without_consent() {
 }
 
 #[test]
-fn authentication_runs_through_consent_to_its_signature() {
+fn authentication_runs_through_the_pin_prompt_to_its_signature() {
     let mut requester = test_requester();
     let granted = [ProfileName::Authentication];
     let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
@@ -881,7 +887,7 @@ fn authentication_runs_through_consent_to_its_signature() {
     let (mut session, proxy) = connected(&mut requester, pair_id, proxy_pairing, move |mut c| {
         let request = c.admit();
         assert_eq!(request.operation, authentication_operation());
-        c.show_consent(&request);
+        c.show_pin_prompt(&request);
         let approval = UserApproval::for_request(&request, SESSION_START_MS);
         let ProxyDispatch::ExecuteCardCommand { command, .. } = c
             .operations
@@ -951,7 +957,7 @@ fn a_denial_ends_the_operation_and_the_session_carries_the_next() {
     let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
     let (mut session, proxy) = connected(&mut requester, pair_id, proxy_pairing, |mut c| {
         let request = c.admit();
-        c.show_consent(&request);
+        c.show_pin_prompt(&request);
         let denied = c
             .operations
             .finish_failure(request.operation_id, ProxyFailure::UserDenied)

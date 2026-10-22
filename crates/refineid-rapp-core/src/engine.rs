@@ -1,4 +1,4 @@
-//! The requester engine: the workstation side of RAPP v26.10.21.
+//! The requester engine: the workstation side of RAPP v26.10.22.
 //!
 //! The engine drives pairing, sessions, and operations through the
 //! canonical protocol boundaries of `refineid_rapp`: the session handshake
@@ -47,7 +47,7 @@ pub struct RequesterConfig {
 }
 
 /// Uniform bytes drawn for the `CPace` initiator's scalar (RAPP
-/// v26.10.21 section 6.1.1: 64 uniform bytes reduced modulo the group
+/// v26.10.22 section 6.1.1: 64 uniform bytes reduced modulo the group
 /// order).
 const CPACE_SCALAR_ENTROPY_BYTES: usize = 64;
 
@@ -189,7 +189,7 @@ impl core::fmt::Display for AdmissionError {
 
 impl core::error::Error for AdmissionError {}
 
-/// How a finished operation ended (RAPP v26.10.21 section 8).
+/// How a finished operation ended (RAPP v26.10.22 section 8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationOutcome {
     /// The result arrived and answers the request.
@@ -328,7 +328,7 @@ impl<Store: PairingStore> Requester<Store> {
     }
 
     /// Pairs with the custodian showing `code`, as the requester (RAPP
-    /// v26.10.21 sections 3, 4.2 and 6).
+    /// v26.10.22 sections 3, 4.2 and 6).
     ///
     /// The transport is already past its `"pairing"` routing preamble. The
     /// custodian's first frame is its offer (section 4.2); the requester
@@ -791,9 +791,36 @@ impl<Store: PairingStore> Requester<Store> {
         session: &mut Session<Transport>,
         wait: Duration,
     ) -> Result<bool, SessionError> {
+        self.await_card(session, wait, |session| {
+            session.card_present() == Some(true)
+        })
+    }
+
+    /// Waits up to `wait` for the custodian's first card report, present or
+    /// absent, which it sends right after `session.ready` (section 8.4 item
+    /// 1), serving the session meanwhile. Returns whether one arrived.
+    ///
+    /// # Errors
+    /// As [`Self::service`].
+    pub fn await_card_report<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+        wait: Duration,
+    ) -> Result<bool, SessionError> {
+        self.await_card(session, wait, |session| session.card_status().is_some())
+    }
+
+    /// Serves `session` until `reported` holds of it or `wait` passes;
+    /// whether it held.
+    fn await_card<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+        wait: Duration,
+        reported: impl Fn(&Session<Transport>) -> bool,
+    ) -> Result<bool, SessionError> {
         let deadline = Instant::now() + wait;
         loop {
-            if session.card_present() == Some(true) {
+            if reported(session) {
                 return Ok(true);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
