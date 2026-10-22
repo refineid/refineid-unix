@@ -612,24 +612,64 @@ impl UiDriver for Gtk4Driver {
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
         eprintln!("DEBUG: run() called");
+        gtk4::init().expect("failed to initialize GTK");
+
+        let application = gtk4::Application::builder()
+            .application_id("fi.refineid.gui")
+            .build();
+
+        let controller_clone = Arc::clone(&controller);
+        let mut widgets = Self::build_ui(&application, &controller_clone);
+
+        eprintln!("DEBUG: UI built");
+
+        // Show the window
+        widgets.window.set_visible(true);
+        widgets.window.present();
+        eprintln!("DEBUG: window shown and presented");
+
+        // Apply initial state
+        let initial_state = controller.state();
+        widgets.apply_state(&initial_state);
+
+        // Open on phone tab if requested
+        if self.opens_on_phone_tab {
+            widgets.notebook.set_current_page(Some(3));
+            widgets.code_boxes.entry.grab_focus();
+        }
+
+        // Set up state change polling
         let state_rx = Arc::new(std::sync::Mutex::new(
             self.state_rx.take().expect("state receiver"),
         ));
-        let application = self.application.clone();
-        let opens_on_phone_tab = self.opens_on_phone_tab;
-        let controller_for_stop = Arc::clone(&controller);
+        let driver = std::rc::Rc::new(std::cell::RefCell::new(widgets));
+        let driver2 = driver.clone();
 
-        application.connect_activate(move |app| {
-            eprintln!("DEBUG: activate handler called");
-            let state_rx = state_rx.clone();
-            Self::run_ui(app, Arc::clone(&controller), state_rx, opens_on_phone_tab);
+        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            let state = controller.state();
+            driver2.borrow_mut().apply_state(&state);
+            glib::ControlFlow::Continue
         });
 
-        eprintln!("DEBUG: calling application.run()");
-        application.run();
-        eprintln!("DEBUG: application.run() returned");
+        let driver3 = driver.clone();
+        let state_rx2 = state_rx.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            let mut rx = state_rx2.lock().unwrap();
+            while let Ok(state) = rx.try_recv() {
+                driver3.borrow_mut().apply_state(&state);
+            }
+            glib::ControlFlow::Continue
+        });
 
-        controller_for_stop.stop();
+        // Run main loop
+        let context = gtk4::glib::MainContext::default();
+        eprintln!("DEBUG: entering main loop");
+        while context.iteration(false) {
+            // Keep running
+        }
+        eprintln!("DEBUG: main loop exited");
+
+        controller.stop();
         Ok(())
     }
 }
