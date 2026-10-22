@@ -24,14 +24,14 @@ fn run_fltk(open_on_phone_tab: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "gtk4")]
 fn run_gtk4(open_on_phone_tab: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (driver, on_state_change, state_rx) = refineid_gui_gtk4::Gtk4Driver::create();
+    let (driver, on_state_change) = refineid_gui_gtk4::Gtk4Driver::create();
     let mut driver = driver;
     if open_on_phone_tab {
         driver.open_on_phone_tab();
     }
     let controller = RefineIdController::new(on_state_change);
     controller.start();
-    driver.run(controller, state_rx)?;
+    driver.run(controller)?;
     Ok(())
 }
 
