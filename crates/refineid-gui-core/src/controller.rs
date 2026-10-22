@@ -129,11 +129,12 @@ impl RefineIdController {
     }
 
     /// Keeps the Phone tab true while the GUI holds no session: at each
-    /// round it browses for the paired phone's record and applies what
-    /// the phone announces, a revocation hint foremost; reads the
-    /// authentication certificate when none is cached yet and the phone
-    /// is on the network; and re-reads the pairing record, which another
-    /// program on this computer may have rewritten.
+    /// round it tells a phone this computer forgot, when that phone is in
+    /// sight (RAPP v26.10.21 section 4.6 item 2); browses for the paired
+    /// phone's record; reads the authentication certificate when none is
+    /// cached yet and the phone is on the network; and re-reads the
+    /// pairing record, which another program on this computer may have
+    /// rewritten.
     ///
     /// When a physical card reader with an inserted card is connected, the local
     /// card reader overrides RAPP completely, and phone polling is suppressed.
@@ -151,15 +152,16 @@ impl RefineIdController {
                     .phone
                     .as_ref()
                     .map(|phone| (phone.pair_id, phone.certificate_cached));
-                if let Some((pair_id, certificate_cached)) = phone
-                    && let Ok(mut reader) = RemoteReader::open_local()
-                {
-                    let seen = reader.observe(pair_id);
-                    if !certificate_cached && seen == Ok(true) {
-                        let _ = reader.refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT);
-                    }
-                    if seen != Ok(false) {
-                        self.refresh_phones();
+                if let Ok(mut reader) = RemoteReader::open_local() {
+                    reader.deliver_revocation_notices();
+                    if let Some((pair_id, certificate_cached)) = phone {
+                        let seen = reader.observe(pair_id);
+                        if !certificate_cached && seen == Ok(true) {
+                            let _ = reader.refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT);
+                        }
+                        if seen != Ok(false) {
+                            self.refresh_phones();
+                        }
                     }
                 }
                 self.refresh_cards();
@@ -796,7 +798,7 @@ impl RefineIdController {
         });
     }
 
-    /// Pairs with the phone showing `code` (RAPP v26.10.18: the phone shows
+    /// Pairs with the phone showing `code` (RAPP v26.10.21: the phone shows
     /// the code and this workstation types it). One ceremony runs at a time.
     fn start_pairing(self: &Arc<Self>, code: &str) {
         if self.state().pairing.is_some() {
@@ -880,8 +882,13 @@ fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String
         Some(RemoteError::CardAbsent) => format!("No card on {phone}"),
         Some(RemoteError::RevokedByPhone) => format!("{phone} forgot this computer; pair again"),
         Some(RemoteError::Withdrawn) => format!("{phone} turned remote card access off"),
-        Some(RemoteError::Outcome(outcome)) if matches!(**outcome, OperationOutcome::Cancelled) => {
+        Some(RemoteError::Outcome(outcome))
+            if matches!(**outcome, OperationOutcome::Cancelled(_)) =>
+        {
             format!("{phone} ended the read before a card was read")
+        }
+        Some(RemoteError::Outcome(outcome)) if matches!(**outcome, OperationOutcome::Lost) => {
+            format!("The connection to {phone} ended before the card was read")
         }
         Some(RemoteError::Outcome(outcome)) if matches!(**outcome, OperationOutcome::Refused) => {
             format!("{phone}'s message was not understood")
@@ -1028,6 +1035,7 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refineid_rapp_core::message::ResultError;
 
     #[test]
     fn the_pairing_line_says_only_what_stands_in_the_way() {
@@ -1039,9 +1047,18 @@ mod tests {
         assert_eq!(
             pairing_outcome_line(
                 "Alpha Phone",
-                Some(&RemoteError::Outcome(Box::new(OperationOutcome::Cancelled)))
+                Some(&RemoteError::Outcome(Box::new(
+                    OperationOutcome::Cancelled(ResultError::OperationExpired)
+                )))
             ),
             "Alpha Phone ended the read before a card was read"
+        );
+        assert_eq!(
+            pairing_outcome_line(
+                "Alpha Phone",
+                Some(&RemoteError::Outcome(Box::new(OperationOutcome::Lost)))
+            ),
+            "The connection to Alpha Phone ended before the card was read"
         );
         assert_eq!(
             pairing_outcome_line(

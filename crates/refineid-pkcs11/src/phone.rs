@@ -16,13 +16,15 @@
 //!
 //! One thread holds the session to the phone: it reads the pairing
 //! record another program keeps, dials while the record is usable, and
-//! keeps the session while the phone reports a card. The slot's token is
-//! the authentication certificate the record caches, read from the card
-//! once when the record lacks it and kept from then on, so the phone
-//! does nothing for the slot but answer pings; it is offered only while
-//! the session reports a card (RAPP v26.10.18 section 8.4). A signature
-//! asked for by the browser is handed to that thread and answered on the
-//! same session; that is the one thing the phone does.
+//! keeps the session open, answering the phone's pings and reading its
+//! card reports (RAPP v26.10.21 sections 8.3 and 8.4). The slot's token is
+//! the authentication certificate the record caches, confirmed against
+//! the fingerprint the phone reports for its card and read from the card
+//! afresh when the record lacks it or the phone serves another card. A
+//! signature asked for by the browser is handed to that thread and
+//! answered on the same session; that is the one thing the phone does.
+//! A pairing forgotten on this computer is told to the phone by that
+//! thread, on the session it holds or on the next one (section 4.6).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -37,13 +39,14 @@ use refineid_pkcs11::remote::{
 use refineid_pkcs11::slot_kind::RemoteSlotId;
 use refineid_rapp::ResultError;
 use refineid_rapp_core::engine::OperationOutcome;
-use refineid_rapp_core::ids::PairId;
+use refineid_rapp_core::ids::{CertificateFingerprint, PairId};
 use refineid_rapp_core::operations::{
     CardKeyProfile, CardOperation, CardOperationResult, SignatureAlgorithm,
 };
 use refineid_rapp_core::remote::{
     PairSummary, RemoteError, RemoteReader, RemoteSession, local_host_name,
 };
+use refineid_rapp_core::store::PairingState;
 use refineid_remote::{DisplayText, RemoteKeyProfile, RemoteSignatureAlgorithm, SignatureRequest};
 
 /// How long one dial browses for the phone and waits for its card.
@@ -58,9 +61,14 @@ const BUSY_PAUSE: Duration = Duration::from_secs(5);
 /// The pause while no usable pairing record exists.
 const UNPAIRED_PAUSE: Duration = Duration::from_secs(3);
 
-/// Between pings on a held session; each ping also re-reads the record
-/// and the phone's card status.
-const PING_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a held session waits for a browser request, and then for the
+/// phone's traffic, in turn: the phone's pings and card reports are read
+/// within one step.
+const SERVICE_STEP: Duration = Duration::from_millis(250);
+
+/// Between readings of the record another program keeps, which may have
+/// forgotten the held pairing.
+const RECORD_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long the first slot refresh waits for the thread's first word,
 /// so a host that lists the slots once at load sees the phone's slot.
@@ -274,6 +282,7 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
         };
         let Some(phone) = reader.phone() else {
             unpaired(shared, requests);
+            reader.deliver_revocation_notices();
             continue;
         };
         let Some(slot) = slot_id(&phone) else {
@@ -287,6 +296,9 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
         // browser that was given no certificate once keeps resuming that
         // handshake and never asks again.
         shared.publish(Some(offer(slot, &phone, shared, phone.auth_cert.clone())));
+        // A phone this computer forgot is told so on a session of its own
+        // when it is in sight (section 4.6 item 2).
+        reader.deliver_revocation_notices();
         // A request that woke the pause has this dial; one that arrives
         // during the dial makes a failed dial try once more at once,
         // and the pause follows only when no request arrived.
@@ -341,8 +353,8 @@ fn offer(
     )
 }
 
-/// Keeps `session` while the record stays usable and the phone reports
-/// a card, answering the browser's requests on it.
+/// Keeps `session` while the record stays usable, answering the browser's
+/// requests on it and serving it between them.
 fn hold(
     shared: &Shared,
     requests: &Receiver<SignRequest>,
@@ -351,27 +363,25 @@ fn hold(
     phone: &PairSummary,
     slot: RemoteSlotId,
 ) -> After {
-    // The certificate comes from the record; the card is read for it
-    // once, when no program has cached it yet.
-    let certificate = match phone.auth_cert.clone() {
-        Some(certificate) => certificate,
-        None => match reader.refresh_auth_cert_on(&mut session) {
-            Ok(certificate) => certificate,
-            Err(_) => {
-                reader.close_session(session);
-                pause(shared, REDIAL_PAUSE);
-                return After::Withdraw;
-            }
-        },
+    // The identity is the one whose fingerprint the phone reports on this
+    // session (section 8.4 item 2): the cached certificate when it is that
+    // one, and otherwise the card's, read once and cached.
+    let (mut certificate, mut confirmed) = match confirm(reader, &mut session) {
+        Some(confirmed) => confirmed,
+        None => {
+            reader.close_session(session);
+            pause(shared, REDIAL_PAUSE);
+            return After::Withdraw;
+        }
     };
     shared.publish(Some(offer(slot, phone, shared, Some(certificate.clone()))));
-    let mut after = After::Keep(certificate.clone());
+    let mut record_checked = Instant::now();
     loop {
         if shared.stopped() {
             reader.close_session(session);
-            break;
+            return After::Keep(certificate);
         }
-        match requests.recv_timeout(PING_INTERVAL) {
+        match requests.recv_timeout(SERVICE_STEP) {
             // The browser gave up while the session was being opened;
             // the card is not asked for a signature nobody will read.
             Ok(request) if request.expired() => {}
@@ -383,10 +393,6 @@ fn hold(
                 match checked(signed, &certificate, &request.request) {
                     Ok(signature) => {
                         let _ = request.reply.send(Ok(signature));
-                        if !session.card_present() {
-                            reader.close_session(session);
-                            break;
-                        }
                     }
                     // A signature the cached certificate does not verify
                     // says the card on the phone is not the one cached:
@@ -396,64 +402,108 @@ fn hold(
                         let _ = request.reply.send(Err(RemoteSignError::Ambiguous));
                         let _ = reader.forget_auth_cert(phone.pair_id);
                         reader.close_session(session);
-                        after = After::Withdraw;
-                        break;
+                        return After::Withdraw;
                     }
                     Err(Failure::Sign(error)) => {
-                        let lost = matches!(
+                        let _ = request.reply.send(Err(error));
+                        if matches!(
                             error,
                             RemoteSignError::Unreachable | RemoteSignError::Withdrawn
-                        );
-                        let _ = request.reply.send(Err(error));
-                        if lost || !session.card_present() {
+                        ) {
                             reader.close_session(session);
-                            break;
+                            return After::Keep(certificate);
                         }
                     }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                match record_state(phone.pair_id) {
-                    RecordState::Usable | RecordState::Unreadable => {}
-                    RecordState::Gone => {
-                        reader.close_session_revoked(session);
-                        after = After::Withdraw;
-                        break;
-                    }
-                }
-                if reader.check_liveness(&mut session).is_err() || !session.card_present() {
-                    reader.close_session(session);
-                    break;
-                }
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 reader.close_session(session);
-                break;
+                return After::Keep(certificate);
+            }
+        }
+        if record_checked.elapsed() >= RECORD_CHECK_INTERVAL {
+            record_checked = Instant::now();
+            match held_record(phone.pair_id) {
+                HeldRecord::Usable | HeldRecord::Unreadable => {}
+                HeldRecord::Forgotten => {
+                    reader.revoke_in_session(session);
+                    return After::Withdraw;
+                }
+                HeldRecord::Gone => {
+                    reader.close_session(session);
+                    return After::Withdraw;
+                }
+            }
+        }
+        match reader.service(&mut session, SERVICE_STEP) {
+            Ok(()) => {}
+            // The phone forgot this computer: the pairing and its token go.
+            Err(RemoteError::RevokedByPhone) => return After::Withdraw,
+            Err(_) => return After::Keep(certificate),
+        }
+        // The phone serves another card: the identity offered is not its
+        // until the card's certificate is read and confirmed.
+        if session
+            .card_fingerprint()
+            .is_some_and(|reported| reported != confirmed)
+        {
+            match confirm(reader, &mut session) {
+                Some((read, fingerprint)) => {
+                    certificate = read;
+                    confirmed = fingerprint;
+                    shared.publish(Some(offer(slot, phone, shared, Some(certificate.clone()))));
+                }
+                None => {
+                    reader.close_session(session);
+                    return After::Withdraw;
+                }
             }
         }
     }
-    after
 }
 
-/// What the record another program keeps says about the held pairing.
+/// The certificate of the card the phone reports on `session`, with the
+/// fingerprint the phone confirmed it by.
+fn confirm(
+    reader: &mut RemoteReader,
+    session: &mut RemoteSession,
+) -> Option<(Vec<u8>, CertificateFingerprint)> {
+    let certificate = reader.confirmed_auth_cert(session).ok()?;
+    let fingerprint = CertificateFingerprint::of_certificate(&certificate);
+    Some((certificate, fingerprint))
+}
+
+/// What the record another program keeps says of the held pairing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecordState {
-    /// The record still names the pairing as the usable one.
+enum HeldRecord {
+    /// The record still names the pairing as usable.
     Usable,
-    /// The store could be read and no longer names it: forgotten or
-    /// superseded here, so the phone is told.
+    /// This computer's user forgot the pairing, or a new pairing
+    /// superseded it (RAPP v26.10.21 section 4.6): the phone is told.
+    Forgotten,
+    /// The store reads but holds no usable record of the pairing: the
+    /// record is gone or no longer decodes. That is no forget, so the
+    /// session closes without the revocation notice (section 10.1).
     Gone,
-    /// The store could not be read just now; nothing is concluded.
+    /// The store cannot be read just now; nothing is concluded.
     Unreadable,
 }
 
-fn record_state(pair_id: PairId) -> RecordState {
-    match RemoteReader::open_local_without_sweep() {
-        Err(_) => RecordState::Unreadable,
-        Ok(reader) => match reader.phone() {
-            Some(phone) if phone.pair_id == pair_id => RecordState::Usable,
-            _ => RecordState::Gone,
-        },
+/// The held pairing as the record another program keeps says.
+fn held_record(pair_id: PairId) -> HeldRecord {
+    let Ok(reader) = RemoteReader::open_local_without_sweep() else {
+        return HeldRecord::Unreadable;
+    };
+    let state = reader
+        .pairs()
+        .into_iter()
+        .find(|pair| pair.pair_id == pair_id)
+        .map(|pair| pair.state);
+    match state {
+        Some(PairingState::PairedDisconnected) => HeldRecord::Usable,
+        Some(PairingState::Revoking) => HeldRecord::Forgotten,
+        _ => HeldRecord::Gone,
     }
 }
 
@@ -559,7 +609,7 @@ const fn signature_algorithm(algorithm: RemoteSignatureAlgorithm) -> SignatureAl
 /// The module's view of a failed request.
 fn sign_error(error: &RemoteError) -> RemoteSignError {
     match error {
-        RemoteError::CardAbsent => RemoteSignError::CardAbsent,
+        RemoteError::CardAbsent | RemoteError::CardChanged => RemoteSignError::CardAbsent,
         RemoteError::Withdrawn | RemoteError::RevokedByPhone => RemoteSignError::Withdrawn,
         RemoteError::Outcome(outcome) => outcome_error(outcome),
         _ => RemoteSignError::Unreachable,
@@ -568,23 +618,29 @@ fn sign_error(error: &RemoteError) -> RemoteSignError {
 
 fn outcome_error(outcome: &OperationOutcome) -> RemoteSignError {
     match outcome {
-        OperationOutcome::Denied | OperationOutcome::Cancelled => RemoteSignError::Cancelled,
-        OperationOutcome::CredentialRejected => RemoteSignError::CredentialRejected,
-        OperationOutcome::Ambiguous => RemoteSignError::Ambiguous,
-        OperationOutcome::Rejected(reason) => rejection_error(reason.as_deref()),
-        _ => RemoteSignError::Unsupported,
+        OperationOutcome::Rejected(error) | OperationOutcome::Cancelled(error) => {
+            result_error(*error)
+        }
+        // The session ended with the operation live: whether the card
+        // signed is not known here (section 8.1 item 3).
+        OperationOutcome::Lost => RemoteSignError::Ambiguous,
+        OperationOutcome::Refused | OperationOutcome::Completed(_) => RemoteSignError::Unsupported,
     }
 }
 
-/// A rejection by the phone, read back from the reason it named.
-fn rejection_error(reason: Option<&str>) -> RemoteSignError {
-    match reason.map(ResultError::from_wire_name) {
-        Some(ResultError::UserCancelled | ResultError::UserDeclined) => RemoteSignError::Cancelled,
-        Some(ResultError::OperationExpired) => RemoteSignError::Expired,
-        Some(ResultError::InvalidCredential) => RemoteSignError::CredentialRejected,
-        Some(ResultError::CardBlocked) => RemoteSignError::CredentialLocked,
-        Some(ResultError::CardError) => RemoteSignError::Ambiguous,
-        _ => RemoteSignError::Unsupported,
+/// A section 10.3 error name the phone gave, as the module reports it.
+const fn result_error(error: ResultError) -> RemoteSignError {
+    match error {
+        ResultError::UserCancelled => RemoteSignError::Cancelled,
+        ResultError::OperationExpired => RemoteSignError::Expired,
+        ResultError::RetryFloor => RemoteSignError::CredentialLocked,
+        ResultError::CardError => RemoteSignError::CardAbsent,
+        ResultError::InvalidLifetime
+        | ResultError::Unauthorized
+        | ResultError::UnsupportedParameter => RemoteSignError::Unsupported,
+        ResultError::Busy | ResultError::DuplicateOperation | ResultError::OperationFailed => {
+            RemoteSignError::Ambiguous
+        }
     }
 }
 
@@ -654,19 +710,7 @@ mod tests {
             RemoteSignError::Unreachable
         );
         assert_eq!(
-            outcome_error(&OperationOutcome::Denied),
-            RemoteSignError::Cancelled
-        );
-        assert_eq!(
-            outcome_error(&OperationOutcome::Cancelled),
-            RemoteSignError::Cancelled
-        );
-        assert_eq!(
-            outcome_error(&OperationOutcome::CredentialRejected),
-            RemoteSignError::CredentialRejected
-        );
-        assert_eq!(
-            outcome_error(&OperationOutcome::Ambiguous),
+            outcome_error(&OperationOutcome::Lost),
             RemoteSignError::Ambiguous
         );
         assert_eq!(
@@ -676,31 +720,35 @@ mod tests {
     }
 
     #[test]
-    fn a_rejection_is_read_back_from_the_reason_the_phone_named() {
-        let named = |error: ResultError| rejection_error(Some(error.as_str()));
+    fn every_error_name_the_phone_gives_maps_to_a_module_error() {
+        let named = |error: ResultError| outcome_error(&OperationOutcome::Rejected(error));
         assert_eq!(
             named(ResultError::UserCancelled),
             RemoteSignError::Cancelled
         );
-        assert_eq!(named(ResultError::UserDeclined), RemoteSignError::Cancelled);
         assert_eq!(
-            named(ResultError::OperationExpired),
+            outcome_error(&OperationOutcome::Cancelled(ResultError::OperationExpired)),
             RemoteSignError::Expired
         );
         assert_eq!(
-            named(ResultError::InvalidCredential),
-            RemoteSignError::CredentialRejected
-        );
-        assert_eq!(
-            named(ResultError::CardBlocked),
+            named(ResultError::RetryFloor),
             RemoteSignError::CredentialLocked
         );
-        assert_eq!(named(ResultError::CardError), RemoteSignError::Ambiguous);
-        assert_eq!(
-            named(ResultError::UnsupportedParameter),
-            RemoteSignError::Unsupported
-        );
-        assert_eq!(rejection_error(None), RemoteSignError::Unsupported);
+        assert_eq!(named(ResultError::CardError), RemoteSignError::CardAbsent);
+        for unsupported in [
+            ResultError::InvalidLifetime,
+            ResultError::Unauthorized,
+            ResultError::UnsupportedParameter,
+        ] {
+            assert_eq!(named(unsupported), RemoteSignError::Unsupported);
+        }
+        for unknown in [
+            ResultError::Busy,
+            ResultError::DuplicateOperation,
+            ResultError::OperationFailed,
+        ] {
+            assert_eq!(named(unknown), RemoteSignError::Ambiguous);
+        }
     }
 
     #[test]

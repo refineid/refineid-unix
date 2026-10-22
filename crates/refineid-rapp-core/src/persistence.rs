@@ -1,51 +1,45 @@
 //! Device-local serialization of a pairing record.
 //!
-//! A durable [`PairingStore`](crate::store::PairingStore) — here the
-//! owner-only [`FilePairingStore`](crate::file_store::FilePairingStore) —
-//! needs the record's bytes. This module is the
-//! only serialization boundary for [`PairingRecord`]: a versioned, length-framed
-//! encoding with no external serde surface, so the pair-specific private key is
-//! never handed to a general-purpose serializer or format.
+//! A durable [`PairingStore`](crate::store::PairingStore) -- here the
+//! owner-only [`FilePairingStore`](crate::file_store::FilePairingStore) --
+//! needs the record's bytes. The engine's half of the record, with the pair
+//! keys, the grants, the storage confirmation and the time it was forgotten,
+//! travels in the engine's own encoding ([`refineid_rapp::encode_pair_record`]);
+//! this module frames it with what the workstation keeps beside it, in a
+//! versioned, length-framed encoding with no external serde surface.
 //!
 //! The encoded blob carries the private key, so [`encode_pairing_record`]
 //! returns it inside [`Zeroizing`]; callers hand it straight to device-only
 //! secret storage and never log it. [`decode_pairing_record`] bounds-checks
-//! every field and rejects trailing bytes, so a truncated or tampered blob
-//! fails closed rather than yielding a half-built record. Neither direction
-//! ever prints a key.
+//! every field, rejects trailing bytes, and rebuilds the record through the
+//! engine's decoder and [`PairingRecord::new`], so a truncated or tampered
+//! blob fails closed rather than yielding a half-built record.
 
+use refineid_rapp::{PairRecordCodecError, decode_pair_record, encode_pair_record};
 use zeroize::Zeroizing;
 
-use crate::ids::PairId;
-use crate::store::{PairingDisposition, PairingRecord};
+use crate::store::{PairingRecord, PeerIntroduction, RecordError};
 
 /// Format tag identifying a `RefineID` pairing-record blob.
-const PAIRING_BLOB_MAGIC: &[u8] = b"RAPP-pair-record";
+pub(crate) const PAIRING_BLOB_MAGIC: &[u8] = b"RAPP-pair-record";
 
 /// The one encoding revision this build reads and writes. Records of earlier
 /// revisions belong to earlier protocol versions and are re-paired.
-const PAIRING_BLOB_VERSION: u8 = 7;
+pub(crate) const PAIRING_BLOB_VERSION: u8 = 8;
 
-/// Format tag identifying a whole stored pairing set.
-const PAIRING_SET_MAGIC: &[u8] = b"RAPP-pair-set";
+/// Bytes of a length prefix: a big-endian `u32`.
+const LENGTH_PREFIX_BYTES: usize = 4;
+/// Bytes of the presence flag of an optional field.
+const OPTIONAL_FLAG_BYTES: usize = 1;
+/// Bytes of the encoding revision.
+const VERSION_BYTES: usize = 1;
 
-/// The pairing-set encoding revision.
-const PAIRING_SET_VERSION: u8 = 1;
+/// An absent optional field.
+const ABSENT: u8 = 0;
+/// A present optional field.
+const PRESENT: u8 = 1;
 
-/// Disposition tag for a usable pairing.
-const DISPOSITION_PAIRED: u8 = 0;
-/// Disposition tag for a revoked (tombstoned) pairing.
-const DISPOSITION_REVOKED: u8 = 1;
-/// Disposition tag for a pairing stored before the peer confirmed its
-/// storage.
-const DISPOSITION_UNCONFIRMED: u8 = 2;
-
-/// Boolean false on the wire.
-const BOOLEAN_FALSE: u8 = 0;
-/// Boolean true on the wire.
-const BOOLEAN_TRUE: u8 = 1;
-
-/// Why a stored pairing blob could not be decoded.
+/// Why a stored pairing blob could not be encoded or decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairingCodecError {
     /// The blob did not begin with the pairing-record format tag.
@@ -59,12 +53,16 @@ pub enum PairingCodecError {
     Truncated,
     /// Bytes remained after the last field was read.
     TrailingBytes,
-    /// A disposition tag was neither paired nor revoked.
-    InvalidDisposition,
-    /// A boolean field was neither zero nor one.
-    InvalidBoolean,
+    /// An optional field's flag was neither absent nor present.
+    InvalidFlag,
     /// A text field was not valid UTF-8.
     InvalidText,
+    /// A length does not fit the length prefix.
+    Oversized,
+    /// The engine's record did not encode or decode.
+    Pairing(PairRecordCodecError),
+    /// The engine's record is not one this store holds.
+    Record(RecordError),
 }
 
 impl core::fmt::Display for PairingCodecError {
@@ -76,11 +74,11 @@ impl core::fmt::Display for PairingCodecError {
             }
             Self::Truncated => formatter.write_str("pairing record ended mid-field"),
             Self::TrailingBytes => formatter.write_str("pairing record had trailing bytes"),
-            Self::InvalidDisposition => {
-                formatter.write_str("pairing record had an unknown disposition")
-            }
-            Self::InvalidBoolean => formatter.write_str("pairing record had a malformed flag"),
+            Self::InvalidFlag => formatter.write_str("pairing record had a malformed flag"),
             Self::InvalidText => formatter.write_str("pairing record held invalid text"),
+            Self::Oversized => formatter.write_str("pairing record field too long"),
+            Self::Pairing(error) => write!(formatter, "pairing keys: {error}"),
+            Self::Record(error) => write!(formatter, "pairing record refused: {error:?}"),
         }
     }
 }
@@ -92,83 +90,61 @@ impl core::error::Error for PairingCodecError {}
 /// The returned blob contains the pair-specific private key and is therefore
 /// wrapped in [`Zeroizing`]: hand it directly to device-only storage
 /// and never log it.
-#[must_use]
-pub fn encode_pairing_record(record: &PairingRecord) -> Zeroizing<Vec<u8>> {
+///
+/// # Errors
+/// [`PairingCodecError::Pairing`] when the engine cannot encode its record,
+/// and [`PairingCodecError::Oversized`] for a field longer than a length
+/// prefix holds.
+pub fn encode_pairing_record(
+    record: &PairingRecord,
+) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
+    let pairing =
+        Zeroizing::new(encode_pair_record(record.pairing()).map_err(PairingCodecError::Pairing)?);
+    let peer = record.peer();
+    let failures = record.candidate_failures().to_be_bytes();
+    let size = PAIRING_BLOB_MAGIC.len()
+        + VERSION_BYTES
+        + LENGTH_PREFIX_BYTES
+        + pairing.len()
+        + failures.len()
+        + LENGTH_PREFIX_BYTES
+        + peer.display_name.len()
+        + LENGTH_PREFIX_BYTES
+        + peer.platform.len()
+        + OPTIONAL_FLAG_BYTES
+        + record
+            .auth_cert()
+            .map(|cert| LENGTH_PREFIX_BYTES + cert.len())
+            .unwrap_or_default();
     // Sized once, so the key bytes are copied into one buffer and no
     // discarded reallocation keeps them.
-    let mut out = Zeroizing::new(Vec::with_capacity(encoded_record_size(record)));
+    let mut out = Zeroizing::new(Vec::with_capacity(size));
     out.extend_from_slice(PAIRING_BLOB_MAGIC);
     out.push(PAIRING_BLOB_VERSION);
-    out.extend_from_slice(record.pair_id.as_bytes());
-    out.extend_from_slice(&record.grants_hash);
-    out.push(disposition_tag(record.disposition));
-    out.push(if record.peer_initiated_termination {
-        BOOLEAN_TRUE
-    } else {
-        BOOLEAN_FALSE
-    });
-    out.extend_from_slice(&record.candidate_failures.to_be_bytes());
-    put_bytes(&mut out, &record.local_private);
-    put_bytes(&mut out, &record.local_public);
-    put_bytes(&mut out, &record.peer_public);
-    put_length(&mut out, record.granted_profiles.len());
-    for profile in &record.granted_profiles {
-        put_bytes(&mut out, profile.as_bytes());
+    put_bytes(&mut out, &pairing)?;
+    out.extend_from_slice(&failures);
+    put_bytes(&mut out, peer.display_name.as_bytes())?;
+    put_bytes(&mut out, peer.platform.as_bytes())?;
+    match record.auth_cert() {
+        Some(cert) => {
+            out.push(PRESENT);
+            put_bytes(&mut out, cert)?;
+        }
+        None => out.push(ABSENT),
     }
-    put_bytes(&mut out, record.peer_display_name.as_bytes());
-    put_bytes(&mut out, record.peer_platform.as_bytes());
-    put_optional_bytes(&mut out, record.auth_cert.as_deref());
-    put_optional_bytes(&mut out, record.signature_cert.as_deref());
-    put_optional_bytes(&mut out, record.root_ca.as_deref());
-    put_optional_bytes(&mut out, record.intermediate_ca.as_deref());
-    out
+    Ok(out)
 }
 
-/// The size of `record`'s encoding, counted field by field.
-fn encoded_record_size(record: &PairingRecord) -> usize {
-    const LENGTH_PREFIX: usize = 4;
-    const OPTIONAL_FLAG: usize = 1;
-    let bytes = |field: &[u8]| LENGTH_PREFIX + field.len();
-    let optional = |field: Option<&[u8]>| OPTIONAL_FLAG + field.map_or(0, bytes);
-    PAIRING_BLOB_MAGIC.len()
-        + 1
-        + record.pair_id.as_bytes().len()
-        + record.grants_hash.len()
-        + 1
-        + 1
-        + record.candidate_failures.to_be_bytes().len()
-        + bytes(&record.local_private)
-        + bytes(&record.local_public)
-        + bytes(&record.peer_public)
-        + LENGTH_PREFIX
-        + record
-            .granted_profiles
-            .iter()
-            .map(|profile| bytes(profile.as_bytes()))
-            .sum::<usize>()
-        + bytes(record.peer_display_name.as_bytes())
-        + bytes(record.peer_platform.as_bytes())
-        + optional(record.auth_cert.as_deref())
-        + optional(record.signature_cert.as_deref())
-        + optional(record.root_ca.as_deref())
-        + optional(record.intermediate_ca.as_deref())
-}
-
-/// The pair identifier of a pairing-record blob written by an earlier
-/// encoding revision, which this build no longer reads.
-///
-/// Such a record belongs to an earlier protocol version; its holder
-/// re-pairs, and the caller removes the record and its key.
+/// Whether `blob` is a pairing record of an earlier encoding revision,
+/// which this build no longer reads: such a record belongs to an earlier
+/// protocol version, and its holder re-pairs.
 #[must_use]
-pub fn superseded_pair_id(blob: &[u8]) -> Option<PairId> {
+pub fn is_superseded(blob: &[u8]) -> bool {
     let mut reader = Reader::new(blob);
-    if reader.take(PAIRING_BLOB_MAGIC.len()).ok()? != PAIRING_BLOB_MAGIC {
-        return None;
-    }
-    if reader.take_u8().ok()? >= PAIRING_BLOB_VERSION {
-        return None;
-    }
-    Some(PairId::from_array(reader.take_array().ok()?))
+    reader.take(PAIRING_BLOB_MAGIC.len()) == Ok(PAIRING_BLOB_MAGIC)
+        && reader
+            .take_u8()
+            .is_ok_and(|version| version < PAIRING_BLOB_VERSION)
 }
 
 /// Reconstructs a pairing record from a device-only blob.
@@ -176,7 +152,8 @@ pub fn superseded_pair_id(blob: &[u8]) -> Option<PairId> {
 /// # Errors
 ///
 /// Fails when the blob is not a pairing record, uses an unknown revision, ends
-/// mid-field, carries trailing bytes, or holds a malformed field.
+/// mid-field, carries trailing bytes, or holds a malformed field or engine
+/// record.
 pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecError> {
     let mut reader = Reader::new(blob);
     if reader.take(PAIRING_BLOB_MAGIC.len())? != PAIRING_BLOB_MAGIC {
@@ -186,150 +163,31 @@ pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecE
     if version != PAIRING_BLOB_VERSION {
         return Err(PairingCodecError::UnsupportedVersion { found: version });
     }
-
-    let pair_id = PairId::from_array(reader.take_array()?);
-    let grants_hash = reader.take_array()?;
-    let disposition = disposition_from_tag(reader.take_u8()?)?;
-    let peer_initiated_termination = boolean_from_tag(reader.take_u8()?)?;
+    let pairing =
+        decode_pair_record(reader.take_length_prefixed()?).map_err(PairingCodecError::Pairing)?;
     let candidate_failures = u32::from_be_bytes(reader.take_array()?);
-    let local_private = Zeroizing::new(reader.take_length_prefixed()?.to_vec());
-    let local_public = reader.take_length_prefixed()?.to_vec();
-    let peer_public = reader.take_length_prefixed()?.to_vec();
-
-    let profile_count = reader.take_length()?;
-    let mut granted_profiles = Vec::with_capacity(profile_count);
-    for _ in 0..profile_count {
-        granted_profiles.push(reader.take_text()?);
-    }
-    let peer_display_name = reader.take_text()?;
-    let peer_platform = reader.take_text()?;
-    let auth_cert = reader.take_optional_bytes()?.map(<[u8]>::to_vec);
-    let signature_cert = reader.take_optional_bytes()?.map(<[u8]>::to_vec);
-    let root_ca = reader.take_optional_bytes()?.map(<[u8]>::to_vec);
-    let intermediate_ca = reader.take_optional_bytes()?.map(<[u8]>::to_vec);
-
+    let peer = PeerIntroduction {
+        display_name: reader.take_text()?,
+        platform: reader.take_text()?,
+    };
+    let auth_cert = match reader.take_u8()? {
+        ABSENT => None,
+        PRESENT => Some(reader.take_length_prefixed()?.to_vec()),
+        _ => return Err(PairingCodecError::InvalidFlag),
+    };
     reader.finish()?;
-
-    Ok(PairingRecord {
-        pair_id,
-        local_private,
-        local_public,
-        peer_public,
-        granted_profiles,
-        grants_hash,
-        peer_display_name,
-        peer_platform,
-        disposition,
-        peer_initiated_termination,
-        candidate_failures,
-        auth_cert,
-        signature_cert,
-        root_ca,
-        intermediate_ca,
-    })
-}
-
-/// Serializes a whole pairing set as one device-only blob.
-///
-/// The durable store persists every record together so one atomic credential
-/// write covers an insert, update, or removal. Like [`encode_pairing_record`],
-/// the result carries private keys and is wrapped in [`Zeroizing`].
-#[must_use]
-pub fn encode_pairing_records(records: &[PairingRecord]) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::new());
-    out.extend_from_slice(PAIRING_SET_MAGIC);
-    out.push(PAIRING_SET_VERSION);
-    put_length(&mut out, records.len());
-    for record in records {
-        put_bytes(&mut out, &encode_pairing_record(record));
-    }
-    out
-}
-
-/// Reconstructs a whole pairing set from a device-only blob.
-///
-/// An empty slice decodes to an empty set, so a store whose credential does not
-/// yet exist starts clean.
-///
-/// # Errors
-///
-/// Fails when the blob is not a pairing set, uses an unknown revision, ends
-/// mid-field, carries trailing bytes, or holds a malformed record.
-pub fn decode_pairing_records(blob: &[u8]) -> Result<Vec<PairingRecord>, PairingCodecError> {
-    if blob.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut reader = Reader::new(blob);
-    if reader.take(PAIRING_SET_MAGIC.len())? != PAIRING_SET_MAGIC {
-        return Err(PairingCodecError::BadMagic);
-    }
-    let version = reader.take_u8()?;
-    if version != PAIRING_SET_VERSION {
-        return Err(PairingCodecError::UnsupportedVersion { found: version });
-    }
-    let count = reader.take_length()?;
-    let mut records = Vec::new();
-    for _ in 0..count {
-        records.push(decode_pairing_record(reader.take_length_prefixed()?)?);
-    }
-    reader.finish()?;
-    Ok(records)
-}
-
-/// Maps a disposition to its wire tag.
-const fn disposition_tag(disposition: PairingDisposition) -> u8 {
-    match disposition {
-        PairingDisposition::Paired => DISPOSITION_PAIRED,
-        PairingDisposition::Revoked => DISPOSITION_REVOKED,
-        PairingDisposition::Unconfirmed => DISPOSITION_UNCONFIRMED,
-    }
-}
-
-/// Maps a wire tag to a disposition.
-const fn disposition_from_tag(tag: u8) -> Result<PairingDisposition, PairingCodecError> {
-    match tag {
-        DISPOSITION_PAIRED => Ok(PairingDisposition::Paired),
-        DISPOSITION_REVOKED => Ok(PairingDisposition::Revoked),
-        DISPOSITION_UNCONFIRMED => Ok(PairingDisposition::Unconfirmed),
-        _ => Err(PairingCodecError::InvalidDisposition),
-    }
-}
-
-/// Maps a wire tag to a boolean.
-const fn boolean_from_tag(tag: u8) -> Result<bool, PairingCodecError> {
-    match tag {
-        BOOLEAN_FALSE => Ok(false),
-        BOOLEAN_TRUE => Ok(true),
-        _ => Err(PairingCodecError::InvalidBoolean),
-    }
-}
-
-/// Appends a count as a big-endian `u32`.
-fn put_length(out: &mut Vec<u8>, length: usize) {
-    // Every length here is a key size, a bounded profile name, or a small
-    // count, so it fits a u32; a saturating cast keeps the encoder infallible
-    // without a silent wrap.
-    let bounded = u32::try_from(length).unwrap_or(u32::MAX);
-    out.extend_from_slice(&bounded.to_be_bytes());
+    Ok(PairingRecord::new(pairing, peer)
+        .map_err(PairingCodecError::Record)?
+        .with_candidate_failures(candidate_failures)
+        .with_auth_cert(auth_cert))
 }
 
 /// Appends a length-prefixed byte string.
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    put_length(out, bytes.len());
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), PairingCodecError> {
+    let length = u32::try_from(bytes.len()).map_err(|_| PairingCodecError::Oversized)?;
+    out.extend_from_slice(&length.to_be_bytes());
     out.extend_from_slice(bytes);
-}
-
-/// Appends an optional length-prefixed byte string.
-fn put_optional_bytes(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
-    match bytes {
-        Some(b) => {
-            out.push(BOOLEAN_TRUE);
-            put_bytes(out, b);
-        }
-        None => {
-            out.push(BOOLEAN_FALSE);
-        }
-    }
+    Ok(())
 }
 
 /// A bounds-checked forward cursor over a blob.
@@ -344,36 +202,30 @@ impl<'blob> Reader<'blob> {
 
     /// Takes exactly `count` bytes or reports truncation.
     const fn take(&mut self, count: usize) -> Result<&'blob [u8], PairingCodecError> {
-        if self.remaining.len() < count {
+        let Some((head, tail)) = self.remaining.split_at_checked(count) else {
             return Err(PairingCodecError::Truncated);
-        }
-        let (head, tail) = self.remaining.split_at(count);
+        };
         self.remaining = tail;
         Ok(head)
     }
 
     /// Takes one byte.
     fn take_u8(&mut self) -> Result<u8, PairingCodecError> {
-        Ok(self.take(1)?[0])
+        let [byte] = self.take_array()?;
+        Ok(byte)
     }
 
     /// Takes a fixed-size array.
     fn take_array<const LENGTH: usize>(&mut self) -> Result<[u8; LENGTH], PairingCodecError> {
-        let slice = self.take(LENGTH)?;
-        let mut array = [0_u8; LENGTH];
-        array.copy_from_slice(slice);
-        Ok(array)
-    }
-
-    /// Takes a big-endian `u32` length as a `usize`.
-    fn take_length(&mut self) -> Result<usize, PairingCodecError> {
-        // A u32 always fits the usize this crate targets (32- and 64-bit).
-        Ok(u32::from_be_bytes(self.take_array()?) as usize)
+        self.take(LENGTH)?
+            .try_into()
+            .map_err(|_| PairingCodecError::Truncated)
     }
 
     /// Takes a length-prefixed byte string.
     fn take_length_prefixed(&mut self) -> Result<&'blob [u8], PairingCodecError> {
-        let length = self.take_length()?;
+        let length = u32::from_be_bytes(self.take_array()?);
+        let length = usize::try_from(length).map_err(|_| PairingCodecError::Truncated)?;
         self.take(length)
     }
 
@@ -383,16 +235,6 @@ impl<'blob> Reader<'blob> {
         core::str::from_utf8(bytes)
             .map(str::to_owned)
             .map_err(|_error| PairingCodecError::InvalidText)
-    }
-
-    /// Takes an optional length-prefixed byte slice.
-    fn take_optional_bytes(&mut self) -> Result<Option<&'blob [u8]>, PairingCodecError> {
-        let tag = self.take_u8()?;
-        match tag {
-            BOOLEAN_FALSE => Ok(None),
-            BOOLEAN_TRUE => Ok(Some(self.take_length_prefixed()?)),
-            _ => Err(PairingCodecError::InvalidBoolean),
-        }
     }
 
     /// Confirms the blob was consumed exactly.
@@ -411,76 +253,86 @@ impl<'blob> Reader<'blob> {
     reason = "test fixtures are constructed to be infallible"
 )]
 mod tests {
-    use zeroize::Zeroizing;
+    use refineid_rapp::ProfileName;
 
     use super::{
         PAIRING_BLOB_MAGIC, PAIRING_BLOB_VERSION, PairingCodecError, decode_pairing_record,
-        decode_pairing_records, encode_pairing_record, encode_pairing_records,
+        encode_pairing_record, is_superseded,
     };
     use crate::ids::PairId;
-    use crate::store::{PairingDisposition, PairingRecord};
+    use crate::store::fixtures::{pair_record, phone};
+    use crate::store::{PairingRecord, PeerIntroduction};
+
+    /// A synthetic pair identifier.
+    const PAIR_ID: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-7";
+    /// When the forgotten fixture's user forgot it.
+    const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
+    /// The re-pairing hint the fixture carries.
+    const FAILURES: u32 = 2;
+    /// A synthetic authentication certificate.
+    const CERTIFICATE: &[u8] = b"synthetic authentication certificate";
+    /// The first encoding revision.
+    const FIRST_REVISION: u8 = 1;
+    /// A revision past the one this build reads.
+    const LATER_REVISION: u8 = PAIRING_BLOB_VERSION + 1;
+    /// A byte appended past the record's end.
+    const TRAILING: &[u8] = b"!";
 
     fn sample() -> PairingRecord {
-        PairingRecord {
-            pair_id: PairId::from_array([7; 16]),
-            local_private: Zeroizing::new(vec![1; 32]),
-            local_public: vec![2; 32],
-            peer_public: vec![3; 32],
-            granted_profiles: vec![
-                "fi.refineid.authentication.v1".into(),
-                "fi.refineid.document-signing.v1".into(),
-            ],
-            grants_hash: [4; 32],
-            peer_display_name: "Holder's Phone".into(),
-            peer_platform: "iOS".into(),
-            disposition: PairingDisposition::Paired,
-            peer_initiated_termination: false,
-            candidate_failures: 2,
-            auth_cert: Some(vec![0x30, 0x82, 0x01, 0x00]),
-            signature_cert: Some(vec![0x30, 0x82, 0x02, 0x00]),
-            root_ca: Some(vec![0x30, 0x82, 0x03, 0x00]),
-            intermediate_ca: Some(vec![0x30, 0x82, 0x04, 0x00]),
-        }
+        PairingRecord::new(
+            pair_record(
+                PairId::from_array(PAIR_ID),
+                vec![ProfileName::Authentication, ProfileName::DocumentSigning],
+            ),
+            PeerIntroduction {
+                display_name: "Holder's Phone".into(),
+                platform: "iOS".into(),
+            },
+        )
+        .unwrap()
+        .with_candidate_failures(FAILURES)
+        .with_auth_cert(Some(CERTIFICATE.to_vec()))
     }
 
     fn assert_same(left: &PairingRecord, right: &PairingRecord) {
-        assert_eq!(left.pair_id, right.pair_id);
+        assert_eq!(left.pair_id(), right.pair_id());
+        assert_eq!(left.state(), right.state());
         assert_eq!(
-            left.local_private.as_slice(),
-            right.local_private.as_slice()
+            left.pairing().local_static_private(),
+            right.pairing().local_static_private()
         );
-        assert_eq!(left.local_public, right.local_public);
-        assert_eq!(left.peer_public, right.peer_public);
-        assert_eq!(left.granted_profiles, right.granted_profiles);
-        assert_eq!(left.grants_hash, right.grants_hash);
-        assert_eq!(left.peer_display_name, right.peer_display_name);
-        assert_eq!(left.peer_platform, right.peer_platform);
-        assert_eq!(left.disposition, right.disposition);
         assert_eq!(
-            left.peer_initiated_termination,
-            right.peer_initiated_termination
+            left.pairing().remote_static_public(),
+            right.pairing().remote_static_public()
         );
-        assert_eq!(left.candidate_failures, right.candidate_failures);
-        assert_eq!(left.auth_cert, right.auth_cert);
-        assert_eq!(left.signature_cert, right.signature_cert);
-        assert_eq!(left.root_ca, right.root_ca);
-        assert_eq!(left.intermediate_ca, right.intermediate_ca);
+        assert_eq!(left.pairing().profiles(), right.pairing().profiles());
+        assert_eq!(left.pairing().grants_hash(), right.pairing().grants_hash());
+        assert_eq!(
+            left.pairing().forgotten_at_ms(),
+            right.pairing().forgotten_at_ms()
+        );
+        assert_eq!(left.peer(), right.peer());
+        assert_eq!(left.candidate_failures(), right.candidate_failures());
+        assert_eq!(left.auth_cert(), right.auth_cert());
+    }
+
+    /// `blob` with its revision replaced by `revision`.
+    fn at_revision(blob: &[u8], revision: u8) -> Vec<u8> {
+        let mut rewritten = PAIRING_BLOB_MAGIC.to_vec();
+        rewritten.push(revision);
+        rewritten.extend_from_slice(blob.get(rewritten.len()..).unwrap());
+        rewritten
     }
 
     #[test]
     fn the_encoder_sizes_its_buffer_once() {
-        let full = sample();
-        let mut bare = sample();
-        bare.local_private = Zeroizing::new(Vec::new());
-        bare.granted_profiles.clear();
-        bare.auth_cert = None;
-        bare.signature_cert = None;
-        bare.root_ca = None;
-        bare.intermediate_ca = None;
-        bare.peer_display_name.clear();
-        for record in [full, bare] {
-            let encoded = encode_pairing_record(&record);
-            assert_eq!(encoded.len(), super::encoded_record_size(&record));
+        let bare = PairingRecord::new(
+            pair_record(PairId::from_array(PAIR_ID), vec![ProfileName::CardStatus]),
+            phone(),
+        )
+        .unwrap();
+        for record in [sample(), sample().forgotten(FORGOTTEN_AT_MS), bare] {
+            let encoded = encode_pairing_record(&record).unwrap();
             assert_eq!(encoded.capacity(), encoded.len());
         }
     }
@@ -488,54 +340,15 @@ mod tests {
     #[test]
     fn round_trips_every_field() {
         let record = sample();
-        let blob = encode_pairing_record(&record);
-        let decoded = decode_pairing_record(&blob).unwrap();
+        let decoded = decode_pairing_record(&encode_pairing_record(&record).unwrap()).unwrap();
         assert_same(&record, &decoded);
     }
 
     #[test]
-    fn round_trips_a_revoked_tombstone() {
-        let mut record = sample();
-        record.disposition = PairingDisposition::Revoked;
-        record.peer_initiated_termination = true;
-        record.local_private = Zeroizing::new(Vec::new());
-        record.peer_public = Vec::new();
-        let decoded = decode_pairing_record(&encode_pairing_record(&record)).unwrap();
+    fn round_trips_a_forgotten_record_with_its_key_and_time() {
+        let record = sample().forgotten(FORGOTTEN_AT_MS);
+        let decoded = decode_pairing_record(&encode_pairing_record(&record).unwrap()).unwrap();
         assert_same(&record, &decoded);
-    }
-
-    #[test]
-    fn round_trips_an_unconfirmed_record() {
-        let mut record = sample();
-        record.disposition = PairingDisposition::Unconfirmed;
-        let decoded = decode_pairing_record(&encode_pairing_record(&record)).unwrap();
-        assert_same(&record, &decoded);
-    }
-
-    #[test]
-    fn round_trips_a_multi_record_set() {
-        let mut second = sample();
-        second.pair_id = PairId::from_array([8; 16]);
-        second.peer_display_name = "Holder's Tablet".into();
-        let records = vec![sample(), second];
-        let decoded = decode_pairing_records(&encode_pairing_records(&records)).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_same(&records[0], &decoded[0]);
-        assert_same(&records[1], &decoded[1]);
-    }
-
-    #[test]
-    fn an_empty_blob_is_an_empty_set() {
-        assert!(decode_pairing_records(&[]).unwrap().is_empty());
-    }
-
-    #[test]
-    fn round_trips_an_empty_set() {
-        assert!(
-            decode_pairing_records(&encode_pairing_records(&[]))
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]
@@ -548,8 +361,10 @@ mod tests {
 
     #[test]
     fn rejects_a_truncated_blob() {
-        let blob = encode_pairing_record(&sample());
-        let cut = &blob[..blob.len() - 1];
+        let blob = encode_pairing_record(&sample()).unwrap();
+        let cut = blob
+            .get(..blob.len().saturating_sub(TRAILING.len()))
+            .unwrap();
         assert!(matches!(
             decode_pairing_record(cut),
             Err(PairingCodecError::Truncated)
@@ -558,8 +373,8 @@ mod tests {
 
     #[test]
     fn rejects_trailing_bytes() {
-        let mut blob = encode_pairing_record(&sample()).to_vec();
-        blob.push(0);
+        let mut blob = encode_pairing_record(&sample()).unwrap().to_vec();
+        blob.extend_from_slice(TRAILING);
         assert!(matches!(
             decode_pairing_record(&blob),
             Err(PairingCodecError::TrailingBytes)
@@ -567,26 +382,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_unknown_revision() {
-        let bogus_version = PAIRING_BLOB_VERSION.wrapping_add(9);
-        let mut blob = encode_pairing_record(&sample()).to_vec();
-        blob[PAIRING_BLOB_MAGIC.len()] = bogus_version;
+    fn rejects_a_later_revision_and_sweeps_only_earlier_ones() {
+        let blob = encode_pairing_record(&sample()).unwrap();
+        let later = at_revision(&blob, LATER_REVISION);
         assert!(matches!(
-            decode_pairing_record(&blob),
-            Err(PairingCodecError::UnsupportedVersion { found })
-                if found == bogus_version
+            decode_pairing_record(&later),
+            Err(PairingCodecError::UnsupportedVersion { found }) if found == LATER_REVISION
         ));
-    }
-
-    #[test]
-    fn earlier_revisions_are_refused() {
-        let mut blob = encode_pairing_record(&sample()).to_vec();
-        for earlier in 1..PAIRING_BLOB_VERSION {
-            blob[PAIRING_BLOB_MAGIC.len()] = earlier;
+        assert!(!is_superseded(&later));
+        assert!(!is_superseded(&blob));
+        for earlier in FIRST_REVISION..PAIRING_BLOB_VERSION {
+            let earlier_blob = at_revision(&blob, earlier);
             assert!(matches!(
-                decode_pairing_record(&blob),
+                decode_pairing_record(&earlier_blob),
                 Err(PairingCodecError::UnsupportedVersion { found }) if found == earlier
             ));
+            assert!(is_superseded(&earlier_blob));
         }
     }
 }

@@ -1,5 +1,5 @@
-//! The `fi.refineid.stream.v1` transport tier (RAPP transport and discovery
-//! hierarchy, sections 3.3 and 4).
+//! The `fi.refineid.stream` transport tier (RAPP v26.10.21 section 2.2.2;
+//! RAPP transport and discovery hierarchy, sections 3.3 and 4).
 //!
 //! The custodian (the phone) listens on an ephemeral TCP port and advertises
 //! `_refineid-stream._tcp.local.` under a fresh random instance name, with a
@@ -18,18 +18,17 @@ use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use refineid_rapp::{
-    DiscoveryKey, DiscoveryRecord, InstanceName, PreambleError, RevocationKey, SessionRouting,
-    TransportProfile, WithdrawalKey, WithdrawnRecord, discovery_epoch, withdrawal_counter,
+    DiscoveryKey, DiscoveryRecord, InstanceName, PreambleError, SessionRouting, TransportProfile,
+    WithdrawalKey, WithdrawnRecord, discovery_epoch, withdrawal_counter,
 };
 
 use crate::transport::{FrameTransport, TcpFrameTransport, TransportError};
-pub use refineid_rapp::{MAX_ROUTING_PREAMBLE_FRAME, RoutingPreamble, STREAM_PROFILE};
+pub use refineid_rapp::{
+    MAX_ROUTING_PREAMBLE_FRAME, RoutingPreamble, STREAM_CANDIDATE_ID, STREAM_PROFILE,
+};
 
 /// The DNS-SD service type of the stream tier.
 pub const STREAM_SERVICE_TYPE: &str = "_refineid-stream._tcp.local";
-
-/// The candidate identifier both peers bind for a stream pairing.
-pub const STREAM_CANDIDATE_ID: &str = "stream-1";
 
 /// TXT key naming the discovery mode.
 const MODE_KEY: &str = "mode";
@@ -113,20 +112,6 @@ impl StreamService {
         } else {
             HintMatch::Other
         }
-    }
-
-    /// Whether this session record's `revoked` entries announce, for this
-    /// instance at `unix_seconds`, that the custodian forgot the pairing
-    /// keyed by `key` (RAPP v26.10.18 section 4.6 item 5).
-    #[must_use]
-    pub fn revokes(&self, key: &RevocationKey, unix_seconds: u64) -> bool {
-        let (Ok(record), Ok(instance)) = (
-            DiscoveryRecord::parse(&self.entries()),
-            InstanceName::new(&self.instance),
-        ) else {
-            return false;
-        };
-        key.matches(&record, &instance, discovery_epoch(unix_seconds))
     }
 
     /// Whether this is a withdrawn record that announces the pairing keyed

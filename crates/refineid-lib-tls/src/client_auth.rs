@@ -1,7 +1,8 @@
 //! Client certificate authentication using remote RAPP card readers over TLS.
 //!
 //! The certificate is offered only on a session the phone opened and on
-//! which it reports a card (RAPP v26.10.18 section 8.4). Each handshake
+//! which it reports the card the certificate belongs to (RAPP v26.10.21
+//! section 8.4). Each handshake
 //! gets its own reader and session: the resolver opens them when the
 //! server asks for a certificate, the signing key owns them, the signer
 //! signs on that session and closes it, and a key dropped without
@@ -67,12 +68,12 @@ impl OfferedSession {
 /// Client certificate resolver backed by a paired RAPP remote card reader.
 ///
 /// The certificate is offered only once the phone has opened a session
-/// and reported a card on it; that session belongs to the handshake's
-/// signing key.
+/// and reported a card on it, and only the one whose fingerprint the phone
+/// reports on that session (RAPP v26.10.21 section 8.4 item 2); that
+/// session belongs to the handshake's signing key.
 #[derive(Debug)]
 pub struct RappClientCertResolver {
     pair: PairId,
-    cert_der: Vec<u8>,
     origin: String,
     /// Why no identity was offered, when the handshake asked and the
     /// resolver had none to give; the caller reports it instead of a
@@ -81,13 +82,11 @@ pub struct RappClientCertResolver {
 }
 
 impl RappClientCertResolver {
-    /// Create a resolver for the given active pair, authentication
-    /// certificate, and origin.
+    /// Create a resolver for the given active pair and origin.
     #[must_use]
-    pub fn new(pair: PairId, cert_der: Vec<u8>, origin: String) -> Self {
+    pub fn new(pair: PairId, origin: String) -> Self {
         Self {
             pair,
-            cert_der,
             origin,
             refusal: Mutex::new(None),
         }
@@ -126,14 +125,21 @@ impl ResolvesClientCert for RappClientCertResolver {
                 return None;
             }
         };
-        let session = match reader.open_session(Some(self.pair), REMOTE_DISCOVERY_TIMEOUT) {
+        let mut session = match reader.open_session(Some(self.pair), REMOTE_DISCOVERY_TIMEOUT) {
             Ok(session) => session,
             Err(error) => {
                 self.record_refusal(error.to_string());
                 return None;
             }
         };
-        let cert = CertificateDer::from(self.cert_der.clone());
+        let cert = match reader.confirmed_auth_cert(&mut session) {
+            Ok(der) => CertificateDer::from(der),
+            Err(error) => {
+                reader.close_session(session);
+                self.record_refusal(error.to_string());
+                return None;
+            }
+        };
         let key = Arc::new(RappSigningKey {
             origin: self.origin.clone(),
             offered: Arc::new(Mutex::new(Some(OfferedSession { reader, session }))),
@@ -226,11 +232,7 @@ impl Signer for RappSigner {
 ///
 /// # Errors
 /// Returns [`HttpsError`] on network, TLS handshake, or RAPP signing errors.
-pub fn get_with_rapp_client_auth(
-    url: &Uri,
-    pair: PairId,
-    cert_der: &[u8],
-) -> Result<String, HttpsError> {
+pub fn get_with_rapp_client_auth(url: &Uri, pair: PairId) -> Result<String, HttpsError> {
     if url.scheme() != Scheme::Https {
         return Err(HttpsError::UnsupportedScheme);
     }
@@ -255,7 +257,7 @@ pub fn get_with_rapp_client_auth(
     let versions: &[&rustls::SupportedProtocolVersion] =
         &[&rustls::version::TLS13, &rustls::version::TLS12];
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let resolver = Arc::new(RappClientCertResolver::new(pair, cert_der.to_vec(), origin));
+    let resolver = Arc::new(RappClientCertResolver::new(pair, origin));
 
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)

@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
+use refineid_rapp_core::profiles::ProfileName;
 use refineid_rapp_core::remote::{RemoteError, RemoteReader};
 
 use super::ArgParseError;
@@ -105,10 +106,22 @@ impl PairArgs {
         println!();
         println!("Successfully paired!");
         println!("Pair ID: {}", pair.pair_id_hex());
-        println!("Granted profiles: {}", pair.granted_profiles.join(", "));
+        println!(
+            "Granted profiles: {}",
+            profile_names(&pair.granted_profiles)
+        );
         println!("Remote reader is now active for PKCS#11 (Firefox / suomi.fi) and CLI!");
         ExitCode::SUCCESS
     }
+}
+
+/// The registered names of `profiles`, for display.
+fn profile_names(profiles: &[ProfileName]) -> String {
+    profiles
+        .iter()
+        .map(|profile| profile.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Reads one line from standard input as the pairing code.
@@ -156,7 +169,7 @@ impl PairsArgs {
         };
         println!("Phone: {} - {}", pair.peer_display_name, pair.peer_platform);
         println!("  Pair ID:    {}", pair.pair_id_hex());
-        println!("  Profiles:   {}", pair.granted_profiles.join(", "));
+        println!("  Profiles:   {}", profile_names(&pair.granted_profiles));
         println!(
             "  Cert cache: {}",
             if pair.auth_cert.is_some() {
@@ -207,10 +220,14 @@ impl UnpairArgs {
             eprintln!("Error forgetting {}: {e}", phone.peer_display_name);
             return ExitCode::FAILURE;
         }
-        println!(
-            "Forgot {}. Remove this computer on the phone as well.",
-            phone.peer_display_name
-        );
+        if reader.deliver_revocation_notices() > 0 {
+            println!("Forgot {}; the phone was told.", phone.peer_display_name);
+        } else {
+            println!(
+                "Forgot {}; the phone is told when this computer next reaches it.",
+                phone.peer_display_name
+            );
+        }
         ExitCode::SUCCESS
     }
 }
@@ -247,7 +264,7 @@ impl AuthArgs {
         println!("======================================================");
         println!("Target URL: {target}");
 
-        let mut reader = match RemoteReader::open_local() {
+        let reader = match RemoteReader::open_local() {
             Ok(reader) => reader,
             Err(e) => {
                 eprintln!("Error opening the paired-phone store: {e}");
@@ -264,20 +281,6 @@ impl AuthArgs {
             pair.pair_id_hex()
         );
 
-        let cert_der = match &pair.auth_cert {
-            Some(cert) => cert.clone(),
-            None => {
-                println!("Retrieving authentication certificate from paired reader...");
-                match reader.refresh_auth_cert(pair.pair_id, DISCOVERY_TIMEOUT) {
-                    Ok(der) => der,
-                    Err(e) => {
-                        eprintln!("Failed to retrieve authentication certificate: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-        };
-
         let uri = match refineid_lib_core::text::Uri::parse(target.to_string()) {
             Ok(u) => u,
             Err(e) => {
@@ -289,11 +292,7 @@ impl AuthArgs {
         println!("Initiating TLS client certificate authentication...");
         #[cfg(feature = "tls-rustls")]
         {
-            match refineid_lib_tls::client_auth::get_with_rapp_client_auth(
-                &uri,
-                pair.pair_id,
-                &cert_der,
-            ) {
+            match refineid_lib_tls::client_auth::get_with_rapp_client_auth(&uri, pair.pair_id) {
                 Ok(response) => {
                     println!("\nAuthentication successful!");
                     if let Some(status_line) = response.lines().next() {

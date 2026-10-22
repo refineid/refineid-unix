@@ -1,6 +1,6 @@
 //! Remote Authorization Proxy Protocol (RAPP) requester core.
 //!
-//! This crate implements the requester role of RAPP v26.10.18 for Unix
+//! This crate implements the requester role of RAPP v26.10.21 for Unix
 //! workstations: the workstation asks for typed credential operations, and
 //! the custodian — the holder's phone — presents consent, talks to the
 //! identity card, and returns only the profile-defined result.
@@ -10,7 +10,6 @@
 
 pub mod addresses;
 pub mod engine;
-pub mod file_journal;
 pub mod file_store;
 pub mod ids;
 pub mod message;
@@ -25,7 +24,7 @@ pub mod stream;
 pub mod transport;
 
 /// The wire version of RAPP from canonical core.
-pub const WIRE_VERSION: (u16, u16, u16) = refineid_rapp::WIRE_VERSION_V26_10_18;
+pub const WIRE_VERSION: (u16, u16, u16) = refineid_rapp::WIRE_VERSION_V26_10_21;
 
 /// The mandatory pairing handshake construction.
 pub const PAIRING_SUITE: &str = refineid_rapp::MANDATORY_PAIRING_SUITE;
@@ -41,16 +40,10 @@ pub mod limits {
     /// Maximum plaintext bytes in one envelope (`MAX_FRAME_PLAINTEXT`).
     pub const MAX_FRAME_PLAINTEXT: usize = refineid_rapp::MAX_FRAME_PLAINTEXT;
 
-    /// Maximum container nesting depth in one message (`MAX_NESTING_DEPTH`).
-    pub const MAX_NESTING_DEPTH: usize = 8;
-
-    /// Maximum UTF-8 bytes in one text string (`MAX_TEXT_SIZE`).
-    pub const MAX_TEXT_SIZE: usize = 4_096;
-
     /// Maximum encoded pairing-offer bytes (`MAX_OFFER_SIZE`).
     pub const MAX_OFFER_SIZE: usize = refineid_rapp::MAX_OFFER_SIZE;
 
-    /// Maximum concurrently active operations per proxy (`MAX_ACTIVE_OPERATIONS`).
+    /// Operations one session carries at a time (section 8.1 item 1).
     pub const MAX_ACTIVE_OPERATIONS: usize = refineid_rapp::MAX_ACTIVE_OPERATIONS;
 
     /// Pairing-offer lifetime in milliseconds (`OFFER_TTL_MS`).

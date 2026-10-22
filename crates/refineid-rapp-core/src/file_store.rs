@@ -3,7 +3,8 @@
 //! Each pairing is one file, written atomically (temporary file, `fsync`,
 //! rename) with mode `0600` inside a `0700` directory. The file holds the
 //! [`persistence`](crate::persistence) encoding, which includes the pair's
-//! private key; nothing here prints or logs it.
+//! private key; nothing here prints or logs it. A pairing's file goes when
+//! its key does.
 //!
 //! The store lives beside, not inside, the directory earlier releases used:
 //! those records belong to an older protocol revision and are left
@@ -19,17 +20,17 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 use crate::ids::PairId;
-use crate::persistence::{decode_pairing_record, encode_pairing_record, superseded_pair_id};
-use crate::store::{PairingDisposition, PairingRecord, PairingStore, StoreError};
+use crate::persistence::{decode_pairing_record, encode_pairing_record, is_superseded};
+use crate::store::{PairingRecord, PairingStore, StoreError};
 
 /// File extension of one stored pairing.
 const RECORD_EXTENSION: &str = "pair";
+/// File extension of a record being written.
+const TEMPORARY_EXTENSION: &str = "tmp";
 /// Owner-only directory permissions.
 const DIRECTORY_MODE: u32 = 0o700;
 /// Owner-only file permissions.
 const FILE_MODE: u32 = 0o600;
-/// The length of a pair private key.
-const PAIR_PRIVATE_KEY_SIZE: usize = 32;
 
 /// What an opener does with the files of records it cannot use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,11 +65,9 @@ impl FilePairingStore {
     }
 
     /// Opens (creating if needed) the store in `directory` and loads every
-    /// readable record. A record of an earlier encoding revision, and a
-    /// paired record whose key is missing or not a key, are removed: their
-    /// pairings are made again. Any other file that does not decode is
-    /// skipped, never rewritten. A revoked record is loaded without a
-    /// key.
+    /// readable record. A record of an earlier encoding revision is
+    /// removed: its pairing is made again. Any other file that does not
+    /// decode is skipped, never rewritten.
     ///
     /// # Errors
     /// [`StoreError::WriteRefused`] when the directory cannot be created or
@@ -104,25 +103,14 @@ impl FilePairingStore {
             let Ok(bytes) = fs::read(&path).map(Zeroizing::new) else {
                 continue;
             };
-            let Ok(mut record) = decode_pairing_record(&bytes) else {
-                if sweep == Sweep::Remove && superseded_pair_id(&bytes).is_some() {
+            let Ok(record) = decode_pairing_record(&bytes) else {
+                if sweep == Sweep::Remove && is_superseded(&bytes) {
                     // A pairing from an earlier protocol version: its
                     // holder pairs again, so the record goes.
                     let _ = fs::remove_file(&path);
                 }
                 continue;
             };
-            if record.disposition == PairingDisposition::Paired
-                && record.local_private.len() != PAIR_PRIVATE_KEY_SIZE
-            {
-                // A pairing without a usable key cannot open a session:
-                // its holder pairs again, so the record goes.
-                if sweep == Sweep::Remove {
-                    let _ = fs::remove_file(&path);
-                }
-                continue;
-            }
-            keep_key_only_while_paired(&mut record);
             let modified = entry
                 .metadata()
                 .and_then(|metadata| metadata.modified())
@@ -151,64 +139,67 @@ impl FilePairingStore {
     }
 }
 
-fn path_for(directory: &Path, pair_id: PairId) -> PathBuf {
-    let mut name = String::with_capacity(pair_id.as_bytes().len() * 2);
-    for byte in pair_id.as_bytes() {
-        use core::fmt::Write as _;
-        let _ = write!(name, "{byte:02x}");
-    }
+/// The file of `pair_id`'s record: the identifier in lowercase hex.
+pub(crate) fn path_for(directory: &Path, pair_id: PairId) -> PathBuf {
+    let name: String = pair_id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     directory.join(name).with_extension(RECORD_EXTENSION)
 }
 
-/// Drops the private key of a revoked record. A record awaiting the
-/// peer's storage confirmation keeps its key: it becomes paired when the
-/// confirmation arrives, and is revoked at the next start when none did.
-fn keep_key_only_while_paired(record: &mut PairingRecord) {
-    if record.disposition == PairingDisposition::Revoked {
-        record.local_private = Zeroizing::new(Vec::new());
-    }
+/// The record of `pair_id` as its file holds it, if it reads.
+fn read_record(directory: &Path, pair_id: PairId) -> Option<PairingRecord> {
+    let bytes = fs::read(path_for(directory, pair_id))
+        .map(Zeroizing::new)
+        .ok()?;
+    decode_pairing_record(&bytes).ok()
 }
 
-/// Writes `record`'s file atomically. The caller has already dropped the
-/// key of a record that is not paired.
+/// Writes `record`'s file atomically.
 ///
 /// # Errors
-/// [`StoreError::WriteRefused`] when a paired record's key is not a key,
-/// or the file cannot be written.
+/// [`StoreError::WriteRefused`] when the record does not encode or the
+/// file cannot be written.
 fn write_record(directory: &Path, record: &PairingRecord) -> Result<(), StoreError> {
-    {
-        if record.disposition == PairingDisposition::Paired
-            && record.local_private.len() != PAIR_PRIVATE_KEY_SIZE
-        {
-            return Err(StoreError::WriteRefused);
-        }
-        let path = path_for(directory, record.pair_id);
-        let temporary = path.with_extension("tmp");
-        let blob = encode_pairing_record(record);
-        let written = (|| {
-            let mut file: File = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(FILE_MODE)
-                .open(&temporary)?;
-            file.write_all(&blob)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &path)
-        })();
-        if written.is_err() {
-            let _ = fs::remove_file(&temporary);
-            return Err(StoreError::WriteRefused);
-        }
-        Ok(())
+    let path = path_for(directory, record.pair_id());
+    let temporary = path.with_extension(TEMPORARY_EXTENSION);
+    let blob = encode_pairing_record(record).map_err(|_| StoreError::WriteRefused)?;
+    let written = (|| {
+        let mut file: File = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(FILE_MODE)
+            .open(&temporary)?;
+        file.write_all(&blob)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(StoreError::WriteRefused);
     }
+    Ok(())
+}
+
+/// Deletes `pair_id`'s file, its key with it, and the addresses kept
+/// beside it.
+///
+/// # Errors
+/// [`StoreError::WriteRefused`] when the file cannot be deleted.
+fn delete_record(directory: &Path, pair_id: PairId) -> Result<(), StoreError> {
+    fs::remove_file(path_for(directory, pair_id)).map_err(|_| StoreError::WriteRefused)?;
+    crate::addresses::forget(directory, pair_id);
+    Ok(())
 }
 
 impl PairingStore for FilePairingStore {
-    fn insert(&mut self, mut record: PairingRecord) -> Result<(), StoreError> {
-        keep_key_only_while_paired(&mut record);
+    fn insert(&mut self, record: PairingRecord) -> Result<(), StoreError> {
         write_record(&self.directory, &record)?;
-        self.records.retain(|entry| entry.pair_id != record.pair_id);
+        self.records
+            .retain(|entry| entry.pair_id() != record.pair_id());
         self.records.push(record);
         Ok(())
     }
@@ -216,46 +207,54 @@ impl PairingStore for FilePairingStore {
     fn get(&self, pair_id: PairId) -> Result<&PairingRecord, StoreError> {
         self.records
             .iter()
-            .find(|entry| entry.pair_id == pair_id)
+            .find(|entry| entry.pair_id() == pair_id)
             .ok_or(StoreError::Unknown)
     }
 
     fn update(
         &mut self,
         pair_id: PairId,
-        change: &mut dyn FnMut(&mut PairingRecord),
+        change: &mut dyn FnMut(PairingRecord) -> Option<PairingRecord>,
     ) -> Result<(), StoreError> {
-        let index = self
-            .records
-            .iter()
-            .position(|entry| entry.pair_id == pair_id)
-            .ok_or(StoreError::Unknown)?;
-        let mut next = self.records[index].clone();
-        change(&mut next);
-        keep_key_only_while_paired(&mut next);
-        write_record(&self.directory, &next)?;
-        self.records[index] = next;
-        Ok(())
-    }
-
-    fn remove(&mut self, pair_id: PairId) -> Result<(), StoreError> {
-        let index = self
-            .records
-            .iter()
-            .position(|entry| entry.pair_id == pair_id)
-            .ok_or(StoreError::Unknown)?;
-        fs::remove_file(path_for(&self.directory, pair_id))
-            .map_err(|_| StoreError::WriteRefused)?;
-        crate::addresses::forget(&self.directory, pair_id);
-        self.records.remove(index);
-        Ok(())
+        let mut outcome = Err(StoreError::Unknown);
+        let directory = &self.directory;
+        self.records = core::mem::take(&mut self.records)
+            .into_iter()
+            .filter_map(|record| {
+                if record.pair_id() != pair_id {
+                    return Some(record);
+                }
+                // Another program may have rewritten or removed the file
+                // since this store read it: the change applies to the
+                // record as the disk holds it now, and a record the disk
+                // no longer holds readably is gone.
+                let current = read_record(directory, pair_id)?;
+                let durable = match change(current) {
+                    Some(next) => write_record(directory, &next).map(|()| Some(next)),
+                    None => delete_record(directory, pair_id).map(|()| None),
+                };
+                match durable {
+                    Ok(next) => {
+                        outcome = Ok(());
+                        next
+                    }
+                    // The change did not reach the disk: the store holds
+                    // what the disk holds.
+                    Err(error) => {
+                        outcome = Err(error);
+                        read_record(directory, pair_id)
+                    }
+                }
+            })
+            .collect();
+        outcome
     }
 
     fn pair_ids(&self) -> Vec<PairId> {
         self.records
             .iter()
             .rev()
-            .map(|entry| entry.pair_id)
+            .map(PairingRecord::pair_id)
             .collect()
     }
 }
@@ -268,35 +267,43 @@ impl PairingStore for FilePairingStore {
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
-    use super::FilePairingStore;
-    use crate::ids::PairId;
-    use crate::store::{PairingDisposition, PairingRecord, PairingStore, StoreError};
+    use refineid_rapp::PairingState;
 
-    fn record(byte: u8) -> PairingRecord {
-        PairingRecord {
-            pair_id: PairId::from_array([byte; 16]),
-            local_private: zeroize::Zeroizing::new(vec![0x11; 32]),
-            local_public: vec![0x22; 32],
-            peer_public: vec![0x33; 32],
-            granted_profiles: vec![crate::profiles::PROFILE_CARD_STATUS.to_owned()],
-            grants_hash: [0x44; 32],
-            peer_display_name: "Phone".into(),
-            peer_platform: "iOS".into(),
-            disposition: PairingDisposition::Paired,
-            peer_initiated_termination: false,
-            candidate_failures: 0,
-            auth_cert: None,
-            signature_cert: None,
-            root_ca: None,
-            intermediate_ca: None,
-        }
-    }
+    use super::{FilePairingStore, path_for};
+    use crate::ids::PairId;
+    use crate::persistence::{PAIRING_BLOB_MAGIC, PAIRING_BLOB_VERSION};
+    use crate::store::PairingStore;
+    use crate::store::fixtures::record;
+
+    /// Synthetic pair identifiers.
+    const FIRST: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-1";
+    const SECOND: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-2";
+    /// A synthetic authentication certificate.
+    const CERTIFICATE: &[u8] = b"synthetic authentication certificate";
+    /// When the forgotten fixture's user forgot it.
+    const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
+    /// A revision before the one this build reads.
+    const EARLIER_REVISION: u8 = PAIRING_BLOB_VERSION - 1;
+    /// The body of a record of an earlier revision.
+    const EARLIER_BODY: &[u8] = b"synthetic record of an earlier revision";
+    /// The permission bits of a mode.
+    const PERMISSION_BITS: u32 = 0o777;
+    /// The mode of the store's directory.
+    const DIRECTORY_MODE: u32 = 0o700;
+    /// The mode of each record file.
+    const FILE_MODE: u32 = 0o600;
 
     fn scratch() -> std::path::PathBuf {
-        let mut name = [0u8; 8];
-        getrandom::fill(&mut name).unwrap();
-        let suffix: String = name.iter().map(|b| format!("{b:02x}")).collect();
-        std::env::temp_dir().join(format!("refineid-rapp-store-{suffix}"))
+        let suffix = getrandom::u64().unwrap();
+        std::env::temp_dir().join(format!("refineid-rapp-store-{suffix:x}"))
+    }
+
+    /// A file holding a record of an earlier encoding revision.
+    fn earlier_blob() -> Vec<u8> {
+        let mut blob = PAIRING_BLOB_MAGIC.to_vec();
+        blob.push(EARLIER_REVISION);
+        blob.extend_from_slice(EARLIER_BODY);
+        blob
     }
 
     #[test]
@@ -304,110 +311,45 @@ mod tests {
         let directory = scratch();
         {
             let mut store = FilePairingStore::open(&directory).unwrap();
-            store.insert(record(1)).unwrap();
-            store.insert(record(2)).unwrap();
+            store.insert(record(PairId::from_array(FIRST))).unwrap();
+            store.insert(record(PairId::from_array(SECOND))).unwrap();
             store
-                .update(PairId::from_array([1; 16]), &mut |entry| {
-                    entry.auth_cert = Some(vec![0x30, 0x00]);
+                .update(PairId::from_array(FIRST), &mut |entry| {
+                    Some(entry.with_auth_cert(Some(CERTIFICATE.to_vec())))
                 })
                 .unwrap();
         }
         let store = FilePairingStore::open(&directory).unwrap();
-        assert_eq!(store.pair_ids().len(), 2);
-        let first = store.get(PairId::from_array([1; 16])).unwrap();
-        assert_eq!(first.auth_cert.as_deref(), Some(&[0x30, 0x00][..]));
-        assert_eq!(first.local_private.as_slice(), [0x11; 32]);
+        assert_eq!(
+            store.pair_ids(),
+            [PairId::from_array(FIRST), PairId::from_array(SECOND)]
+        );
+        let first = store.get(PairId::from_array(FIRST)).unwrap();
+        assert_eq!(first.auth_cert(), Some(CERTIFICATE));
         let directory_mode = std::fs::metadata(&directory).unwrap().permissions().mode();
-        assert_eq!(directory_mode & 0o777, 0o700);
+        assert_eq!(directory_mode & PERMISSION_BITS, DIRECTORY_MODE);
         for entry in std::fs::read_dir(&directory).unwrap() {
             let mode = entry.unwrap().metadata().unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
+            assert_eq!(mode & PERMISSION_BITS, FILE_MODE);
         }
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
-    fn a_revoked_record_holds_no_key() {
+    fn a_forgotten_record_keeps_its_key_and_time_across_reopening() {
         let directory = scratch();
+        let pair_id = PairId::from_array(FIRST);
         let mut store = FilePairingStore::open(&directory).unwrap();
-        store.insert(record(6)).unwrap();
+        store.insert(record(pair_id)).unwrap();
+        let key = *store.get(pair_id).unwrap().pairing().local_static_private();
         store
-            .update(PairId::from_array([6; 16]), &mut |entry| {
-                entry.disposition = PairingDisposition::Revoked;
-            })
-            .unwrap();
-        assert!(
-            store
-                .get(PairId::from_array([6; 16]))
-                .unwrap()
-                .local_private
-                .is_empty()
-        );
-        let bytes =
-            std::fs::read(super::path_for(&directory, PairId::from_array([6; 16]))).unwrap();
-        assert!(!bytes.windows(32).any(|window| window == [0x11; 32]));
-        let reopened = FilePairingStore::open(&directory).unwrap();
-        let loaded = reopened.get(PairId::from_array([6; 16])).unwrap();
-        assert!(loaded.local_private.is_empty());
-        assert!(loaded.to_core_pair_record().is_err());
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    fn a_paired_record_without_a_usable_key_is_dropped_and_a_bad_key_is_refused() {
-        let directory = scratch();
-        {
-            let mut store = FilePairingStore::open(&directory).unwrap();
-            let mut short = record(10);
-            short.local_private = zeroize::Zeroizing::new(vec![0x11; 16]);
-            assert_eq!(store.insert(short), Err(StoreError::WriteRefused));
-            store.insert(record(11)).unwrap();
-            store.insert(record(12)).unwrap();
-            store.insert(record(13)).unwrap();
-        }
-        let mut keyless = record(11);
-        keyless.local_private = zeroize::Zeroizing::new(Vec::new());
-        let keyless_path = super::path_for(&directory, PairId::from_array([11; 16]));
-        std::fs::write(
-            &keyless_path,
-            crate::persistence::encode_pairing_record(&keyless),
-        )
-        .unwrap();
-        let mut short_key = record(12);
-        short_key.local_private = zeroize::Zeroizing::new(vec![0x11; 16]);
-        let short_path = super::path_for(&directory, PairId::from_array([12; 16]));
-        std::fs::write(
-            &short_path,
-            crate::persistence::encode_pairing_record(&short_key),
-        )
-        .unwrap();
-        let store = FilePairingStore::open(&directory).unwrap();
-        assert_eq!(store.pair_ids(), vec![PairId::from_array([13; 16])]);
-        assert!(!keyless_path.exists());
-        assert!(!short_path.exists());
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    fn an_unconfirmed_record_keeps_its_key_until_it_is_paired() {
-        let directory = scratch();
-        let mut store = FilePairingStore::open(&directory).unwrap();
-        let mut awaiting = record(14);
-        awaiting.disposition = PairingDisposition::Unconfirmed;
-        store.insert(awaiting).unwrap();
-        let on_disk = FilePairingStore::open(&directory).unwrap();
-        let loaded = on_disk.get(PairId::from_array([14; 16])).unwrap();
-        assert_eq!(loaded.disposition, PairingDisposition::Unconfirmed);
-        assert_eq!(loaded.local_private.as_slice(), [0x11; 32]);
-        store
-            .update(PairId::from_array([14; 16]), &mut |entry| {
-                entry.disposition = PairingDisposition::Paired;
-            })
+            .update(pair_id, &mut |entry| Some(entry.forgotten(FORGOTTEN_AT_MS)))
             .unwrap();
         let reopened = FilePairingStore::open(&directory).unwrap();
-        let paired = reopened.get(PairId::from_array([14; 16])).unwrap();
-        assert_eq!(paired.disposition, PairingDisposition::Paired);
-        assert_eq!(paired.local_private.as_slice(), [0x11; 32]);
+        let loaded = reopened.get(pair_id).unwrap();
+        assert_eq!(loaded.state(), PairingState::Revoking);
+        assert_eq!(loaded.pairing().forgotten_at_ms(), Some(FORGOTTEN_AT_MS));
+        assert_eq!(loaded.pairing().local_static_private(), &key);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -416,60 +358,52 @@ mod tests {
         let directory = scratch();
         {
             let mut store = FilePairingStore::open(&directory).unwrap();
-            store.insert(record(21)).unwrap();
-            store.insert(record(22)).unwrap();
+            store.insert(record(PairId::from_array(SECOND))).unwrap();
         }
-        let mut keyless = record(21);
-        keyless.local_private = zeroize::Zeroizing::new(Vec::new());
-        let keyless_path = super::path_for(&directory, PairId::from_array([21; 16]));
-        std::fs::write(
-            &keyless_path,
-            crate::persistence::encode_pairing_record(&keyless),
-        )
-        .unwrap();
-        let mut earlier = b"RAPP-pair-record".to_vec();
-        earlier.push(5);
-        earlier.extend_from_slice(PairId::from_array([9; 16]).as_bytes());
-        earlier.extend_from_slice(&[0x55; 40]);
-        let earlier_path = directory.join("earlier.pair");
-        std::fs::write(&earlier_path, &earlier).unwrap();
+        let earlier_path = path_for(&directory, PairId::from_array(FIRST));
+        std::fs::write(&earlier_path, earlier_blob()).unwrap();
         let store = FilePairingStore::open_without_sweep(&directory).unwrap();
-        assert_eq!(store.pair_ids(), vec![PairId::from_array([22; 16])]);
-        assert!(keyless_path.exists());
+        assert_eq!(store.pair_ids(), [PairId::from_array(SECOND)]);
         assert!(earlier_path.exists());
         let swept = FilePairingStore::open(&directory).unwrap();
-        assert_eq!(swept.pair_ids(), vec![PairId::from_array([22; 16])]);
-        assert!(!keyless_path.exists());
+        assert_eq!(swept.pair_ids(), [PairId::from_array(SECOND)]);
         assert!(!earlier_path.exists());
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    fn records_of_an_earlier_revision_are_dropped() {
-        let directory = scratch();
-        drop(FilePairingStore::open(&directory).unwrap());
-        let pair_id = PairId::from_array([9; 16]);
-        let mut blob = b"RAPP-pair-record".to_vec();
-        blob.push(5);
-        blob.extend_from_slice(pair_id.as_bytes());
-        blob.extend_from_slice(&[0x55; 40]);
-        let path = directory.join("earlier.pair");
-        std::fs::write(&path, &blob).unwrap();
-        let store = FilePairingStore::open(&directory).unwrap();
-        assert!(store.pair_ids().is_empty());
-        assert!(!path.exists());
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
     fn removal_deletes_the_file_and_unreadable_files_are_skipped() {
         let directory = scratch();
+        let pair_id = PairId::from_array(FIRST);
         let mut store = FilePairingStore::open(&directory).unwrap();
-        store.insert(record(3)).unwrap();
-        std::fs::write(directory.join("garbage.pair"), b"not a record").unwrap();
-        store.remove(PairId::from_array([3; 16])).unwrap();
+        store.insert(record(pair_id)).unwrap();
+        let garbage = directory.join("garbage.pair");
+        std::fs::write(&garbage, b"not a record").unwrap();
+        store.remove(pair_id).unwrap();
+        assert!(!path_for(&directory, pair_id).exists());
         let reopened = FilePairingStore::open(&directory).unwrap();
         assert!(reopened.pair_ids().is_empty());
+        // A file that is no record of any revision is skipped, never
+        // deleted.
+        assert!(garbage.exists());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_refused_write_leaves_what_the_disk_holds() {
+        let directory = scratch();
+        let pair_id = PairId::from_array(FIRST);
+        let mut store = FilePairingStore::open(&directory).unwrap();
+        store.insert(record(pair_id)).unwrap();
+        let blocked = path_for(&directory, pair_id).with_extension(super::TEMPORARY_EXTENSION);
+        std::fs::create_dir(&blocked).unwrap();
+        assert_eq!(
+            store.update(pair_id, &mut |entry| {
+                Some(entry.with_auth_cert(Some(CERTIFICATE.to_vec())))
+            }),
+            Err(crate::store::StoreError::WriteRefused)
+        );
+        assert_eq!(store.get(pair_id).unwrap().auth_cert(), None);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }

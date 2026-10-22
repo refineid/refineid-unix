@@ -20,8 +20,8 @@ The **RefineID Remote Card Proxy** enables Linux and BSD workstations to perform
 4. **Workstation UX Hygiene: Local Card Reader First**: By default, RefineID Unix operates strictly as a **Local Smart Card Reader** (interfacing with local CCID hardware via `pcscd`). Background radio scanning and network mDNS discovery run ONLY when the user explicitly enables "Remote Phone Reader" in settings.
 5. **Normative 3-Tier Discovery & Transport Hierarchy**:
    * **Tier 1: Apple Native (Direct P2P)**: Exclusively Apple-to-Apple; not applicable on Unix.
-   * **Tier 2: Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble.v1`)**: BlueZ BLE GATT / L2CAP Credit-Based Channels (CoC) with physical RSSI proximity gating ($\ge -55\text{ dBm}$). Works completely offline with zero IP infrastructure.
-   * **Tier 3: Local IP Stream via mDNS / DNS-SD Fallback (`fi.refineid.stream.v1`)**: Universal cross-platform fallback when Bluetooth is absent, disabled, or in VMs. Discovered via RFC 6762 / 6763 (Avahi / `systemd-resolved`), connecting outbound to the phone.
+   * **Tier 2: Bluetooth / BLE Proximity Transport (`fi.refineid.rapp.ble`)**: BlueZ BLE GATT / L2CAP Credit-Based Channels (CoC) with physical RSSI proximity gating ($\ge -55\text{ dBm}$). Works completely offline with zero IP infrastructure.
+   * **Tier 3: Local IP Stream via mDNS / DNS-SD Fallback (`fi.refineid.stream`)**: Universal cross-platform fallback when Bluetooth is absent, disabled, or in VMs. Discovered via RFC 6762 / 6763 (Avahi / `systemd-resolved`), connecting outbound to the phone.
 6. **Noise Cryptography Over Untrusted Transports**: End-to-end authenticated encryption (`Noise_XXpsk3` for pairing, `Noise_KK` for sessions) using Curve25519, ChaCha20-Poly1305, and SHA-256 over BLE L2CAP or Local TCP streams. The underlay is treated as an untrusted wire.
 7. **Strict PIN Custody Rules**:
    * **Rule #1**: PIN codes (PIN1 and PIN2) NEVER leave the phone. PIN2 prompts appear exclusively on the phone's protected display.
@@ -91,7 +91,7 @@ Pairing establishes cryptographic association between the Unix workstation and t
    * In `refineid-gui` (or CLI `refineid pair`), the user turns on "Remote Phone Reader" and selects the discovered phone.
    * Desktop prompts for the 6-character code displayed on the phone.
 3. **Mutual Authentication (`CPaceRistretto255` KC2 + `Noise_XXpsk3`)**:
-   * The 6-character code is upper-cased; the letters `I`, `L`, `O` and `U` are not in the alphabet and a code carrying one is refused (RAPP v26.10.18 section 3.1).
+   * The 6-character code is upper-cased; the letters `I`, `L`, `O` and `U` are not in the alphabet and a code carrying one is refused (RAPP v26.10.21 section 3.1).
    * PAKE exchange (`CPaceRistretto255`) mutually authenticates both endpoints and derives a 256-bit PSK.
    * `Noise_XXpsk3` performs authenticated key exchange, binding the handshake to canonical offer hashes.
    * Both devices exchange and authenticate static Curve25519 public keys.

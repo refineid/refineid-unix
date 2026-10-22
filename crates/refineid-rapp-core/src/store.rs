@@ -1,239 +1,201 @@
-//! Durable pairing records and the operation journal.
+//! Durable pairing records.
 //!
-//! A pairing record is the atomic result of pairing: pair keys, `pair_id`,
-//! granted profiles, `grants_hash`, labels, and the
-//! fail-stop marker. The journal records each operation from the moment its
-//! request is written (RAPP v26.10.18 section 8): an unanswered consequential
-//! request is in flight and ends ambiguous, and terminal states are
-//! permanent.
+//! A pairing record is the engine's [`PairRecord`] -- the pair keys,
+//! `pair_id`, the granted profiles and their `grants_hash`, whether the
+//! peer confirmed its storage (RAPP v26.10.21 section 4.3 item 4), and when
+//! this computer's user forgot it (section 4.6 item 2) -- with what this
+//! computer keeps beside it: the phone's labels, the re-pairing hint, and
+//! the cached authentication certificate. Operations leave nothing here:
+//! an operation lives and ends inside its session (section 8.1).
 //!
-//! Both stores are traits so the workstation keeps pair keys in owner-only
-//! files and the journal where it chooses, while tests use the
-//! in-memory forms shipped here. Neither store ever contains a credential
-//! value, a card identifier, or message plaintext.
+//! A record exists while its key does. A pairing that is revoked loses its
+//! key and its record together.
+//!
+//! The store is a trait so the workstation keeps records in owner-only
+//! files while tests use the in-memory form shipped here. It never
+//! contains a credential value, a card identifier, or message plaintext.
 
-use zeroize::Zeroizing;
+pub use refineid_rapp::PairingState;
+use refineid_rapp::{ActivePairing, EndpointRole, PairRecord};
 
-use crate::ids::{OperationId, PairId};
-pub use refineid_rapp::OperationState;
+use crate::ids::PairId;
 
-/// The fail-stop disposition of a stored pairing (Section 14.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PairingDisposition {
-    /// The pairing is usable: both endpoints confirmed storing it.
-    Paired,
-    /// The record was stored before the peer confirmed its own storage
-    /// (RAPP v26.10.18 section 4.3 item 4). It opens no session and is
-    /// never dialed; one found at start-up is revoked.
-    Unconfirmed,
-    /// The pairing was terminated — by local action, authenticated peer
-    /// notice, an authenticated protocol violation, or credential rejection.
-    /// Keys are destroyed; the record is the tombstone.
-    Revoked,
+/// The re-pairing hint of a record no candidate has failed.
+const NO_CANDIDATE_FAILURES: u32 = 0;
+/// What one failed session candidate adds to the hint.
+const ONE_CANDIDATE_FAILURE: u32 = 1;
+
+/// What a phone introduced itself as in `pairing.hello` (section 7.1):
+/// labels for display, not identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerIntroduction {
+    /// The phone's display label.
+    pub display_name: String,
+    /// The phone's platform label.
+    pub platform: String,
 }
 
-/// One stored peer relationship.
-#[derive(Clone)]
+/// Why a record was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordError {
+    /// The engine's record belongs to the custodian role; this store holds
+    /// the requester's half of each pairing.
+    NotRequester,
+    /// The record names another pairing than the confirmation does.
+    PairMismatch,
+}
+
+/// One stored pairing.
 pub struct PairingRecord {
-    /// The derived pair identifier.
-    pub pair_id: PairId,
-    /// The local pair-specific private key; emptied on revocation.
-    pub local_private: Zeroizing<Vec<u8>>,
-    /// The local pair-specific public key.
-    pub local_public: Vec<u8>,
-    /// The peer's pair-specific public key; emptied on revocation.
-    pub peer_public: Vec<u8>,
-    /// The granted credential profiles.
-    pub granted_profiles: Vec<String>,
-    /// The grants hash bound into every session prologue.
-    pub grants_hash: [u8; 32],
-    /// The peer's display label. A label, not an identity.
-    pub peer_display_name: String,
-    /// The peer's platform label.
-    pub peer_platform: String,
-    /// The fail-stop disposition.
-    pub disposition: PairingDisposition,
-    /// Whether the peer initiated the revocation.
-    pub peer_initiated_termination: bool,
-    /// Consecutive failed session-candidate authentications, for the
-    /// re-pairing hint of Section 14.6.
-    pub candidate_failures: u32,
-    /// Cached DER bytes of the authentication certificate, if populated.
-    pub auth_cert: Option<Vec<u8>>,
-    /// Cached DER bytes of the signature certificate, if populated.
-    pub signature_cert: Option<Vec<u8>>,
-    /// Cached DER bytes of the root CA certificate, if populated.
-    pub root_ca: Option<Vec<u8>>,
-    /// Cached DER bytes of the intermediate CA certificate, if populated.
-    pub intermediate_ca: Option<Vec<u8>>,
+    pairing: PairRecord,
+    peer: PeerIntroduction,
+    candidate_failures: u32,
+    auth_cert: Option<Vec<u8>>,
 }
 
 impl core::fmt::Debug for PairingRecord {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_struct("PairingRecord")
-            .field("pair_id", &self.pair_id)
-            .field("disposition", &self.disposition)
+            .field("pair_id", &self.pairing.pair_id())
+            .field("state", &self.state())
             .finish_non_exhaustive()
     }
 }
 
-/// Default display name when peer display name is unspecified.
-pub const DEFAULT_PEER_DISPLAY_NAME: &str = "Peer";
-/// Default platform when peer platform is unspecified.
-pub const DEFAULT_PEER_PLATFORM: &str = "Unknown";
-
 impl PairingRecord {
-    /// Convert to canonical core [`refineid_rapp::PairRecord`].
+    /// The record of the requester's half of `pairing`, introduced by
+    /// `peer`, with no re-pairing hint and no cached certificate.
     ///
     /// # Errors
-    /// Returns [`refineid_rapp::PairRecordError`] if keys or profiles are invalid.
-    pub fn to_core_pair_record(
-        &self,
-    ) -> Result<refineid_rapp::PairRecord, refineid_rapp::PairRecordError> {
-        let local_private: [u8; 32] = self
-            .local_private
-            .as_slice()
-            .try_into()
-            .map_err(|_| refineid_rapp::PairRecordError::InvalidStaticKey)?;
-        let local_public: [u8; 32] = self
-            .local_public
-            .as_slice()
-            .try_into()
-            .map_err(|_| refineid_rapp::PairRecordError::InvalidStaticKey)?;
-        let peer_public: [u8; 32] = self
-            .peer_public
-            .as_slice()
-            .try_into()
-            .map_err(|_| refineid_rapp::PairRecordError::InvalidStaticKey)?;
-        let mut profiles: Vec<refineid_rapp::ProfileName> = Vec::new();
-        for p in &self.granted_profiles {
-            let parsed = refineid_rapp::ProfileName::parse(p)
-                .ok_or(refineid_rapp::PairRecordError::NoNegotiatedProfiles)?;
-            profiles.push(parsed);
+    /// [`RecordError::NotRequester`] for a custodian's record.
+    pub fn new(pairing: PairRecord, peer: PeerIntroduction) -> Result<Self, RecordError> {
+        if pairing.role() != EndpointRole::Requester {
+            return Err(RecordError::NotRequester);
         }
-        if profiles.is_empty() {
-            return Err(refineid_rapp::PairRecordError::NoNegotiatedProfiles);
-        }
-        let grants_hash = refineid_rapp::GrantsHash::from_array(self.grants_hash);
-        refineid_rapp::PairRecord::new(
-            self.pair_id,
-            refineid_rapp::EndpointRole::Requester,
-            local_private,
-            local_public,
-            peer_public,
-            grants_hash,
-            profiles,
-            0,
-        )
-    }
-
-    /// Construct from canonical core [`refineid_rapp::PairRecord`].
-    #[must_use]
-    pub fn from_core_pair_record(
-        core: &refineid_rapp::PairRecord,
-        peer_display_name: String,
-        peer_platform: String,
-    ) -> Self {
-        Self {
-            pair_id: core.pair_id(),
-            local_private: Zeroizing::new(core.local_static_private().to_vec()),
-            local_public: core.local_static_public().to_vec(),
-            peer_public: core.remote_static_public().to_vec(),
-            granted_profiles: core
-                .profiles()
-                .iter()
-                .map(|p| p.as_str().to_owned())
-                .collect(),
-            grants_hash: *core.grants_hash().as_bytes(),
-            peer_display_name,
-            peer_platform,
-            disposition: if core.is_storage_confirmed() {
-                PairingDisposition::Paired
-            } else {
-                PairingDisposition::Unconfirmed
-            },
-            peer_initiated_termination: false,
-            candidate_failures: 0,
+        Ok(Self {
+            pairing,
+            peer,
+            candidate_failures: NO_CANDIDATE_FAILURES,
             auth_cert: None,
-            signature_cert: None,
-            root_ca: None,
-            intermediate_ca: None,
-        }
+        })
     }
-}
 
-/// Adapter bridging [`PairingStore`] to canonical core [`refineid_rapp::PairStore`].
-#[derive(Debug)]
-pub struct CorePairStoreAdapter<'a, S: PairingStore> {
-    /// Backing pairing store.
-    pub inner: &'a mut S,
-}
-
-impl<'a, S: PairingStore> CorePairStoreAdapter<'a, S> {
-    /// Creates a new adapter over the given pairing store.
-    pub const fn new(inner: &'a mut S) -> Self {
-        Self { inner }
+    /// The pairing's identifier.
+    #[must_use]
+    pub const fn pair_id(&self) -> PairId {
+        self.pairing.pair_id()
     }
-}
 
-impl<S: PairingStore> refineid_rapp::PairStore for CorePairStoreAdapter<'_, S> {
-    type Error = StoreError;
+    /// The engine's record of the pairing.
+    #[must_use]
+    pub const fn pairing(&self) -> &PairRecord {
+        &self.pairing
+    }
 
-    fn load(&mut self, pair_id: PairId) -> Result<Option<refineid_rapp::PairRecord>, Self::Error> {
-        match self.inner.get(pair_id) {
-            Ok(rec) => {
-                if rec.disposition == PairingDisposition::Paired {
-                    rec.to_core_pair_record()
-                        .map(Some)
-                        .map_err(|_| StoreError::Unknown)
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(StoreError::Unknown) => Ok(None),
-            Err(e) => Err(e),
+    /// Where the stored pairing stands in the pairing machine of RAPP
+    /// v26.10.21: awaiting the peer's storage confirmation
+    /// ([`PairingState::StorageConfirming`]), usable
+    /// ([`PairingState::PairedDisconnected`]), or forgotten and keeping
+    /// its key for the close ([`PairingState::Revoking`]).
+    #[must_use]
+    pub const fn state(&self) -> PairingState {
+        if self.pairing.forgotten_at_ms().is_some() {
+            PairingState::Revoking
+        } else if self.pairing.is_storage_confirmed() {
+            PairingState::PairedDisconnected
+        } else {
+            PairingState::StorageConfirming
         }
     }
 
-    fn insert(
-        &mut self,
-        record: refineid_rapp::PairRecord,
-    ) -> Result<(), refineid_rapp::PairStoreError<Self::Error>> {
-        let (display_name, platform) = self.inner.get(record.pair_id()).map_or_else(
-            |_| {
-                (
-                    DEFAULT_PEER_DISPLAY_NAME.to_owned(),
-                    DEFAULT_PEER_PLATFORM.to_owned(),
-                )
-            },
-            |r| (r.peer_display_name.clone(), r.peer_platform.clone()),
-        );
-        let pairing_record = PairingRecord::from_core_pair_record(&record, display_name, platform);
-        self.inner
-            .insert(pairing_record)
-            .map_err(refineid_rapp::PairStoreError::Backend)
+    /// What the phone introduced itself as.
+    #[must_use]
+    pub const fn peer(&self) -> &PeerIntroduction {
+        &self.peer
     }
 
-    fn revoke(
-        &mut self,
-        tombstone: refineid_rapp::PairTombstone,
-    ) -> Result<(), refineid_rapp::PairStoreError<Self::Error>> {
-        self.inner
-            .update(tombstone.pair_id, &mut |r| {
-                r.disposition = PairingDisposition::Revoked;
-                r.local_private = Zeroizing::new(Vec::new());
-                r.peer_public = Vec::new();
-            })
-            .map_err(refineid_rapp::PairStoreError::Backend)
+    /// Consecutive failed session-candidate authentications.
+    #[must_use]
+    pub const fn candidate_failures(&self) -> u32 {
+        self.candidate_failures
     }
 
-    fn is_revoked(&mut self, pair_id: PairId) -> Result<bool, Self::Error> {
-        match self.inner.get(pair_id) {
-            Ok(rec) => Ok(rec.disposition == PairingDisposition::Revoked),
-            Err(StoreError::Unknown) => Ok(false),
-            Err(e) => Err(e),
+    /// The cached DER authentication certificate, if read.
+    #[must_use]
+    pub fn auth_cert(&self) -> Option<&[u8]> {
+        self.auth_cert.as_deref()
+    }
+
+    /// The record once the peer confirmed its storage (section 4.3 item
+    /// 4); `active` is the engine's proof of both confirmations.
+    ///
+    /// # Errors
+    /// [`RecordError::PairMismatch`] when `active` proves another pairing;
+    /// the record and its key are gone.
+    pub fn confirmed(self, active: ActivePairing) -> Result<Self, RecordError> {
+        let Self {
+            pairing,
+            peer,
+            candidate_failures,
+            auth_cert,
+        } = self;
+        let pairing = active
+            .confirm(pairing)
+            .map_err(|_| RecordError::PairMismatch)?;
+        Ok(Self {
+            pairing,
+            peer,
+            candidate_failures,
+            auth_cert,
+        })
+    }
+
+    /// The record its user forgot at `at_ms`, milliseconds since the Unix
+    /// epoch (section 4.6 item 2): it serves nothing from then on.
+    #[must_use]
+    pub fn forgotten(self, at_ms: u64) -> Self {
+        Self {
+            pairing: self.pairing.forgotten(at_ms),
+            ..self
         }
+    }
+
+    /// The record with the phone introduced as `peer`.
+    #[must_use]
+    pub fn with_peer(self, peer: PeerIntroduction) -> Self {
+        Self { peer, ..self }
+    }
+
+    /// The record after one more consecutive failed session candidate.
+    #[must_use]
+    pub fn with_failed_candidate(self) -> Self {
+        let failures = self
+            .candidate_failures
+            .saturating_add(ONE_CANDIDATE_FAILURE);
+        self.with_candidate_failures(failures)
+    }
+
+    /// The record once a session candidate authenticated.
+    #[must_use]
+    pub fn with_authenticated_candidate(self) -> Self {
+        self.with_candidate_failures(NO_CANDIDATE_FAILURES)
+    }
+
+    /// The record counting `failures` consecutive failed candidates, as
+    /// storage kept it.
+    #[must_use]
+    pub(crate) fn with_candidate_failures(self, failures: u32) -> Self {
+        Self {
+            candidate_failures: failures,
+            ..self
+        }
+    }
+
+    /// The record caching `auth_cert`, or none.
+    #[must_use]
+    pub fn with_auth_cert(self, auth_cert: Option<Vec<u8>>) -> Self {
+        Self { auth_cert, ..self }
     }
 }
 
@@ -248,7 +210,7 @@ pub enum StoreError {
 
 /// Durable storage for pairing records.
 pub trait PairingStore {
-    /// Stores a new record atomically.
+    /// Stores a record atomically, in place of any record of its pairing.
     ///
     /// # Errors
     ///
@@ -262,23 +224,30 @@ pub trait PairingStore {
     /// Fails when no record exists.
     fn get(&self, pair_id: PairId) -> Result<&PairingRecord, StoreError>;
 
-    /// Applies a change to one record.
+    /// Replaces one record by what `change` makes of it, atomically: its
+    /// successor, or nothing, which removes the record and its key.
+    /// `change` is given the record as the store durably holds it now,
+    /// which another program sharing the store may have rewritten since
+    /// this one read it.
     ///
     /// # Errors
     ///
-    /// Fails when no record exists or the write is refused.
+    /// Fails when no record exists or the write is refused; a refused
+    /// write leaves the record as the store last held it durably.
     fn update(
         &mut self,
         pair_id: PairId,
-        change: &mut dyn FnMut(&mut PairingRecord),
+        change: &mut dyn FnMut(PairingRecord) -> Option<PairingRecord>,
     ) -> Result<(), StoreError>;
 
-    /// Removes one record entirely (the user's forget action).
+    /// Removes one record entirely, its key with it.
     ///
     /// # Errors
     ///
-    /// Fails when no record exists.
-    fn remove(&mut self, pair_id: PairId) -> Result<(), StoreError>;
+    /// As [`Self::update`].
+    fn remove(&mut self, pair_id: PairId) -> Result<(), StoreError> {
+        self.update(pair_id, &mut |_| None)
+    }
 
     /// Every stored pairing, newest first.
     fn pair_ids(&self) -> Vec<PairId>;
@@ -300,7 +269,8 @@ impl MemoryPairingStore {
 
 impl PairingStore for MemoryPairingStore {
     fn insert(&mut self, record: PairingRecord) -> Result<(), StoreError> {
-        self.records.retain(|entry| entry.pair_id != record.pair_id);
+        self.records
+            .retain(|entry| entry.pair_id() != record.pair_id());
         self.records.push(record);
         Ok(())
     }
@@ -308,121 +278,85 @@ impl PairingStore for MemoryPairingStore {
     fn get(&self, pair_id: PairId) -> Result<&PairingRecord, StoreError> {
         self.records
             .iter()
-            .find(|entry| entry.pair_id == pair_id)
+            .find(|entry| entry.pair_id() == pair_id)
             .ok_or(StoreError::Unknown)
     }
 
     fn update(
         &mut self,
         pair_id: PairId,
-        change: &mut dyn FnMut(&mut PairingRecord),
+        change: &mut dyn FnMut(PairingRecord) -> Option<PairingRecord>,
     ) -> Result<(), StoreError> {
-        let record = self
-            .records
-            .iter_mut()
-            .find(|entry| entry.pair_id == pair_id)
-            .ok_or(StoreError::Unknown)?;
-        change(record);
-        Ok(())
-    }
-
-    fn remove(&mut self, pair_id: PairId) -> Result<(), StoreError> {
-        let before = self.records.len();
-        self.records.retain(|entry| entry.pair_id != pair_id);
-        if self.records.len() == before {
-            return Err(StoreError::Unknown);
-        }
-        Ok(())
+        let mut outcome = Err(StoreError::Unknown);
+        self.records = core::mem::take(&mut self.records)
+            .into_iter()
+            .filter_map(|record| {
+                if record.pair_id() != pair_id {
+                    return Some(record);
+                }
+                outcome = Ok(());
+                change(record)
+            })
+            .collect();
+        outcome
     }
 
     fn pair_ids(&self) -> Vec<PairId> {
         self.records
             .iter()
             .rev()
-            .map(|entry| entry.pair_id)
+            .map(PairingRecord::pair_id)
             .collect()
     }
 }
 
-/// One journaled operation on the requester.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JournalEntry {
-    /// The operation identifier.
-    pub operation_id: OperationId,
-    /// The pairing the operation ran under.
-    pub pair_id: PairId,
-    /// The request hash of the journaled request.
-    pub request_hash: [u8; 32],
-    /// The credential profile name.
-    pub profile: String,
-    /// The profile action name.
-    pub action: String,
-    /// The current requester-projection state.
-    pub state: OperationState,
-    /// Whether automatic retry is permanently forbidden (`INV-06`).
-    pub retry_prohibited: bool,
-    /// The custodian's state from a section 8.3 status answer,
-    /// stored as an annotation that transitions nothing.
-    pub reconciled_proxy_state: Option<String>,
-}
+/// Synthetic engine records for this crate's tests.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use refineid_rapp::{
+        EndpointRole, PairRecord, ProfileName, compute_grants_hash, generate_pair_key_material,
+    };
 
-/// The requester's durable operation journal.
-pub trait OperationJournal {
-    /// Creates or replaces the entry for one operation.
-    ///
-    /// The write must be durable before the call returns: the request is
-    /// journaled before `operation.request` is sent.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the backing store refuses the write.
-    fn record(&mut self, entry: JournalEntry) -> Result<(), StoreError>;
+    use super::{PairingRecord, PeerIntroduction};
+    use crate::ids::PairId;
 
-    /// Reads the entry for one operation.
-    ///
-    /// # Errors
-    ///
-    /// Fails when no entry exists.
-    fn get(&self, operation_id: OperationId) -> Result<&JournalEntry, StoreError>;
+    /// When the fixtures' pairings were made.
+    pub(crate) const CREATED_AT_MS: u64 = 1_700_000_000_000;
 
-    /// The non-terminal entries needing section 8.3 reconciliation.
-    fn open_entries(&self) -> Vec<&JournalEntry>;
-}
-
-/// An in-memory journal for tests and composition.
-#[derive(Debug, Default)]
-pub struct MemoryJournal {
-    entries: Vec<JournalEntry>,
-}
-
-impl MemoryJournal {
-    /// Creates an empty journal.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl OperationJournal for MemoryJournal {
-    fn record(&mut self, entry: JournalEntry) -> Result<(), StoreError> {
-        self.entries
-            .retain(|existing| existing.operation_id != entry.operation_id);
-        self.entries.push(entry);
-        Ok(())
+    /// The phone every fixture is paired with.
+    pub(crate) fn phone() -> PeerIntroduction {
+        PeerIntroduction {
+            display_name: "Alpha Phone".into(),
+            platform: "iOS".into(),
+        }
     }
 
-    fn get(&self, operation_id: OperationId) -> Result<&JournalEntry, StoreError> {
-        self.entries
-            .iter()
-            .find(|entry| entry.operation_id == operation_id)
-            .ok_or(StoreError::Unknown)
+    /// A confirmed requester record of `pair_id` granting `profiles`, with
+    /// fresh keys.
+    pub(crate) fn pair_record(pair_id: PairId, profiles: Vec<ProfileName>) -> PairRecord {
+        let local = generate_pair_key_material().expect("local keys");
+        let peer = generate_pair_key_material().expect("peer keys");
+        let grants_hash = compute_grants_hash(&profiles).expect("grants hash");
+        local
+            .with_private_key(|private| {
+                PairRecord::new(
+                    pair_id,
+                    EndpointRole::Requester,
+                    *private,
+                    *local.public_key(),
+                    *peer.public_key(),
+                    grants_hash,
+                    profiles,
+                    CREATED_AT_MS,
+                )
+            })
+            .expect("a valid record")
     }
 
-    fn open_entries(&self) -> Vec<&JournalEntry> {
-        self.entries
-            .iter()
-            .filter(|entry| !entry.state.is_terminal())
-            .collect()
+    /// A usable record of `pair_id` granting card status.
+    pub(crate) fn record(pair_id: PairId) -> PairingRecord {
+        PairingRecord::new(pair_record(pair_id, vec![ProfileName::CardStatus]), phone())
+            .expect("a requester record")
     }
 }
 
@@ -432,75 +366,76 @@ impl OperationJournal for MemoryJournal {
     reason = "test fixtures are constructed to be infallible"
 )]
 mod tests {
-    use super::{
-        JournalEntry, MemoryJournal, MemoryPairingStore, OperationJournal, OperationState,
-        PairingDisposition, PairingRecord, PairingStore, StoreError,
-    };
-    use crate::ids::{OperationId, PairId};
-    use zeroize::Zeroizing;
+    use refineid_rapp::{EndpointRole, PairRecord, PairingState, ProfileName};
 
-    fn record(pair_id: PairId) -> PairingRecord {
-        PairingRecord {
-            pair_id,
-            local_private: Zeroizing::new(vec![1; 32]),
-            local_public: vec![2; 32],
-            peer_public: vec![3; 32],
-            granted_profiles: vec!["fi.refineid.card-status.v1".into()],
-            grants_hash: [4; 32],
-            peer_display_name: "Phone".into(),
-            peer_platform: "iOS".into(),
-            disposition: PairingDisposition::Paired,
-            peer_initiated_termination: false,
-            candidate_failures: 0,
-            auth_cert: None,
-            signature_cert: None,
-            root_ca: None,
-            intermediate_ca: None,
-        }
-    }
+    use super::fixtures::{CREATED_AT_MS, phone, record};
+    use super::{MemoryPairingStore, PairingRecord, PairingStore, RecordError, StoreError};
+    use crate::ids::PairId;
+
+    /// A synthetic pair identifier.
+    const PAIR_ID: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-1";
+    /// When the fixture's user forgot it.
+    const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
+    /// The re-pairing hint the update test records.
+    const FAILURES: u32 = 1;
 
     #[test]
-    fn pairing_records_round_trip_and_update() {
+    fn records_update_into_their_successor_and_go_with_their_key() {
         let mut store = MemoryPairingStore::new();
-        let pair_id = PairId::from_array([7; 16]);
+        let pair_id = PairId::from_array(PAIR_ID);
         store.insert(record(pair_id)).unwrap();
         store
-            .update(pair_id, &mut |entry| entry.candidate_failures += 1)
+            .update(pair_id, &mut |entry| {
+                Some(entry.with_candidate_failures(FAILURES))
+            })
             .unwrap();
-        assert_eq!(store.get(pair_id).unwrap().candidate_failures, 1);
+        assert_eq!(store.get(pair_id).unwrap().candidate_failures(), FAILURES);
         store.remove(pair_id).unwrap();
         assert!(matches!(store.get(pair_id), Err(StoreError::Unknown)));
+        assert_eq!(store.remove(pair_id), Err(StoreError::Unknown));
     }
 
     #[test]
-    fn journal_reports_open_entries_only() {
-        let mut journal = MemoryJournal::new();
-        let open = JournalEntry {
-            operation_id: OperationId::from_array([1; 16]),
-            pair_id: PairId::from_array([7; 16]),
-            request_hash: [0; 32],
-            profile: "fi.refineid.authentication.v1".into(),
-            action: "sign".into(),
-            state: OperationState::Committed,
-            retry_prohibited: false,
-            reconciled_proxy_state: None,
-        };
-        let done = JournalEntry {
-            operation_id: OperationId::from_array([2; 16]),
-            state: OperationState::Completed,
-            ..open.clone()
-        };
-        journal.record(open.clone()).unwrap();
-        journal.record(done).unwrap();
-        let open_entries = journal.open_entries();
-        assert_eq!(open_entries.len(), 1);
-        assert_eq!(open_entries[0].operation_id, open.operation_id);
+    fn a_forgotten_record_is_revoking_and_serves_nothing() {
+        let usable = record(PairId::from_array(PAIR_ID));
+        assert_eq!(usable.state(), PairingState::PairedDisconnected);
+        assert!(!usable.pairing().serving_profiles().is_empty());
+        let forgotten = usable.forgotten(FORGOTTEN_AT_MS);
+        assert_eq!(forgotten.state(), PairingState::Revoking);
+        assert_eq!(forgotten.pairing().forgotten_at_ms(), Some(FORGOTTEN_AT_MS));
+        assert!(forgotten.pairing().serving_profiles().is_empty());
     }
 
     #[test]
-    fn pairing_record_debug_redacts_keys() {
-        let text = format!("{:?}", record(PairId::from_array([7; 16])));
-        assert!(!text.contains('1'));
+    fn a_custodians_record_is_refused() {
+        let local = refineid_rapp::generate_pair_key_material().unwrap();
+        let peer = refineid_rapp::generate_pair_key_material().unwrap();
+        let profiles = vec![ProfileName::CardStatus];
+        let grants_hash = refineid_rapp::compute_grants_hash(&profiles).unwrap();
+        let custodian = local
+            .with_private_key(|private| {
+                PairRecord::new(
+                    PairId::from_array(PAIR_ID),
+                    EndpointRole::Proxy,
+                    *private,
+                    *local.public_key(),
+                    *peer.public_key(),
+                    grants_hash,
+                    profiles,
+                    CREATED_AT_MS,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            PairingRecord::new(custodian, phone()).err(),
+            Some(RecordError::NotRequester)
+        );
+    }
+
+    #[test]
+    fn pairing_record_debug_names_no_key() {
+        let text = format!("{:?}", record(PairId::from_array(PAIR_ID)));
         assert!(text.contains("pair_id"));
+        assert!(!text.contains("private"));
     }
 }
