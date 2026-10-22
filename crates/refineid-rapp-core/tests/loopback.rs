@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use refineid_rapp::{
     BinaryFrame, CardInspection, CardKeyProfile as KeyProfile, CardOperation, CardOperationResult,
-    CardStatusMessage, CertificateFingerprint, CloseReason, CpaceKc2Responder,
-    DEFAULT_OPERATION_LIFETIME_MS, EndpointRole, EstablishedSessionRuntime,
+    CardPresence, CardReader, CardStatusMessage, CertificateFingerprint, CloseReason,
+    CpaceKc2Responder, DEFAULT_OPERATION_LIFETIME_MS, EndpointRole, EstablishedSessionRuntime,
     LIVENESS_CHALLENGE_SIZE, LIVENESS_PING_AFTER_SILENCE_MS, OperationId, OperationRequest,
     OperationResultMessage, PairId, PairRecord, PairingHandshake, PairingOffer, PairingState,
     PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage, ProxyDispatch, ProxyFailure,
@@ -40,7 +40,7 @@ use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::profiles::{
     PROFILE_AUTHENTICATION, PROFILE_CARD_STATUS, PROFILE_DOCUMENT_SIGNING,
 };
-use refineid_rapp_core::remote::{RemoteError, execute_on_session};
+use refineid_rapp_core::remote::{CardRequest, RemoteError, execute_on_session};
 use refineid_rapp_core::store::{MemoryPairingStore, PairingRecord, PairingStore, StoreError};
 use refineid_rapp_core::transport::{FrameTransport, MemoryTransport};
 
@@ -205,9 +205,21 @@ fn authentication_operation() -> CardOperation {
 }
 
 /// The card report of a phone serving the card whose certificate is
-/// `certificate`.
+/// `certificate` over NFC, with no card reader attached.
 fn present(certificate: &[u8]) -> CardStatusMessage {
-    CardStatusMessage::Present(CertificateFingerprint::of_certificate(certificate))
+    CardStatusMessage {
+        card: CardPresence::Present(CertificateFingerprint::of_certificate(certificate)),
+        reader: CardReader::Absent,
+    }
+}
+
+/// The card report of a phone holding no card, with `reader` as its card
+/// reader stands.
+const fn absent(reader: CardReader) -> CardStatusMessage {
+    CardStatusMessage {
+        card: CardPresence::Absent,
+        reader,
+    }
 }
 
 /// Whether the scripted custodian confirms its storage (section 4.3 item
@@ -546,7 +558,7 @@ fn a_session_reports_which_card_the_phone_serves() {
     let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || {
         let mut custodian = custodian_session(&proxy_pairing, proxy_transport);
-        custodian.report_card(CardStatusMessage::Absent);
+        custodian.report_card(absent(CardReader::Absent));
         std::thread::sleep(SHORT_DELAY);
         custodian.report_card(present(CERTIFICATE));
         custodian.report_card(present(OTHER_CERTIFICATE));
@@ -575,7 +587,7 @@ fn a_wait_for_a_card_that_runs_out_leaves_the_session_open() {
     let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || {
         let mut custodian = custodian_session(&proxy_pairing, proxy_transport);
-        custodian.report_card(CardStatusMessage::Absent);
+        custodian.report_card(absent(CardReader::Absent));
         std::thread::sleep(LONG_DELAY);
         custodian.report_card(present(CERTIFICATE));
         custodian.receive_close();
@@ -1130,26 +1142,34 @@ fn a_result_that_does_not_answer_its_request_closes_the_session_and_keeps_the_pa
 
 #[test]
 fn an_operation_needs_a_card_the_phone_reports() {
-    let mut requester = test_requester();
-    let granted = [ProfileName::CardStatus];
-    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
-    let (mut session, proxy) = connected(&mut requester, pair_id, proxy_pairing, |mut c| {
-        c.report_card(CardStatusMessage::Absent);
-        c.receive_close();
-    });
-    requester.service(&mut session, SERVICE_WAIT).unwrap();
-    assert_eq!(session.card_present(), Some(false));
-    assert_eq!(
-        execute_on_session(
-            &mut requester,
-            &mut session,
-            &CardOperation::InspectCard,
-            Duration::from_millis(LIFETIME_MS),
-        ),
-        Err(RemoteError::CardAbsent)
-    );
-    requester.disconnect(&mut session, CloseReason::Complete);
-    proxy.join().unwrap();
+    // Section 8.4 item 6: the phone's reader is named only while the phone
+    // reports one attached.
+    for (reader, request) in [
+        (CardReader::Attached, CardRequest::InPhoneReader),
+        (CardReader::Absent, CardRequest::ToPhone),
+    ] {
+        let mut requester = test_requester();
+        let granted = [ProfileName::CardStatus];
+        let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+        let (mut session, proxy) =
+            connected(&mut requester, pair_id, proxy_pairing, move |mut c| {
+                c.report_card(absent(reader));
+                c.receive_close();
+            });
+        requester.service(&mut session, SERVICE_WAIT).unwrap();
+        assert_eq!(session.card_present(), Some(false));
+        assert_eq!(
+            execute_on_session(
+                &mut requester,
+                &mut session,
+                &CardOperation::InspectCard,
+                Duration::from_millis(LIFETIME_MS),
+            ),
+            Err(RemoteError::CardAbsent(request))
+        );
+        requester.disconnect(&mut session, CloseReason::Complete);
+        proxy.join().unwrap();
+    }
 }
 
 #[test]

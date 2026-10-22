@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use crate::ids::{OperationId, PairId, RandomIdExt};
-use crate::message::{CardStatusMessage, CloseReason, ResultError, ResultStatus};
+use crate::message::{CardPresence, CardStatusMessage, CloseReason, ResultError, ResultStatus};
 use crate::offer::{OfferError, PairingOffer};
 use crate::operations::{CardOperation, CardOperationResult, OperationError};
 use crate::store::{PairingRecord, PairingStore, PeerIntroduction, RecordError, StoreError};
@@ -253,7 +253,7 @@ impl<Transport: FrameTransport> Session<Transport> {
     #[must_use]
     pub fn card_present(&self) -> Option<bool> {
         self.card
-            .map(|status| matches!(status, CardStatusMessage::Present(_)))
+            .map(|status| matches!(status.card, CardPresence::Present(_)))
     }
 
     /// The pairing this session serves.

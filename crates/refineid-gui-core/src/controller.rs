@@ -36,7 +36,7 @@ use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_rapp_core::engine::OperationOutcome;
 
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
-use refineid_rapp_core::remote::{RemoteError, RemoteReader};
+use refineid_rapp_core::remote::{CardRequest, RemoteError, RemoteReader};
 
 use crate::error::GuiCoreError;
 use crate::image::{RgbaImageBuffer, decode_document_image};
@@ -879,7 +879,12 @@ const PHONE_WATCH_INTERVAL: Duration = Duration::from_secs(10);
 fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String {
     match read_error {
         None => String::new(),
-        Some(RemoteError::CardAbsent) => format!("No card on {phone}"),
+        Some(RemoteError::CardAbsent(CardRequest::InPhoneReader)) => {
+            format!("Insert the card into {phone}'s card reader")
+        }
+        Some(RemoteError::CardAbsent(CardRequest::ToPhone)) => {
+            format!("Present the card to {phone}")
+        }
         Some(RemoteError::RevokedByPhone) => format!("{phone} forgot this computer; pair again"),
         Some(RemoteError::Withdrawn) => format!("{phone} turned remote card access off"),
         Some(RemoteError::Outcome(outcome))
@@ -1041,8 +1046,18 @@ mod tests {
     fn the_pairing_line_says_only_what_stands_in_the_way() {
         assert_eq!(pairing_outcome_line("Alpha Phone", None), "");
         assert_eq!(
-            pairing_outcome_line("Alpha Phone", Some(&RemoteError::CardAbsent)),
-            "No card on Alpha Phone"
+            pairing_outcome_line(
+                "Alpha Phone",
+                Some(&RemoteError::CardAbsent(CardRequest::InPhoneReader))
+            ),
+            "Insert the card into Alpha Phone's card reader"
+        );
+        assert_eq!(
+            pairing_outcome_line(
+                "Alpha Phone",
+                Some(&RemoteError::CardAbsent(CardRequest::ToPhone))
+            ),
+            "Present the card to Alpha Phone"
         );
         assert_eq!(
             pairing_outcome_line(
