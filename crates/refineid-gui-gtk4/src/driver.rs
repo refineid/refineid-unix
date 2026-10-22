@@ -132,6 +132,7 @@ struct Gtk4Widgets {
 pub struct Gtk4Driver {
     application: gtk4::Application,
     state_tx: mpsc::Sender<UiState>,
+    state_rx: Option<mpsc::Receiver<UiState>>,
     opens_on_phone_tab: bool,
     widgets: Option<Gtk4Widgets>,
 }
@@ -154,8 +155,7 @@ impl Gtk4Driver {
     }
 
     /// Create a new GTK4 driver and its state notification callback.
-    /// Returns the driver, the callback, and the state receiver for `run()`.
-    pub fn create() -> (Self, StateChangeCallback, mpsc::Receiver<UiState>) {
+    pub fn create() -> (Self, StateChangeCallback) {
         let application = gtk4::Application::builder()
             .application_id("fi.refineid.gui")
             .build();
@@ -169,11 +169,12 @@ impl Gtk4Driver {
         let driver = Self {
             application,
             state_tx,
+            state_rx: Some(state_rx),
             opens_on_phone_tab: false,
             widgets: None,
         };
 
-        (driver, on_state_change, state_rx)
+        (driver, on_state_change)
     }
 
     /// Build all UI controls and attach callbacks dispatching to `controller`.
@@ -645,11 +646,13 @@ impl Gtk4Driver {
         reveal_btn.add_css_class("circular");
         let reveal_icon = gtk4::Image::from_icon_name("view-reveal-symbolic");
         reveal_btn.set_child(Some(&reveal_icon));
-        let mut visible = false;
+        let visible = std::rc::Rc::new(std::cell::Cell::new(false));
+        let visible_clone = visible.clone();
+        let entry_clone = entry.clone();
         reveal_btn.connect_clicked(move |_| {
-            visible = !visible;
-            entry.set_visibility(visible);
-            let icon_name = if visible {
+            visible_clone.set(!visible_clone.get());
+            entry_clone.set_visibility(visible_clone.get());
+            let icon_name = if visible_clone.get() {
                 "view-hide-symbolic"
             } else {
                 "view-reveal-symbolic"
@@ -1084,11 +1087,12 @@ impl Gtk4Driver {
         // Callbacks
         {
             let c = Arc::clone(controller);
+            let c_activate = Arc::clone(&c);
             let entry = pair_code_entry.clone();
             pair_code_entry.connect_activate(move |entry| {
                 let code = entry.text();
                 if code.chars().count() == PAIRING_CODE_LEN {
-                    c.handle_intent(UserIntent::StartPairing {
+                    c_activate.handle_intent(UserIntent::StartPairing {
                         code: code.to_string(),
                     });
                 }
@@ -1096,9 +1100,8 @@ impl Gtk4Driver {
             pair_code_entry.connect_changed(move |entry| {
                 let code = entry.text();
                 if code.chars().count() == PAIRING_CODE_LEN {
-                    let c2 = Arc::clone(&c);
                     let code_owned = code.to_string();
-                    c2.handle_intent(UserIntent::StartPairing { code: code_owned });
+                    c.handle_intent(UserIntent::StartPairing { code: code_owned });
                 }
             });
         }
@@ -1286,11 +1289,8 @@ impl UiDriver for Gtk4Driver {
         self.render_widgets(state);
     }
 
-    fn run(
-        self,
-        controller: Arc<RefineIdController>,
-        state_rx: mpsc::Receiver<UiState>,
-    ) -> Result<(), GuiCoreError> {
+    fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
+        let state_rx = self.state_rx.take().expect("state receiver");
         self.init_ui(&controller);
         self.render_widgets(&controller.state());
 
