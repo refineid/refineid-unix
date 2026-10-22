@@ -63,7 +63,7 @@ fn filter_digits(entry: &gtk4::Entry, text: &str, max: usize) {
 }
 
 /// Widget handles maintained by the GTK4 driver.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "fields wired in later implementation passes")]
 struct Gtk4Widgets {
     window: gtk4::ApplicationWindow,
     notebook: gtk4::Notebook,
