@@ -564,7 +564,7 @@ impl Gtk4Driver {
         let mut widgets = Self::build_ui(app, &controller_clone);
 
         // Show the window
-        widgets.window.show();
+        widgets.window.set_visible(true);
         widgets.window.present();
 
         // Apply initial state
