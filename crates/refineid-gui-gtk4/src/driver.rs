@@ -665,7 +665,7 @@ impl UiDriver for Gtk4Driver {
         // Run main loop
         let context = gtk4::glib::MainContext::default();
         eprintln!("DEBUG: entering main loop");
-        while context.iteration(false) {
+        while context.iteration(true) {
             // Keep running
         }
         eprintln!("DEBUG: main loop exited");
