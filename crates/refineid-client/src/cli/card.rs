@@ -194,25 +194,13 @@ impl CardArgs {
         }
 
         match inspect_res {
+            // RAPP v26.10.21 section 9.1: the inspection carries the answer
+            // to reset, or its historical bytes; PIN state stays on the phone.
+            Ok(CardOperationResult::Inspection(insp)) if insp.answer_to_reset.is_empty() => {
+                println!("  ATR:          (not exposed by the phone)");
+            }
             Ok(CardOperationResult::Inspection(insp)) => {
-                let p1_att = insp
-                    .pin1_attempts
-                    .map_or_else(|| "Unknown".into(), |a| a.to_string());
-                let p2_att = insp
-                    .pin2_attempts
-                    .map_or_else(|| "Unknown".into(), |a| a.to_string());
-                let puk_att = insp
-                    .puk_attempts
-                    .map_or_else(|| "Unknown".into(), |a| a.to_string());
-                println!(
-                    "  PIN1 Status:  {p1_att} attempts remaining (factory: {})",
-                    insp.pin1_factory
-                );
-                println!(
-                    "  PIN2 Status:  {p2_att} attempts remaining (factory: {})",
-                    insp.pin2_factory
-                );
-                println!("  PUK Status:   {puk_att} attempts remaining");
+                println!("  ATR:          {}", hex::encode(&insp.answer_to_reset));
             }
             Ok(_) => {}
             Err(e) => {

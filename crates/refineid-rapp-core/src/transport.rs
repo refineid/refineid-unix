@@ -1,4 +1,4 @@
-//! The transport-profile contract of specification Section 16.
+//! The transport-profile contract of RAPP v26.10.21 section 2.2.
 //!
 //! A transport delivers bounded binary frames in order, reports EOF and
 //! failure distinctly, and names the candidate both endpoints later echo
@@ -7,10 +7,8 @@
 //! already encrypted underlay changes nothing.
 //!
 //! Two implementations ship with the crate: an in-memory pair for loopback
-//! conformance tests, and a length-prefixed byte-stream framing used by the
-//! experimental TCP profile `fi.refineid.stream.v1`. The named design
-//! targets of Section 16 (`local-quic-v1`, `relay-websocket-v1`) can be
-//! added behind the same trait without touching protocol code.
+//! conformance tests, and the length-prefixed framing of the stream
+//! transport profile `fi.refineid.stream` (RAPP v26.10.21 section 2.2.2).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -145,7 +143,7 @@ impl FrameTransport for MemoryTransport {
     }
 
     /// The in-process stand-in for a stream connection binds the stream
-    /// profile: v26.10.18 binds only registered transport profiles.
+    /// profile: v26.10.21 binds only registered transport profiles.
     fn profile(&self) -> &str {
         STREAM_PROFILE
     }
@@ -240,7 +238,9 @@ impl FrameTransport for TcpFrameTransport {
             return Err(TransportError::Failed);
         }
         let mut frame = vec![0u8; length];
-        read_exact_classified(&mut self.stream, &mut frame)?;
+        // Past the prefix the stream is mid-frame: any interruption,
+        // the deadline included, leaves it unframed.
+        read_exact_classified(&mut self.stream, &mut frame).map_err(|_| TransportError::Failed)?;
         Ok(frame)
     }
 
@@ -295,7 +295,9 @@ impl refineid_rapp::FrameTransport for TcpFrameTransport {
     }
 }
 
-/// Reads exactly one buffer, classifying EOF, deadline, and failure.
+/// Reads exactly one buffer, classifying EOF, deadline, and failure. The
+/// deadline is `TimedOut` only while nothing of the buffer has arrived;
+/// reached after part of it, it leaves the stream mid-frame, a failure.
 fn read_exact_classified(stream: &mut TcpStream, buffer: &mut [u8]) -> Result<(), TransportError> {
     let mut filled = 0;
     while filled < buffer.len() {
@@ -312,7 +314,11 @@ fn read_exact_classified(stream: &mut TcpStream, buffer: &mut [u8]) -> Result<()
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return Err(TransportError::TimedOut);
+                return Err(if filled == 0 {
+                    TransportError::TimedOut
+                } else {
+                    TransportError::Failed
+                });
             }
             Err(_) => return Err(TransportError::Failed),
         }
@@ -360,6 +366,27 @@ mod tests {
         assert_eq!(server.receive_frame().unwrap(), vec![0xAA; 300]);
         drop(client);
         assert_eq!(server.receive_frame(), Err(TransportError::Eof));
+    }
+
+    #[test]
+    fn a_deadline_before_a_frame_is_quiet_and_one_inside_it_fails() {
+        use std::io::Write as _;
+        /// The length a truncated frame announces.
+        const ANNOUNCED: u16 = 4;
+        /// The part of it that arrives.
+        const ARRIVED: &[u8] = b"s";
+        /// How long the receiver waits.
+        const DEADLINE: Duration = Duration::from_millis(100);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let deadline = DEADLINE;
+        let mut client = TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut server = TcpFrameTransport::new(server, "t-2", deadline).unwrap();
+        assert_eq!(server.receive_frame(), Err(TransportError::TimedOut));
+        client.write_all(&ANNOUNCED.to_be_bytes()).unwrap();
+        client.write_all(ARRIVED).unwrap();
+        assert_eq!(server.receive_frame(), Err(TransportError::Failed));
     }
 
     #[test]

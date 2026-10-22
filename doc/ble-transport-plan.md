@@ -2,7 +2,7 @@
 
 - **Document Version**: `26.8.26.135`
 - **Protocol Wire Version**: `26.8`
-- **Target Profile Identifier**: `fi.refineid.ble.v1`
+- **Target Profile Identifier**: `fi.refineid.rapp.ble`
 - **Status**: Vetted Architecture & Implementation Plan
 - **Date**: 2026-08-26
 - **Applies To**: `RefineID-Apple` (iOS/macOS), `RefineID-Unix` (Linux), `RefineID-Android`
@@ -25,10 +25,10 @@ To avoid over-engineering, connection fragility, and unnecessary OS pairing fric
 
 ---
 
-## 2. Protocol Wire Specification (`fi.refineid.ble.v1`)
+## 2. Protocol Wire Specification (`fi.refineid.rapp.ble`)
 
 ### 2.1 Transport Framing
-Like the TCP stream profile (`fi.refineid.stream.v1`), every RAPP frame over BLE consists of:
+Like the TCP stream profile (`fi.refineid.stream`), every RAPP frame over BLE consists of:
 - **2-byte big-endian length prefix** ($N \le 65,535$).
 - **$N$ bytes of payload** (Noise handshake message or Noise transport envelope).
 
@@ -69,11 +69,11 @@ Immediately upon L2CAP channel connection, before the Noise handshake:
 
 ```cddl
 ble-routing-preamble = [
-  "RAPP-ble-v1",
+  "rapp-ble",
   tstr,                             ; "pairing" or "session"
   bstr                              ; empty (for pairing), or for a session a fresh
                                     ; 16-byte nonce || 16-byte routing tag keyed by
-                                    ; the pairing's static agreement (RAPP v26.10.18 §2.2.1)
+                                    ; the pairing's static agreement (RAPP v26.10.21 §2.2.1)
 ]
 ```
 
@@ -105,7 +105,7 @@ ble-routing-preamble = [
 
 ### 4.3 Transport Selection & Fallback Policy
 The connection coordinator manages multi-transport failover:
-1. **Parallel Probe**: Probe LAN Stream (`fi.refineid.stream.v1`) and BLE (`fi.refineid.ble.v1`) concurrently.
+1. **Parallel Probe**: Probe LAN Stream (`fi.refineid.stream`) and BLE (`fi.refineid.rapp.ble`) concurrently.
 2. **Preference**: Use LAN if reachable within 1.5 seconds (lower latency).
 3. **Fallback**: If LAN is unreachable (e.g. public Wi-Fi client isolation), seamlessly complete connection over BLE L2CAP.
 

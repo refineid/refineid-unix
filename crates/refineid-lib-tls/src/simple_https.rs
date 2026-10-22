@@ -613,14 +613,9 @@ mod tests {
 
         let reader = RemoteReader::open_local().expect("paired-phone store");
         let pair = reader.phone().expect("a paired phone");
-        let cert_der = pair
-            .auth_cert
-            .as_ref()
-            .expect("cached authentication certificate on pair record");
 
         let url = Uri::parse("https://card.refineid.fi/".to_owned()).expect("valid URL");
-        let response =
-            get_with_rapp_client_auth(&url, pair.pair_id, cert_der).expect("successful login");
+        let response = get_with_rapp_client_auth(&url, pair.pair_id).expect("successful login");
 
         println!("=== Response from https://card.refineid.fi ===");
         println!("{response}");

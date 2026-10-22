@@ -345,16 +345,19 @@ pub enum UserIntent {
 mod tests {
     use super::*;
 
-    fn summary(revoked: bool, unconfirmed: bool, forgotten: bool) -> PairSummary {
+    use refineid_rapp_core::store::PairingState;
+
+    /// A synthetic pair identifier.
+    const PAIR_ID: PairId = PairId::from_array(*b"synthetic-pair-1");
+
+    fn summary(state: PairingState) -> PairSummary {
         PairSummary {
-            pair_id: PairId::from_array([0; 16]),
+            pair_id: PAIR_ID,
             peer_display_name: "Alpha Phone".to_owned(),
             peer_platform: "Android".to_owned(),
             granted_profiles: Vec::new(),
             auth_cert: None,
-            revoked,
-            unconfirmed,
-            forgotten_by_phone: forgotten,
+            state,
         }
     }
 
@@ -377,11 +380,11 @@ mod tests {
 
     #[test]
     fn only_a_usable_pairing_is_a_phone() {
-        let phone = PairedPhone::from_summary(&summary(false, false, false)).expect("phone");
+        let phone =
+            PairedPhone::from_summary(&summary(PairingState::PairedDisconnected)).expect("phone");
         assert_eq!(phone.name, "Alpha Phone");
         assert!(!phone.certificate_cached);
-        assert!(PairedPhone::from_summary(&summary(false, true, false)).is_none());
-        assert!(PairedPhone::from_summary(&summary(true, false, true)).is_none());
-        assert!(PairedPhone::from_summary(&summary(true, false, false)).is_none());
+        assert!(PairedPhone::from_summary(&summary(PairingState::StorageConfirming)).is_none());
+        assert!(PairedPhone::from_summary(&summary(PairingState::Revoking)).is_none());
     }
 }
