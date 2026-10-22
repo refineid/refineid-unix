@@ -559,15 +559,16 @@ impl Gtk4Driver {
         state_rx: Arc<std::sync::Mutex<mpsc::Receiver<UiState>>>,
         opens_on_phone_tab: bool,
     ) {
+        eprintln!("DEBUG: run_ui called");
         // Build UI inside activate handler (GTK4 requirement)
         let controller_clone = Arc::clone(&controller);
         let mut widgets = Self::build_ui(app, &controller_clone);
+        eprintln!("DEBUG: UI built, window={:?}", widgets.window);
 
         // Show the window
         widgets.window.set_visible(true);
         widgets.window.present();
-
-        // Apply initial state
+        eprintln!("DEBUG: window shown and presented");
         let initial_state = controller.state();
         widgets.apply_state(&initial_state);
 
@@ -610,6 +611,7 @@ impl UiDriver for Gtk4Driver {
     }
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
+        eprintln!("DEBUG: run() called");
         let state_rx = Arc::new(std::sync::Mutex::new(
             self.state_rx.take().expect("state receiver"),
         ));
@@ -618,11 +620,14 @@ impl UiDriver for Gtk4Driver {
         let controller_for_stop = Arc::clone(&controller);
 
         application.connect_activate(move |app| {
+            eprintln!("DEBUG: activate handler called");
             let state_rx = state_rx.clone();
             Self::run_ui(app, Arc::clone(&controller), state_rx, opens_on_phone_tab);
         });
 
+        eprintln!("DEBUG: calling application.run()");
         application.run();
+        eprintln!("DEBUG: application.run() returned");
 
         controller_for_stop.stop();
         Ok(())
