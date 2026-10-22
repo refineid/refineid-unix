@@ -178,6 +178,9 @@ impl Gtk4Driver {
 
     /// Build all UI controls and attach callbacks dispatching to `controller`.
     fn init_ui(&mut self, controller: &Arc<RefineIdController>) {
+        // Initialize GTK before creating any widgets.
+        gtk4::init().expect("failed to initialize GTK");
+
         let window = gtk4::ApplicationWindow::builder()
             .application(&self.application)
             .default_width(920)
