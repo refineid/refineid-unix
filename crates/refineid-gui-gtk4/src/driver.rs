@@ -7,6 +7,7 @@
 //! the pairing code, and no PIN-length hints anywhere.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
 
 use refineid_gui_core::PinManageSlot;
@@ -555,12 +556,12 @@ impl Gtk4Driver {
     fn run_ui(
         app: &gtk4::Application,
         controller: Arc<RefineIdController>,
-        state_rx: mpsc::Receiver<UiState>,
+        state_rx: Arc<std::sync::Mutex<mpsc::Receiver<UiState>>>,
         opens_on_phone_tab: bool,
     ) {
         // Build UI inside activate handler (GTK4 requirement)
         let controller_clone = Arc::clone(&controller);
-        let widgets = Self::build_ui(app, &controller_clone);
+        let mut widgets = Self::build_ui(app, &controller_clone);
 
         // Show the window
         widgets.window.show();
@@ -588,8 +589,10 @@ impl Gtk4Driver {
 
         // Poll the channel too
         let driver3 = driver.clone();
+        let state_rx2 = state_rx.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-            while let Ok(state) = state_rx.try_recv() {
+            let mut rx = state_rx2.lock().unwrap();
+            while let Ok(state) = rx.try_recv() {
                 driver3.borrow_mut().apply_state(&state);
             }
             glib::ControlFlow::Continue
@@ -607,17 +610,21 @@ impl UiDriver for Gtk4Driver {
     }
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
-        let state_rx = self.state_rx.take().expect("state receiver");
+        let state_rx = Arc::new(std::sync::Mutex::new(
+            self.state_rx.take().expect("state receiver"),
+        ));
         let application = self.application.clone();
         let opens_on_phone_tab = self.opens_on_phone_tab;
+        let controller_for_stop = Arc::clone(&controller);
 
         application.connect_activate(move |app| {
+            let state_rx = state_rx.clone();
             Self::run_ui(app, Arc::clone(&controller), state_rx, opens_on_phone_tab);
         });
 
         application.run();
 
-        controller.stop();
+        controller_for_stop.stop();
         Ok(())
     }
 }
