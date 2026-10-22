@@ -2,9 +2,11 @@
 //! the paired phone, over the stream tier.
 //!
 //! This is the surface the CLI, the GUI, the TLS client, and the PKCS#11
-//! module use. Pairing browses for a custodian in `mode=pairing`; a session
-//! browses for custodians in `mode=session`, dials each, and opens with a
-//! routing value that is fresh per dial and keyed by the pairing's static
+//! module use. Pairing browses for custodians in `mode=pairing` and tries
+//! the typed code with each one found, in turn (RAPP v26.10.22 section
+//! 4.2, "Trying Each Custodian in Pairing Mode"). A session browses for
+//! custodians in `mode=session`, dials each, and opens with a routing
+//! value that is fresh per dial and keyed by the pairing's static
 //! agreement. A custodian that does not hold the pairing closes the
 //! connection, and the next one is tried. A withdrawn record announcing the
 //! pairing, or a session close carrying `service_withdrawn`, ends the
@@ -28,12 +30,13 @@ use std::time::{Duration, Instant};
 use crate::addresses;
 
 use crate::engine::{
-    AdmissionError, OperationOutcome, PairingError, Requester, RequesterConfig, Session,
-    SessionEnd, SessionError, current_time_ms,
+    AdmissionError, OperationOutcome, PairingCandidateSource, PairingSearchError, Requester,
+    RequesterConfig, Session, SessionEnd, SessionError, current_time_ms, read_offer,
 };
 use crate::file_store::FilePairingStore;
 use crate::ids::{CertificateFingerprint, PairId};
 use crate::message::{CardPresence, CardReader, CardStatusMessage, CloseReason};
+use crate::offer::PairingOffer;
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
 use crate::session_lock::{LockError, SessionLock, ceremony_lock_path, session_lock_path};
 use crate::store::{PairingRecord, PairingStore, PeerIntroduction, StoreError};
@@ -65,7 +68,7 @@ fn custodian_name(introduced: &str, host: &str) -> String {
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
 /// How long pairing waits for each custodian message; the holder may be
-/// reading the screen.
+/// reading the screen. `CPace` step 2 has the shorter attempt deadline.
 const PAIRING_RECEIVE_DEADLINE: Duration = Duration::from_secs(60);
 /// How long a session handshake waits for each custodian message.
 const SESSION_RECEIVE_DEADLINE: Duration = Duration::from_secs(30);
@@ -126,6 +129,59 @@ fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// The custodians in pairing mode on the local network, browsed round by
+/// round until `deadline`: the endpoints a typed code is tried with, each
+/// known by its service instance and dialed at the addresses it last
+/// answered from.
+struct PairingServices {
+    found: Vec<StreamService>,
+    deadline: Instant,
+}
+
+impl PairingServices {
+    /// The record last seen for `instance`.
+    fn service(&self, instance: &str) -> Option<&StreamService> {
+        self.found
+            .iter()
+            .find(|service| service.instance == instance)
+    }
+}
+
+impl PairingCandidateSource for PairingServices {
+    type Endpoint = String;
+    type Transport = TcpFrameTransport;
+
+    fn discover(&mut self) -> Option<Vec<String>> {
+        if Instant::now() >= self.deadline {
+            return None;
+        }
+        let services = browse(DiscoveryMode::Pairing, BROWSE_ROUND);
+        let instances = services
+            .iter()
+            .map(|service| service.instance.clone())
+            .collect();
+        for service in services {
+            self.found
+                .retain(|known| known.instance != service.instance);
+            self.found.push(service);
+        }
+        Some(instances)
+    }
+
+    fn open(&mut self, instance: &String) -> Option<(TcpFrameTransport, PairingOffer)> {
+        let service = self.service(instance)?;
+        let mut transport = dial(
+            &service.endpoints,
+            STREAM_CANDIDATE_ID,
+            PAIRING_RECEIVE_DEADLINE,
+            &RoutingPreamble::Pairing,
+        )
+        .ok()?;
+        let offer = read_offer(&mut transport).ok()?;
+        Some((transport, offer))
+    }
 }
 
 /// The session custodians worth dialing for the pairing keyed by `keys`,
@@ -261,7 +317,8 @@ pub enum RemoteError {
     Store(StoreError),
     /// No stored pairing matches.
     NotPaired,
-    /// No custodian advertised the needed mode before the deadline.
+    /// No custodian advertised a session for the pairing before the
+    /// deadline.
     NotFound,
     /// The phone announced that it stopped serving the pairing.
     Withdrawn,
@@ -276,8 +333,8 @@ pub enum RemoteError {
     CardChanged,
     /// The system random source failed.
     RandomUnavailable,
-    /// Pairing failed.
-    Pairing(PairingError),
+    /// The typed code paired with no phone.
+    Pairing(PairingSearchError),
     /// No custodian opened a session for the pairing, or the session
     /// ended.
     Session(SessionError),
@@ -641,8 +698,9 @@ impl RemoteReader {
         }
     }
 
-    /// Pairs with the phone showing `code`, browsing for it until
-    /// `discovery_timeout` passes.
+    /// Pairs with the phone showing `code`, trying each phone in pairing
+    /// mode found until `discovery_timeout` passes with none tried (RAPP
+    /// v26.10.22 section 4.2, "Trying Each Custodian in Pairing Mode").
     ///
     /// Every profile the offer names is requested and granted; the phone
     /// decides what it grants and the sets must agree.
@@ -651,64 +709,47 @@ impl RemoteReader {
     /// lock is held until this returns.
     ///
     /// # Errors
-    /// [`RemoteError::Pairing`] for a malformed or mistyped code and other
-    /// pairing failures, [`RemoteError::NotFound`] when no phone in a
-    /// pairing ceremony answered, [`RemoteError::Busy`] when another
-    /// program is pairing, and [`RemoteError::Store`] when the record of a
-    /// completed ceremony cannot be written.
+    /// [`RemoteError::Pairing`] for input that is not a code, a search that
+    /// found no phone in pairing mode, a code every phone tried refused,
+    /// and a ceremony that failed with the phone holding the code;
+    /// [`RemoteError::Busy`] when another program is pairing, and
+    /// [`RemoteError::Store`] when the record of a completed ceremony
+    /// cannot be written.
     pub fn pair_with_code(
         &mut self,
         code: &str,
         discovery_timeout: Duration,
     ) -> Result<PairSummary, RemoteError> {
         if crate::offer::normalize_pairing_code(code).is_none() {
-            return Err(RemoteError::Pairing(PairingError::InvalidCode));
+            return Err(RemoteError::Pairing(PairingSearchError::InvalidCode));
         }
         let _ceremony = take_lock(&ceremony_lock_path(self.requester.store().directory()))?;
-        let deadline = Instant::now() + discovery_timeout;
-        let mut last = RemoteError::NotFound;
-        while Instant::now() < deadline {
-            for service in browse(DiscoveryMode::Pairing, BROWSE_ROUND) {
-                let Ok(transport) = dial(
-                    &service.endpoints,
-                    STREAM_CANDIDATE_ID,
-                    PAIRING_RECEIVE_DEADLINE,
-                    &RoutingPreamble::Pairing,
-                ) else {
-                    continue;
-                };
-                match self
-                    .requester
-                    .pair_with_code(code, transport, |_, requested| Some(requested.to_vec()))
-                {
-                    Ok(pair_id) => {
-                        self.supersede_others(pair_id);
-                        // The name is for display; a refused rewrite keeps
-                        // the introduced one, the pairing stands either way.
-                        let host = service.host.clone();
-                        let _ = self.requester.store_mut().update(pair_id, &mut |record| {
-                            let peer = PeerIntroduction {
-                                display_name: custodian_name(&record.peer().display_name, &host),
-                                platform: record.peer().platform.clone(),
-                            };
-                            Some(record.with_peer(peer))
-                        });
-                        return self
-                            .pairs()
-                            .into_iter()
-                            .find(|pair| pair.pair_id == pair_id)
-                            .ok_or(RemoteError::NotPaired);
-                    }
-                    // A mistyped code spent one of the phone's attempts;
-                    // trying another phone would spend that one's too.
-                    Err(PairingError::CodeMismatch) => {
-                        return Err(RemoteError::Pairing(PairingError::CodeMismatch));
-                    }
-                    Err(error) => last = RemoteError::Pairing(error),
-                }
-            }
-        }
-        Err(last)
+        let mut services = PairingServices {
+            found: Vec::new(),
+            deadline: Instant::now() + discovery_timeout,
+        };
+        let (pair_id, instance) = self
+            .requester
+            .pair_with_code(code, &mut services, |_, requested| Some(requested.to_vec()))
+            .map_err(RemoteError::Pairing)?;
+        self.supersede_others(pair_id);
+        // The name is for display; a refused rewrite keeps the introduced
+        // one, the pairing stands either way.
+        let host = services
+            .service(&instance)
+            .map(|service| service.host.clone())
+            .unwrap_or_default();
+        let _ = self.requester.store_mut().update(pair_id, &mut |record| {
+            let peer = PeerIntroduction {
+                display_name: custodian_name(&record.peer().display_name, &host),
+                platform: record.peer().platform.clone(),
+            };
+            Some(record.with_peer(peer))
+        });
+        self.pairs()
+            .into_iter()
+            .find(|pair| pair.pair_id == pair_id)
+            .ok_or(RemoteError::NotPaired)
     }
 
     /// Listens once for the phone holding `pair_id` without dialing it.
@@ -1066,9 +1107,9 @@ mod tests {
 
     use super::{
         AdmissionError, CardOperationResult, CardPresence, CardReader, CardRequest,
-        CardStatusMessage, CertificateFingerprint, OperationOutcome, PairingKeys, RemoteError,
-        RemoteReader, StreamService, current_time_ms, lifetime_ms, operation_result, sessions_for,
-        unix_seconds,
+        CardStatusMessage, CertificateFingerprint, OperationOutcome, PairingKeys,
+        PairingSearchError, RemoteError, RemoteReader, StreamService, current_time_ms, lifetime_ms,
+        operation_result, sessions_for, unix_seconds,
     };
     use crate::file_store::{FilePairingStore, path_for};
     use crate::session_lock::{SessionLock, ceremony_lock_path, session_lock_path};
@@ -1289,7 +1330,23 @@ mod tests {
         drop(held);
         assert_eq!(
             reader.pair_with_code(CODE, Duration::ZERO).err(),
-            Some(RemoteError::NotFound)
+            Some(RemoteError::Pairing(PairingSearchError::NoneInPairingMode))
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_search_that_tried_no_phone_says_none_was_in_pairing_mode() {
+        let directory = scratch();
+        let mut reader = reader_with_pairing(&directory);
+        let outcome = reader.pair_with_code(CODE, Duration::ZERO).err();
+        assert_eq!(
+            outcome.map(|error| error.to_string()),
+            Some("pairing: no phone in pairing mode was found".to_owned())
+        );
+        assert_eq!(
+            RemoteError::Pairing(PairingSearchError::NotAccepted).to_string(),
+            "pairing: the code was not accepted"
         );
         let _ = std::fs::remove_dir_all(directory);
     }

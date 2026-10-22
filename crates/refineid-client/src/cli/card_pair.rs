@@ -83,8 +83,8 @@ impl PairArgs {
         );
         let pair = match reader.pair_with_code(&normalized, DISCOVERY_TIMEOUT) {
             Ok(pair) => pair,
-            Err(RemoteError::Pairing(refineid_rapp_core::engine::PairingError::CodeMismatch)) => {
-                eprintln!("Pairing failed: the code does not match the one on the phone.");
+            Err(RemoteError::Pairing(error)) => {
+                eprintln!("Pairing failed: {error}.");
                 return ExitCode::FAILURE;
             }
             Err(e) => {
