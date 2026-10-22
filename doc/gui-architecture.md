@@ -2,8 +2,9 @@
 
 - **Document Version**: `26.9.28.1`
 - **Protocol Wire Version**: `26.10.22`
-- **Status**: Approved Architecture & Implementation Plan
+- **Status**: Implemented (Tier 2: FLTK; Tier 1: GTK4 planned)
 - **Date**: 2026-09-28
+- **Implemented**: 2026-10-22 — FLTK driver (`refineid-gui-fltk`) is the Tier 2 backend; GTK4 driver (`refineid-gui-gtk4`) is planned for Tier 1.
 - **Applies To**: `RefineID-Unix` (Linux, NetBSD, FreeBSD, OpenBSD)
 
 ---
