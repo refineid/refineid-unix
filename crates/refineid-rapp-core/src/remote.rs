@@ -75,7 +75,7 @@ const SESSION_RECEIVE_DEADLINE: Duration = Duration::from_secs(30);
 const CARD_REPORT_WAIT: Duration = Duration::from_secs(5);
 /// The lifetime each request asks for unless the caller bounds it
 /// (section 8.1 item 2).
-const OPERATION_LIFETIME: Duration = Duration::from_millis(120_000);
+const OPERATION_LIFETIME: Duration = Duration::from_millis(300_000);
 
 /// What a new session waits for before it is handed over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
