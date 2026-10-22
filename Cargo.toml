@@ -4,6 +4,7 @@ members = [
     "crates/refineid-gui",
     "crates/refineid-gui-core",
     "crates/refineid-gui-fltk",
+    "crates/refineid-gui-gtk4",
     "crates/refineid-client",
     "crates/refineid-lib-core",
     "crates/refineid-lib-pcsc",
@@ -31,6 +32,7 @@ refineid-lib-pcsc = { path = "crates/refineid-lib-pcsc", version = "26" }
 refineid-lib-tls = { path = "crates/refineid-lib-tls", version = "26" }
 refineid-gui-core = { path = "crates/refineid-gui-core", version = "26" }
 refineid-gui-fltk = { path = "crates/refineid-gui-fltk", version = "26" }
+refineid-gui-gtk4 = { path = "crates/refineid-gui-gtk4", version = "26" }
 refineid-rapp-core = { path = "crates/refineid-rapp-core", version = "26" }
 
 refineid-auth = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
@@ -41,6 +43,8 @@ refineid-pcsc = { git = "https://github.com/refineid/refineid-core.git", branch 
 refineid-pkcs11 = { git = "https://github.com/refineid/refineid-core.git", branch = "main", default-features = false }
 refineid-remote = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 fltk = "1.5.23"
+gtk4 = "0.9"
+gdk-pixbuf = "0.21"
 
 # rustls backend for server-authenticated HTTPS (TSA calls, trusted
 # lists, validator APIs). `ring` rather than the default aws-lc-rs:

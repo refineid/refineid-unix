@@ -11,7 +11,18 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# GTK4 driver (Tier 1, modern desktop). Requires system GTK4 libraries.
+gtk4 = ["dep:refineid-gui-gtk4", "dep:gtk4"]
+# FLTK driver (Tier 2, purist/minimal). Default on BSD and minimal setups.
+fltk = ["dep:refineid-gui-fltk"]
+default = ["fltk"]
+
 [dependencies]
 refineid-gui-core = { path = "../refineid-gui-core", version = "26" }
-refineid-gui-fltk = { path = "../refineid-gui-fltk", version = "26" }
+
+refineid-gui-fltk = { path = "../refineid-gui-fltk", version = "26", optional = true }
+refineid-gui-gtk4 = { path = "../refineid-gui-gtk4", version = "26", optional = true }
+gtk4 = { workspace = true, optional = true }
+
 refineid-lib-core.workspace = true
