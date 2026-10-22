@@ -734,6 +734,10 @@ fn a_session_handshake_that_fails_changes_nothing_stored() {
     let mut requester = requester_over(FilePairingStore::open(&directory).unwrap());
     let (pair_id, _proxy) = paired(&mut requester, &[ProfileName::CardStatus]);
     let stored = record_files(&directory);
+    assert!(
+        !stored.is_empty(),
+        "the pairing is stored before the failures"
+    );
     for _ in 0..HANDSHAKE_FAILURES {
         let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
         let proxy = std::thread::spawn(move || {
