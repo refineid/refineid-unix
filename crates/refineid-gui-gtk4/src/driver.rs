@@ -1121,7 +1121,7 @@ impl Gtk4Driver {
                     let code_owned = code.to_string();
                     glib::idle_add(move || {
                         c2.handle_intent(UserIntent::StartPairing { code: code_owned });
-                        glib::Continue(false)
+                        glib::source::Continue(false)
                     });
                 }
             });
@@ -1397,7 +1397,7 @@ impl UiDriver for Gtk4Driver {
                 while let Ok(state) = state_rx.try_recv() {
                     driver.borrow_mut().render_widgets(&state);
                 }
-                glib::Continue(true)
+                glib::source::Continue(true)
             }
         });
 
