@@ -116,7 +116,7 @@ struct Gtk4Widgets {
     sign_button: gtk4::Button,
     sign_result_label: gtk4::Label,
     // Phone tab
-    pair_code_entry: gtk4::Entry,
+    code_boxes: CodeBoxes,
     pair_status_label: gtk4::Label,
     phone_name_label: gtk4::Label,
     phone_state_label: gtk4::Label,
@@ -180,6 +180,39 @@ impl Gtk4Driver {
     fn init_ui(&mut self, controller: &Arc<RefineIdController>) {
         // Initialize GTK before creating any widgets.
         gtk4::init().expect("failed to initialize GTK");
+
+        // Load CSS for code boxes and other styling.
+        let css_provider = gtk4::CssProvider::new();
+        css_provider
+            .load_from_data(
+                b"
+                .code-box {
+                    border: 2px solid #cccccc;
+                    border-radius: 8px;
+                    background-color: #fafafa;
+                }
+                .code-box-filled {
+                    border-color: #333333;
+                    background-color: #ffffff;
+                }
+                .code-box-active {
+                    border-color: #007aff;
+                    background-color: #e3f2fd;
+                }
+                .code-char {
+                    font-family: monospace;
+                    font-size: 24px;
+                    font-weight: bold;
+                    color: #333333;
+                }
+            ",
+            )
+            .ok();
+        gtk4::StyleContext::add_provider_for_display(
+            &gtk4::gdk::Display::default().expect("no display"),
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
 
         // Register the application so the startup signal is emitted
         // before we create any windows.
@@ -281,7 +314,7 @@ impl Gtk4Driver {
             sign_button: sign.sign_button,
             sign_result_label: sign.sign_result_label,
             // Phone
-            pair_code_entry: phone.pair_code_entry,
+            code_boxes: phone.code_boxes,
             pair_status_label: phone.pair_status_label,
             phone_name_label: phone.phone_name_label,
             phone_state_label: phone.phone_state_label,
@@ -1046,15 +1079,8 @@ impl Gtk4Driver {
             .build();
         reader_card.append(&code_label);
 
-        let pair_code_entry = gtk4::Entry::builder()
-            .placeholder_text("7KX4M9")
-            .width_chars(10)
-            .max_width_chars(PAIRING_CODE_LEN as i32)
-            .build();
-        pair_code_entry.connect_insert_text(move |entry, text, _position| {
-            filter_digits(entry, text, PAIRING_CODE_LEN);
-        });
-        reader_card.append(&pair_code_entry);
+        let code_boxes = CodeBoxes::new(PAIRING_CODE_LEN, 2);
+        reader_card.append(code_boxes.container());
 
         let pair_status_label = gtk4::Label::builder()
             .label("")
@@ -1093,7 +1119,8 @@ impl Gtk4Driver {
         {
             let c = Arc::clone(controller);
             let c_activate = Arc::clone(&c);
-            pair_code_entry.connect_activate(move |entry| {
+            let code_boxes_clone = code_boxes.clone();
+            code_boxes.entry.connect_activate(move |entry| {
                 let code = entry.text();
                 if code.chars().count() == PAIRING_CODE_LEN {
                     c_activate.handle_intent(UserIntent::StartPairing {
@@ -1101,8 +1128,9 @@ impl Gtk4Driver {
                     });
                 }
             });
-            pair_code_entry.connect_changed(move |entry| {
+            code_boxes.entry.connect_changed(move |entry| {
                 let code = entry.text();
+                code_boxes_clone.render(&code);
                 if code.chars().count() == PAIRING_CODE_LEN {
                     let code_owned = code.to_string();
                     c.handle_intent(UserIntent::StartPairing { code: code_owned });
@@ -1124,7 +1152,7 @@ impl Gtk4Driver {
         PhoneWidgets {
             page,
             tab_label,
-            pair_code_entry,
+            code_boxes,
             pair_status_label,
             phone_name_label,
             phone_state_label,
@@ -1241,13 +1269,14 @@ impl Gtk4Driver {
         if !state.has_local_card {
             if let Some(ref pairing) = state.pairing {
                 widgets.pair_status_label.set_label(&pairing.status);
-                widgets.pair_code_entry.set_sensitive(false);
+                widgets.code_boxes.entry.set_sensitive(false);
             } else {
                 widgets.pair_status_label.set_label("");
-                widgets.pair_code_entry.set_sensitive(true);
+                widgets.code_boxes.entry.set_sensitive(true);
                 if widgets.pairing_running {
-                    widgets.pair_code_entry.set_text("");
-                    widgets.pair_code_entry.grab_focus();
+                    widgets.code_boxes.entry.set_text("");
+                    widgets.code_boxes.render("");
+                    widgets.code_boxes.entry.grab_focus();
                 }
             }
 
@@ -1270,7 +1299,7 @@ impl Gtk4Driver {
             widgets.phone_card.set_visible(false);
             widgets.reader_card.set_visible(false);
             widgets.pair_status_label.set_label("");
-            widgets.pair_code_entry.set_sensitive(false);
+            widgets.code_boxes.entry.set_sensitive(false);
         }
 
         widgets.pairing_running = state.pairing.is_some();
@@ -1433,7 +1462,7 @@ struct SignWidgets {
 struct PhoneWidgets {
     page: gtk4::Box,
     tab_label: gtk4::Label,
-    pair_code_entry: gtk4::Entry,
+    code_boxes: CodeBoxes,
     pair_status_label: gtk4::Label,
     phone_name_label: gtk4::Label,
     phone_state_label: gtk4::Label,
@@ -1522,4 +1551,147 @@ fn show_alert(message: &str) {
 /// GTK4 removed `Dialog::run()`, so this always proceeds for now.
 fn show_confirmation(_question: &str, _cancel: &str, _confirm: &str) -> bool {
     true
+}
+
+// ---------------------------------------------------------------------------
+// Code boxes widget (macOS-style pairing code entry)
+// ---------------------------------------------------------------------------
+
+/// One box position: shows a character or is empty, with focus styling.
+#[derive(Clone)]
+struct CodeBox {
+    frame: gtk4::Frame,
+    label: gtk4::Label,
+}
+
+/// Code boxes: one box per character, groups of two, macOS-style.
+///
+/// A hidden `gtk4::Entry` handles keyboard input; the boxes are purely
+/// visual. The box at position `len` (next character to enter) carries the
+/// accent color so the user knows where to type.
+#[derive(Clone)]
+struct CodeBoxes {
+    container: gtk4::Box,
+    boxes: Vec<CodeBox>,
+    entry: gtk4::Entry,
+    length: usize,
+    group_size: usize,
+}
+
+impl CodeBoxes {
+    /// Create code boxes for a code of `length` characters.
+    fn new(length: usize, group_size: usize) -> Self {
+        let container = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(6)
+            .halign(gtk4::Align::Center)
+            .valign(gtk4::Align::Center)
+            .build();
+
+        let mut boxes = Vec::new();
+        for i in 0..length {
+            if i > 0 && i % group_size == 0 {
+                // Extra gap between groups.
+                let gap = gtk4::Box::builder().width_request(8).build();
+                container.append(&gap);
+            }
+
+            let frame = gtk4::Frame::builder()
+                .width_request(44)
+                .height_request(52)
+                .build();
+            frame.add_css_class("code-box");
+
+            let label = gtk4::Label::builder()
+                .label("")
+                .halign(gtk4::Align::Center)
+                .valign(gtk4::Align::Center)
+                .build();
+            label.add_css_class("code-char");
+            frame.set_child(Some(&label));
+
+            container.append(&frame);
+            boxes.push(CodeBox { frame, label });
+        }
+
+        let entry = gtk4::Entry::builder()
+            .visible(false)
+            .width_chars(0)
+            .max_width_chars(0)
+            .build();
+        entry.set_can_focus(true);
+        entry.grab_focus();
+
+        // Filter to pairing-code characters only.
+        entry.connect_insert_text(move |entry, text, _position| {
+            let filtered: String = text
+                .chars()
+                .filter(|c| pairing_code_character(*c).is_some())
+                .collect();
+            if filtered != text {
+                entry.block_signals();
+                let current = entry.text();
+                let pos = entry.position() as usize;
+                let new_text = format!("{}{}{}", &current[..pos], filtered, &current[pos..]);
+                entry.set_text(&new_text);
+                entry.set_position(new_text.chars().count() as i32);
+                entry.unblock_signals();
+            }
+            // Return () to allow default handling.
+        });
+
+        container.append(&entry);
+
+        Self {
+            container,
+            boxes,
+            entry,
+            length,
+            group_size,
+        }
+    }
+
+    /// The container widget for the boxes.
+    fn container(&self) -> &gtk4::Box {
+        &self.container
+    }
+
+    /// Update box display from the current code text.
+    fn render(&self, code: &str) {
+        let chars: Vec<char> = code.chars().collect();
+        for (i, box_) in self.boxes.iter().enumerate() {
+            let ch = chars.get(i).map(|c| c.to_string()).unwrap_or_default();
+            box_.label.set_label(&ch);
+            // Active box: next position to enter.
+            if i == chars.len() && chars.len() < self.length {
+                box_.frame.add_css_class("code-box-active");
+            } else {
+                box_.frame.remove_css_class("code-box-active");
+            }
+            // Filled boxes get a different style.
+            if i < chars.len() {
+                box_.frame.add_css_class("code-box-filled");
+            } else {
+                box_.frame.remove_css_class("code-box-filled");
+            }
+        }
+    }
+
+    /// Return the current code text.
+    fn text(&self) -> String {
+        self.entry.text()
+    }
+
+    /// Clear the entry and redraw.
+    fn clear(&self) {
+        self.entry.set_text("");
+        self.render("");
+    }
+
+    /// The container widget.
+    fn container(&self) -> &gtk4::Box {
+        // The entry is appended to the same container as the boxes.
+        // We need access to the parent. Store it instead.
+        unreachable!()
+    }
 }
