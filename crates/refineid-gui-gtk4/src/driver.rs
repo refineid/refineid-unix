@@ -16,7 +16,7 @@ use refineid_gui_core::error::GuiCoreError;
 use refineid_gui_core::model::{SignFormat, UiState, UserIntent};
 use refineid_lib_core::auth::{PIN_TRY_LIMIT, PinStatus, PukStatus};
 use refineid_lib_core::pin::PinBytes;
-use refineid_rapp_core::offer::PAIRING_CODE_LENGTH;
+use refineid_rapp_core::offer::{PAIRING_CODE_LENGTH, pairing_code_character};
 
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -1308,7 +1308,7 @@ impl Gtk4Driver {
         if self.opens_on_phone_tab {
             widgets.notebook.set_current_page(Some(3));
             self.opens_on_phone_tab = false;
-            widgets.pair_code_entry.grab_focus();
+            widgets.code_boxes.entry.grab_focus();
         }
     }
 }
@@ -1571,7 +1571,7 @@ struct CodeBox {
 /// accent color so the user knows where to type.
 #[derive(Clone)]
 struct CodeBoxes {
-    container: gtk4::Box,
+    container_widget: gtk4::Box,
     boxes: Vec<CodeBox>,
     entry: gtk4::Entry,
     length: usize,
@@ -1629,13 +1629,11 @@ impl CodeBoxes {
                 .filter(|c| pairing_code_character(*c).is_some())
                 .collect();
             if filtered != text {
-                entry.block_signals();
                 let current = entry.text();
                 let pos = entry.position() as usize;
                 let new_text = format!("{}{}{}", &current[..pos], filtered, &current[pos..]);
                 entry.set_text(&new_text);
                 entry.set_position(new_text.chars().count() as i32);
-                entry.unblock_signals();
             }
             // Return () to allow default handling.
         });
@@ -1643,7 +1641,7 @@ impl CodeBoxes {
         container.append(&entry);
 
         Self {
-            container,
+            container_widget,
             boxes,
             entry,
             length,
@@ -1653,7 +1651,7 @@ impl CodeBoxes {
 
     /// The container widget for the boxes.
     fn container(&self) -> &gtk4::Box {
-        &self.container
+        &self.container_widget
     }
 
     /// Update box display from the current code text.
