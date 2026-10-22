@@ -619,6 +619,7 @@ impl UiDriver for Gtk4Driver {
             .build();
 
         let controller_clone = Arc::clone(&controller);
+        let controller_for_stop = Arc::clone(&controller);
         let mut widgets = Self::build_ui(&application, &controller_clone);
 
         eprintln!("DEBUG: UI built");
@@ -669,7 +670,7 @@ impl UiDriver for Gtk4Driver {
         }
         eprintln!("DEBUG: main loop exited");
 
-        controller.stop();
+        controller_for_stop.stop();
         Ok(())
     }
 }
