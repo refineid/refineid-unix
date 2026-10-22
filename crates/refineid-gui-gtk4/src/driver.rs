@@ -131,7 +131,6 @@ struct Gtk4Widgets {
 /// Presentation driver using GTK 4.
 pub struct Gtk4Driver {
     application: gtk4::Application,
-    state_tx: mpsc::Sender<UiState>,
     state_rx: Option<mpsc::Receiver<UiState>>,
     opens_on_phone_tab: bool,
     widgets: Option<Gtk4Widgets>,
@@ -168,7 +167,6 @@ impl Gtk4Driver {
 
         let driver = Self {
             application,
-            state_tx,
             state_rx: Some(state_rx),
             opens_on_phone_tab: false,
             widgets: None,
@@ -942,7 +940,6 @@ impl Gtk4Driver {
 
         // Callbacks
         {
-            let c = Arc::clone(controller);
             add_document_button.connect_clicked(move |_| {
                 show_alert("File selection not yet implemented in GTK4 driver.");
             });
@@ -1088,7 +1085,6 @@ impl Gtk4Driver {
         {
             let c = Arc::clone(controller);
             let c_activate = Arc::clone(&c);
-            let entry = pair_code_entry.clone();
             pair_code_entry.connect_activate(move |entry| {
                 let code = entry.text();
                 if code.chars().count() == PAIRING_CODE_LEN {
