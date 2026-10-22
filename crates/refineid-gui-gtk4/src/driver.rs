@@ -183,7 +183,7 @@ impl Gtk4Driver {
 
         // Register the application so the startup signal is emitted
         // before we create any windows.
-        let _ = self.application.register();
+        let _ = self.application.register(None::<&gtk4::gio::Cancellable>);
 
         let window = gtk4::ApplicationWindow::builder()
             .application(&self.application)
