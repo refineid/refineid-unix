@@ -279,24 +279,170 @@ impl Gtk4Driver {
         let css_provider = gtk4::CssProvider::new();
         css_provider.load_from_data(
             "
-                .code-box {
-                    border: 2px solid #cccccc;
+                /* macOS-style window background */
+                window {
+                    background-color: #f5f5f7;
+                }
+
+                /* Section title styling */
+                .title {
+                    font-weight: 600;
+                    font-size: 14px;
+                    color: #1d1d1f;
+                    margin-bottom: 8px;
+                }
+
+                /* Card-like containers for sections */
+                .card {
+                    background-color: #ffffff;
+                    border: 1px solid #d1d1d6;
+                    border-radius: 12px;
+                    padding: 16px;
+                }
+
+                /* Primary action buttons (macOS blue) */
+                .suggested-action {
+                    background-color: #007aff;
+                    color: #ffffff;
+                    border: none;
                     border-radius: 8px;
-                    background-color: #fafafa;
+                    padding: 8px 16px;
+                    font-weight: 500;
+                    font-size: 13px;
+                }
+                .suggested-action:hover {
+                    background-color: #0069d9;
+                }
+                .suggested-action:active {
+                    background-color: #0062cc;
+                }
+                .suggested-action:disabled {
+                    background-color: #d1d1d6;
+                    color: #86868b;
+                }
+
+                /* Destructive action buttons (macOS red) */
+                .destructive-action {
+                    background-color: #ff3b30;
+                    color: #ffffff;
+                    border: none;
+                    border-radius: 8px;
+                    padding: 8px 16px;
+                    font-weight: 500;
+                    font-size: 13px;
+                }
+                .destructive-action:hover {
+                    background-color: #d70015;
+                }
+                .destructive-action:active {
+                    background-color: #c5000f;
+                }
+                .destructive-action:disabled {
+                    background-color: #d1d1d6;
+                    color: #86868b;
+                }
+
+                /* Circular reveal buttons */
+                .circular {
+                    border: none;
+                    border-radius: 6px;
+                    padding: 4px;
+                    min-width: 32px;
+                    min-height: 32px;
+                }
+                .circular:hover {
+                    background-color: #e5e5ea;
+                }
+
+                /* Flat icon buttons */
+                .flat {
+                    border: none;
+                    border-radius: 6px;
+                    padding: 4px;
+                }
+                .flat:hover {
+                    background-color: #e5e5ea;
+                }
+
+                /* Code boxes styling */
+                .code-box {
+                    border: 1.5px solid #d1d1d6;
+                    border-radius: 8px;
+                    background-color: #ffffff;
+                    min-width: 44px;
+                    min-height: 52px;
                 }
                 .code-box-filled {
-                    border-color: #333333;
-                    background-color: #ffffff;
+                    border-color: #1d1d1f;
+                    background-color: #f5f5f7;
                 }
                 .code-box-active {
                     border-color: #007aff;
-                    background-color: #e3f2fd;
+                    background-color: #e5f2ff;
                 }
                 .code-char {
-                    font-family: monospace;
-                    font-size: 24px;
-                    font-weight: bold;
-                    color: #333333;
+                    font-family: 'SF Mono', 'Menlo', monospace;
+                    font-size: 20px;
+                    font-weight: 500;
+                    color: #1d1d1f;
+                }
+
+                /* Entry/secret fields */
+                entry {
+                    border: 1px solid #d1d1d6;
+                    border-radius: 8px;
+                    padding: 8px 12px;
+                    background-color: #ffffff;
+                    color: #1d1d1f;
+                    font-size: 14px;
+                }
+                entry:focus {
+                    border-color: #007aff;
+                    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+                }
+
+                /* Labels */
+                label {
+                    color: #1d1d1f;
+                    font-size: 13px;
+                }
+
+                /* Status/info labels */
+                .status-label {
+                    color: #86868b;
+                    font-size: 12px;
+                }
+
+                /* Notebook tab styling */
+                notebook tab {
+                    font-weight: 500;
+                    font-size: 13px;
+                    color: #86868b;
+                }
+                notebook tab:selected {
+                    color: #007aff;
+                    font-weight: 600;
+                }
+
+                /* Info bar */
+                infobar {
+                    background-color: #fdedc4;
+                    border: none;
+                    border-radius: 8px;
+                }
+
+                /* List box for documents */
+                listbox {
+                    border: 1px solid #d1d1d6;
+                    border-radius: 8px;
+                    background-color: #ffffff;
+                }
+                listbox row {
+                    border-bottom: 1px solid #f2f2f2;
+                    padding: 8px;
+                }
+                listbox row:last-child {
+                    border-bottom: none;
                 }
             ",
         );
