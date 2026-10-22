@@ -4,9 +4,11 @@
 //! `pair_id`, the granted profiles and their `grants_hash`, whether the
 //! peer confirmed its storage (RAPP v26.10.21 section 4.3 item 4), and when
 //! this computer's user forgot it (section 4.6 item 2) -- with what this
-//! computer keeps beside it: the phone's labels, the re-pairing hint, and
-//! the cached authentication certificate. Operations leave nothing here:
-//! an operation lives and ends inside its session (section 8.1).
+//! computer keeps beside it: the phone's labels and the cached
+//! authentication certificate. Operations leave nothing here: an operation
+//! lives and ends inside its session (section 8.1), and a session that
+//! fails before authentication changes nothing stored (section 10.1 item
+//! 1).
 //!
 //! A record exists while its key does. A pairing that is revoked loses its
 //! key and its record together.
@@ -19,11 +21,6 @@ pub use refineid_rapp::PairingState;
 use refineid_rapp::{ActivePairing, EndpointRole, PairRecord};
 
 use crate::ids::PairId;
-
-/// The re-pairing hint of a record no candidate has failed.
-const NO_CANDIDATE_FAILURES: u32 = 0;
-/// What one failed session candidate adds to the hint.
-const ONE_CANDIDATE_FAILURE: u32 = 1;
 
 /// What a phone introduced itself as in `pairing.hello` (section 7.1):
 /// labels for display, not identities.
@@ -49,7 +46,6 @@ pub enum RecordError {
 pub struct PairingRecord {
     pairing: PairRecord,
     peer: PeerIntroduction,
-    candidate_failures: u32,
     auth_cert: Option<Vec<u8>>,
 }
 
@@ -65,7 +61,7 @@ impl core::fmt::Debug for PairingRecord {
 
 impl PairingRecord {
     /// The record of the requester's half of `pairing`, introduced by
-    /// `peer`, with no re-pairing hint and no cached certificate.
+    /// `peer`, with no cached certificate.
     ///
     /// # Errors
     /// [`RecordError::NotRequester`] for a custodian's record.
@@ -76,7 +72,6 @@ impl PairingRecord {
         Ok(Self {
             pairing,
             peer,
-            candidate_failures: NO_CANDIDATE_FAILURES,
             auth_cert: None,
         })
     }
@@ -115,12 +110,6 @@ impl PairingRecord {
         &self.peer
     }
 
-    /// Consecutive failed session-candidate authentications.
-    #[must_use]
-    pub const fn candidate_failures(&self) -> u32 {
-        self.candidate_failures
-    }
-
     /// The cached DER authentication certificate, if read.
     #[must_use]
     pub fn auth_cert(&self) -> Option<&[u8]> {
@@ -137,7 +126,6 @@ impl PairingRecord {
         let Self {
             pairing,
             peer,
-            candidate_failures,
             auth_cert,
         } = self;
         let pairing = active
@@ -146,7 +134,6 @@ impl PairingRecord {
         Ok(Self {
             pairing,
             peer,
-            candidate_failures,
             auth_cert,
         })
     }
@@ -165,31 +152,6 @@ impl PairingRecord {
     #[must_use]
     pub fn with_peer(self, peer: PeerIntroduction) -> Self {
         Self { peer, ..self }
-    }
-
-    /// The record after one more consecutive failed session candidate.
-    #[must_use]
-    pub fn with_failed_candidate(self) -> Self {
-        let failures = self
-            .candidate_failures
-            .saturating_add(ONE_CANDIDATE_FAILURE);
-        self.with_candidate_failures(failures)
-    }
-
-    /// The record once a session candidate authenticated.
-    #[must_use]
-    pub fn with_authenticated_candidate(self) -> Self {
-        self.with_candidate_failures(NO_CANDIDATE_FAILURES)
-    }
-
-    /// The record counting `failures` consecutive failed candidates, as
-    /// storage kept it.
-    #[must_use]
-    pub(crate) fn with_candidate_failures(self, failures: u32) -> Self {
-        Self {
-            candidate_failures: failures,
-            ..self
-        }
     }
 
     /// The record caching `auth_cert`, or none.
@@ -376,8 +338,8 @@ mod tests {
     const PAIR_ID: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-1";
     /// When the fixture's user forgot it.
     const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
-    /// The re-pairing hint the update test records.
-    const FAILURES: u32 = 1;
+    /// A synthetic authentication certificate.
+    const CERTIFICATE: &[u8] = b"synthetic authentication certificate";
 
     #[test]
     fn records_update_into_their_successor_and_go_with_their_key() {
@@ -386,10 +348,10 @@ mod tests {
         store.insert(record(pair_id)).unwrap();
         store
             .update(pair_id, &mut |entry| {
-                Some(entry.with_candidate_failures(FAILURES))
+                Some(entry.with_auth_cert(Some(CERTIFICATE.to_vec())))
             })
             .unwrap();
-        assert_eq!(store.get(pair_id).unwrap().candidate_failures(), FAILURES);
+        assert_eq!(store.get(pair_id).unwrap().auth_cert(), Some(CERTIFICATE));
         store.remove(pair_id).unwrap();
         assert!(matches!(store.get(pair_id), Err(StoreError::Unknown)));
         assert_eq!(store.remove(pair_id), Err(StoreError::Unknown));

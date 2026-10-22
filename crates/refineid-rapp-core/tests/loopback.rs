@@ -86,6 +86,10 @@ const SERVICE_WAIT: Duration = Duration::from_millis(500);
 /// tests.
 const SHORT_DELAY: Duration = Duration::from_millis(150);
 const LONG_DELAY: Duration = Duration::from_millis(400);
+/// The extension of a pairing record file.
+const RECORD_EXTENSION: &str = "pair";
+/// How many failed session handshakes a test runs in a row.
+const HANDSHAKE_FAILURES: usize = 3;
 /// A wait for a card shorter than [`LONG_DELAY`].
 const SHORT_WAIT: Duration = Duration::from_millis(100);
 
@@ -152,6 +156,31 @@ impl PairingStore for HaltingStore {
 
 fn test_requester() -> TestRequester {
     requester_over(MemoryPairingStore::new())
+}
+
+/// A fresh directory for a file store.
+fn scratch_directory() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "refineid-rapp-loopback-{:x}",
+        getrandom::u64().unwrap()
+    ))
+}
+
+/// The pairing record files in `directory`, each with its bytes, in name
+/// order.
+fn record_files(directory: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == RECORD_EXTENSION))
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 /// A requester engine over `store`.
@@ -662,10 +691,7 @@ fn a_pairing_forgotten_during_a_session_is_closed_on_it() {
 
 #[test]
 fn a_pairing_another_program_forgot_during_a_session_loses_its_key_file_with_the_close() {
-    let directory = std::env::temp_dir().join(format!(
-        "refineid-rapp-loopback-{:x}",
-        getrandom::u64().unwrap()
-    ));
+    let directory = scratch_directory();
     let mut requester = requester_over(FilePairingStore::open(&directory).unwrap());
     let (pair_id, proxy_pairing) = paired(&mut requester, &[ProfileName::CardStatus]);
     let (mut session, proxy) =
@@ -696,12 +722,41 @@ fn a_pairing_another_program_forgot_during_a_session_loses_its_key_file_with_the
             .pair_ids()
             .is_empty()
     );
-    let leftover_records = std::fs::read_dir(&directory)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pair"))
-        .count();
-    assert_eq!(leftover_records, 0);
+    assert!(record_files(&directory).is_empty());
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn a_session_handshake_that_fails_changes_nothing_stored() {
+    /// What the scripted phone answers in place of `Noise_KK` message 2.
+    const FORGED_ANSWER: &[u8] = b"synthetic answer that opens no session";
+    let directory = scratch_directory();
+    let mut requester = requester_over(FilePairingStore::open(&directory).unwrap());
+    let (pair_id, _proxy) = paired(&mut requester, &[ProfileName::CardStatus]);
+    let stored = record_files(&directory);
+    assert!(
+        !stored.is_empty(),
+        "the pairing is stored before the failures"
+    );
+    for _ in 0..HANDSHAKE_FAILURES {
+        let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+        let proxy = std::thread::spawn(move || {
+            proxy_transport.receive_frame().unwrap();
+            proxy_transport.send_frame(FORGED_ANSWER).unwrap();
+        });
+        assert_eq!(
+            requester.connect(pair_id, requester_transport).err(),
+            Some(SessionError::HandshakeFailed)
+        );
+        proxy.join().unwrap();
+    }
+    // Section 10.1 item 1: before authentication the connection closes
+    // and nothing stored changes.
+    assert_eq!(record_files(&directory), stored);
+    assert_eq!(
+        requester.store().get(pair_id).unwrap().state(),
+        PairingState::PairedDisconnected
+    );
     std::fs::remove_dir_all(&directory).unwrap();
 }
 
