@@ -2,8 +2,9 @@
 //!
 //! A pairing record is the engine's [`PairRecord`] -- the pair keys,
 //! `pair_id`, the granted profiles and their `grants_hash`, whether the
-//! peer confirmed its storage (RAPP v26.10.22 section 4.3 item 4), and when
-//! this computer's user forgot it (section 4.6 item 2) -- with what this
+//! peer confirmed its storage (RAPP v26.10.22 section 4.3 item 4), when
+//! this computer's user forgot it or it expired (section 4.6 items 2 and
+//! 5), and its latest session time (item 5) -- with what this
 //! computer keeps beside it: the phone's labels and the cached
 //! authentication certificate. Operations leave nothing here: an operation
 //! lives and ends inside its session (section 8.1), and a session that
@@ -18,9 +19,10 @@
 //! contains a credential value, a card identifier, or message plaintext.
 
 pub use refineid_rapp::PairingState;
-use refineid_rapp::{ActivePairing, EndpointRole, PairRecord};
+use refineid_rapp::{ActivePairing, EndpointRole, PairRecord, SweepError, SweepOutcome};
 
 use crate::ids::PairId;
+use crate::persistence::frame_pairing_record;
 
 /// What a phone introduced itself as in `pairing.hello` (section 7.1):
 /// labels for display, not identities.
@@ -148,6 +150,36 @@ impl PairingRecord {
         }
     }
 
+    /// The pairing's idle-expiry sweep at `now_ms`, milliseconds since the
+    /// Unix epoch (section 4.6 item 5), with `session_established` saying
+    /// whether a session to it is established now: the engine's
+    /// [`PairRecord::sweep`]. A change is handed to `write` as the whole
+    /// stored record and taken into this one only once `write` returned
+    /// `Ok`; with nothing to change, `write` is not called.
+    ///
+    /// # Errors
+    /// [`SweepError::Store`] with `write`'s error, or with
+    /// [`StoreError::WriteRefused`] for a record that does not frame, and
+    /// [`SweepError::Encoding`] when the engine's record does not encode;
+    /// the record is unchanged.
+    pub fn sweep(
+        &mut self,
+        now_ms: u64,
+        session_established: bool,
+        write: impl FnOnce(&[u8]) -> Result<(), StoreError>,
+    ) -> Result<SweepOutcome, SweepError<StoreError>> {
+        let Self {
+            pairing,
+            peer,
+            auth_cert,
+        } = self;
+        pairing.sweep(now_ms, session_established, |encoded| {
+            let blob = frame_pairing_record(encoded.as_bytes(), peer, auth_cert.as_deref())
+                .map_err(|_| StoreError::WriteRefused)?;
+            write(&blob)
+        })
+    }
+
     /// The record with the phone introduced as `peer`.
     #[must_use]
     pub fn with_peer(self, peer: PeerIntroduction) -> Self {
@@ -211,6 +243,23 @@ pub trait PairingStore {
         self.update(pair_id, &mut |_| None)
     }
 
+    /// One record's idle-expiry sweep at `now_ms` (section 4.6 item 5), as
+    /// [`PairingRecord::sweep`] on the record as the store durably holds it
+    /// now: a change is written before it is taken.
+    ///
+    /// # Errors
+    ///
+    /// [`SweepError::Store`] with [`StoreError::Unknown`] when no record
+    /// exists, and as [`PairingRecord::sweep`]; a refused write leaves the
+    /// record as the store last held it durably, and the next sweep repeats
+    /// the step.
+    fn sweep(
+        &mut self,
+        pair_id: PairId,
+        now_ms: u64,
+        session_established: bool,
+    ) -> Result<SweepOutcome, SweepError<StoreError>>;
+
     /// Every stored pairing, newest first.
     fn pair_ids(&self) -> Vec<PairId>;
 }
@@ -261,6 +310,19 @@ impl PairingStore for MemoryPairingStore {
             })
             .collect();
         outcome
+    }
+
+    fn sweep(
+        &mut self,
+        pair_id: PairId,
+        now_ms: u64,
+        session_established: bool,
+    ) -> Result<SweepOutcome, SweepError<StoreError>> {
+        self.records
+            .iter_mut()
+            .find(|entry| entry.pair_id() == pair_id)
+            .ok_or(SweepError::Store(StoreError::Unknown))?
+            .sweep(now_ms, session_established, |_| Ok(()))
     }
 
     fn pair_ids(&self) -> Vec<PairId> {

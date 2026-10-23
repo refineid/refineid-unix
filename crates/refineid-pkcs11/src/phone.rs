@@ -28,7 +28,9 @@
 //! that thread and answered on the same session, dialing for one when
 //! none is open; that is the one thing the phone does. A pairing forgotten
 //! on this computer is told to the phone by that thread, on the session it
-//! holds or on the next one (section 4.6).
+//! holds or on the next one (section 4.6). The thread sweeps the pairings
+//! for idle expiry when it starts and daily (section 4.6 item 5); a pairing
+//! that expires takes its slot with it, silently.
 //!
 //! The host finalizes the module when its user quits it or unloads the
 //! module, and that is this computer's withdrawal (section 4.5 item 8):
@@ -36,6 +38,7 @@
 //! dial not yet open without a notice, keeps the pairing, and ends before
 //! `C_Finalize` returns.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -48,7 +51,8 @@ use refineid_pkcs11::remote::{
 };
 use refineid_pkcs11::slot_kind::RemoteSlotId;
 use refineid_rapp::{IDENTITY_OFFER_GRACE_MS, ResultError};
-use refineid_rapp_core::engine::{OperationOutcome, Withdrawal};
+use refineid_rapp_core::engine::{IDLE_SWEEP_INTERVAL, OperationOutcome, Withdrawal};
+use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::ids::{CertificateFingerprint, PairId};
 use refineid_rapp_core::operations::{
     CardKeyProfile, CardOperation, CardOperationResult, SignatureAlgorithm,
@@ -311,6 +315,8 @@ impl Shared {
 pub struct PhoneSource {
     shared: Arc<Shared>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// The directory of the pairing store the session thread reads.
+    store: PathBuf,
 }
 
 impl core::fmt::Debug for PhoneSource {
@@ -328,10 +334,16 @@ impl Default for PhoneSource {
 }
 
 impl PhoneSource {
-    /// A source that starts its session thread at the first slot
-    /// refresh.
+    /// A source over this user's pairing store that starts its session
+    /// thread at the first slot refresh.
     #[must_use]
     pub fn new() -> Self {
+        Self::over_store(FilePairingStore::default_directory())
+    }
+
+    /// A source over the pairing store in `store` that starts its session
+    /// thread at the first slot refresh.
+    fn over_store(store: PathBuf) -> Self {
         Self {
             shared: Arc::new(Shared {
                 offer: Mutex::new(None),
@@ -342,6 +354,7 @@ impl PhoneSource {
                 spoken: (Mutex::new(false), Condvar::new()),
             }),
             worker: Mutex::new(None),
+            store,
         }
     }
 
@@ -357,9 +370,10 @@ impl PhoneSource {
             *requests = Some(sender);
         }
         let shared = Arc::clone(&self.shared);
+        let store = self.store.clone();
         *worker = thread::Builder::new()
             .name("refineid-phone".to_owned())
-            .spawn(move || serve(&shared, &receiver))
+            .spawn(move || serve(&shared, &receiver, &store))
             .ok();
         drop(worker);
         self.shared.await_first_word(FIRST_WORD_WAIT);
@@ -444,10 +458,19 @@ fn computer_context() -> DisplayText {
     })
 }
 
-/// The session thread: read the record, dial, read the certificate,
-/// hold, answer.
-fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
+/// The session thread over the pairing store in `store`: read the record,
+/// dial, read the certificate, hold, answer.
+fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
+    let mut idle_swept: Option<Instant> = None;
     while !shared.stopped() {
+        // A pairing that expires is no longer usable: the round below
+        // finds no phone and the slot goes. A refused store is swept again
+        // on the next round.
+        if idle_swept.is_none_or(|at| at.elapsed() >= IDLE_SWEEP_INTERVAL)
+            && expire_idle_pairings(store)
+        {
+            idle_swept = Some(Instant::now());
+        }
         // A connected card reader with a card overrides RAPP.
         // When a physical card is present in an attached reader, withdraw the phone slot.
         if refineid_lib_pcsc::presence_signature()
@@ -460,7 +483,7 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
 
         // A store that cannot be read just now says nothing of the
         // pairing: the offering and its grace stand as they are.
-        let Ok(mut reader) = RemoteReader::open_local_without_sweep()
+        let Ok(mut reader) = RemoteReader::open_local_without_sweep(store)
             .map(|reader| reader.following(shared.withdrawal()))
         else {
             pause(shared, UNPAIRED_PAUSE);
@@ -496,10 +519,12 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
         // and the pause follows only when no request arrived.
         shared.wanted.store(false, Ordering::Release);
         match reader.dial_session(phone.pair_id, DIAL_TIMEOUT) {
-            Ok(session) => match hold(shared, requests, &mut reader, session, &phone, slot) {
-                After::Grace => shared.token(|offering| offering.unconfirmed(Instant::now())),
-                After::Withdraw => shared.token(Offering::withdrawn),
-            },
+            Ok(session) => {
+                match hold(shared, requests, store, &mut reader, session, &phone, slot) {
+                    After::Grace => shared.token(|offering| offering.unconfirmed(Instant::now())),
+                    After::Withdraw => shared.token(Offering::withdrawn),
+                }
+            }
             Err(RemoteError::Busy) => pause(shared, BUSY_PAUSE),
             // The phone announced that it stopped serving: its presence
             // goes at once (section 4.5 item 6).
@@ -512,6 +537,13 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
         }
     }
     shared.withdraw_slot();
+}
+
+/// Sweeps the pairings in `store` for idle expiry (section 4.6 item 5);
+/// whether every change was stored.
+fn expire_idle_pairings(store: &Path) -> bool {
+    RemoteReader::open_local_without_sweep(store)
+        .is_ok_and(|mut reader| reader.expire_idle_pairings().is_ok())
 }
 
 /// No pairing to serve: the slot goes, requests that wait are told the
@@ -585,6 +617,7 @@ fn ended_by(error: &RemoteError) -> Option<After> {
 fn hold(
     shared: &Shared,
     requests: &Receiver<SignRequest>,
+    store: &Path,
     reader: &mut RemoteReader,
     mut session: RemoteSession,
     phone: &PairSummary,
@@ -705,7 +738,7 @@ fn hold(
         }
         if record_checked.elapsed() >= RECORD_CHECK_INTERVAL {
             record_checked = Instant::now();
-            match held_record(phone.pair_id) {
+            match held_record(store, phone.pair_id) {
                 HeldRecord::Usable | HeldRecord::Unreadable => {}
                 HeldRecord::Forgotten => {
                     reader.revoke_in_session(session);
@@ -743,9 +776,9 @@ enum HeldRecord {
     Unreadable,
 }
 
-/// The held pairing as the record another program keeps says.
-fn held_record(pair_id: PairId) -> HeldRecord {
-    let Ok(reader) = RemoteReader::open_local_without_sweep() else {
+/// The held pairing as the record another program keeps in `store` says.
+fn held_record(store: &Path, pair_id: PairId) -> HeldRecord {
+    let Ok(reader) = RemoteReader::open_local_without_sweep(store) else {
         return HeldRecord::Unreadable;
     };
     let state = reader
@@ -918,7 +951,14 @@ fn pause(shared: &Shared, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refineid_rapp::{
+        EndpointRole, PAIR_ID_SIZE, PAIRING_IDLE_EXPIRY_MS, PairRecord, ProfileName,
+        compute_grants_hash, generate_pair_key_material,
+    };
+    use refineid_rapp_core::engine::current_time_ms;
     use refineid_rapp_core::remote::CardRequest;
+    use refineid_rapp_core::session_lock::{SessionLock, session_lock_path};
+    use refineid_rapp_core::store::{PairingRecord, PairingStore as _, PeerIntroduction};
 
     const DIGEST_SHA384_LEN: usize = 48;
 
@@ -1017,7 +1057,7 @@ mod tests {
     /// Hex digits that spell one byte.
     const HEX_DIGITS_PER_BYTE: usize = 2;
     /// Hex digits that spell a pair identifier.
-    const PAIR_ID_HEX_DIGITS: usize = refineid_rapp::PAIR_ID_SIZE * HEX_DIGITS_PER_BYTE;
+    const PAIR_ID_HEX_DIGITS: usize = PAIR_ID_SIZE * HEX_DIGITS_PER_BYTE;
 
     fn the_slot() -> RemoteSlotId {
         RemoteSlotId::parse(&"a".repeat(PAIR_ID_HEX_DIGITS)).expect("a pair identifier in hex")
@@ -1260,11 +1300,96 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    /// The pairing in the test's store.
+    const PAIR_ID: [u8; PAIR_ID_SIZE] = *b"synthetic-pair-1";
+    /// When the test's pairing was made: past the idle limit at any run.
+    const LONG_AGO_MS: u64 = 1_700_000_000_000;
+    /// How long the test waits for the thread's sweep to reach the store.
+    const SWEEP_WAIT: Duration = Duration::from_secs(5);
+    /// The pause between looks at the store.
+    const SWEEP_LOOK: Duration = Duration::from_millis(20);
+
+    /// A fresh directory for a pairing store of the test's own.
+    fn scratch_store() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "refineid-pkcs11-phone-{}-{nanos:x}",
+            std::process::id()
+        ))
+    }
+
+    /// A confirmed pairing of [`PAIR_ID`] made at [`LONG_AGO_MS`] that has
+    /// had no session.
+    fn idle_pairing() -> PairingRecord {
+        let local = generate_pair_key_material().expect("local keys");
+        let peer = generate_pair_key_material().expect("peer keys");
+        let profiles = vec![ProfileName::Authentication];
+        let grants_hash = compute_grants_hash(&profiles).expect("grants hash");
+        let pairing = local
+            .with_private_key(|private| {
+                PairRecord::new(
+                    PairId::from_array(PAIR_ID),
+                    EndpointRole::Requester,
+                    *private,
+                    *local.public_key(),
+                    *peer.public_key(),
+                    grants_hash,
+                    profiles,
+                    LONG_AGO_MS,
+                )
+            })
+            .expect("a valid record");
+        let phone = PeerIntroduction {
+            display_name: "Alpha Phone".to_owned(),
+            platform: "iOS".to_owned(),
+        };
+        PairingRecord::new(pairing, phone).expect("a requester record")
+    }
+
+    /// The state of [`PAIR_ID`] in `store`, once it reads as `state` or
+    /// [`SWEEP_WAIT`] passed.
+    fn state_within_wait(store: &Path, state: PairingState) -> Option<PairingState> {
+        let deadline = Instant::now() + SWEEP_WAIT;
+        loop {
+            let read = FilePairingStore::open_without_sweep(store)
+                .ok()
+                .and_then(|records| {
+                    records
+                        .get(PairId::from_array(PAIR_ID))
+                        .ok()
+                        .map(PairingRecord::state)
+                });
+            if read == Some(state) || Instant::now() >= deadline {
+                return read;
+            }
+            thread::sleep(SWEEP_LOOK);
+        }
+    }
+
     #[test]
     fn a_stopped_source_offers_nothing_and_signs_nothing() {
-        let source = PhoneSource::new();
+        let store = scratch_store();
+        assert!(current_time_ms() >= LONG_AGO_MS + PAIRING_IDLE_EXPIRY_MS);
+        FilePairingStore::open(&store)
+            .expect("the test's store")
+            .insert(idle_pairing())
+            .expect("the pairing is stored");
+        // Held here, the pairing's session lock keeps the thread from
+        // dialing for the pairing.
+        let session = SessionLock::acquire(&session_lock_path(&store, PairId::from_array(PAIR_ID)))
+            .expect("the pairing's session lock");
+        let source = PhoneSource::over_store(store.clone());
         let _ = source.offered();
         assert!(source.worker.lock().expect("worker").is_some());
+        // The thread swept the test's store at its start: the pairing idle
+        // past the limit expired there.
+        assert_eq!(
+            state_within_wait(&store, PairingState::Revoking),
+            Some(PairingState::Revoking)
+        );
         let run = source.shared.withdrawal();
         source.stop();
         // The run withdrew; the next one starts with its own withdrawal
@@ -1290,5 +1415,7 @@ mod tests {
         let _ = source.offered();
         assert!(source.worker.lock().expect("worker").is_some());
         source.stop();
+        drop(session);
+        std::fs::remove_dir_all(&store).expect("the test's store is removed");
     }
 }

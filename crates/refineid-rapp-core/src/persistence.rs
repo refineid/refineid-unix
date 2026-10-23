@@ -3,8 +3,9 @@
 //! A durable [`PairingStore`](crate::store::PairingStore) -- here the
 //! owner-only [`FilePairingStore`](crate::file_store::FilePairingStore) --
 //! needs the record's bytes. The engine's half of the record, with the pair
-//! keys, the grants, the storage confirmation and the time it was forgotten,
-//! travels in the engine's own encoding ([`refineid_rapp::encode_pair_record`]);
+//! keys, the grants, the storage confirmation, the time it was forgotten and
+//! its latest session time, travels in the engine's own encoding
+//! ([`refineid_rapp::encode_pair_record`]);
 //! this module frames it with what the workstation keeps beside it, in a
 //! versioned, length-framed encoding with no external serde surface.
 //!
@@ -25,7 +26,16 @@ pub(crate) const PAIRING_BLOB_MAGIC: &[u8] = b"RAPP-pair-record";
 
 /// The one encoding revision this build reads and writes. Records of earlier
 /// revisions belong to earlier protocol versions and are re-paired.
-pub(crate) const PAIRING_BLOB_VERSION: u8 = 9;
+pub(crate) const PAIRING_BLOB_VERSION: u8 = 10;
+
+/// The engine's pair record format this revision frames. A new engine
+/// format takes a new revision, so that records of the old one read as
+/// superseded.
+const FRAMED_PAIR_RECORD_FORMAT: u64 = 7;
+const _: () = assert!(
+    FRAMED_PAIR_RECORD_FORMAT == refineid_rapp::PAIR_RECORD_FORMAT_VERSION,
+    "a new engine pair record format needs a new PAIRING_BLOB_VERSION"
+);
 
 /// Bytes of a length prefix: a big-endian `u32`.
 const LENGTH_PREFIX_BYTES: usize = 4;
@@ -100,7 +110,20 @@ pub fn encode_pairing_record(
 ) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
     let pairing =
         Zeroizing::new(encode_pair_record(record.pairing()).map_err(PairingCodecError::Pairing)?);
-    let peer = record.peer();
+    frame_pairing_record(&pairing, record.peer(), record.auth_cert())
+}
+
+/// Frames `pairing`, the engine's encoded record, with what the workstation
+/// keeps beside it, into the stored blob.
+///
+/// # Errors
+/// [`PairingCodecError::Oversized`] for a field longer than a length prefix
+/// holds.
+pub(crate) fn frame_pairing_record(
+    pairing: &[u8],
+    peer: &PeerIntroduction,
+    auth_cert: Option<&[u8]>,
+) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
     let size = PAIRING_BLOB_MAGIC.len()
         + VERSION_BYTES
         + LENGTH_PREFIX_BYTES
@@ -110,8 +133,7 @@ pub fn encode_pairing_record(
         + LENGTH_PREFIX_BYTES
         + peer.platform.len()
         + OPTIONAL_FLAG_BYTES
-        + record
-            .auth_cert()
+        + auth_cert
             .map(|cert| LENGTH_PREFIX_BYTES + cert.len())
             .unwrap_or_default();
     // Sized once, so the key bytes are copied into one buffer and no
@@ -119,10 +141,10 @@ pub fn encode_pairing_record(
     let mut out = Zeroizing::new(Vec::with_capacity(size));
     out.extend_from_slice(PAIRING_BLOB_MAGIC);
     out.push(PAIRING_BLOB_VERSION);
-    put_bytes(&mut out, &pairing)?;
+    put_bytes(&mut out, pairing)?;
     put_bytes(&mut out, peer.display_name.as_bytes())?;
     put_bytes(&mut out, peer.platform.as_bytes())?;
-    match record.auth_cert() {
+    match auth_cert {
         Some(cert) => {
             out.push(PRESENT);
             put_bytes(&mut out, cert)?;
@@ -248,7 +270,7 @@ impl<'blob> Reader<'blob> {
     reason = "test fixtures are constructed to be infallible"
 )]
 mod tests {
-    use refineid_rapp::ProfileName;
+    use refineid_rapp::{ProfileName, SweepOutcome};
 
     use super::{
         PAIRING_BLOB_MAGIC, PAIRING_BLOB_VERSION, PairingCodecError, decode_pairing_record,
@@ -262,6 +284,8 @@ mod tests {
     const PAIR_ID: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-7";
     /// When the forgotten fixture's user forgot it.
     const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
+    /// When the fixture's pairing was in session.
+    const SESSION_AT_MS: u64 = 1_750_000_000_000;
     /// A synthetic authentication certificate.
     const CERTIFICATE: &[u8] = b"synthetic authentication certificate";
     /// The first encoding revision.
@@ -303,6 +327,10 @@ mod tests {
             left.pairing().forgotten_at_ms(),
             right.pairing().forgotten_at_ms()
         );
+        assert_eq!(
+            left.pairing().last_session_at_ms(),
+            right.pairing().last_session_at_ms()
+        );
         assert_eq!(left.peer(), right.peer());
         assert_eq!(left.auth_cert(), right.auth_cert());
     }
@@ -340,6 +368,22 @@ mod tests {
         let record = sample().forgotten(FORGOTTEN_AT_MS);
         let decoded = decode_pairing_record(&encode_pairing_record(&record).unwrap()).unwrap();
         assert_same(&record, &decoded);
+    }
+
+    #[test]
+    fn a_swept_record_is_written_whole_with_its_session_time() {
+        let mut record = sample();
+        let mut written = None;
+        assert_eq!(
+            record.sweep(SESSION_AT_MS, true, |blob| {
+                written = Some(blob.to_vec());
+                Ok(())
+            }),
+            Ok(SweepOutcome::Recorded)
+        );
+        let decoded = decode_pairing_record(&written.unwrap()).unwrap();
+        assert_same(&record, &decoded);
+        assert_eq!(decoded.pairing().last_session_at_ms(), Some(SESSION_AT_MS));
     }
 
     #[test]

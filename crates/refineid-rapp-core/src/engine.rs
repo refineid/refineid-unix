@@ -5,16 +5,17 @@
 //! code across the custodians in pairing mode (section 4.2), the session
 //! handshake and the custodian's `session.ready` (section 7.1 item 5), the
 //! liveness rule of section 8.3, the requester operation engine of section
-//! 8, and the revocation of section 4.6. Nothing of an operation outlives
-//! its session: a lost result is asked for again as a new operation.
+//! 8, and the revocation and idle expiry of section 4.6. Nothing of an
+//! operation outlives its session: a lost result is asked for again as a new
+//! operation.
 //!
 //! The engine is blocking and synchronous: the PKCS#11 module, TLS client,
 //! CLI, and GUI call it from their own threads. A requester that follows a
 //! [`Withdrawal`] closes its open session with `service_withdrawn` once
 //! another thread raises it (section 4.5 item 8).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -30,7 +31,8 @@ use refineid_rapp::{
     OperationRequest, OperationViolation, PairingCandidates, PairingHandshake, PairingSecret,
     PairingState, PairingStorage, PingChallenge, ProfileName, ReadyOutcome, RequesterDispatch,
     RequesterEngineError, RequesterOperationEngine, RuntimePoll, RuntimeReceive,
-    SessionAuthentication, SessionHandshake, TransportProfile, generate_pair_key_material,
+    SessionAuthentication, SessionHandshake, SweepError, SweepOutcome, TransportProfile,
+    generate_pair_key_material,
 };
 
 /// How long one receive waits before the liveness clock is read again: a
@@ -51,6 +53,14 @@ const WITHDRAWAL_LOOKS_PER_BOUND: u64 = 4;
 /// bound (section 4.5 item 8).
 const WITHDRAWAL_POLL: Duration =
     Duration::from_millis(refineid_rapp::QUIT_WITHDRAWAL_BOUND_MS / WITHDRAWAL_LOOKS_PER_BOUND);
+
+/// Seconds in a day.
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// How often a program that runs sweeps its pairings for idle expiry, and
+/// notes the time of a session it holds open: once a day (RAPP v26.10.22
+/// section 4.6 item 5).
+pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(SECONDS_PER_DAY);
 
 /// This computer's withdrawal from remote use (RAPP v26.10.22 section 4.5
 /// item 8), raised once from any thread. A requester that follows it closes
@@ -389,6 +399,14 @@ pub struct Session<Transport: FrameTransport> {
     /// What the custodian last said about its card (section 8.4), once it
     /// has said anything on this session.
     card: Option<CardStatusMessage>,
+    /// Raised from the verified `session.ready` until the session ends;
+    /// the requester that opened it reads it for idle expiry (section 4.6
+    /// item 5).
+    established: Arc<AtomicBool>,
+    /// When the pairing's session time was last noted.
+    noted: Instant,
+    /// Whether the session's end was noted.
+    end_noted: bool,
 }
 
 impl<Transport: FrameTransport> Session<Transport> {
@@ -433,6 +451,7 @@ impl<Transport: FrameTransport> Session<Transport> {
         let _ = self.operations.session_closed();
         self.card = None;
         self.end = Some(end);
+        self.established.store(false, Ordering::Release);
     }
 
     /// Delivers a sealed close, best effort, and finishes the session.
@@ -462,6 +481,9 @@ pub struct Requester<Store: PairingStore> {
     config: RequesterConfig,
     store: Store,
     withdrawal: Option<Withdrawal>,
+    /// The sessions this engine opened, by pairing: one is established
+    /// while it lives and its flag is raised.
+    sessions: Vec<(PairId, Weak<AtomicBool>)>,
 }
 
 impl<Store: PairingStore> Requester<Store> {
@@ -471,6 +493,7 @@ impl<Store: PairingStore> Requester<Store> {
             config,
             store,
             withdrawal: None,
+            sessions: Vec::new(),
         }
     }
 
@@ -906,7 +929,11 @@ impl<Store: PairingStore> Requester<Store> {
             .into_established()
             .map_err(|_| SessionError::EngineFault)?;
         let started = Instant::now();
-        Ok(Session {
+        let established = Arc::new(AtomicBool::new(true));
+        self.sessions
+            .retain(|(_, session)| session.strong_count() > 0);
+        self.sessions.push((pair_id, Arc::downgrade(&established)));
+        let mut session = Session {
             transport,
             runtime: EstablishedSessionRuntime::new(endpoint, 0),
             operations: RequesterOperationEngine::new(),
@@ -915,6 +942,36 @@ impl<Store: PairingStore> Requester<Store> {
             started,
             end: None,
             card: None,
+            established,
+            noted: started,
+            end_noted: false,
+        };
+        self.note_session(&mut session);
+        Ok(session)
+    }
+
+    /// Notes that `session`'s pairing is in session now, for idle expiry
+    /// (section 4.6 item 5). A note the store refused is made by the next.
+    fn note_session<Transport: FrameTransport>(&mut self, session: &mut Session<Transport>) {
+        let _ = self.store.sweep(session.pair_id, current_time_ms(), true);
+        session.noted = Instant::now();
+    }
+
+    /// Notes the end of `session` once, when it ended.
+    fn note_end<Transport: FrameTransport>(&mut self, session: &mut Session<Transport>) {
+        if session.end.is_some() && !session.end_noted {
+            session.end_noted = true;
+            self.note_session(session);
+        }
+    }
+
+    /// Whether a session this engine opened to `pair_id` is established.
+    fn in_session(&self, pair_id: PairId) -> bool {
+        self.sessions.iter().any(|(held, session)| {
+            *held == pair_id
+                && session
+                    .upgrade()
+                    .is_some_and(|established| established.load(Ordering::Acquire))
         })
     }
 
@@ -1082,6 +1139,7 @@ impl<Store: PairingStore> Requester<Store> {
         }
         let notice = session.runtime.close_with_reason(reason).ok();
         session.close_with(notice, SessionEnd::LocalClose);
+        self.note_end(session);
     }
 
     /// Tells the custodian on `session` that this computer forgot the
@@ -1105,6 +1163,7 @@ impl<Store: PairingStore> Requester<Store> {
             linger(&mut session.transport);
         }
         session.finish(SessionEnd::LocalClose);
+        self.note_end(session);
         if sent {
             let _ = self.store.update(session.pair_id, &mut |record| {
                 (record.state() != PairingState::Revoking).then_some(record)
@@ -1157,6 +1216,7 @@ impl<Store: PairingStore> Requester<Store> {
             .is_ok_and(|frame| session.transport.send_frame(frame.as_bytes()).is_ok());
         if !sent {
             session.finish(SessionEnd::TransportLoss);
+            self.note_end(session);
             return Ok(OperationOutcome::Lost);
         }
         loop {
@@ -1184,8 +1244,23 @@ impl<Store: PairingStore> Requester<Store> {
     /// liveness rule. Pings, pongs, and card reports are handled here; the
     /// live operation's progress and end are returned. A raised withdrawal
     /// closes the session with `service_withdrawn` instead (section 4.5
-    /// item 8).
+    /// item 8). The pairing's session time is noted daily while the
+    /// session is open, and when it ends (section 4.6 item 5).
     fn pump<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+        wait: Duration,
+    ) -> Result<Option<RequesterDispatch>, SessionError> {
+        if session.end.is_none() && session.noted.elapsed() >= IDLE_SWEEP_INTERVAL {
+            self.note_session(session);
+        }
+        let pumped = self.pump_frame(session, wait);
+        self.note_end(session);
+        pumped
+    }
+
+    /// One step of [`Self::pump`].
+    fn pump_frame<Transport: FrameTransport>(
         &mut self,
         session: &mut Session<Transport>,
         wait: Duration,
@@ -1354,6 +1429,36 @@ impl<Store: PairingStore> Requester<Store> {
     /// destroyed.
     pub fn expire_revocation_notices(&mut self, now_ms: u64) -> usize {
         self.remove_where(|record| record.pairing().revocation_notice_expired(now_ms))
+    }
+
+    /// Sweeps every stored pairing for idle expiry at `now_ms`, the wall
+    /// clock (section 4.6 item 5). A pairing in a session this engine holds
+    /// has the time noted; any other that had no session for
+    /// [`refineid_rapp::PAIRING_IDLE_EXPIRY_MS`] expires: it serves nothing
+    /// from then on and keeps its key only for the close of items 2 to 4.
+    /// Nothing is sent. A session another program on this computer holds
+    /// is not seen here; that program notes its time daily. Returns how
+    /// many expired.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the store refused a pairing's change: that
+    /// pairing stays as it was for the next sweep, and the others are
+    /// swept.
+    pub fn expire_idle_pairings(&mut self, now_ms: u64) -> Result<usize, StoreError> {
+        let mut expired = 0;
+        let mut refused = None;
+        for pair_id in self.store.pair_ids() {
+            let established = self.in_session(pair_id);
+            match self.store.sweep(pair_id, now_ms, established) {
+                Ok(SweepOutcome::Expired) => expired += 1,
+                Ok(SweepOutcome::Recorded | SweepOutcome::Kept) => {}
+                // Another program removed the record meanwhile.
+                Err(SweepError::Store(StoreError::Unknown)) => {}
+                Err(SweepError::Store(error)) => refused = Some(error),
+                Err(SweepError::Encoding(_)) => refused = Some(StoreError::WriteRefused),
+            }
+        }
+        refused.map_or(Ok(expired), Err)
     }
 
     /// Removes every record `doomed` names, as the store durably holds it,
