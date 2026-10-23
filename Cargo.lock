@@ -1690,7 +1690,7 @@ source = "git+https://github.com/refineid/refineid-core.git?branch=main#82f2e9a6
 
 [[package]]
 name = "refineid-client"
-version = "26.10.22"
+version = "26.10.23"
 dependencies = [
  "hex",
  "hickory-resolver",
@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui"
-version = "26.10.22"
+version = "26.10.23"
 dependencies = [
  "refineid-gui-core",
  "refineid-gui-fltk",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-core"
-version = "26.10.22"
+version = "26.10.23"
 dependencies = [
  "hex",
  "image",
@@ -1754,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-fltk"
-version = "26.10.22"
+version = "26.10.23"
 dependencies = [
  "arboard",
  "fltk",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-core"
-version = "26.10.22"
+version = "26.10.23"
 dependencies = [
  "aes 0.9.3",
  "cbc",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-pcsc"
-version = "26.10.22"
+version = "26.10.23"
 dependencies = [
  "pcsc",
  "refineid-lib-core",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-tls"
-version = "26.10.22"
+version = "26.10.23"
 dependencies = [
  "refineid-lib-core",
  "refineid-rapp-core",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-rapp-core"
-version = "26.10.22"
+version = "26.10.23"
 dependencies = [
  "getrandom 0.4.3",
  "refineid-rapp",
@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-unix-pkcs11"
-version = "26.10.22"
+version = "26.10.23"
 dependencies = [
  "libc",
  "refineid-lib-core",
