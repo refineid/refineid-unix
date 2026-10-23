@@ -17,6 +17,7 @@ use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
+use refineid_rapp::{SweepError, SweepOutcome};
 use zeroize::Zeroizing;
 
 use crate::ids::PairId;
@@ -163,9 +164,18 @@ fn read_record(directory: &Path, pair_id: PairId) -> Option<PairingRecord> {
 /// [`StoreError::WriteRefused`] when the record does not encode or the
 /// file cannot be written.
 fn write_record(directory: &Path, record: &PairingRecord) -> Result<(), StoreError> {
-    let path = path_for(directory, record.pair_id());
-    let temporary = path.with_extension(TEMPORARY_EXTENSION);
     let blob = encode_pairing_record(record).map_err(|_| StoreError::WriteRefused)?;
+    write_blob(directory, record.pair_id(), &blob)
+}
+
+/// Writes `blob`, the stored form of `pair_id`'s record, as its file,
+/// atomically.
+///
+/// # Errors
+/// [`StoreError::WriteRefused`] when the file cannot be written.
+fn write_blob(directory: &Path, pair_id: PairId, blob: &[u8]) -> Result<(), StoreError> {
+    let path = path_for(directory, pair_id);
+    let temporary = path.with_extension(TEMPORARY_EXTENSION);
     let written = (|| {
         let mut file: File = OpenOptions::new()
             .write(true)
@@ -173,7 +183,7 @@ fn write_record(directory: &Path, record: &PairingRecord) -> Result<(), StoreErr
             .truncate(true)
             .mode(FILE_MODE)
             .open(&temporary)?;
-        file.write_all(&blob)?;
+        file.write_all(blob)?;
         file.sync_all()?;
         fs::rename(&temporary, &path)
     })();
@@ -250,6 +260,35 @@ impl PairingStore for FilePairingStore {
         outcome
     }
 
+    fn sweep(
+        &mut self,
+        pair_id: PairId,
+        now_ms: u64,
+        session_established: bool,
+    ) -> Result<SweepOutcome, SweepError<StoreError>> {
+        let unknown = SweepError::Store(StoreError::Unknown);
+        let position = self
+            .records
+            .iter()
+            .position(|entry| entry.pair_id() == pair_id)
+            .ok_or(unknown)?;
+        // As in `update`: the sweep applies to the record as the disk holds
+        // it now, and a record the disk no longer holds readably is gone.
+        let Some(mut current) = read_record(&self.directory, pair_id) else {
+            self.records.remove(position);
+            return Err(unknown);
+        };
+        let directory = &self.directory;
+        let outcome = current.sweep(now_ms, session_established, |blob| {
+            write_blob(directory, pair_id, blob)
+        });
+        // Swept or refused, `current` is what the disk holds.
+        if let Some(entry) = self.records.get_mut(position) {
+            *entry = current;
+        }
+        outcome
+    }
+
     fn pair_ids(&self) -> Vec<PairId> {
         self.records
             .iter()
@@ -267,13 +306,13 @@ impl PairingStore for FilePairingStore {
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
-    use refineid_rapp::PairingState;
+    use refineid_rapp::{PAIRING_IDLE_EXPIRY_MS, PairingState, SweepError, SweepOutcome};
 
     use super::{FilePairingStore, path_for};
     use crate::ids::PairId;
     use crate::persistence::{PAIRING_BLOB_MAGIC, PAIRING_BLOB_VERSION};
-    use crate::store::PairingStore;
-    use crate::store::fixtures::record;
+    use crate::store::fixtures::{CREATED_AT_MS, record};
+    use crate::store::{PairingStore, StoreError};
 
     /// Synthetic pair identifiers.
     const FIRST: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-1";
@@ -282,6 +321,10 @@ mod tests {
     const CERTIFICATE: &[u8] = b"synthetic authentication certificate";
     /// When the forgotten fixture's user forgot it.
     const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
+    /// When the fixture's pairing reaches the idle limit without a session.
+    const IDLE_LIMIT_AT_MS: u64 = CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS;
+    /// When another program noted a session to the fixture's pairing.
+    const SESSION_AT_MS: u64 = 1_700_500_000_000;
     /// A revision before the one this build reads.
     const EARLIER_REVISION: u8 = PAIRING_BLOB_VERSION - 1;
     /// The body of a record of an earlier revision.
@@ -390,6 +433,76 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_sweep_the_disk_refused_is_repeated_by_the_next() {
+        let directory = scratch();
+        let pair_id = PairId::from_array(FIRST);
+        let mut store = FilePairingStore::open(&directory).unwrap();
+        store.insert(record(pair_id)).unwrap();
+        let blocked = path_for(&directory, pair_id).with_extension(super::TEMPORARY_EXTENSION);
+        std::fs::create_dir(&blocked).unwrap();
+        // A sweep that changes nothing writes nothing.
+        assert_eq!(
+            store.sweep(pair_id, CREATED_AT_MS, false),
+            Ok(SweepOutcome::Kept)
+        );
+        assert_eq!(
+            store.sweep(pair_id, IDLE_LIMIT_AT_MS, false),
+            Err(SweepError::Store(StoreError::WriteRefused))
+        );
+        assert_eq!(
+            store.get(pair_id).unwrap().state(),
+            PairingState::PairedDisconnected
+        );
+        let disk = FilePairingStore::open_without_sweep(&directory).unwrap();
+        assert_eq!(
+            disk.get(pair_id).unwrap().state(),
+            PairingState::PairedDisconnected
+        );
+        std::fs::remove_dir(&blocked).unwrap();
+        assert_eq!(
+            store.sweep(pair_id, IDLE_LIMIT_AT_MS, false),
+            Ok(SweepOutcome::Expired)
+        );
+        let reopened = FilePairingStore::open(&directory).unwrap();
+        let expired = reopened.get(pair_id).unwrap();
+        assert_eq!(expired.state(), PairingState::Revoking);
+        assert_eq!(expired.pairing().forgotten_at_ms(), Some(IDLE_LIMIT_AT_MS));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_idle_sweep_reads_the_session_another_program_noted() {
+        let directory = scratch();
+        let pair_id = PairId::from_array(FIRST);
+        let mut stale = FilePairingStore::open(&directory).unwrap();
+        stale.insert(record(pair_id)).unwrap();
+        let mut holder = FilePairingStore::open(&directory).unwrap();
+        assert_eq!(
+            holder.sweep(pair_id, SESSION_AT_MS, true),
+            Ok(SweepOutcome::Recorded)
+        );
+        assert_eq!(
+            stale.get(pair_id).unwrap().pairing().last_session_at_ms(),
+            None
+        );
+        assert_eq!(
+            stale.sweep(pair_id, IDLE_LIMIT_AT_MS, false),
+            Ok(SweepOutcome::Kept)
+        );
+        assert_eq!(
+            stale.get(pair_id).unwrap().pairing().last_session_at_ms(),
+            Some(SESSION_AT_MS)
+        );
+        std::fs::remove_file(path_for(&directory, pair_id)).unwrap();
+        assert_eq!(
+            stale.sweep(pair_id, IDLE_LIMIT_AT_MS, false),
+            Err(SweepError::Store(StoreError::Unknown))
+        );
+        assert!(stale.pair_ids().is_empty());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn a_refused_write_leaves_what_the_disk_holds() {
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
@@ -401,7 +514,7 @@ mod tests {
             store.update(pair_id, &mut |entry| {
                 Some(entry.with_auth_cert(Some(CERTIFICATE.to_vec())))
             }),
-            Err(crate::store::StoreError::WriteRefused)
+            Err(StoreError::WriteRefused)
         );
         assert_eq!(store.get(pair_id).unwrap().auth_cert(), None);
         std::fs::remove_dir_all(&directory).unwrap();

@@ -537,14 +537,13 @@ impl RemoteReader {
         Self::open(&local_host_name(), local_platform())
     }
 
-    /// Opens the default store as this computer without sweeping it, for
-    /// a program that reads the records another program keeps.
+    /// Opens the store in `directory` as this computer without sweeping
+    /// it, for a program that reads the records another program keeps.
     ///
     /// # Errors
     /// [`RemoteError::Store`] when the store cannot be opened.
-    pub fn open_local_without_sweep() -> Result<Self, RemoteError> {
-        let store = FilePairingStore::open_without_sweep(&FilePairingStore::default_directory())
-            .map_err(RemoteError::Store)?;
+    pub fn open_local_without_sweep(directory: &std::path::Path) -> Result<Self, RemoteError> {
+        let store = FilePairingStore::open_without_sweep(directory).map_err(RemoteError::Store)?;
         Ok(Self::with_store(
             &local_host_name(),
             local_platform(),
@@ -596,16 +595,34 @@ impl RemoteReader {
         }
     }
 
-    /// The owning program's sweep of the store: forgotten records that
-    /// waited out their notice window lose their keys (section 4.6 item
-    /// 3), and, while no pairing ceremony runs on this computer, records a
-    /// past ceremony left unconfirmed are revoked (section 4.3 item 4). A
-    /// running ceremony's record is unconfirmed until its phone answers.
+    /// The owning program's sweep of the store: pairings without a session
+    /// for the idle limit expire (section 4.6 item 5), forgotten records
+    /// that waited out their notice window lose their keys (item 3), and,
+    /// while no pairing ceremony runs on this computer, records a past
+    /// ceremony left unconfirmed are revoked (section 4.3 item 4). A
+    /// running ceremony's record is unconfirmed until its phone answers. A
+    /// change the store refused is made by the next open.
     fn sweep(&mut self) {
+        let _ = self.expire_idle_pairings();
         self.requester.expire_revocation_notices(current_time_ms());
         if let Ok(_ceremony) = take_lock(&ceremony_lock_path(self.requester.store().directory())) {
             self.requester.revoke_unconfirmed_pairings();
         }
+    }
+
+    /// Sweeps every stored pairing for idle expiry now (section 4.6 item
+    /// 5): a pairing that had no session for
+    /// [`refineid_rapp::PAIRING_IDLE_EXPIRY_DAYS`] days expires silently,
+    /// serves nothing from then on, and keeps its key only for the close
+    /// of items 2 to 4. Returns how many expired.
+    ///
+    /// # Errors
+    /// [`RemoteError::Store`] when the store refused a pairing's change;
+    /// that pairing stays as it was for the next sweep.
+    pub fn expire_idle_pairings(&mut self) -> Result<usize, RemoteError> {
+        self.requester
+            .expire_idle_pairings(current_time_ms())
+            .map_err(RemoteError::Store)
     }
 
     /// Every stored pairing, newest first.
@@ -1157,7 +1174,7 @@ mod tests {
     use crate::file_store::{FilePairingStore, path_for};
     use crate::session_lock::{SessionLock, ceremony_lock_path, session_lock_path};
     use crate::store::PairingStore as _;
-    use crate::store::fixtures::record;
+    use crate::store::fixtures::{CREATED_AT_MS, record};
 
     /// The pairing every reader holds.
     const PAIR_ID: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-1";
@@ -1295,6 +1312,24 @@ mod tests {
         reader.sweep();
         assert!(reader.pairs().is_empty());
         assert!(!path_for(&directory, PairId::from_array(PAIR_ID)).exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn the_owners_sweep_expires_a_pairing_idle_for_thirty_days() {
+        let directory = scratch();
+        let mut reader = reader_with_pairing(&directory);
+        let pair_id = PairId::from_array(PAIR_ID);
+        assert!(current_time_ms() >= CREATED_AT_MS + refineid_rapp::PAIRING_IDLE_EXPIRY_MS);
+        assert!(reader.phone().is_some());
+        reader.sweep();
+        // The pairing serves nothing and keeps its key only for the close
+        // of a later session.
+        assert_eq!(reader.phone(), None);
+        let summary = reader.pairs().into_iter().next().unwrap();
+        assert_eq!(summary.state, PairingState::Revoking);
+        assert!(path_for(&directory, pair_id).exists());
+        assert_eq!(reader.expire_idle_pairings(), Ok(0));
         let _ = std::fs::remove_dir_all(directory);
     }
 

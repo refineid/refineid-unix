@@ -28,11 +28,12 @@ use refineid_rapp::{
     CertificateFingerprint, CloseReason, CpaceKc2Responder, DEFAULT_OPERATION_LIFETIME_MS,
     EndpointRole, EstablishedSessionRuntime, LIVENESS_CHALLENGE_SIZE,
     LIVENESS_PING_AFTER_SILENCE_MS, OFFER_ID_SIZE, OfferId, OperationId, OperationRequest,
-    OperationResultMessage, PAIRING_CANDIDATES_MAX, PairId, PairRecord, PairingHandshake,
-    PairingOffer, PairingState, PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage,
-    ProxyDispatch, ProxyFailure, ProxyOperationEngine, QUIT_WITHDRAWAL_BOUND_MS,
-    REVOCATION_NOTICE_MS, ResultError, RuntimePoll, RuntimeReceive, SESSION_READY_NONCE_SIZE,
-    SessionHandshake, SignatureAlgorithm, TransportProfile, TypedMessage, UserApproval,
+    OperationResultMessage, PAIRING_CANDIDATES_MAX, PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord,
+    PairingHandshake, PairingOffer, PairingState, PingChallenge, ProfileName, ProgressEvent,
+    ProtocolErrorMessage, ProxyDispatch, ProxyFailure, ProxyOperationEngine,
+    QUIT_WITHDRAWAL_BOUND_MS, REVOCATION_NOTICE_MS, ResultError, RuntimePoll, RuntimeReceive,
+    SESSION_READY_NONCE_SIZE, SessionHandshake, SignatureAlgorithm, SweepError, SweepOutcome,
+    TransportProfile, TypedMessage, UserApproval, decode_pair_record, encode_pair_record,
     generate_pair_key_material, standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
@@ -168,6 +169,18 @@ impl PairingStore for HaltingStore {
             return Err(StoreError::WriteRefused);
         }
         self.inner.update(pair_id, change)
+    }
+
+    fn sweep(
+        &mut self,
+        pair_id: PairId,
+        now_ms: u64,
+        session_established: bool,
+    ) -> Result<SweepOutcome, SweepError<StoreError>> {
+        if self.halted {
+            return Err(SweepError::Store(StoreError::WriteRefused));
+        }
+        self.inner.sweep(pair_id, now_ms, session_established)
     }
 
     fn pair_ids(&self) -> Vec<PairId> {
@@ -835,6 +848,195 @@ fn a_forgotten_pairing_untold_for_thirty_days_loses_its_key() {
         1
     );
     assert!(requester.store().get(pair_id).is_err());
+}
+
+/// A second copy of the custodian's `record`, for a second session.
+fn copy_of(record: &PairRecord) -> PairRecord {
+    decode_pair_record(&encode_pair_record(record).unwrap()).unwrap()
+}
+
+/// The latest session time `requester` holds for `pair_id`.
+fn last_session<Store: PairingStore>(requester: &Requester<Store>, pair_id: PairId) -> Option<u64> {
+    requester
+        .store()
+        .get(pair_id)
+        .unwrap()
+        .pairing()
+        .last_session_at_ms()
+}
+
+#[test]
+fn a_session_notes_its_time_when_it_opens_and_when_it_ends() {
+    let mut requester = test_requester();
+    let (pair_id, proxy_pairing) = paired(&mut requester, &[ProfileName::CardStatus]);
+    assert_eq!(last_session(&requester, pair_id), None);
+    let before = current_time_ms();
+    let (mut session, proxy) = connected(
+        &mut requester,
+        pair_id,
+        copy_of(&proxy_pairing),
+        |mut custodian| {
+            assert_eq!(custodian.receive_close(), CloseReason::Normal);
+        },
+    );
+    let opened = last_session(&requester, pair_id).unwrap();
+    assert!(opened >= before);
+    std::thread::sleep(SHORT_DELAY);
+    requester.disconnect(&mut session, CloseReason::Normal);
+    proxy.join().unwrap();
+    let closed_here = last_session(&requester, pair_id).unwrap();
+    assert!(closed_here > opened);
+    // A session the phone ends is noted as well.
+    let (mut session, proxy) = connected(&mut requester, pair_id, proxy_pairing, |custodian| {
+        std::thread::sleep(SHORT_DELAY);
+        let Custodian {
+            mut runtime,
+            mut transport,
+            ..
+        } = custodian;
+        let notice = runtime.close_with_reason(CloseReason::Normal).unwrap();
+        transport.send_frame(notice.as_bytes()).unwrap();
+    });
+    assert_eq!(
+        requester.service(&mut session, DEADLINE),
+        Err(SessionError::ClosedByPeer(CloseReason::Normal))
+    );
+    proxy.join().unwrap();
+    assert!(last_session(&requester, pair_id).unwrap() > closed_here);
+    assert_eq!(
+        requester.store().get(pair_id).unwrap().state(),
+        PairingState::PairedDisconnected
+    );
+}
+
+#[test]
+fn a_pairing_without_a_session_for_thirty_days_expires_silently() {
+    let mut requester = test_requester();
+    let (pair_id, _proxy) = paired(&mut requester, &[ProfileName::CardStatus]);
+    let created = requester
+        .store()
+        .get(pair_id)
+        .unwrap()
+        .pairing()
+        .created_at_ms();
+    assert_eq!(
+        requester.expire_idle_pairings(created + PAIRING_IDLE_EXPIRY_MS - 1),
+        Ok(0)
+    );
+    assert_eq!(
+        requester.store().get(pair_id).unwrap().state(),
+        PairingState::PairedDisconnected
+    );
+    assert_eq!(
+        requester.expire_idle_pairings(created + PAIRING_IDLE_EXPIRY_MS),
+        Ok(1)
+    );
+    // Section 4.6 item 5: the pairing is revoked, serves nothing, and keeps
+    // its key only for the close of a later session.
+    let record = requester.store().get(pair_id).unwrap();
+    assert_eq!(record.state(), PairingState::Revoking);
+    assert!(record.pairing().serving_profiles().is_empty());
+    let (unused, _other) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    assert!(matches!(
+        requester.connect(pair_id, unused),
+        Err(SessionError::NotPaired(PairingState::Revoking))
+    ));
+}
+
+#[test]
+fn the_idle_time_runs_from_the_latest_session() {
+    let mut requester = test_requester();
+    let (pair_id, proxy_pairing) = paired(&mut requester, &[ProfileName::CardStatus]);
+    let created = requester
+        .store()
+        .get(pair_id)
+        .unwrap()
+        .pairing()
+        .created_at_ms();
+    std::thread::sleep(SHORT_DELAY);
+    let (mut session, proxy) =
+        connected(&mut requester, pair_id, proxy_pairing, |mut custodian| {
+            assert_eq!(custodian.receive_close(), CloseReason::Normal);
+        });
+    requester.disconnect(&mut session, CloseReason::Normal);
+    proxy.join().unwrap();
+    let last = last_session(&requester, pair_id).unwrap();
+    assert!(last > created);
+    assert_eq!(
+        requester.expire_idle_pairings(created + PAIRING_IDLE_EXPIRY_MS),
+        Ok(0)
+    );
+    assert_eq!(
+        requester.expire_idle_pairings(last + PAIRING_IDLE_EXPIRY_MS - 1),
+        Ok(0)
+    );
+    assert_eq!(
+        requester.expire_idle_pairings(last + PAIRING_IDLE_EXPIRY_MS),
+        Ok(1)
+    );
+}
+
+#[test]
+fn a_pairing_in_session_never_expires() {
+    let mut requester = test_requester();
+    let (pair_id, proxy_pairing) = paired(&mut requester, &[ProfileName::CardStatus]);
+    let (mut session, proxy) =
+        connected(&mut requester, pair_id, proxy_pairing, |mut custodian| {
+            assert_eq!(custodian.receive_close(), CloseReason::Normal);
+        });
+    let far = current_time_ms() + PAIRING_IDLE_EXPIRY_MS * 2;
+    // The sweep notes the open session instead of expiring its pairing.
+    assert_eq!(requester.expire_idle_pairings(far), Ok(0));
+    assert_eq!(last_session(&requester, pair_id), Some(far));
+    assert_eq!(
+        requester.store().get(pair_id).unwrap().state(),
+        PairingState::PairedDisconnected
+    );
+    requester.disconnect(&mut session, CloseReason::Normal);
+    proxy.join().unwrap();
+    // Once it ended, the idle time runs from the latest time noted.
+    assert_eq!(last_session(&requester, pair_id), Some(far));
+    assert_eq!(
+        requester.expire_idle_pairings(far + PAIRING_IDLE_EXPIRY_MS - 1),
+        Ok(0)
+    );
+    assert_eq!(
+        requester.expire_idle_pairings(far + PAIRING_IDLE_EXPIRY_MS),
+        Ok(1)
+    );
+}
+
+#[test]
+fn an_idle_sweep_the_store_refused_is_repeated_by_the_next() {
+    let mut requester = requester_over(HaltingStore::default());
+    let (pair_id, _proxy) = paired(&mut requester, &[ProfileName::CardStatus]);
+    let created = requester
+        .store()
+        .get(pair_id)
+        .unwrap()
+        .pairing()
+        .created_at_ms();
+    let expiry = created + PAIRING_IDLE_EXPIRY_MS;
+    requester.store_mut().halted = true;
+    assert_eq!(
+        requester.expire_idle_pairings(expiry),
+        Err(StoreError::WriteRefused)
+    );
+    assert_eq!(
+        requester.store().get(pair_id).unwrap().state(),
+        PairingState::PairedDisconnected
+    );
+    requester.store_mut().halted = false;
+    assert_eq!(requester.expire_idle_pairings(expiry), Ok(1));
+    assert_eq!(
+        requester
+            .store()
+            .get(pair_id)
+            .unwrap()
+            .pairing()
+            .forgotten_at_ms(),
+        Some(expiry)
+    );
 }
 
 #[test]
