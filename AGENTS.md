@@ -118,7 +118,7 @@ and no magic numbers. Define everything.
 Refinement types:
 
 - Read
-  [refinement-types.md](https://github.com/refineid/refineid-core/blob/main/docs/architecture/refinement-types.md)
+  [refinement-types.md](https://github.com/refineid/refineid-core/blob/main/doc/architecture/refinement-types.md)
   and its case study before designing or reviewing a type.
 - A type is a predicate: input from the wire, the card, the platform or
   storage crosses one border, with one constructor that checks every
@@ -145,7 +145,7 @@ No magic numbers:
 ## STPA in design
 
 Every design includes a short System-Theoretic Process Analysis (STPA),
-sized to the change. [stpa-rapp.md](https://github.com/refineid/refineid-core/blob/main/docs/security/stpa-rapp.md) is the worked example and the
+sized to the change. [stpa-rapp.md](https://github.com/refineid/refineid-core/blob/main/doc/security/stpa-rapp.md) is the worked example and the
 record for RAPP and its applications.
 
 - Ground the analysis in the losses (L-n) and hazards (H-n) the record
