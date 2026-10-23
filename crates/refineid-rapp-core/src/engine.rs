@@ -9,8 +9,12 @@
 //! its session: a lost result is asked for again as a new operation.
 //!
 //! The engine is blocking and synchronous: the PKCS#11 module, TLS client,
-//! CLI, and GUI call it from their own threads.
+//! CLI, and GUI call it from their own threads. A requester that follows a
+//! [`Withdrawal`] closes its open session with `service_withdrawn` once
+//! another thread raises it (section 4.5 item 8).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -37,6 +41,43 @@ const LIVENESS_TICK: Duration = Duration::from_secs(1);
 /// How long a revocation close waits for the phone to close its side, so
 /// the phone reads the close before this side's socket goes.
 const CLOSE_LINGER: Duration = Duration::from_secs(2);
+
+/// How many times a wait on an open session looks for this computer's
+/// withdrawal within the quit bound.
+const WITHDRAWAL_LOOKS_PER_BOUND: u64 = 4;
+
+/// How long one receive waits before the withdrawal is looked at again:
+/// the close of a requester that quits is written well within the quit
+/// bound (section 4.5 item 8).
+const WITHDRAWAL_POLL: Duration =
+    Duration::from_millis(refineid_rapp::QUIT_WITHDRAWAL_BOUND_MS / WITHDRAWAL_LOOKS_PER_BOUND);
+
+/// This computer's withdrawal from remote use (RAPP v26.10.22 section 4.5
+/// item 8), raised once from any thread. A requester that follows it closes
+/// its open session with `service_withdrawn` within a quarter of
+/// `QUIT_WITHDRAWAL_BOUND_MS` of the raise, whatever the session waits for,
+/// sends no new operation, and keeps every pairing.
+#[derive(Clone, Debug, Default)]
+pub struct Withdrawal(Arc<AtomicBool>);
+
+impl Withdrawal {
+    /// A withdrawal not yet raised.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Raises the withdrawal for every requester that follows it.
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the withdrawal was raised.
+    #[must_use]
+    pub fn raised(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 /// Local labels sent inside `pairing.hello`. Labels, not identities.
 #[derive(Clone, Debug)]
@@ -245,6 +286,10 @@ pub enum SessionError {
     Violation,
     /// The peer closed the session.
     ClosedByPeer(CloseReason),
+    /// This computer withdrew from remote use (section 4.5 item 8): an
+    /// open session closed with `service_withdrawn`, and no session is
+    /// dialed. The pairing stands.
+    WithdrawnHere,
     /// The engine encountered an internal fault.
     EngineFault,
 }
@@ -258,6 +303,7 @@ impl core::fmt::Display for SessionError {
             Self::Transport(e) => write!(f, "transport error: {e:?}"),
             Self::Violation => f.write_str("the phone's message was not understood"),
             Self::ClosedByPeer(reason) => write!(f, "session closed by peer: {reason:?}"),
+            Self::WithdrawnHere => f.write_str("this computer withdrew from remote use"),
             Self::EngineFault => f.write_str("engine fault"),
         }
     }
@@ -415,12 +461,28 @@ impl<Transport: FrameTransport> core::fmt::Debug for Session<Transport> {
 pub struct Requester<Store: PairingStore> {
     config: RequesterConfig,
     store: Store,
+    withdrawal: Option<Withdrawal>,
 }
 
 impl<Store: PairingStore> Requester<Store> {
-    /// Creates an engine over its store.
+    /// Creates an engine over its store, following no withdrawal.
     pub const fn new(config: RequesterConfig, store: Store) -> Self {
-        Self { config, store }
+        Self {
+            config,
+            store,
+            withdrawal: None,
+        }
+    }
+
+    /// Follows `withdrawal` from now on (section 4.5 item 8).
+    pub fn follow(&mut self, withdrawal: Withdrawal) {
+        self.withdrawal = Some(withdrawal);
+    }
+
+    /// Whether the withdrawal this engine follows was raised.
+    #[must_use]
+    pub fn withdrawn(&self) -> bool {
+        self.withdrawal.as_ref().is_some_and(Withdrawal::raised)
     }
 
     /// The pairing store, for inspection.
@@ -800,12 +862,17 @@ impl<Store: PairingStore> Requester<Store> {
     ///
     /// # Errors
     /// [`SessionError`] on an unknown or unusable pairing, a failed
-    /// handshake, a peer close, a protocol violation, or transport loss.
+    /// handshake, a peer close, a protocol violation, or transport loss;
+    /// [`SessionError::WithdrawnHere`] once this computer withdrew, the
+    /// connection closed without a notice.
     pub fn connect<Transport: FrameTransport>(
         &mut self,
         pair_id: PairId,
         mut transport: Transport,
     ) -> Result<Session<Transport>, SessionError> {
+        if self.withdrawn() {
+            return Err(SessionError::WithdrawnHere);
+        }
         let record = self
             .store
             .get(pair_id)
@@ -858,13 +925,16 @@ impl<Store: PairingStore> Requester<Store> {
     ///
     /// # Errors
     /// [`SessionError`] on an unknown pairing, one that was not forgotten,
-    /// a failed handshake, or transport loss; the key is kept for a later
-    /// session.
+    /// a failed handshake, transport loss, or this computer's withdrawal;
+    /// the key is kept for a later session.
     pub fn send_revocation_notice<Transport: FrameTransport>(
         &mut self,
         pair_id: PairId,
         mut transport: Transport,
     ) -> Result<(), SessionError> {
+        if self.withdrawn() {
+            return Err(SessionError::WithdrawnHere);
+        }
         let record = self
             .store
             .get(pair_id)
@@ -1045,11 +1115,12 @@ impl<Store: PairingStore> Requester<Store> {
     /// Runs one typed operation to its outcome (section 8): the request
     /// goes out under a fresh identifier and the session is served until
     /// the result arrives or the session ends. Liveness bounds a phone
-    /// that falls silent; the phone's own deadline bounds the rest.
+    /// that falls silent, a raised withdrawal ends the session and the
+    /// operation with it, and the phone's own deadline bounds the rest.
     ///
     /// # Errors
     /// Returns [`AdmissionError`] when the session cannot carry the
-    /// operation.
+    /// operation; a withdrawn engine closes the session unasked.
     pub fn execute<Transport: FrameTransport>(
         &mut self,
         session: &mut Session<Transport>,
@@ -1057,6 +1128,9 @@ impl<Store: PairingStore> Requester<Store> {
         expires_after_ms: u64,
     ) -> Result<OperationOutcome, AdmissionError> {
         let profile: ProfileName = operation.required_profile();
+        if self.withdrawn() {
+            self.disconnect(session, CloseReason::ServiceWithdrawn);
+        }
         if session.end.is_some() {
             return Err(AdmissionError::SessionNotHealthy);
         }
@@ -1108,7 +1182,9 @@ impl<Store: PairingStore> Requester<Store> {
 
     /// Receives at most one frame within `wait`, after keeping the
     /// liveness rule. Pings, pongs, and card reports are handled here; the
-    /// live operation's progress and end are returned.
+    /// live operation's progress and end are returned. A raised withdrawal
+    /// closes the session with `service_withdrawn` instead (section 4.5
+    /// item 8).
     fn pump<Transport: FrameTransport>(
         &mut self,
         session: &mut Session<Transport>,
@@ -1117,10 +1193,14 @@ impl<Store: PairingStore> Requester<Store> {
         if session.end.is_some() {
             return Err(SessionError::EngineFault);
         }
+        if self.withdrawn() {
+            self.disconnect(session, CloseReason::ServiceWithdrawn);
+            return Err(SessionError::WithdrawnHere);
+        }
         Self::keep_alive(session)?;
         if let Err(error) = session
             .transport
-            .set_receive_deadline(wait.min(LIVENESS_TICK))
+            .set_receive_deadline(wait.min(LIVENESS_TICK).min(WITHDRAWAL_POLL))
         {
             session.finish(SessionEnd::TransportLoss);
             return Err(SessionError::Transport(error));

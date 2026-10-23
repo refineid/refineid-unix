@@ -29,10 +29,16 @@
 //! none is open; that is the one thing the phone does. A pairing forgotten
 //! on this computer is told to the phone by that thread, on the session it
 //! holds or on the next one (section 4.6).
+//!
+//! The host finalizes the module when its user quits it or unloads the
+//! module, and that is this computer's withdrawal (section 4.5 item 8):
+//! the thread closes its open session with `service_withdrawn`, drops a
+//! dial not yet open without a notice, keeps the pairing, and ends before
+//! `C_Finalize` returns.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -42,7 +48,7 @@ use refineid_pkcs11::remote::{
 };
 use refineid_pkcs11::slot_kind::RemoteSlotId;
 use refineid_rapp::{IDENTITY_OFFER_GRACE_MS, ResultError};
-use refineid_rapp_core::engine::OperationOutcome;
+use refineid_rapp_core::engine::{OperationOutcome, Withdrawal};
 use refineid_rapp_core::ids::{CertificateFingerprint, PairId};
 use refineid_rapp_core::operations::{
     CardKeyProfile, CardOperation, CardOperationResult, SignatureAlgorithm,
@@ -202,7 +208,9 @@ impl Offering {
 struct Shared {
     offer: Mutex<Option<Offering>>,
     requests: Mutex<Option<Sender<SignRequest>>>,
-    stop: AtomicBool,
+    /// Raised when the host finalizes the module, which ends the thread's
+    /// run; each run has its own.
+    withdrawal: Mutex<Withdrawal>,
     /// A request is waiting while no session is held: the thread dials
     /// at once instead of pausing out its round.
     wanted: AtomicBool,
@@ -271,8 +279,27 @@ impl Shared {
         }
     }
 
+    /// The withdrawal of the thread's current run.
+    fn withdrawal(&self) -> Withdrawal {
+        self.withdrawal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Gives the next run a withdrawal not yet raised.
+    fn renew_withdrawal(&self) {
+        *self
+            .withdrawal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Withdrawal::new();
+    }
+
     fn stopped(&self) -> bool {
-        self.stop.load(Ordering::Acquire)
+        self.withdrawal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .raised()
     }
 
     fn wanted(&self) -> bool {
@@ -309,7 +336,7 @@ impl PhoneSource {
             shared: Arc::new(Shared {
                 offer: Mutex::new(None),
                 requests: Mutex::new(None),
-                stop: AtomicBool::new(false),
+                withdrawal: Mutex::new(Withdrawal::new()),
                 wanted: AtomicBool::new(false),
                 context: computer_context(),
                 spoken: (Mutex::new(false), Condvar::new()),
@@ -383,11 +410,17 @@ impl RemoteTokenSource for PhoneSource {
         }
     }
 
+    /// This computer withdraws (RAPP v26.10.22 section 4.5 item 8): the
+    /// thread writes the `service_withdrawn` close of its open session
+    /// within a quarter of the quit bound and ends; a dial in progress ends
+    /// at its next step without a notice.
     fn stop(&self) {
-        self.shared.stop.store(true, Ordering::Release);
+        self.shared.withdrawal().raise();
         if let Ok(mut requests) = self.shared.requests.lock() {
             *requests = None;
         }
+        // The host unloads the module once this returns: no code of it may
+        // still run on the thread then.
         let handle = self.worker.lock().ok().and_then(|mut worker| worker.take());
         if let Some(handle) = handle {
             let _ = handle.join();
@@ -398,7 +431,7 @@ impl RemoteTokenSource for PhoneSource {
         if let Ok(mut spoken) = self.shared.spoken.0.lock() {
             *spoken = false;
         }
-        self.shared.stop.store(false, Ordering::Release);
+        self.shared.renew_withdrawal();
     }
 }
 
@@ -427,7 +460,9 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>) {
 
         // A store that cannot be read just now says nothing of the
         // pairing: the offering and its grace stand as they are.
-        let Ok(mut reader) = RemoteReader::open_local_without_sweep() else {
+        let Ok(mut reader) = RemoteReader::open_local_without_sweep()
+            .map(|reader| reader.following(shared.withdrawal()))
+        else {
             pause(shared, UNPAIRED_PAUSE);
             continue;
         };
@@ -562,7 +597,7 @@ fn hold(
     let mut record_checked = Instant::now();
     loop {
         if shared.stopped() {
-            reader.close_session(session);
+            reader.withdraw_session(session);
             return After::Grace;
         }
         let event = card_event(
@@ -662,8 +697,9 @@ fn hold(
                 }
             },
             Err(RecvTimeoutError::Timeout) => {}
+            // Only the module's stop drops the request channel.
             Err(RecvTimeoutError::Disconnected) => {
-                reader.close_session(session);
+                reader.withdraw_session(session);
                 return After::Grace;
             }
         }
@@ -1065,7 +1101,7 @@ mod tests {
         Shared {
             offer: Mutex::new(None),
             requests: Mutex::new(None),
-            stop: AtomicBool::new(false),
+            withdrawal: Mutex::new(Withdrawal::new()),
             wanted: AtomicBool::new(false),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
@@ -1157,7 +1193,7 @@ mod tests {
         let shared = Shared {
             offer: Mutex::new(None),
             requests: Mutex::new(None),
-            stop: AtomicBool::new(false),
+            withdrawal: Mutex::new(Withdrawal::new()),
             wanted: AtomicBool::new(false),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
@@ -1214,7 +1250,7 @@ mod tests {
         let shared = Shared {
             offer: Mutex::new(None),
             requests: Mutex::new(None),
-            stop: AtomicBool::new(false),
+            withdrawal: Mutex::new(Withdrawal::new()),
             wanted: AtomicBool::new(true),
             context: computer_context(),
             spoken: (Mutex::new(false), Condvar::new()),
@@ -1229,7 +1265,12 @@ mod tests {
         let source = PhoneSource::new();
         let _ = source.offered();
         assert!(source.worker.lock().expect("worker").is_some());
+        let run = source.shared.withdrawal();
         source.stop();
+        // The run withdrew; the next one starts with its own withdrawal
+        // not yet raised.
+        assert!(run.raised());
+        assert!(!source.shared.stopped());
         assert!(source.worker.lock().expect("worker").is_none());
         assert!(source.shared.offer.lock().expect("offer").is_none());
         assert!(source.shared.requests.lock().expect("requests").is_none());

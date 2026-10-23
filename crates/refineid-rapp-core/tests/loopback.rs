@@ -30,14 +30,15 @@ use refineid_rapp::{
     LIVENESS_PING_AFTER_SILENCE_MS, OFFER_ID_SIZE, OfferId, OperationId, OperationRequest,
     OperationResultMessage, PAIRING_CANDIDATES_MAX, PairId, PairRecord, PairingHandshake,
     PairingOffer, PairingState, PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage,
-    ProxyDispatch, ProxyFailure, ProxyOperationEngine, REVOCATION_NOTICE_MS, ResultError,
-    RuntimePoll, RuntimeReceive, SESSION_READY_NONCE_SIZE, SessionHandshake, SignatureAlgorithm,
-    TransportProfile, TypedMessage, UserApproval, generate_pair_key_material,
-    standard_pairing_context_v2,
+    ProxyDispatch, ProxyFailure, ProxyOperationEngine, QUIT_WITHDRAWAL_BOUND_MS,
+    REVOCATION_NOTICE_MS, ResultError, RuntimePoll, RuntimeReceive, SESSION_READY_NONCE_SIZE,
+    SessionHandshake, SignatureAlgorithm, TransportProfile, TypedMessage, UserApproval,
+    generate_pair_key_material, standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
-    OpenedConnection, OperationOutcome, PairingCandidateSource, PairingError, PairingSearchError,
-    Requester, RequesterConfig, Session, SessionEnd, SessionError, current_time_ms, read_offer,
+    AdmissionError, OpenedConnection, OperationOutcome, PairingCandidateSource, PairingError,
+    PairingSearchError, Requester, RequesterConfig, Session, SessionEnd, SessionError, Withdrawal,
+    current_time_ms, read_offer,
 };
 use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::profiles::{
@@ -104,6 +105,9 @@ const RECORD_EXTENSION: &str = "pair";
 const HANDSHAKE_FAILURES: usize = 3;
 /// A wait for a card shorter than [`LONG_DELAY`].
 const SHORT_WAIT: Duration = Duration::from_millis(100);
+/// How long a requester that quits waits for its withdrawal closes to
+/// leave (section 4.5 item 8).
+const QUIT_BOUND: Duration = Duration::from_millis(QUIT_WITHDRAWAL_BOUND_MS);
 
 /// The custodian's random stream offer and its bootstrap bytes (section
 /// 4.2), and the CPace context it binds.
@@ -1344,6 +1348,87 @@ fn a_withdrawn_session_keeps_the_pairing_and_reports_the_reason() {
         requester.store().get(pair_id).unwrap().state(),
         PairingState::PairedDisconnected
     );
+}
+
+#[test]
+fn quitting_during_the_pin_prompt_tells_the_phone_within_the_quit_bound() {
+    let mut requester = test_requester();
+    let withdrawal = Withdrawal::new();
+    requester.follow(withdrawal.clone());
+    let granted = [ProfileName::Authentication];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (mut session, proxy) = connected(&mut requester, pair_id, proxy_pairing, move |mut c| {
+        let request = c.admit();
+        c.show_pin_prompt(&request);
+        // The computer quits while the holder reads the prompt.
+        let quit_at = Instant::now();
+        withdrawal.raise();
+        assert_eq!(c.receive_close(), CloseReason::ServiceWithdrawn);
+        assert!(quit_at.elapsed() < QUIT_BOUND);
+    });
+    // The operation ends with its session (section 8.1 item 3).
+    assert_eq!(
+        requester
+            .execute(&mut session, &authentication_operation(), LIFETIME_MS)
+            .unwrap(),
+        OperationOutcome::Lost
+    );
+    proxy.join().unwrap();
+    assert_eq!(session.end(), Some(SessionEnd::LocalClose));
+    assert_eq!(
+        requester.store().get(pair_id).unwrap().state(),
+        PairingState::PairedDisconnected
+    );
+}
+
+#[test]
+fn a_withdrawal_closes_an_idle_session_keeps_the_pairing_and_dials_no_more() {
+    let mut requester = test_requester();
+    let withdrawal = Withdrawal::new();
+    requester.follow(withdrawal.clone());
+    let granted = [ProfileName::CardStatus];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (mut session, proxy) = connected(&mut requester, pair_id, proxy_pairing, |mut c| {
+        assert_eq!(c.receive_close(), CloseReason::ServiceWithdrawn);
+    });
+    withdrawal.raise();
+    assert_eq!(
+        requester.service(&mut session, DEADLINE),
+        Err(SessionError::WithdrawnHere)
+    );
+    proxy.join().unwrap();
+    assert_eq!(session.end(), Some(SessionEnd::LocalClose));
+    assert_eq!(
+        requester.store().get(pair_id).unwrap().state(),
+        PairingState::PairedDisconnected
+    );
+    // A connection made after the withdrawal closes without a notice.
+    let (unused, mut custodian_side) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    assert!(matches!(
+        requester.connect(pair_id, unused),
+        Err(SessionError::WithdrawnHere)
+    ));
+    assert_eq!(custodian_side.receive_frame(), Err(TransportError::Eof));
+}
+
+#[test]
+fn a_withdrawn_requester_sends_no_new_operation() {
+    let mut requester = test_requester();
+    let withdrawal = Withdrawal::new();
+    requester.follow(withdrawal.clone());
+    let granted = [ProfileName::CardStatus];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (mut session, proxy) = connected(&mut requester, pair_id, proxy_pairing, |mut c| {
+        // The close comes in place of the request.
+        assert_eq!(c.receive_close(), CloseReason::ServiceWithdrawn);
+    });
+    withdrawal.raise();
+    assert_eq!(
+        requester.execute(&mut session, &CardOperation::InspectCard, LIFETIME_MS),
+        Err(AdmissionError::SessionNotHealthy)
+    );
+    proxy.join().unwrap();
+    assert_eq!(session.end(), Some(SessionEnd::LocalClose));
 }
 
 #[test]

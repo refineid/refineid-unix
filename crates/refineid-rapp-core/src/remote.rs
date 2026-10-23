@@ -23,6 +23,11 @@
 //! 8.4); an operation is sent only on a session that reports one, and the
 //! phone's identity is offered only on a certificate whose fingerprint the
 //! phone confirmed on a session.
+//!
+//! A reader that follows a [`Withdrawal`] stops when it is raised (section
+//! 4.5 item 8): its open session closes with `service_withdrawn`, a dial
+//! not yet open closes without a notice, nothing more is dialed, and every
+//! pairing stays.
 
 use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
@@ -31,7 +36,7 @@ use crate::addresses;
 
 use crate::engine::{
     AdmissionError, OperationOutcome, PairingCandidateSource, PairingSearchError, Requester,
-    RequesterConfig, Session, SessionEnd, SessionError, current_time_ms, read_offer,
+    RequesterConfig, Session, SessionEnd, SessionError, Withdrawal, current_time_ms, read_offer,
 };
 use crate::file_store::FilePairingStore;
 use crate::ids::{CertificateFingerprint, PairId};
@@ -572,6 +577,25 @@ impl RemoteReader {
         }
     }
 
+    /// Follows `withdrawal`, this computer's withdrawal from remote use
+    /// (section 4.5 item 8), for the program that holds the phone's
+    /// session.
+    #[must_use]
+    pub fn following(mut self, withdrawal: Withdrawal) -> Self {
+        self.requester.follow(withdrawal);
+        self
+    }
+
+    /// Dials only while this computer has not withdrawn (section 4.5 item
+    /// 8).
+    fn may_dial(&self) -> Result<(), RemoteError> {
+        if self.requester.withdrawn() {
+            Err(RemoteError::Session(SessionError::WithdrawnHere))
+        } else {
+            Ok(())
+        }
+    }
+
     /// The owning program's sweep of the store: forgotten records that
     /// waited out their notice window lose their keys (section 4.6 item
     /// 3), and, while no pairing ceremony runs on this computer, records a
@@ -645,8 +669,12 @@ impl RemoteReader {
     }
 
     /// Tells the phone holding the forgotten `pair_id` that this computer
-    /// forgot it, when one is in sight; whether it was told.
+    /// forgot it, when one is in sight and this computer has not withdrawn;
+    /// whether it was told.
     fn deliver_revocation_notice(&mut self, pair_id: PairId) -> bool {
+        if self.may_dial().is_err() {
+            return false;
+        }
         let Ok(record) = self.requester.store().get(pair_id) else {
             return false;
         };
@@ -804,7 +832,8 @@ impl RemoteReader {
     /// # Errors
     /// [`RemoteError`] when no pairing matches, another program holds the
     /// pairing's session, no phone opens a session for it, the phone
-    /// forgot this computer, or no card is reported before the timeout.
+    /// forgot this computer, no card is reported before the timeout, or
+    /// this computer withdrew, which ends the search at its next round.
     pub fn open_session(
         &mut self,
         pair_id: Option<PairId>,
@@ -838,6 +867,7 @@ impl RemoteReader {
         discovery_timeout: Duration,
         wait: CardWait,
     ) -> Result<RemoteSession, RemoteError> {
+        self.may_dial()?;
         let pair_id = match pair_id {
             Some(pair_id) => pair_id,
             None => self.phone().ok_or(RemoteError::NotPaired)?.pair_id,
@@ -858,7 +888,9 @@ impl RemoteReader {
         let deadline = Instant::now() + discovery_timeout;
         let mut last = RemoteError::NotFound;
         while Instant::now() < deadline {
+            self.may_dial()?;
             for service in sessions_for(&keys, self.browse_for(pair_id))? {
+                self.may_dial()?;
                 let Ok(transport) = dial(
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
@@ -958,7 +990,8 @@ impl RemoteReader {
     /// # Errors
     /// [`RemoteError::Withdrawn`] or [`RemoteError::RevokedByPhone`] when
     /// the phone closed the session with that reason, and
-    /// [`RemoteError::Session`] when the session ended otherwise.
+    /// [`RemoteError::Session`] when the session ended otherwise, this
+    /// computer's withdrawal included.
     pub fn service(
         &mut self,
         session: &mut RemoteSession,
@@ -974,6 +1007,16 @@ impl RemoteReader {
     pub fn close_session(&mut self, mut session: RemoteSession) {
         self.requester
             .disconnect(&mut session.session, CloseReason::Complete);
+    }
+
+    /// Closes `session` as this computer's withdrawal from remote use
+    /// (section 4.5 item 8): `session.close` with `service_withdrawn`,
+    /// written to the connection before it goes, with no wait for the
+    /// phone. The pairing stays; an already ended session is left as it
+    /// ended.
+    pub fn withdraw_session(&mut self, mut session: RemoteSession) {
+        self.requester
+            .disconnect(&mut session.session, CloseReason::ServiceWithdrawn);
     }
 
     /// Closes `session` telling the phone that this computer forgot the
@@ -1103,13 +1146,13 @@ mod tests {
         withdrawal_counter,
     };
 
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
-        AdmissionError, CardOperationResult, CardPresence, CardReader, CardRequest,
+        AdmissionError, BROWSE_ROUND, CardOperationResult, CardPresence, CardReader, CardRequest,
         CardStatusMessage, CertificateFingerprint, OperationOutcome, PairingKeys,
-        PairingSearchError, RemoteError, RemoteReader, StreamService, current_time_ms, lifetime_ms,
-        operation_result, sessions_for, unix_seconds,
+        PairingSearchError, RemoteError, RemoteReader, SessionError, StreamService, Withdrawal,
+        current_time_ms, lifetime_ms, operation_result, sessions_for, unix_seconds,
     };
     use crate::file_store::{FilePairingStore, path_for};
     use crate::session_lock::{SessionLock, ceremony_lock_path, session_lock_path};
@@ -1315,6 +1358,52 @@ mod tests {
             second.open_session(Some(pair_id), Duration::ZERO).err(),
             Some(RemoteError::NotFound)
         );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_withdrawn_reader_dials_nothing_and_keeps_the_pairing() {
+        let directory = scratch();
+        let withdrawal = Withdrawal::new();
+        let mut reader = reader_with_pairing(&directory).following(withdrawal.clone());
+        let pair_id = PairId::from_array(PAIR_ID);
+        withdrawal.raise();
+        let started = Instant::now();
+        assert_eq!(
+            reader.dial_session(pair_id, SEARCH).err(),
+            Some(RemoteError::Session(SessionError::WithdrawnHere))
+        );
+        // No browse round ran.
+        assert!(started.elapsed() < BROWSE_ROUND);
+        assert!(reader.phone().is_some_and(|phone| phone.usable()));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_withdrawal_ends_a_search_at_its_next_round() {
+        /// A search several rounds long.
+        const LONG_SEARCH: Duration = Duration::from_secs(10);
+        /// How far into the search the computer quits.
+        const QUIT_AFTER: Duration = Duration::from_millis(100);
+        /// The rounds a search may run before it sees the withdrawal: the
+        /// one in progress and its end.
+        const ROUNDS_TO_STOP: u32 = 2;
+        let directory = scratch();
+        let withdrawal = Withdrawal::new();
+        let mut reader = reader_with_pairing(&directory).following(withdrawal.clone());
+        let pair_id = PairId::from_array(PAIR_ID);
+        let quit = std::thread::spawn(move || {
+            std::thread::sleep(QUIT_AFTER);
+            withdrawal.raise();
+        });
+        let started = Instant::now();
+        let outcome = reader.dial_session(pair_id, LONG_SEARCH);
+        quit.join().unwrap();
+        assert_eq!(
+            outcome.err(),
+            Some(RemoteError::Session(SessionError::WithdrawnHere))
+        );
+        assert!(started.elapsed() < BROWSE_ROUND * ROUNDS_TO_STOP);
         let _ = std::fs::remove_dir_all(directory);
     }
 
