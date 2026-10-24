@@ -6,12 +6,12 @@
 #
 # Usage:
 #
-#   scripts/agent-housekeeping.sh [--clean]
+#   script/agent-housekeeping.sh [--clean]
 #
 # Without flags the script only reports. With --clean it removes worktrees
 # whose branch is merged into main, whose tree is clean, and that hold no
-# unpushed commits, then deletes the merged branch. Anything else —
-# uncommitted changes, unpushed commits, or an unmerged branch — is
+# unpushed commits, then deletes the merged branch. Anything else
+# (uncommitted changes, unpushed commits, or an unmerged branch) is
 # reported with its latest commit message and never destroyed.
 
 set -euo pipefail
@@ -20,7 +20,7 @@ clean=0
 if [[ "${1:-}" == "--clean" ]]; then
   clean=1
 elif [[ $# -gt 0 ]]; then
-  echo "usage: scripts/agent-housekeeping.sh [--clean]" >&2
+  echo "usage: script/agent-housekeeping.sh [--clean]" >&2
   exit 2
 fi
 
@@ -28,6 +28,8 @@ repo=$(git rev-parse --show-toplevel)
 cd "${repo}"
 git worktree prune
 primary=$(git worktree list --porcelain | sed -n 's/^worktree //p' | head -n 1)
+# Policy: every task worktree lives under ../wt/ next to the main checkout.
+wt_root="$(dirname "${primary}")/wt"
 
 stale_after_seconds=86400
 now=$(date +%s)
@@ -87,8 +89,8 @@ while IFS= read -r line; do
 
       size="$(du -sh "${path}" 2>/dev/null | cut -f1)"
       echo "--- ${path} [${size}]"
-      if [[ "${path}" != *"/src/wt/"* ]]; then
-        echo "  policy: NON-COMPLIANT (worktree must live under ~/src/wt/)"
+      if [[ "${path}" != "${wt_root}/"* ]]; then
+        echo "  policy: NON-COMPLIANT (worktree must live under ../wt/ next to the main checkout)"
       fi
       echo "  branch: ${branch} (merged: ${merged}, dirty: ${dirty}, unpushed: ${unpushed})"
       echo "  activity: ${activity}"

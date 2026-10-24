@@ -63,6 +63,8 @@
   branch's only checkout with it.
 - One task, one worktree, one branch (`<topic>`), one pull request per branch.
 - Run `script/agent-housekeeping.sh` when starting and keep the house clean.
+  [doc/process/agent-worktrees.md](doc/process/agent-worktrees.md) describes
+  the layout, the script and the task lifecycle.
 - Merge the pull request after mandatory local verification and review pass,
   then remove the worktree and branch and fast-forward `main`.
 
