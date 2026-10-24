@@ -510,11 +510,19 @@ impl Gtk4Driver {
                 sw.status_pill_label.set_text("Via Phone");
                 sw.status_pill_label
                     .set_css_classes(&["status-pill", "status-pill-green"]);
+            } else if state.reader_connected {
+                sw.holder_name_label
+                    .set_text("Insert the card into the reader.");
+                sw.holder_name_label
+                    .set_css_classes(&["apple-secondary-text"]);
+                sw.status_pill_label.set_text("No Card");
+                sw.status_pill_label
+                    .set_css_classes(&["status-pill", "status-pill-gray"]);
             } else {
                 sw.holder_name_label.set_text("Connect a card reader.");
                 sw.holder_name_label
                     .set_css_classes(&["apple-secondary-text"]);
-                sw.status_pill_label.set_text("No Card");
+                sw.status_pill_label.set_text("No Reader");
                 sw.status_pill_label
                     .set_css_classes(&["status-pill", "status-pill-gray"]);
             }

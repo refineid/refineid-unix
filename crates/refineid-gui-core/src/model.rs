@@ -238,6 +238,8 @@ pub struct UiState {
     /// Whether at least one physical smart card is present in an attached card reader.
     /// When true, the physical card reader overrides RAPP, and the Phone page/tab is suppressed.
     pub has_local_card: bool,
+    /// Whether at least one physical smart card reader is connected to this computer.
+    pub reader_connected: bool,
     /// Whether the currently selected card is hosted on a local PC/SC reader.
     /// When false (e.g. remote phone over RAPP), photo loading via local CAN is unavailable
     /// and credentials must be handled directly on the phone.
@@ -286,6 +288,7 @@ impl Default for UiState {
             unblock_uses_activation_code: false,
             signature_supported: false,
             has_local_card: false,
+            reader_connected: false,
             selected_card_is_local: false,
             can_text: String::new(),
             portrait: None,
@@ -399,5 +402,12 @@ mod tests {
         assert!(!phone.certificate_cached);
         assert!(PairedPhone::from_summary(&summary(PairingState::StorageConfirming)).is_none());
         assert!(PairedPhone::from_summary(&summary(PairingState::Revoking)).is_none());
+    }
+
+    #[test]
+    fn default_ui_state_defaults_reader_connected_to_false() {
+        let state = UiState::default();
+        assert!(!state.reader_connected);
+        assert!(!state.has_local_card);
     }
 }

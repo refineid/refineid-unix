@@ -82,7 +82,13 @@ impl std::fmt::Debug for RefineIdController {
 impl RefineIdController {
     /// Create a new controller with the specified state change callback.
     pub fn new(on_state_change: impl Fn(&UiState) + Send + Sync + 'static) -> Arc<Self> {
-        let initial_state = UiState::default();
+        let initial_reader_connected = refineid_lib_pcsc::presence_signature()
+            .map(|sig| !sig.is_empty())
+            .unwrap_or(false);
+        let initial_state = UiState {
+            reader_connected: initial_reader_connected,
+            ..UiState::default()
+        };
         on_state_change(&initial_state);
 
         Arc::new(Self {
@@ -339,6 +345,10 @@ impl RefineIdController {
 
         let controller = Arc::clone(self);
         thread::spawn(move || {
+            let reader_connected = refineid_lib_pcsc::presence_signature()
+                .map(|sig| !sig.is_empty())
+                .unwrap_or(false);
+
             // No reader, or none with a card, is an empty list, not an error.
             let reports = match refineid_client::card_manager::inspect_cards(None) {
                 Ok(reports) => Ok(reports),
@@ -361,6 +371,7 @@ impl RefineIdController {
                     controller.update_state(|state| {
                         state.busy = false;
                         state.has_local_card = has_local_card;
+                        state.reader_connected = reader_connected;
                     });
                     controller.replace_cards(cards);
                 }
@@ -370,6 +381,7 @@ impl RefineIdController {
                         state.cards.clear();
                         state.selected_card = None;
                         state.has_local_card = false;
+                        state.reader_connected = reader_connected;
                         state.selected_card_is_local = false;
                         state.status_message = format!("Card inspection error: {err}");
                     });
@@ -380,6 +392,10 @@ impl RefineIdController {
 
     fn run_presence_monitor(&self) {
         let mut baseline = refineid_lib_pcsc::presence_signature().unwrap_or_default();
+        let initial_reader_connected = !baseline.is_empty();
+        self.update_state(|state| {
+            state.reader_connected = initial_reader_connected;
+        });
         while !self.presence_stop.load(Ordering::Acquire) {
             match refineid_lib_pcsc::wait_for_presence_change(&baseline, CARD_PRESENCE_WAIT) {
                 Ok(true) => {
@@ -387,8 +403,12 @@ impl RefineIdController {
                     baseline = refineid_lib_pcsc::presence_signature().unwrap_or(baseline);
                     if !self.presence_stop.load(Ordering::Acquire) {
                         let local_card_present = baseline.iter().any(|(_, present)| *present);
+                        let reader_connected = !baseline.is_empty();
                         let include_phones = !local_card_present && self.has_usable_phone();
                         let cards = self.inspect_until_settled(&baseline, include_phones);
+                        self.update_state(|state| {
+                            state.reader_connected = reader_connected;
+                        });
                         self.replace_cards(cards);
                     }
                 }
