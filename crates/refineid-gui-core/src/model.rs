@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use refineid_client::card_check::CardCheckReport;
 use refineid_client::card_pin::{ActivationCardContext, PinManageSlot};
-use refineid_lib_core::auth::{PinStatus, PukStatus};
+use refineid_lib_core::auth::{PinSlot, PinStatus, PukStatus, check_retry_floor};
 use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::CardGeneration;
@@ -104,13 +104,10 @@ impl ManagedCard {
             )
     }
 
-    /// Check if PIN change is available.
-    pub fn pin_change_available(&self, status: Option<&PinStatus>) -> bool {
-        match status {
-            Some(PinStatus::Remaining(tries)) => !tries.is_exhausted(),
-            Some(PinStatus::Verified) => true,
-            Some(PinStatus::Locked | PinStatus::NoInfo | PinStatus::Other(_)) | None => false,
-        }
+    /// Whether a change with the current PIN passes the retry floor for
+    /// `slot`: five, four or three tries left, or already verified.
+    pub fn pin_change_available(&self, slot: PinSlot, status: Option<&PinStatus>) -> bool {
+        status.is_some_and(|&status| check_retry_floor(slot, status).is_ok())
     }
 
     /// Check if legacy factory activation is required.

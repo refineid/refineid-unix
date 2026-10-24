@@ -420,6 +420,7 @@ fn report_outcome(
             if matches!(
                 &e,
                 crate::card_sign::SignErrorKind::PinRejected { .. }
+                    | crate::card_sign::SignErrorKind::RetryFloor(_)
                     | crate::card_sign::SignErrorKind::PinPolicy { .. }
             ) =>
         {

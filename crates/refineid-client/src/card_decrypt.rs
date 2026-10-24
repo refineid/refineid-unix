@@ -24,7 +24,10 @@
 use alloc::fmt;
 use std::path::PathBuf;
 
-use refineid_lib_core::auth::{AuthError, PinOps as _, PinPolicyReason, VerifyOutcome};
+use refineid_lib_core::auth::{
+    AuthError, PinOps as _, PinPolicyReason, PinSlot, RetryFloorRefusal, VerifyOutcome,
+    check_retry_floor,
+};
 use refineid_lib_core::backend::{
     ReaderAccessCap, ReaderBackend as _, ReaderBackendOps as _, ReaderPickError,
 };
@@ -96,6 +99,9 @@ pub enum DecryptAuthError {
     WrongCiphertextLength(usize),
     /// VERIFY of PIN1 returned a non-Ok outcome.
     PinRejected(VerifyOutcome),
+    /// The retry floor refused the PIN1 VERIFY: the card reports two, one
+    /// or no tries left, the PIN blocked, or no readable counter.
+    RetryFloor(RetryFloorRefusal),
     /// Local-policy rejection on PIN1 (length / non-digit)
     /// before any APDU went out. Counter is unaffected.
     PinPolicy(PinPolicyReason),
@@ -147,6 +153,7 @@ impl fmt::Display for DecryptAuthError {
             Self::PinRejected(VerifyOutcome::Ok) => {
                 write!(f, "internal: PinRejected(Ok) is not an error state")
             }
+            Self::RetryFloor(refusal) => write!(f, "{refusal}"),
             Self::PinPolicy(r) => write!(f, "PIN1 rejected locally: {r}"),
             Self::Pkcs15Select(s) => write!(f, "SELECT PKCS#15 app: {s}"),
             Self::DecryptSw { stage, sw } => {
@@ -209,6 +216,11 @@ pub(crate) fn decrypt_auth_first(
         .select_pkcs15_application()
         .map_err(|e| DecryptAuthError::Pkcs15Select(format!("{e}")))?;
 
+    let status = transport.pin_status(PinSlot::Pin1).map_err(|e| match e {
+        AuthError::Transport(t) => DecryptAuthError::Transport(format!("{t}")),
+        AuthError::PinPolicy(r) => DecryptAuthError::PinPolicy(r),
+    })?;
+    check_retry_floor(PinSlot::Pin1, status).map_err(DecryptAuthError::RetryFloor)?;
     let outcome = transport
         .verify_pin1(options.pin.clone())
         .map_err(|e| match e {

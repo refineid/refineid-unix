@@ -40,8 +40,7 @@ pub mod commands;
 pub use refineid_auth::{
     ActivationReport, ActivationScheme, CACHE_FINGERPRINT_KEY_LEN, CACHE_FINGERPRINT_LEN,
     CardActivationNeeds, CredentialHealthReport, ManageOutcome, PinChangeRecord, PinManageOps,
-    PinRetryRisk, classify_manage_sw, pin1_status_permits_consumer_authentication,
-    pin1_status_permits_reusable_cache, pin2_status_permits_qualified_signature,
+    RetryFloorRefusal, classify_manage_sw, pin1_status_permits_reusable_cache,
     read_pin_change_record, read_puk_status_from_container,
 };
 
@@ -255,6 +254,40 @@ pub enum PinStatus {
     Locked,
     /// Anything else -- surfaced opaquely for the caller.
     Other(u16),
+}
+
+impl From<PinSlot> for refineid_auth::PinSlot {
+    fn from(slot: PinSlot) -> Self {
+        match slot {
+            PinSlot::Pin1 => Self::Pin1,
+            PinSlot::Pin2 => Self::Pin2,
+        }
+    }
+}
+
+impl From<PinStatus> for refineid_auth::PinStatus {
+    fn from(status: PinStatus) -> Self {
+        match status {
+            PinStatus::Verified => Self::Verified,
+            PinStatus::Remaining(retries) => refineid_apdu::PinRetries::from_nibble(retries.get())
+                .map_or(Self::NoInfo, Self::Remaining),
+            PinStatus::NoInfo => Self::NoInfo,
+            PinStatus::Locked => Self::Locked,
+            PinStatus::Other(sw) => Self::Other(refineid_apdu::StatusWord::from_u16(sw)),
+        }
+    }
+}
+
+/// The retry floor from `refineid-auth`, applied to a status this crate
+/// probed: a command that can spend a `slot` attempt is sent only at
+/// five, four or three tries left, or when the PIN is already verified.
+/// A PUK-driven reset is not a PIN attempt and does not pass through
+/// here.
+///
+/// # Errors
+/// [`RetryFloorRefusal`] naming the PIN and the state that refused it.
+pub fn check_retry_floor(slot: PinSlot, status: PinStatus) -> Result<(), RetryFloorRefusal> {
+    refineid_auth::check_retry_floor(slot.into(), status.into())
 }
 
 /// Outcome of the counter-safe PUK retry probe through the FINEID

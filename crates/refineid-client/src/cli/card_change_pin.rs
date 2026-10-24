@@ -14,50 +14,10 @@
 
 //! `card change-pin1` / `card change-pin2` typed arguments.
 
-use refineid_lib_core::auth::PinStatus;
-use refineid_lib_core::pin_retry_risk::PinRetryRisk;
+use refineid_lib_core::auth::check_retry_floor;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::PinManageSlot;
-
-/// Refuse a change on a PIN one or two attempts from lockout -- the repo-wide
-/// floor -- so a wrong current value can never spend the last margin. Every
-/// other state passes; a locked or zero-attempt card is left for the card to
-/// reject, since recovery there is a PUK unblock, not a change.
-fn check_retry_floor(
-    cmd: &str,
-    slot: PinManageSlot,
-    status: PinStatus,
-) -> Result<(), std::process::ExitCode> {
-    use crate::exit_status::ExitStatus;
-
-    let retries = match status {
-        PinStatus::Remaining(retries) => retries,
-        PinStatus::Verified => return Ok(()),
-        PinStatus::Locked => {
-            eprintln!("{cmd}: {} is locked; unblock with the PUK", slot.label());
-            return Err(ExitStatus::CardCredentialRejected.into());
-        }
-        PinStatus::NoInfo | PinStatus::Other(_) => {
-            eprintln!("{cmd}: retry status is uncertain; refusing");
-            return Err(ExitStatus::RuntimeFailure.into());
-        }
-    };
-    match PinRetryRisk::from_retries(retries) {
-        Some(PinRetryRisk::CriticalThreatLevel | PinRetryRisk::LockdownImminent) => {
-            eprintln!(
-                "{cmd}: {} has only {retries} attempt(s) left; refusing to risk a lockout (unblock with the PUK)",
-                slot.label()
-            );
-            Err(ExitStatus::CardCredentialRejected.into())
-        }
-        Some(_) => Ok(()),
-        None => {
-            eprintln!("{cmd}: retry status is invalid; refusing");
-            Err(ExitStatus::RuntimeFailure.into())
-        }
-    }
-}
 
 /// Parsed `card change-pin{1,2} [--reader SUBSTR]` arguments.
 ///
@@ -118,8 +78,11 @@ impl ChangePinArgs {
                 return ExitStatus::RuntimeFailure.into();
             }
         };
-        if let Err(exit) = check_retry_floor(cmd, slot, retry_status) {
-            return exit;
+        // A change presents the current PIN, so it is a PIN attempt: refuse
+        // below the retry floor before prompting.
+        if let Err(refusal) = check_retry_floor(slot.as_pin_slot(), retry_status) {
+            eprintln!("{cmd}: {refusal}");
+            return ExitStatus::CardCredentialRejected.into();
         }
         let (current_env, new_env) = match slot {
             PinManageSlot::Pin1 => ("REFINEID_CURRENT_PIN1", "REFINEID_NEW_PIN1"),
@@ -158,7 +121,10 @@ impl ChangePinArgs {
             Err(crate::card_pin::CardPinError::ReaderPick(pe)) => {
                 super::util::reader_pick_exit(cmd, &pe)
             }
-            Err(e @ crate::card_pin::CardPinError::PinPolicy(_)) => {
+            Err(
+                e @ (crate::card_pin::CardPinError::PinPolicy(_)
+                | crate::card_pin::CardPinError::RetryFloor(_)),
+            ) => {
                 eprintln!("{cmd}: {e}");
                 ExitStatus::CardCredentialRejected.into()
             }
