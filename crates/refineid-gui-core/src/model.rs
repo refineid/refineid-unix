@@ -24,7 +24,7 @@ use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_lib_core::sign::document::Format;
-use refineid_rapp_core::ids::PairId;
+pub use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::remote::PairSummary;
 
 use crate::image::RgbaImageBuffer;
