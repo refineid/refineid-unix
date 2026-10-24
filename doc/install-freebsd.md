@@ -1,5 +1,9 @@
 # Installing RefineID on FreeBSD
 
+This is the from-source installation. The `refineid` package
+([packages.md](packages.md)) installs the same files and enables pcscd;
+the ACS reader note in section 2 and section 3 apply to it as well.
+
 Verified on FreeBSD 15.1-RELEASE amd64 with an ACS ACR39U USB reader and
 an xfce desktop. Everything below runs as root unless the prompt says
 otherwise.
