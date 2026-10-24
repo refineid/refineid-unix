@@ -431,14 +431,14 @@ impl Gtk4Driver {
             sw.key_button.set_sensitive(!state.busy);
         } else if let Some(ref phone) = state.phone {
             *sw.remote_action.borrow_mut() = RemoteButtonAction::ForgetPhone;
-            sw.key_icon.set_icon_name(Some("network-wireless-symbolic"));
+            sw.key_icon.set_icon_name(Some("phone-symbolic"));
             sw.key_button
                 .set_tooltip_text(Some(&format!("{} connected (click to forget)", phone.name)));
             sw.key_button.add_css_class("apple-circle-button-active");
             sw.key_button.set_sensitive(!state.busy);
         } else {
             *sw.remote_action.borrow_mut() = RemoteButtonAction::TogglePairing;
-            sw.key_icon.set_icon_name(Some("network-wireless-symbolic"));
+            sw.key_icon.set_icon_name(Some("phone-symbolic"));
             sw.key_button.set_tooltip_text(Some("Pair Phone"));
             sw.key_button.remove_css_class("apple-circle-button-active");
             sw.key_button.set_sensitive(!state.busy);
@@ -638,8 +638,13 @@ impl Gtk4Driver {
                 color: #ffffff;
                 font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
             }
-            headerbar {
+            headerbar,
+            headerbar.titlebar,
+            window.csd headerbar,
+            headerbar:backdrop {
+                background: #1e1e1e;
                 background-color: #1e1e1e;
+                background-image: none;
                 border-bottom: 1px solid rgba(255, 255, 255, 0.08);
                 box-shadow: none;
                 color: #ffffff;
@@ -711,20 +716,31 @@ impl Gtk4Driver {
                 background-color: #3a3a3c;
                 color: #636366;
             }
-            .apple-circle-button {
+            headerbar button.apple-circle-button,
+            button.apple-circle-button {
                 border-radius: 50%;
                 min-width: 32px;
                 min-height: 32px;
                 padding: 6px;
+                background: rgba(255, 255, 255, 0.08);
                 background-color: rgba(255, 255, 255, 0.08);
-                border: 1px solid rgba(255, 255, 255, 0.1);
+                background-image: none;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                color: rgba(255, 255, 255, 0.85);
+                box-shadow: none;
+            }
+            headerbar button.apple-circle-button:hover,
+            button.apple-circle-button:hover {
+                background: rgba(255, 255, 255, 0.16);
+                background-color: rgba(255, 255, 255, 0.16);
+                background-image: none;
                 color: #ffffff;
             }
-            .apple-circle-button:hover {
-                background-color: rgba(255, 255, 255, 0.16);
-            }
-            .apple-circle-button-active {
+            headerbar button.apple-circle-button-active,
+            button.apple-circle-button-active {
+                background: rgba(48, 209, 88, 0.2);
                 background-color: rgba(48, 209, 88, 0.2);
+                background-image: none;
                 border-color: rgba(48, 209, 88, 0.5);
                 color: #30d158;
             }
@@ -839,6 +855,9 @@ impl UiDriver for Gtk4Driver {
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
         gtk4::init().map_err(|e| GuiCoreError::Driver(e.to_string()))?;
+        if let Some(settings) = gtk4::Settings::default() {
+            settings.set_gtk_application_prefer_dark_theme(true);
+        }
         glib::set_prgname(Some("refineid-gui"));
         glib::set_application_name("RefineID");
         Self::load_css();
@@ -2183,7 +2202,7 @@ mod tests {
         let controller = RefineIdController::new(|_| {});
         let (pw_win, pw_widgets) = build_pincodes_window(&controller, &app_win);
         let key_button = gtk4::Button::builder().build();
-        let key_icon = gtk4::Image::from_icon_name("network-wireless-symbolic");
+        let key_icon = gtk4::Image::from_icon_name("phone-symbolic");
         let (_main_box, sw) =
             build_status_view(&controller, &app_win, &pw_win, key_button, key_icon);
 
