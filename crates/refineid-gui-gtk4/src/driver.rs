@@ -39,7 +39,8 @@ use gtk4::prelude::*;
 /// Full pristine retry limit for PIN and PUK (FINEID S4-1).
 const RETRY_FULL_THRESHOLD: usize = PIN_TRY_LIMIT as usize;
 
-/// Retry counter warning threshold. Below this count, warnings are highlighted.
+/// Retry counter warning threshold (FINEID S4-1 / card policy).
+/// When fewer than 3 attempts remain, warning styling is highlighted to prevent accidental lockout.
 const RETRY_WARN_THRESHOLD: usize = 3;
 
 /// Minimum and maximum PUK length (8..=12 digits, FINEID S4-1 §8.1.5).
@@ -187,11 +188,32 @@ fn show_confirm(
 // 6-Box Pairing Code Entry Component
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct CodeBoxes {
     overlay: gtk4::Overlay,
     labels: Vec<gtk4::Label>,
     entry: gtk4::Entry,
     is_focused: Rc<Cell<bool>>,
+}
+
+fn render_code_boxes(labels: &[gtk4::Label], code: &str, is_focused: bool) {
+    let chars: Vec<char> = code.chars().filter_map(pairing_code_character).collect();
+    let current_len = chars.len();
+    for (i, lbl) in labels.iter().enumerate() {
+        if let Some(&c) = chars.get(i) {
+            lbl.set_label(&c.to_string());
+            lbl.add_css_class("code-box-filled");
+            lbl.remove_css_class("code-box-active");
+        } else {
+            lbl.set_label("");
+            lbl.remove_css_class("code-box-filled");
+            if i == current_len && is_focused {
+                lbl.add_css_class("code-box-active");
+            } else {
+                lbl.remove_css_class("code-box-active");
+            }
+        }
+    }
 }
 
 impl CodeBoxes {
@@ -250,16 +272,21 @@ impl CodeBoxes {
         {
             let foc = Rc::clone(&is_focused);
             let e_ent = entry.clone();
+            let lbls = boxes.clone();
             focus_ctrl.connect_enter(move |_| {
                 foc.set(true);
                 e_ent.select_region(-1, -1);
                 e_ent.set_position(-1);
+                render_code_boxes(&lbls, &e_ent.text(), true);
             });
         }
         {
             let foc = Rc::clone(&is_focused);
+            let e_ent = entry.clone();
+            let lbls = boxes.clone();
             focus_ctrl.connect_leave(move |_| {
                 foc.set(false);
+                render_code_boxes(&lbls, &e_ent.text(), false);
             });
         }
         entry.add_controller(focus_ctrl);
@@ -273,29 +300,22 @@ impl CodeBoxes {
     }
 
     fn update(&self, code: &str) {
-        let chars: Vec<char> = code.chars().filter_map(pairing_code_character).collect();
-        let current_len = chars.len();
-        for (i, lbl) in self.labels.iter().enumerate() {
-            if let Some(&c) = chars.get(i) {
-                lbl.set_label(&c.to_string());
-                lbl.add_css_class("code-box-filled");
-                lbl.remove_css_class("code-box-active");
-            } else {
-                lbl.set_label("");
-                lbl.remove_css_class("code-box-filled");
-                if i == current_len && self.is_focused.get() {
-                    lbl.add_css_class("code-box-active");
-                } else {
-                    lbl.remove_css_class("code-box-active");
-                }
-            }
-        }
+        render_code_boxes(&self.labels, code, self.is_focused.get());
     }
 
     fn clear(&self) {
         self.entry.set_text("");
         self.update("");
     }
+}
+
+/// Unified logic for determining whether the Sign button can be enabled.
+fn compute_sign_sensitivity(state: &UiState, pin_len: usize) -> bool {
+    (state.has_local_card || state.phone.is_some())
+        && state.signature_supported
+        && !state.pdf_documents.is_empty()
+        && (MIN_PIN2_DIGITS..=MAX_PIN2_DIGITS).contains(&pin_len)
+        && !state.busy
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +353,7 @@ struct StatusWidgets {
     sign_button: gtk4::Button,
 
     // State Trackers
-    current_ui_state: RefCell<UiState>,
+    current_ui_state: Rc<RefCell<UiState>>,
     last_pdf_documents: RefCell<Vec<PathBuf>>,
     showing_pairing: Rc<RefCell<bool>>,
 }
@@ -570,13 +590,8 @@ impl Gtk4Driver {
 
     /// Single unified source of truth for Sign button sensitivity.
     fn update_sign_button_sensitivity(sw: &StatusWidgets) {
-        let state = sw.current_ui_state.borrow();
         let pin_len = sw.pin2_entry.text().chars().count();
-        let can_sign = (state.has_local_card || state.phone.is_some())
-            && state.signature_supported
-            && !state.pdf_documents.is_empty()
-            && (MIN_PIN2_DIGITS..=MAX_PIN2_DIGITS).contains(&pin_len)
-            && !state.busy;
+        let can_sign = compute_sign_sensitivity(&sw.current_ui_state.borrow(), pin_len);
         sw.sign_button.set_sensitive(can_sign);
     }
 
@@ -1225,17 +1240,12 @@ fn build_status_view(
         let sp = Rc::clone(&showing_pairing);
         let n_box = normal_identity_box.clone();
         let p_box = pairing_box.clone();
-        let c_boxes_clear = CodeBoxes {
-            overlay: pairing_code_boxes.overlay.clone(),
-            labels: pairing_code_boxes.labels.clone(),
-            entry: pairing_code_boxes.entry.clone(),
-            is_focused: pairing_code_boxes.is_focused.clone(),
-        };
+        let cb = pairing_code_boxes.clone();
         btn_cancel_pair.connect_clicked(move |_| {
             *sp.borrow_mut() = false;
             p_box.set_visible(false);
             n_box.set_visible(true);
-            c_boxes_clear.clear();
+            cb.clear();
         });
     }
 
@@ -1260,29 +1270,7 @@ fn build_status_view(
     {
         let c = Arc::clone(controller);
         let last_submitted: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let cboxes_lbls = pairing_code_boxes.labels.clone();
-        let update_labels = move |text: &str, is_focused: bool| {
-            let chars: Vec<char> = text.chars().collect();
-            let current_len = chars.len();
-            for (i, lbl) in cboxes_lbls.iter().enumerate() {
-                if let Some(&ch) = chars.get(i) {
-                    lbl.set_label(&ch.to_string());
-                    lbl.add_css_class("code-box-filled");
-                    lbl.remove_css_class("code-box-active");
-                } else {
-                    lbl.set_label("");
-                    lbl.remove_css_class("code-box-filled");
-                    if i == current_len && is_focused {
-                        lbl.add_css_class("code-box-active");
-                    } else {
-                        lbl.remove_css_class("code-box-active");
-                    }
-                }
-            }
-        };
-
-        let u1 = update_labels.clone();
-        let foc_ch = Rc::clone(&pairing_code_boxes.is_focused);
+        let cb = pairing_code_boxes.clone();
         pairing_code_boxes.entry.connect_changed(move |e| {
             let cur = e.text();
             let filtered = filter_pairing_code(&cur);
@@ -1292,7 +1280,7 @@ fn build_status_view(
                 e.set_position(-1);
                 return;
             }
-            u1(&filtered, foc_ch.get());
+            cb.update(&filtered);
             if filtered.chars().count() == PAIRING_CODE_LEN {
                 let mut prev = last_submitted.borrow_mut();
                 if prev.as_deref() == Some(&filtered) {
@@ -1304,25 +1292,6 @@ fn build_status_view(
                 *last_submitted.borrow_mut() = None;
             }
         });
-
-        {
-            let u_foc = update_labels.clone();
-            let e_foc = pairing_code_boxes.entry.clone();
-            let foc_ctrl = gtk4::EventControllerFocus::new();
-            foc_ctrl.connect_enter(move |_| {
-                u_foc(&e_foc.text(), true);
-            });
-            pairing_code_boxes.entry.add_controller(foc_ctrl);
-        }
-        {
-            let u_foc = update_labels.clone();
-            let e_foc = pairing_code_boxes.entry.clone();
-            let foc_ctrl = gtk4::EventControllerFocus::new();
-            foc_ctrl.connect_leave(move |_| {
-                u_foc(&e_foc.text(), false);
-            });
-            pairing_code_boxes.entry.add_controller(foc_ctrl);
-        }
     }
 
     // File chooser helper
@@ -1399,10 +1368,10 @@ fn build_status_view(
     }
 
     // PIN 2 Filter & Sign button sensitivity
-    let current_ui_state = RefCell::new(UiState::default());
+    let current_ui_state = Rc::new(RefCell::new(UiState::default()));
     {
         let s_btn = sign_button.clone();
-        let p2_ent = pin2_entry.clone();
+        let state_ref = Rc::clone(&current_ui_state);
         pin2_entry.connect_changed(move |e| {
             let cur = e.text();
             let filtered = filter_digits(&cur, MAX_PIN2_DIGITS);
@@ -1410,10 +1379,9 @@ fn build_status_view(
                 e.set_text(&filtered);
                 return;
             }
-            let count = filtered.chars().count();
-            s_btn.set_sensitive(
-                p2_ent.is_sensitive() && (MIN_PIN2_DIGITS..=MAX_PIN2_DIGITS).contains(&count),
-            );
+            let pin_len = filtered.chars().count();
+            let can_sign = compute_sign_sensitivity(&state_ref.borrow(), pin_len);
+            s_btn.set_sensitive(can_sign);
         });
     }
 
