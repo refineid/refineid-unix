@@ -32,7 +32,6 @@ use std::path::PathBuf;
 struct CardEmrtdHelpers;
 
 use refineid_lib_core::backend::{ReaderAccessCap, ReaderBackend as _, ReaderPickError};
-use refineid_lib_core::crypto::digest::Sha256;
 use refineid_lib_core::emrtd::{DocumentImage, EmrtdError, EmrtdPersonalData, read_personal_data};
 use refineid_lib_core::identity::CredentialIdentity;
 use refineid_lib_core::pkcs15::FineidReaderPicker as _;
@@ -48,29 +47,12 @@ pub struct EmrtdReadOptions {
     /// and DG2 carried a recognised JPEG / JPEG2000 envelope,
     /// the embedded image is written there.
     pub save_face: Option<PathBuf>,
-    /// Optional output path for the raw EF.SOD DER bytes (CMS
-    /// `SignedData`). Useful for offline inspection of the
-    /// Document Signing Certificate and the `LDSSecurityObject`
-    /// when our parser flags an unsupported algorithm.
-    pub save_sod: Option<PathBuf>,
-    /// Optional output path for the Document Signing
-    /// Certificate DER bytes (the first cert embedded in
-    /// EF.SOD). Lets the caller inspect the DSC offline and
-    /// fetch the matching CSCA from the country's official
-    /// publication.
-    pub save_dsc: Option<PathBuf>,
     /// Optional output path for the cardholder's displayed-
     /// signature image (DG7 -- the handwritten signature
     /// scanned at issuance). When set and DG7 carried a
     /// recognised JPEG / JPEG2000 envelope, the embedded image
     /// is written there.
     pub save_signature: Option<PathBuf>,
-    /// Optional directory of trusted CSCA cert DER files. Every
-    /// regular file in the directory is loaded and tried as the
-    /// chain anchor for the DSC. The first cert whose subject
-    /// DN matches the DSC's issuer DN and whose signature on
-    /// the DSC verifies closes the `DSC -> CSCA` hop.
-    pub csca_dir: Option<PathBuf>,
     /// Optional substring match against reader names. `None`
     /// picks the first reader with a card present (the existing
     /// default); `Some("OMNIKEY")` would target a specific
@@ -105,10 +87,6 @@ pub struct EmrtdReadReport {
     /// `save_signature` was set and DG7 carried a recognised
     /// image.
     pub signature_saved_to: Option<PathBuf>,
-    /// Trusted-CSCA directory the caller passed in (if any).
-    /// Used by the Passive Authentication display block to
-    /// close the DSC -> CSCA chain.
-    pub csca_dir: Option<PathBuf>,
 }
 
 /// Error returned from `read_first` / `card emrtd` flow.
@@ -132,11 +110,11 @@ pub enum EmrtdReadError {
     /// front.
     BadCan,
     /// `--save-*` file write failed. `what` is the human label
-    /// for the artefact ("face", "signature", "EF.SOD", "DSC")
-    /// so the error message names the right thing.
+    /// for the artefact ("face", "signature") so the error
+    /// message names the right thing.
     SaveFile {
         /// Human label for the artefact ("face", "signature",
-        /// "EF.SOD", "DSC"). Tier 0 `&'static str` from a fixed
+        /// "DG7 (raw)"). Tier 0 `&'static str` from a fixed
         /// compile-time set.
         what: &'static str,
         /// Filesystem path the write was attempted against.
@@ -275,39 +253,23 @@ pub fn read_first(
         }
         None => None,
     };
-    if let (Some(path), Some(sod)) = (&options.save_sod, data.sod_der.as_ref()) {
-        CardEmrtdHelpers::write_artefact("EF.SOD", path, sod)?;
-    }
-    if let (Some(path), Some(sod)) = (&options.save_dsc, data.sod_der.as_ref())
-        && let Ok(sd_owned) = refineid_lib_core::cms::OwnedSignedData::from_der(sod)
-        && let Some(dsc) = sd_owned
-            .view()
-            .certificates_der
-            .first()
-            .copied()
-            .map(<[u8]>::to_vec)
-    {
-        CardEmrtdHelpers::write_artefact("DSC", path, &dsc)?;
-    }
-
     Ok(EmrtdReadReport {
         reader: reader_id.as_str().to_owned(),
         preflight_identity,
         data,
         face_saved_to,
         signature_saved_to,
-        csca_dir: options.csca_dir.clone(),
     })
 }
 
 impl CardEmrtdHelpers {
-    /// Persist an eMRTD artefact (face image, signature image,
-    /// SOD, DG14, etc.) to disk and wrap any I/O failure in a
+    /// Persist an eMRTD artefact (face image, signature image)
+    /// to disk and wrap any I/O failure in a
     /// labelled [`EmrtdReadError::SaveFile`].
     ///
     /// `what` is a stable `&'static str` so the error variant
-    /// can name the artefact in the message ("face image",
-    /// "EF.SOD") without allocating per call.
+    /// can name the artefact in the message ("face",
+    /// "signature") without allocating per call.
     fn write_artefact(
         what: &'static str,
         path: &PathBuf,
@@ -417,366 +379,34 @@ impl fmt::Display for EmrtdReadReport {
         if let Some(path) = &self.signature_saved_to {
             writeln!(f, "signature saved to: {}", path.display())?;
         }
-        // Passive Authentication: SOD signature + DG hash check.
-        write_passive_auth(f, &self.data, self.csca_dir.as_deref())?;
-        Ok(())
+        write_data_groups(f, &self.data.data_groups)
     }
 }
 
-/// Render the DG-hash inventory + DG1/DG2 hash verdicts.
-fn write_passive_auth_dg_hashes(
-    f: &mut fmt::Formatter<'_>,
-    data: &EmrtdPersonalData,
-    verified: &refineid_lib_core::cms::VerifiedSignedData<'_>,
-) -> fmt::Result {
-    // Trust by construction: the DG-hash table comes from the
-    // signature-verified eContent, so a "DG hash: ok" can never be
-    // computed from an unverified, attacker-controlled SOD.
-    let lds = match verified.lds_security_object() {
-        Ok(l) => l,
-        Err(e) => {
-            return writeln!(
-                f,
-                "passive auth:     DG hashes: FAILED (LDSSecurityObject parse: {e})"
-            );
-        }
-    };
-    let mut dg1_ok = false;
-    let mut dg2_ok = false;
-    for (dg_num, expected) in &lds.data_group_hashes {
-        match *dg_num {
-            1 => {
-                let actual = lds.hash_algorithm.digest(&data.dg1_der);
-                dg1_ok = actual == *expected;
-            }
-            2 => {
-                let actual = lds.hash_algorithm.digest(&data.dg2_der);
-                dg2_ok = actual == *expected;
-            }
-            _ => {}
-        }
-    }
+/// Number of data groups ICAO 9303-10 defines (DG1 to DG16).
+const DATA_GROUP_COUNT: usize = 16;
+
+/// List the data groups EF.SOD names, one per line, with the
+/// ICAO 9303-10 content label. The list comes from the
+/// unverified EF.SOD: it is an inventory, not an attestation.
+fn write_data_groups(f: &mut fmt::Formatter<'_>, data_groups: &[u32]) -> fmt::Result {
+    writeln!(f)?;
     writeln!(
         f,
-        "passive auth:     DG hash alg: {}",
-        lds.hash_algorithm.label()
+        "data groups in EF.SOD ({} of {DATA_GROUP_COUNT} present):",
+        data_groups.len()
     )?;
-    // List every DG number the SOD attests to. Just an
-    // inventory: we don't have to be able to *read* a DG for
-    // its hash to be listed here -- EAC-protected DGs (3, 4)
-    // appear too, which is the point. Per-DG content labels
-    // follow ICAO 9303-10 Table 3 + the Finnish DVV profile.
-    let mut dg_nums: Vec<u32> = lds.data_group_hashes.iter().map(|(n, _)| *n).collect();
-    dg_nums.sort_unstable();
-    writeln!(
-        f,
-        "    data groups in EF.SOD ({} of 16 present):",
-        dg_nums.len()
-    )?;
-    for n in &dg_nums {
+    for n in data_groups {
         let (label, note) = dg_content(*n);
         if note.is_empty() {
-            writeln!(f, "      DG{n:<2}  {label}")?;
+            writeln!(f, "  DG{n:<2}  {label}")?;
         } else {
-            writeln!(f, "      DG{n:<2}  {label} ({note})")?;
+            writeln!(f, "  DG{n:<2}  {label} ({note})")?;
         }
-    }
-    writeln!(
-        f,
-        "    DG1 hash:     {}",
-        if dg1_ok { "ok" } else { "MISMATCH" }
-    )?;
-    writeln!(
-        f,
-        "    DG2 hash:     {}",
-        if dg2_ok { "ok" } else { "MISMATCH" }
-    )
-}
-
-/// Render SOD signer alg + DSC public-key + SOD signature verdict.
-fn write_passive_auth_sod_sig(
-    f: &mut fmt::Formatter<'_>,
-    sd: &refineid_lib_core::cms::SignedData<'_>,
-) -> fmt::Result {
-    use refineid_lib_core::x509::OwnedCert;
-    let sig_alg_oid = sd.signer.signature_algorithm_oid;
-    writeln!(
-        f,
-        "    SOD signer alg: {}",
-        refineid_lib_core::x509::SignatureAlgorithm::from_oid(sig_alg_oid.as_bytes()).label()
-    )?;
-    if let Some(dsc_der) = sd.certificates_der.first() {
-        match OwnedCert::from_der(*dsc_der) {
-            Ok(dsc_owned) => {
-                let dsc = dsc_owned.view();
-                let dsc_alg =
-                    refineid_lib_core::x509::parse_subject_public_key_info(dsc.spki.as_der());
-                writeln!(
-                    f,
-                    "    DSC public key: {}",
-                    dsc_alg.map_or_else(
-                        || "<unparsed>".to_owned(),
-                        refineid_lib_core::x509::PublicKeyAlgorithm::label,
-                    )
-                )?;
-                match sd.verify(dsc.spki.as_der()) {
-                    Ok(()) => writeln!(f, "    SOD signature: ok (signed by embedded DSC)"),
-                    Err(e) => writeln!(f, "    SOD signature: FAILED ({e})"),
-                }
-            }
-            Err(e) => writeln!(f, "    SOD signature: skipped (DSC parse: {e})"),
-        }
-    } else {
-        writeln!(f, "    SOD signature: skipped (no DSC embedded in SOD)")
-    }
-}
-
-/// Render the DSC -> CSCA chain step + DSC subject/issuer CNs.
-fn write_passive_auth_dsc_csca(
-    f: &mut fmt::Formatter<'_>,
-    sd: &refineid_lib_core::cms::SignedData<'_>,
-    csca_dir: Option<&std::path::Path>,
-) -> fmt::Result {
-    use refineid_lib_core::x509::OwnedCert;
-    let dsc_parsed = sd
-        .certificates_der
-        .first()
-        .and_then(|der| OwnedCert::from_der(*der).ok().map(|c| (der.to_vec(), c)));
-    let chain_outcome =
-        if let (Some(dir), Some((_dsc_der, dsc_owned))) = (csca_dir, dsc_parsed.as_ref()) {
-            verify_dsc_against_csca_dir(&dsc_owned.view(), dir)
-        } else if dsc_parsed.is_none() {
-            CscaCheck::Skipped("no DSC embedded in SOD".to_owned())
-        } else {
-            CscaCheck::Skipped("no --csca-dir supplied".to_owned())
-        };
-    writeln!(
-        f,
-        "    DSC -> CSCA:  {}",
-        CardEmrtdHelpers::fmt_csca_check(&chain_outcome)
-    )?;
-    if let Some((_, dsc_owned)) = dsc_parsed.as_ref() {
-        let dsc = dsc_owned.view();
-        let subject = dsc
-            .subject
-            .common_name()
-            .map_or_else(|| "<unparsed>".to_owned(), |cn| cn.as_str().to_owned());
-        let issuer = dsc
-            .issuer
-            .common_name()
-            .map_or_else(|| "<unparsed>".to_owned(), |cn| cn.as_str().to_owned());
-        writeln!(f, "    DSC subject:   {subject}")?;
-        writeln!(f, "    DSC issuer:    {issuer}")?;
     }
     Ok(())
 }
 
-/// Write the passive-authentication block of the eMRTD report.
-///
-/// ICAO 9303 Part 11 §5.1 -- passive authentication compares
-/// the read DG hashes against the SOD-declared hashes and
-/// verifies the SOD's signature back to a CSCA. The block
-/// covers all three steps (DG-hash table, SOD signature, DSC
-/// -> CSCA chain) and emits a per-step verdict so the operator
-/// can see exactly where coverage stops.
-fn write_passive_auth(
-    f: &mut fmt::Formatter<'_>,
-    data: &EmrtdPersonalData,
-    csca_dir: Option<&std::path::Path>,
-) -> fmt::Result {
-    use refineid_lib_core::cms::{OwnedSignedData, VerifiedSignedData};
-    use refineid_lib_core::x509::OwnedCert;
-    let Some(sod_der) = &data.sod_der else {
-        writeln!(f, "passive auth:     skipped (no EF.SOD on card)")?;
-        return Ok(());
-    };
-    let sd_owned = match OwnedSignedData::from_der(sod_der) {
-        Ok(s) => s,
-        Err(e) => {
-            writeln!(f, "passive auth:     FAILED (SOD parse: {e})")?;
-            return Ok(());
-        }
-    };
-    let sd = sd_owned.view();
-    // Verify the CMS signature against the embedded DSC FIRST. The DG
-    // hashes are trustworthy only if the SOD signature checked, so the
-    // hash comparison is gated behind the resulting VerifiedSignedData;
-    // an unverified SOD shows "not checked", never a meaningful "ok".
-    // (Whether the DSC itself is trusted is the separate DSC->CSCA step
-    // below.)
-    let verified = sd
-        .certificates_der
-        .first()
-        .and_then(|dsc_der| OwnedCert::from_der(dsc_der).ok())
-        .and_then(|dsc_owned| VerifiedSignedData::verify(&sd, &dsc_owned.view().spki).ok());
-    if let Some(verified) = &verified {
-        write_passive_auth_dg_hashes(f, data, verified)?;
-    } else {
-        writeln!(
-            f,
-            "passive auth:     DG hashes: not checked (SOD signature did not verify)"
-        )?;
-    }
-    write_passive_auth_sod_sig(f, &sd)?;
-    write_passive_auth_dsc_csca(f, &sd, csca_dir)
-}
-
-/// Outcome of the DSC->CSCA chain step inside passive
-/// authentication.
-///
-/// `Failed` covers both "no matching CSCA" and "matched but
-/// signature didn't verify"; the embedded string carries the
-/// distinction so the report reader can act on it (rotate the
-/// CSCA bundle, vs. file a fraud signal). `Skipped` covers the
-/// pre-conditions: no `csca_dir` was supplied, or the SOD
-/// didn't carry a DSC.
-#[derive(Debug)]
-enum CscaCheck {
-    /// CSCA cert found + signature verified.
-    Ok {
-        /// Parsed CSCA subject CN, if the DN parsed.
-        csca_cn: Option<refineid_lib_core::identity::CommonName>,
-        /// Filesystem path the CSCA was loaded from, for the
-        /// report.
-        path: String,
-        /// SHA-256 fingerprint of the matched CSCA's DER, for
-        /// cross-checking against `PINNED_CSCA_SHA256`.
-        sha256: Sha256,
-        /// `Some(label)` when the fingerprint matches a pinned
-        /// CSCA entry. Distinguishes "found + verified +
-        /// pinned" from "found + verified but pin-list misses
-        /// this CSCA" (an operational gap to file).
-        pinned_label: Option<&'static str>,
-    },
-    /// CSCA dir was scanned but nothing matched / verified.
-    /// The string explains why.
-    Failed(String),
-    /// Nothing was even attempted.
-    Skipped(String),
-}
-
-impl CardEmrtdHelpers {
-    /// Render a [`CscaCheck`] outcome as one-or-more lines
-    /// for the passive-auth report block.
-    ///
-    /// `Ok` emits three lines (CSCA CN / file path / SHA-256
-    /// with pin annotation); failures collapse to a single
-    /// `FAILED (...)` line. The pin annotation distinguishes
-    /// "matched a pinned CSCA" from "matched a CSCA outside
-    /// `PINNED_CSCA_SHA256`" so an operator can spot gaps.
-    fn fmt_csca_check(check: &CscaCheck) -> String {
-        match check {
-            CscaCheck::Ok {
-                csca_cn,
-                path,
-                sha256,
-                pinned_label,
-            } => {
-                let pin_note = pinned_label.map_or_else(
-                    || " (not in PINNED_CSCA_SHA256)".to_owned(),
-                    |l| format!(" [pinned: {l}]"),
-                );
-                let csca_label = csca_cn
-                    .as_ref()
-                    .map_or_else(|| "<unparsed>".to_owned(), |cn| cn.as_str().to_owned());
-                format!(
-                    "ok via {csca_label}\n      file:        {path}\n      sha256:      {sha256}{pin_note}"
-                )
-            }
-            CscaCheck::Failed(why) => format!("FAILED ({why})"),
-            CscaCheck::Skipped(why) => format!("skipped ({why})"),
-        }
-    }
-}
-
-/// Walk a CSCA bundle directory looking for the CSCA that
-/// issued `dsc`, and verify the signature once a candidate is
-/// found.
-///
-/// ICAO 9303 Part 12 §6.3 -- CSCAs are exchanged out-of-band
-/// (the ICAO PKD or a state-specific feed). This function
-/// implements the dumbest-possible matcher: subject DN equality
-/// for candidate selection, then `verify_signed_by`
-/// for the cryptographic check. First success wins; on
-/// repeated failures, only the last is propagated to keep the
-/// report concise.
-fn verify_dsc_against_csca_dir(
-    dsc: &refineid_lib_core::x509::Certificate<'_>,
-    dir: &std::path::Path,
-) -> CscaCheck {
-    use refineid_lib_core::x509::OwnedCert;
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => return CscaCheck::Failed(format!("read_dir({}): {e}", dir.display())),
-    };
-    let mut tried = 0_usize;
-    let mut last_err: Option<String> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Some(candidate_der) = CardEmrtdHelpers::decode_csca_candidate(&bytes) else {
-            continue;
-        };
-        let Ok(candidate_owned) = OwnedCert::from_der(&candidate_der) else {
-            continue;
-        };
-        let candidate = candidate_owned.view();
-        // Subject DN match -> issuer match.
-        if candidate.subject != dsc.issuer {
-            continue;
-        }
-        tried = tried.saturating_add(1);
-        if let Err(e) = dsc.verify_signed_by(candidate) {
-            last_err = Some(format!("{}: {e}", path.display()));
-            continue;
-        }
-        // Found one. Capture identity.
-        let fp = Sha256::of(&candidate_der);
-        let csca_cn = candidate.subject.common_name();
-        let pinned_label = crate::trust_roots::pinned_csca_label(fp);
-        return CscaCheck::Ok {
-            csca_cn,
-            path: path.display().to_string(),
-            sha256: fp,
-            pinned_label,
-        };
-    }
-    if tried == 0 {
-        CscaCheck::Failed(format!(
-            "no cert in {} matched DSC issuer DN",
-            dir.display()
-        ))
-    } else if let Some(why) = last_err {
-        CscaCheck::Failed(format!(
-            "candidate found but signature did not verify ({why})"
-        ))
-    } else {
-        CscaCheck::Failed("no matching CSCA verified".to_owned())
-    }
-}
-
-/// Accept either raw DER or PEM-wrapped CERTIFICATE bytes.
-impl CardEmrtdHelpers {
-    /// Decode a CSCA file's bytes into DER, accepting either
-    /// raw `.cer/.der` or PEM-wrapped `.pem` content.
-    ///
-    /// Wraps [`crate::text::decode_cert_pem_or_der`] with the
-    /// expected PEM label fixed at `"CERTIFICATE"`. Caller
-    /// hands the raw file bytes; the result is canonical DER
-    /// ready for `OwnedCert::from_der`.
-    fn decode_csca_candidate(bytes: &[u8]) -> Option<Vec<u8>> {
-        crate::text::decode_cert_pem_or_der(bytes)
-    }
-}
-
-/// Render a `YYMMDD` MRZ date as `YYYY-MM-DD` using the ICAO
-/// 9303 sliding-window rule (YY < 50 -> 20YY, else 19YY).
-/// Returns the raw input untouched if it doesn't look like 6 digits.
 /// ICAO 9303-10 Table 3 friendly labels for the standard data
 /// groups, plus an access-constraint note for the DGs that
 /// can't be read with a citizen-tier inspection key (no

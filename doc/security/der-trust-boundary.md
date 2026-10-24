@@ -29,7 +29,7 @@ CertDer (owned, card-read)        provenance only, honestly unvalidated
   -> ParsedCert<'a>               X.509 syntax validated
   -> PathValidatedCert<'a>        chain validated
   -> RevocationCheckedCert<'a>    revocation checked
-  -> PurposeBoundCert<'a, P>      bound to Auth / NonRep / CSCA / DSC / MLS
+  -> PurposeBoundCert<'a, P>      bound to Auth / NonRep
 ```
 
 A `PurposeBoundCert<AuthPurpose>` is unforgeable proof that every
@@ -54,7 +54,7 @@ borrowed validated view -> further stages for further guarantees.
 | Card EF.CardAccess | `CardAccess::parse(der: &[u8])` | `Result<CardAccess, CardAccessError>` ✅ | validating ctor; described malformation |
 | Network (OCSP) | `client::http::get -> Vec<u8>` then `ocsp::parse_response(der: &[u8])` | `OcspResponse<'_>` | raw `Vec<u8>` threaded to parser |
 | Network (CRL) | `client::http::get -> Vec<u8>` then `crl::parse_crl(der: &[u8])` | `Crl<'_>` | raw `Vec<u8>` threaded |
-| eMRTD SOD | `cms::parse_lds_security_object(der: &[u8])` | `LdsSecurityObject<'_>` | raw `&[u8]` |
+| eMRTD SOD | `cms::LdsSecurityObject::parse(der: &[u8])` (crate-private, from `emrtd::read_personal_data`) | `LdsSecurityObject<'_>` | raw `&[u8]`; data-group inventory only, unverified |
 | Login chain | `CertDer::new(der.to_vec())` (suomi_login, fineid) | `CertDer` ✅ | typed |
 
 The literal front door legitimately takes `&[u8]` / `Vec<u8>` -- at
@@ -76,10 +76,6 @@ deeper than the first parse.
 - **`Vec<u8>` threaded from `http::get` to the parser.** The OCSP/CRL
   bytes travel as anonymous `Vec<u8>` between fetch and parse instead
   of a `OcspResponseDer` / `CrlDer` the moment they are fetched.
-- **Redundant raw+parsed passing.** e.g.
-  `icao_pkd::from_cert(der: &[u8], cert: &Certificate<'_>)` takes
-  both the bytes and the parsed view -- the parsed view already
-  borrows the bytes; passing both invites them to disagree.
 - ~~**`parse_token_info` / `parse_card_access` return `Option`,** so a
   parse failure is indistinguishable from "absent" -- a weaker
   boundary than the `Result` the cert/OCSP/CRL parsers use.~~
@@ -109,17 +105,7 @@ guarantees:
    take `VerifiedOcspResponse`, never `&[u8]`.
 2. **`CrlDer` (owned) + `VerifiedCrl<'a>`.** Same shape; the CRL
    signature check becomes the constructor of `VerifiedCrl`.
-3. **eMRTD SOD: `VerifiedSignedData<'a>`** (done) -- the CMS
-   `SignedData` whose signer (DSC) signature verified. Its
-   `lds_security_object()` is the only door to the DG-hash table, so a
-   passive-auth DG-hash comparison can't be computed from an
-   unverified, attacker-controlled SOD. (Verifying against the
-   *embedded* DSC is necessary-but-not-sufficient; the DSC->CSCA chain
-   is the separate cert-state-lattice step. Unlike OCSP/CRL the
-   consumers are diagnostic displays, not a consumed verdict, so the
-   win is display honesty -- an unverified SOD shows "not checked"
-   rather than a meaningless "DG hash: ok".)
-4. Promote `parse_token_info` / `parse_card_access` from `Option`
+3. Promote `parse_token_info` / `parse_card_access` from `Option`
    to `Result` so "malformed" is distinct from "absent" --
    closing the weak boundary. **(done)** Each parser returns the
    narrowest honest error: `BerError` for token-info (its only hard
@@ -139,11 +125,7 @@ wrapper + borrowed view split.
    KATs. **(done -- `VerifiedOcspResponse`)**
 2. CRL next, same shape, backed by the CRL KATs. **(done --
    `VerifiedCrl`)**
-3. SOD next. **(done -- `VerifiedSignedData`)** No isolated KATs: the
-   CMS module had no unit-test fixtures and a full signed-SOD fixture
-   is disproportionate, so the gate is type-enforced
-   (`lds_security_object` unreachable without `verify`).
-4. token-info / card-access (lower stakes): promote
+3. token-info / card-access (lower stakes): promote
    `parse_token_info` / `parse_card_access` from `Option` to `Result`
    so "malformed" is distinct from "absent". **(done)** A boundary
    tightening, not a verified-signature lattice -- these carry no

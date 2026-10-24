@@ -16,3 +16,9 @@ Copied here so the `cert_chain` tests can build a real two-link chain without re
 The intermediate's `issuer` DN is byte-identical to the ECC root's `subject` DN,
 and the root's key verifies the intermediate's signature,
 so `walk_chain` resolves the issuer from the pool and exercises the real ECDSA-P384/SHA-384 chain-verify path.
+
+## `icao-pkd-un-csca-2.pem`
+
+The self-signed *United Nations CSCA* root certificate (RSA, `sha256WithRSAEncryption`) from the ICAO PKD.
+Tests use it as a public self-signed RSA certificate:
+its signature verifies under its own key over its own TBS bytes, so no private key is needed.

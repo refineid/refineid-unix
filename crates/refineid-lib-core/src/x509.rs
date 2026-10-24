@@ -106,9 +106,6 @@ const OID_GIVEN_NAME: Oid<'static> = known::GIVEN_NAME;
 const OID_KEY_USAGE: Oid<'static> = known::KEY_USAGE;
 /// `OID_BASIC_CONSTRAINTS` constant.
 const OID_BASIC_CONSTRAINTS: Oid<'static> = known::BASIC_CONSTRAINTS;
-/// id-icao-mlSigner -- EKU OID that ICAO Doc 9303 §12
-/// requires on a CSCA Master List Signer cert.
-pub const OID_ICAO_ML_SIGNER: Oid<'static> = known::ICAO_ML_SIGNER;
 /// `OID_SUBJECT_ALT_NAME` constant.
 const OID_SUBJECT_ALT_NAME: Oid<'static> = known::SUBJECT_ALT_NAME;
 /// `OID_CRL_DISTRIBUTION_POINTS` constant.
@@ -2001,9 +1998,7 @@ pub fn extract_extended_key_usage<B: AsRef<[u8]>>(extensions: B) -> Vec<String> 
 /// Parsed Extended Key Usage extension with raw OID bytes.
 ///
 /// Carries the OID values plus the critical-flag, for callers
-/// that need exact-OID comparison (e.g. ICAO Doc 9303 §12
-/// mandates EKU `id-icao-mlSigner` critical on every Master
-/// List Signer cert).
+/// that need exact-OID comparison.
 #[derive(Debug, Clone)]
 pub struct ExtendedKeyUsage<'a> {
     /// EKU OID values from the `KeyPurposeId` SEQUENCE (RFC
@@ -2071,10 +2066,7 @@ pub fn extract_extended_key_usage_meta<B: AsRef<[u8]>>(
 
 /// Parsed Key Usage extension with criticality.
 ///
-/// Carries the `KeyUsage` flags and the critical-flag. ICAO
-/// Doc 9303 requires DSC certs to carry `Key Usage` critical
-/// with only `digitalSignature` asserted; CSCA certs to carry
-/// critical `keyCertSign | cRLSign`.
+/// Carries the `KeyUsage` flags and the critical-flag.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyUsageMeta {
     /// The parsed Key Usage flags. See [`KeyUsage`] for the

@@ -18,9 +18,8 @@
 //! validity window, key usage, public-key shape, SHA-256
 //! fingerprint, and any AIA / CRL / OCSP / SAN-email URLs that
 //! live in v3 extensions. Useful for inspecting saved cert DERs
-//! (`card status --save-cert DIR`), DSCs extracted from EF.SOD
-//! (`card emrtd --save-dsc`), or CSCAs fetched from third-party
-//! channels.
+//! (`card status --save-cert DIR`) or certificates fetched from
+//! third-party channels.
 
 use alloc::fmt;
 use std::path::{Path, PathBuf};
@@ -325,7 +324,7 @@ mod tests {
     // Real, bundled certs (also the production trust anchors).
     // `show_cert` reads from a path, so each is staged into a
     // temp file first.
-    const ICAO_CSCA_PEM: &[u8] = include_bytes!("../trust-anchors/icao-pkd-un-csca-2.pem");
+    const ICAO_CSCA_PEM: &[u8] = include_bytes!("../test-vectors/icao-pkd-un-csca-2.pem");
     const DVV_ROOT_RSA_DER: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-rsa.der");
     const DVV_ROOT_ECC_DER: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-ecc.der");
 

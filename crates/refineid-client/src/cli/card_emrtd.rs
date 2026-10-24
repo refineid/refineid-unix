@@ -21,8 +21,7 @@ use refineid_lib_core::can::Can;
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
 /// Parsed `card emrtd --can NNNNNN [--save-face PATH]
-/// [--save-signature PATH] [--save-sod PATH] [--save-dsc PATH]
-/// [--csca-dir DIR] [--reader SUBSTR]` arguments.
+/// [--save-signature PATH] [--reader SUBSTR]` arguments.
 ///
 /// `can` is the typed [`Can`] -- the 6-digit value is
 /// validated at this trust boundary via `Can::new`, so the
@@ -38,15 +37,6 @@ pub struct EmrtdArgs {
     /// Optional path to save DG7 displayed signature image
     /// (`--save-signature PATH`).
     pub save_signature: Option<PathBuf>,
-    /// Optional path to save the EF.SOD CMS `SignedData` bytes
-    /// (`--save-sod PATH`). Useful for offline PA verification.
-    pub save_sod: Option<PathBuf>,
-    /// Optional path to save the Document Signer Certificate
-    /// extracted from EF.SOD (`--save-dsc PATH`).
-    pub save_dsc: Option<PathBuf>,
-    /// Optional trusted-CSCA pool directory (`--csca-dir DIR`)
-    /// for the DSC -> CSCA hop in Passive Authentication.
-    pub csca_dir: Option<PathBuf>,
     /// Optional substring match against reader names
     /// (`--reader SUBSTR`). Tier 0 `String`; presentational
     /// input to `ReaderFilter::new`.
@@ -61,19 +51,13 @@ impl EmrtdArgs {
             can,
             save_face,
             save_signature,
-            save_sod,
-            save_dsc,
-            csca_dir,
             reader_filter,
         } = self;
         let backend = refineid_lib_pcsc::PcscBackend;
         let options = crate::card_emrtd::EmrtdReadOptions {
             can,
             save_face,
-            save_sod,
-            save_dsc,
             save_signature,
-            csca_dir,
             reader_filter,
         };
         match crate::card_emrtd::read_first(backend, &options) {
@@ -101,9 +85,6 @@ impl EmrtdArgs {
         let mut can_raw: Option<String> = None;
         let mut save_face: Option<PathBuf> = None;
         let mut save_signature: Option<PathBuf> = None;
-        let mut save_sod: Option<PathBuf> = None;
-        let mut save_dsc: Option<PathBuf> = None;
-        let mut csca_dir: Option<PathBuf> = None;
         let mut reader_filter: Option<String> = None;
         let tokens = argv.into_vec();
         let mut iter = tokens.iter();
@@ -129,27 +110,6 @@ impl EmrtdArgs {
                         flag: "--save-signature",
                     })?;
                     save_signature = Some(PathBuf::from(value));
-                }
-                "--save-sod" => {
-                    let value = iter.next().ok_or(ArgParseError::MissingValue {
-                        cmd: VerbTag::CardEmrtd,
-                        flag: "--save-sod",
-                    })?;
-                    save_sod = Some(PathBuf::from(value));
-                }
-                "--save-dsc" => {
-                    let value = iter.next().ok_or(ArgParseError::MissingValue {
-                        cmd: VerbTag::CardEmrtd,
-                        flag: "--save-dsc",
-                    })?;
-                    save_dsc = Some(PathBuf::from(value));
-                }
-                "--csca-dir" => {
-                    let value = iter.next().ok_or(ArgParseError::MissingValue {
-                        cmd: VerbTag::CardEmrtd,
-                        flag: "--csca-dir",
-                    })?;
-                    csca_dir = Some(PathBuf::from(value));
                 }
                 "--reader" => {
                     let value = iter.next().ok_or(ArgParseError::MissingValue {
@@ -180,9 +140,6 @@ impl EmrtdArgs {
             can,
             save_face,
             save_signature,
-            save_sod,
-            save_dsc,
-            csca_dir,
             reader_filter,
         })
     }
@@ -198,7 +155,7 @@ mod tests {
     fn parses_can_only() -> TestResult {
         let a = EmrtdArgs::parse(argv(&["--can", "123456"]))?;
         check_true(a.save_face.is_none(), "save_face=None")?;
-        check_true(a.csca_dir.is_none(), "csca_dir=None")
+        check_true(a.save_signature.is_none(), "save_signature=None")
         // SPECIMEN-TRAVEL CAN is 797449; pick a generic in-shape value
         // for the unit test.
     }
@@ -228,10 +185,14 @@ mod tests {
             "123456",
             "--save-face",
             "/f",
-            "--save-sod",
+            "--save-signature",
             "/s",
         ]))?;
         check(&a.save_face, &Some(PathBuf::from("/f")), "save_face")?;
-        check(&a.save_sod, &Some(PathBuf::from("/s")), "save_sod")
+        check(
+            &a.save_signature,
+            &Some(PathBuf::from("/s")),
+            "save_signature",
+        )
     }
 }

@@ -273,7 +273,7 @@ one card; pass --reader SUBSTR when multiple cards are connected.
 
 subcommands:
   card [--offline] [--reader SUBSTR] [--can NNNNNN | --no-can]
-       [--crl-file PATH] [--save-cert DIR] [--icao-pkd PATH]
+       [--crl-file PATH] [--save-cert DIR]
       per-card readout: certificates, chain walk + revocation, PIN
       retry counters, and (with --can) the eMRTD section.
         --offline       skip every network fetch
@@ -282,7 +282,6 @@ subcommands:
         --no-can        skip the eMRTD section (no prompt)
         --crl-file P    use a pre-fetched CRL instead of HTTP fetch
         --save-cert DIR write each slot's DER to DIR
-        --icao-pkd P    Master List (.ml) or PKD LDIF trust anchors
       Without --can / --no-can on a TTY, prompts for CAN (empty = skip).
 
   card emrtd --can NNNNNN [options]
@@ -290,9 +289,6 @@ subcommands:
       flags that write artefacts to disk).
         --save-face P       face image
         --save-signature P  displayed-signature image
-        --save-sod P        raw EF.SOD
-        --save-dsc P        embedded Document Signing Certificate DER
-        --csca-dir D        candidate trust anchors
         --reader S          target one reader
 
   card activate [--allow-reactivate] [--reader SUBSTR]

@@ -15,8 +15,8 @@
 //! Tiny text-codec helpers shared across CLI modules.
 //!
 //! base64 decode + PEM auto-detect. Both are minimal
-//! RFC 4648 / RFC 7468 implementations -- enough for cert /
-//! CSCA loading without reaching for the `base64` / `pem`
+//! RFC 4648 / RFC 7468 implementations -- enough for cert
+//! loading without reaching for the `base64` / `pem`
 //! crates.
 
 /// DER SEQUENCE tag byte (universal class, constructed, tag 16).

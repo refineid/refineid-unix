@@ -31,10 +31,8 @@
 //!
 //! Out of scope for v0:
 //!
-//! - Passive authentication via EF.SOD (chains DG hashes to the
-//!   document-signing certificate of the issuing CSCA). Required
-//!   for tamper-proof reads; nice-to-have but separable from the
-//!   data-extraction shape.
+//! - Passive authentication via EF.SOD. The read data is shown,
+//!   not authenticated.
 //! - Active Authentication / Chip Authentication. Both are
 //!   optional on FINEID-S1 cards.
 //! - DG3-DG16 except DG2 (face). DG11 (extended personal data,
@@ -1085,22 +1083,19 @@ pub struct EmrtdPersonalData {
     /// scan didn't find a recognised magic -- the underlying
     /// DG7 bytes may still be present in `dg7_der`.
     pub signature_image: Option<DocumentImage>,
-    /// Raw DG1 bytes, kept for Passive Authentication hash
-    /// verification against EF.SOD.
-    pub dg1_der: Vec<u8>,
-    /// Raw DG2 bytes (same reason).
-    pub dg2_der: Vec<u8>,
     /// Raw DG7 bytes when DG7 was provisioned and read. Kept
     /// independently of `signature_image` so callers can
     /// recover the bytes even when the JPEG / JPEG2000 magic
     /// scan fails (e.g. if a profile uses a different image
     /// format inside the ICAO biometric envelope).
     pub dg7_der: Option<Vec<u8>>,
-    /// Raw EF.SOD bytes (when the card published one). The
-    /// caller runs `cms::parse_signed_data` + per-DG hash
-    /// verification against this blob to complete Passive
-    /// Authentication.
+    /// Raw EF.SOD bytes (when the card published one). Not
+    /// verified: no passive authentication is performed.
     pub sod_der: Option<Vec<u8>>,
+    /// ICAO data-group numbers EF.SOD's `LDSSecurityObject`
+    /// lists, ascending. Read from the unverified EF.SOD; empty
+    /// when EF.SOD is absent or does not parse.
+    pub data_groups: Vec<u32>,
     /// Raw DG14 bytes when DG14 was provisioned and read. DG14
     /// is `SecurityInfos` (a SET of protocol-OID + parameters),
     /// notably carrying `ChipAuthenticationPublicKeyInfo` for
@@ -1412,7 +1407,7 @@ pub fn read_personal_data<T: CardTransport>(
     // still return DG1 + DG2 + face, which is enough for a
     // useful report.
     let sod_der = read_optional_dg(&mut sm, SFI_EF_SOD)?;
-    let inventory = DgInventory {
+    let mut inventory = DgInventory {
         numbers: sod_der
             .as_deref()
             .and_then(|s| crate::cms::SignedData::parse(s).ok())
@@ -1420,6 +1415,7 @@ pub fn read_personal_data<T: CardTransport>(
             .map(|lds| lds.data_group_hashes.iter().map(|(n, _)| *n).collect())
             .unwrap_or_default(),
     };
+    inventory.numbers.sort_unstable();
     let optional = read_optional_dgs(&mut sm, &inventory)?;
     let dg7 = optional.dg7;
     let signature_image = dg7
@@ -1471,9 +1467,8 @@ pub fn read_personal_data<T: CardTransport>(
         additional_personal,
         additional_document,
         signature_image,
-        dg1_der: dg1,
-        dg2_der: dg2,
         sod_der,
+        data_groups: inventory.numbers,
         dg7_der: dg7,
         dg14_der,
         dg15_der,

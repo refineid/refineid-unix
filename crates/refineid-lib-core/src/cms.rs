@@ -12,8 +12,9 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! CMS `SignedData` parser (RFC 5652), scoped to what Passive
-//! Authentication needs.
+//! CMS `SignedData` parser (RFC 5652), scoped to one-signer
+//! verification and to reading the eMRTD EF.SOD data-group
+//! inventory.
 //!
 //! Surface:
 //!
@@ -24,11 +25,10 @@
 //!   eMRTD).
 //! - [`SignedData`] holds the encapsulated content
 //!   (`econtent_der` = the `LDSSecurityObject` bytes for an
-//!   eMRTD SOD), the embedded certificates (Document Signing
-//!   Certificate), and the sole signerInfo's signature
-//!   material.
+//!   eMRTD SOD), the embedded certificates, and the sole
+//!   signerInfo's signature material.
 //! - [`SignedData::verify`] verifies the signerInfo's signature
-//!   against a supplied signer public key (the DSC). Handles
+//!   against a supplied signer public key. Handles
 //!   both the "signedAttrs present" path (sign over DER(SET OF
 //!   attrs)) and the "signedAttrs absent" path (sign over
 //!   eContent directly).
@@ -90,7 +90,7 @@ use sha2::{Digest as _, Sha256, Sha384, Sha512};
 
 // ----- Hash algorithm dispatch -----
 
-/// Hash algorithm dispatch for CMS / eMRTD passive authentication.
+/// Hash algorithm dispatch for CMS signer verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashAlgorithm {
     /// SHA-256 (OID `2.16.840.1.101.3.4.2.1`).
@@ -231,7 +231,7 @@ impl core::fmt::Display for CmsError {
 impl core::error::Error for CmsError {}
 
 /// Parsed subset of a CMS `SignedData` value sufficient for
-/// passive authentication.
+/// one-signer verification.
 #[derive(Debug, Clone)]
 pub struct SignedData<'a> {
     /// Inner `EncapsulatedContentInfo.eContentType` OID.
@@ -365,59 +365,6 @@ impl OwnedSignedData {
     pub fn view(&self) -> SignedData<'_> {
         SignedData::parse(&self.der)
             .expect("OwnedSignedData: from_der validated DER at construction")
-    }
-
-    /// Raw DER bytes.
-    #[must_use]
-    #[inline]
-    pub fn as_der(&self) -> &[u8] {
-        &self.der
-    }
-}
-
-/// Owning wrapper around a parsed `LDSSecurityObject`.
-///
-/// Same pattern as [`OwnedSignedData`].
-#[derive(Debug, Clone)]
-pub struct OwnedLdsSecurityObject {
-    /// `der` field.
-    der: Vec<u8>,
-}
-
-impl OwnedLdsSecurityObject {
-    /// Parse `der` as an eMRTD `LDSSecurityObject`.
-    ///
-    /// # Errors
-    /// [`CmsError`] from the CMS parser.
-    #[inline]
-    pub fn from_der<B: AsRef<[u8]>>(der: B) -> Result<Self, CmsError> {
-        let bytes = der.as_ref().to_vec();
-        // Validate-only parse; see `OwnedSignedData::from_der`
-        // for the explicit-drop rationale.
-        drop(LdsSecurityObject::parse(&bytes)?);
-        Ok(Self { der: bytes })
-    }
-
-    /// Re-parse the owned DER and hand back the borrowed view.
-    ///
-    /// # Performance
-    /// Parses the DER on **every call** (O(n) in the DER length). For
-    /// repeated field access bind the view once (`let lds = owned.view();`)
-    /// and reuse it, rather than calling `view()` per field.
-    ///
-    /// # Panics
-    /// Never -- [`from_der`] validated at construction.
-    ///
-    /// [`from_der`]: Self::from_der.
-    #[must_use]
-    #[expect(
-        clippy::expect_used,
-        reason = "from_der validated the DER at construction. Acceptable construction invariant in production code; see `OwnedSignedData::view`."
-    )]
-    #[inline]
-    pub fn view(&self) -> LdsSecurityObject<'_> {
-        LdsSecurityObject::parse(&self.der)
-            .expect("OwnedLdsSecurityObject: from_der validated DER at construction")
     }
 
     /// Raw DER bytes.
@@ -1057,7 +1004,7 @@ impl CmsHelpers {
 
 impl SignedData<'_> {
     /// Verify the signerInfo's signature against `signer_spki_der`
-    /// (the DSC's SPKI). When `signedAttrs` was present, also
+    /// (the signer certificate's SPKI). When `signedAttrs` was present, also
     /// verifies that the `messageDigest` attribute matches
     /// `hash(eContent)`.
     ///
@@ -1105,61 +1052,8 @@ impl SignedData<'_> {
     }
 }
 
-/// A CMS [`SignedData`] whose signer (DSC) signature has been
-/// verified against a signer SPKI.
-///
-/// Trust by construction (see `doc/typing-discipline.md`): the only
-/// production constructor is [`VerifiedSignedData::verify`], so the
-/// signed eContent -- for an eMRTD SOD, the `LDSSecurityObject` of
-/// data-group hashes -- is reachable only after the CMS signature
-/// checked. A passive-auth DG-hash comparison taken from
-/// [`lds_security_object`](Self::lds_security_object) therefore cannot
-/// be computed from an unverified, attacker-controlled SOD.
-///
-/// Verifying against the *embedded* DSC is necessary but not
-/// sufficient for passive authentication: the caller must also chain
-/// the DSC to a trusted CSCA (the cert-state lattice). This type
-/// proves the CMS-signature half; DSC->CSCA is a separate step.
-#[derive(Debug, Clone)]
-pub struct VerifiedSignedData<'a> {
-    /// The verified inner `SignedData`.
-    signed_data: SignedData<'a>,
-}
-
-impl<'a> VerifiedSignedData<'a> {
-    /// Verify `signed_data`'s signer signature against `signer_spki`
-    /// (the DSC's SPKI) and, on success, wrap it. The only production
-    /// door to the verified eContent.
-    ///
-    /// # Errors
-    /// [`CmsError`] when the signature (or the `messageDigest`
-    /// cross-check) does not verify against `signer_spki`.
-    #[inline]
-    pub fn verify(
-        signed_data: &SignedData<'a>,
-        signer_spki: &crate::x509::SpkiDer<'_>,
-    ) -> Result<Self, CmsError> {
-        signed_data.verify(signer_spki.as_der())?;
-        Ok(Self {
-            signed_data: signed_data.clone(),
-        })
-    }
-
-    /// Parse the verified eContent as an `LDSSecurityObject` -- the
-    /// data-group hash table whose integrity the CMS signature now
-    /// attests to. Reachable only on a verified `SignedData`.
-    ///
-    /// # Errors
-    /// [`CmsError`] if the verified eContent is not a well-formed
-    /// `LDSSecurityObject`.
-    #[inline]
-    pub fn lds_security_object(&self) -> Result<LdsSecurityObject<'a>, CmsError> {
-        LdsSecurityObject::parse(self.signed_data.econtent_der)
-    }
-}
-
-// `known::EC_PUBLIC_KEY` is *sometimes* the signatureAlgorithm OID for
-// self-signed CSCAs -- the hash then comes from the signerInfo's
+// `known::EC_PUBLIC_KEY` is *sometimes* the signatureAlgorithm OID in
+// a signerInfo -- the hash then comes from the signerInfo's
 // digestAlgorithm (handled via the `digest_alg_fallback` arm below).
 
 /// Inputs for CMS signer signature verification.
@@ -1194,7 +1088,7 @@ struct RsaVerifyInput<'a> {
 /// RFC 5652 §5.4 (message-digest computation) and RFC 5754 (RSA /
 /// ECDSA signature algorithms). The `digest_alg_fallback` is used
 /// when the signature OID is the bare key-type OID (`id-ecPublicKey`
-/// or `rsaEncryption`) -- some CSCA self-signatures encode it that
+/// or `rsaEncryption`) -- some signers encode it that
 /// way and the digest is taken from `signerInfo.digestAlgorithm`.
 ///
 /// Returns `Err(UnsupportedSignatureAlgorithm)` when the OID is
@@ -1357,12 +1251,12 @@ impl<'a> LdsSecurityObject<'a> {
 mod tests {
 
     use super::{
-        CmsError, CmsHelpers, HashAlgorithm, LdsSecurityObject, OwnedLdsSecurityObject,
-        OwnedSignedData, SignedData, SignerIdentifier, SignerInfo, VerifiedSignedData,
+        CmsError, CmsHelpers, HashAlgorithm, LdsSecurityObject, OwnedSignedData, SignedData,
+        SignerIdentifier, SignerInfo,
     };
     use crate::ber::{BerTlv, BerTlvIter, Sequence, tlv};
     use crate::oid::{Oid, known};
-    use crate::x509::{Certificate, SpkiDer};
+    use crate::x509::Certificate;
 
     // Committed CMS / SPKI fixtures. Generated offline with OpenSSL
     // 3.x (refineid-lib-core never generates keys; the verifier is
@@ -1433,7 +1327,7 @@ mod tests {
         6613fd61ac2e60db8d4039844238e15e5e76de70305e2624d429ecf66c193b99\
         dda4b5a213bde6bd9e531be4d8";
 
-    // SubjectPublicKeyInfo of the RSA DSC that signed RSA_CMS_HEX (294 bytes).
+    // SubjectPublicKeyInfo of the RSA signer that signed RSA_CMS_HEX (294 bytes).
     const RSA_SPKI_HEX: &str = "\
         30820122300d06092a864886f70d01010105000382010f003082010a02820101\
         00ed28349290c82f3dd4871eff7b2ec12d057a9d2dc9ba566cd8ce23a0b5fc55\
@@ -1524,7 +1418,7 @@ mod tests {
         26305b257a65ed479616b39b82d90d80e29ede124348caa561157599805c0220\
         20f1188ac93ef8dcfb94db3fb4e5288d57db45f5ad6cdf857003d68a7b5f903c";
 
-    // SubjectPublicKeyInfo of the EC P-256 DSC that signed EC_CMS_HEX (91 bytes).
+    // SubjectPublicKeyInfo of the EC P-256 signer that signed EC_CMS_HEX (91 bytes).
     const EC_SPKI_HEX: &str = "\
         3059301306072a8648ce3d020106082a8648ce3d03010703420004c82edd70fc\
         6c5829254ff642c69c483feca07c0f57d5b5cd4bad59712052f4d553093ef814\
@@ -1715,7 +1609,7 @@ mod tests {
         assert_eq!(sd.econtent_type_oid, known::ICAO_LDS_SECURITY_OBJECT);
         // eContent is the embedded LDSSecurityObject SEQUENCE.
         assert_eq!(sd.econtent_der.first(), Some(&0x30));
-        // Exactly the DSC was embedded.
+        // Exactly the signer certificate was embedded.
         assert_eq!(sd.certificates_der.len(), 1);
         let cert = sd.certificates_der.first().expect("one cert");
         assert_eq!(cert.first(), Some(&0x30));
@@ -2040,36 +1934,6 @@ mod tests {
         ));
     }
 
-    // ----- VerifiedSignedData + LDSSecurityObject -----
-
-    #[test]
-    fn verified_signed_data_exposes_lds_hashes() {
-        let der = unhex(RSA_CMS_HEX);
-        let spki_der = unhex(RSA_SPKI_HEX);
-        let spki = SpkiDer::try_from(spki_der.as_slice()).expect("SPKI parses");
-        let sd = SignedData::parse(&der).expect("parse");
-        let verified = VerifiedSignedData::verify(&sd, &spki).expect("verify");
-        let lds = verified.lds_security_object().expect("LDS parses");
-        assert_eq!(lds.hash_algorithm, HashAlgorithm::Sha256);
-        assert_eq!(lds.data_group_hashes.len(), 2);
-        let mut dgs = lds.data_group_hashes.iter();
-        let dg1 = dgs.next().expect("DG1");
-        let dg2 = dgs.next().expect("DG2");
-        assert_eq!(dg1.0, 1);
-        assert_eq!(dg1.1, unhex(DG1_HASH_HEX).as_slice());
-        assert_eq!(dg2.0, 2);
-        assert_eq!(dg2.1, unhex(DG2_HASH_HEX).as_slice());
-    }
-
-    #[test]
-    fn verified_signed_data_rejects_bad_signature() {
-        let der = unhex(RSA_CMS_HEX);
-        let wrong_der = unhex(WRONG_RSA_SPKI_HEX);
-        let wrong = SpkiDer::try_from(wrong_der.as_slice()).expect("SPKI parses");
-        let sd = SignedData::parse(&der).expect("parse");
-        VerifiedSignedData::verify(&sd, &wrong).expect_err("wrong SPKI fails signature check");
-    }
-
     // ----- parse_lds_security_object -----
 
     #[test]
@@ -2079,6 +1943,13 @@ mod tests {
         let lds = LdsSecurityObject::parse(sd.econtent_der).expect("LDS parses");
         assert_eq!(lds.hash_algorithm, HashAlgorithm::Sha256);
         assert_eq!(lds.data_group_hashes.len(), 2);
+        let mut dgs = lds.data_group_hashes.iter();
+        let dg1 = dgs.next().expect("DG1");
+        let dg2 = dgs.next().expect("DG2");
+        assert_eq!(dg1.0, 1);
+        assert_eq!(dg1.1, unhex(DG1_HASH_HEX).as_slice());
+        assert_eq!(dg2.0, 2);
+        assert_eq!(dg2.1, unhex(DG2_HASH_HEX).as_slice());
     }
 
     #[test]
@@ -2112,22 +1983,6 @@ mod tests {
     fn owned_signed_data_rejects_garbage() {
         OwnedSignedData::from_der([0xDE_u8, 0xAD, 0xBE, 0xEF])
             .expect_err("garbage bytes are not SignedData");
-    }
-
-    #[test]
-    fn owned_lds_security_object_roundtrips() {
-        let der = unhex(RSA_CMS_HEX);
-        let sd = SignedData::parse(&der).expect("parse");
-        let econtent = sd.econtent_der.to_vec();
-        let owned = OwnedLdsSecurityObject::from_der(&econtent).expect("construct");
-        assert_eq!(owned.as_der(), econtent.as_slice());
-        assert_eq!(owned.view().data_group_hashes.len(), 2);
-    }
-
-    #[test]
-    fn owned_lds_security_object_rejects_garbage() {
-        OwnedLdsSecurityObject::from_der([0x00_u8, 0x01])
-            .expect_err("garbage bytes are not an LDS security object");
     }
 
     // ----- CmsError Display -----

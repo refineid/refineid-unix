@@ -1030,7 +1030,6 @@ fn phone_card(dev_name: &str, serial: TokenSerial, identity: CredentialIdentity)
         pin2_changed: None,
         emrtd: None,
         emrtd_error: None,
-        dsc_csca_check: None,
     };
     ManagedCard {
         source: CardSource::Phone,
@@ -1142,7 +1141,6 @@ mod tests {
             pin2_changed: Some(true),
             emrtd: None,
             emrtd_error: None,
-            dsc_csca_check: None,
         };
 
         // When a physical card is present, phone is never added even if include_phones is true

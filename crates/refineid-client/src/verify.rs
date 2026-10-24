@@ -239,7 +239,7 @@ mod tests {
     use super::*;
     use crate::test_util::{TempDir, TestResult, check, check_true};
 
-    const ICAO_CSCA_PEM: &[u8] = include_bytes!("../trust-anchors/icao-pkd-un-csca-2.pem");
+    const ICAO_CSCA_PEM: &[u8] = include_bytes!("../test-vectors/icao-pkd-un-csca-2.pem");
     const DVV_ROOT_ECC_DER: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-ecc.der");
 
     /// The TBS bytes + signature of the bundled CSCA. A

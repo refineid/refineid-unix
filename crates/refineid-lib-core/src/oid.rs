@@ -286,14 +286,11 @@ pub mod known {
     /// `2.5.4.42` -- id-at-givenName.
     pub const GIVEN_NAME: Oid<'static> = oid_dotted!("2.5.4.42");
 
-    // ---- ICAO PKD ----
+    // ---- ICAO 9303 ----
 
     /// `2.23.136.1.1.1` -- id-icao-mrtd-security-ldsSecurityObject
     /// (ICAO 9303-10) -- the SOD eContentType.
     pub const ICAO_LDS_SECURITY_OBJECT: Oid<'static> = oid_dotted!("2.23.136.1.1.1");
-
-    /// `2.23.136.1.1.3` -- id-icao-cscaMasterListSignedData (ICAO 9303-12).
-    pub const ICAO_ML_SIGNER: Oid<'static> = oid_dotted!("2.23.136.1.1.3");
 
     /// `2.5.29.15` -- id-ce-keyUsage (critical in FINEID S2).
     pub const KEY_USAGE: Oid<'static> = oid_dotted!("2.5.29.15");
@@ -439,11 +436,6 @@ pub mod known {
     /// `1.2.840.10045.1.1` -- prime-field.
     pub const PRIME_FIELD: Oid<'static> = oid_dotted!("1.2.840.10045.1.1");
 
-    // ---- ICAO PKD (additional) ----
-
-    /// `2.23.136.1.1.2` -- id-icao-cscaMasterList (CMS eContentType).
-    pub const CSCA_MASTER_LIST: Oid<'static> = oid_dotted!("2.23.136.1.1.2");
-
     // ---- PACE mechanism (BSI TR-03110-3) ----
 
     /// `0.4.0.127.0.7.2.2.4.2.4` -- id-PACE-ECDH-GM-AES-CBC-CMAC-256.
@@ -559,14 +551,6 @@ mod tests {
     #[test]
     fn display_ad_ocsp() {
         assert_eq!(format!("{}", known::AD_OCSP), "1.3.6.1.5.5.7.48.1");
-    }
-
-    #[test]
-    fn display_icao_ml_signer() {
-        // 2.23.136.1.1.3 -- 2*40+23=103 doesn't fit in one byte
-        // so first byte is 0x67 = 103; remaining arcs are
-        // 136, 1, 1, 3 base-128 encoded.
-        assert_eq!(format!("{}", known::ICAO_ML_SIGNER), "2.23.136.1.1.3");
     }
 
     #[test]

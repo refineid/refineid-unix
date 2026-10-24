@@ -637,7 +637,7 @@ mod tests {
     use refineid_lib_core::text::Uri;
 
     // A self-signed sha256WithRSA CSCA root (PEM).
-    const ICAO_CSCA_PEM: &[u8] = include_bytes!("../trust-anchors/icao-pkd-un-csca-2.pem");
+    const ICAO_CSCA_PEM: &[u8] = include_bytes!("../test-vectors/icao-pkd-un-csca-2.pem");
     // A real two-link DVV chain: the G4E citizen intermediate
     // (leaf) is signed by the self-signed G3 ECC root. See
     // ../test-vectors/README.md for provenance.
