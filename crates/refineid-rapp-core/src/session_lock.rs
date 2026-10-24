@@ -88,9 +88,16 @@ pub fn ceremony_lock_path(directory: &Path) -> PathBuf {
 )]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+    use std::time::Duration;
 
     use super::{LockError, SessionLock, ceremony_lock_path, session_lock_path};
     use crate::ids::PairId;
+
+    /// The pause between looks at a lock its holder has dropped.
+    const RELEASE_STEP: Duration = Duration::from_millis(5);
+    /// How many looks a dropped lock is given before it counts as held.
+    const RELEASE_LOOKS: usize = 50;
 
     fn scratch() -> std::path::PathBuf {
         let mut name = [0u8; 8];
@@ -101,6 +108,21 @@ mod tests {
         directory
     }
 
+    /// Takes the lock at `path` once the kernel has released it. A child
+    /// another test forks inherits the open file description until it
+    /// execs, so the release can trail the drop by a moment.
+    fn acquire_eventually(path: &Path) -> Result<SessionLock, LockError> {
+        let mut outcome = SessionLock::acquire(path);
+        for _ in 1..RELEASE_LOOKS {
+            if !matches!(outcome, Err(LockError::Held)) {
+                break;
+            }
+            std::thread::sleep(RELEASE_STEP);
+            outcome = SessionLock::acquire(path);
+        }
+        outcome
+    }
+
     #[test]
     fn a_held_lock_refuses_a_second_holder_until_it_is_dropped() {
         let directory = scratch();
@@ -108,7 +130,7 @@ mod tests {
         let first = SessionLock::acquire(&path).unwrap();
         assert_eq!(SessionLock::acquire(&path).err(), Some(LockError::Held));
         drop(first);
-        assert!(SessionLock::acquire(&path).is_ok());
+        assert!(acquire_eventually(&path).is_ok());
         let _ = std::fs::remove_dir_all(directory);
     }
 
