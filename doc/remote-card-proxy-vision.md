@@ -4,7 +4,7 @@
 - **Protocol Versions**: `26.9.28`, `26.10.1`
 - **Status**: Normative Architecture & Design Vision
 - **Applies To**: `RefineID-Unix` (Linux, FreeBSD, NetBSD, NixOS), `RefineID-Apple`, `RefineID-Android`
-- **Companion Specification**: [RAPP Transport and Discovery Hierarchy Specification](../../refineid-core/doc/protocols/rapp-transport-and-discovery-hierarchy.md)
+- **Companion Specification**: [RAPP Transport and Discovery Hierarchy Specification](https://github.com/refineid/refineid-core/blob/main/doc/protocols/rapp-transport-and-discovery-hierarchy.md)
 
 ---
 
