@@ -44,7 +44,7 @@ use crate::message::{CardPresence, CardReader, CardStatusMessage, CloseReason};
 use crate::offer::PairingOffer;
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
 use crate::session_lock::{LockError, SessionLock, ceremony_lock_path, session_lock_path};
-use crate::store::{PairingRecord, PairingStore, PeerIntroduction, StoreError};
+use crate::store::{PairingRecord, PairingStore, StoreError};
 use crate::stream::{
     DiscoveryMode, HintMatch, RoutingPreamble, STREAM_CANDIDATE_ID, StreamService, browse,
     browse_stream_services, dial,
@@ -54,21 +54,6 @@ use crate::transport::TcpFrameTransport;
 use refineid_rapp::{
     DiscoveryKey, PairingState, ProfileName, RoutingKey, TransportProfile, WithdrawalKey,
 };
-
-/// The names a phone gives when its system hands the app only the
-/// device type.
-const DEVICE_TYPE_NAMES: [&str; 2] = ["iPhone", "iPad"];
-
-/// The name a custodian is listed under: the one it introduced itself
-/// with, or its host name on the network when the introduction was only
-/// its device type and the host name is known.
-fn custodian_name(introduced: &str, host: &str) -> String {
-    if DEVICE_TYPE_NAMES.contains(&introduced) && !host.is_empty() {
-        host.to_owned()
-    } else {
-        introduced.to_owned()
-    }
-}
 
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
@@ -773,24 +758,11 @@ impl RemoteReader {
             found: Vec::new(),
             deadline: Instant::now() + discovery_timeout,
         };
-        let (pair_id, instance) = self
+        let (pair_id, _) = self
             .requester
             .pair_with_code(code, &mut services, |_, requested| Some(requested.to_vec()))
             .map_err(RemoteError::Pairing)?;
         self.supersede_others(pair_id);
-        // The name is for display; a refused rewrite keeps the introduced
-        // one, the pairing stands either way.
-        let host = services
-            .service(&instance)
-            .map(|service| service.host.clone())
-            .unwrap_or_default();
-        let _ = self.requester.store_mut().update(pair_id, &mut |record| {
-            let peer = PeerIntroduction {
-                display_name: custodian_name(&record.peer().display_name, &host),
-                platform: record.peer().platform.clone(),
-            };
-            Some(record.with_peer(peer))
-        });
         self.pairs()
             .into_iter()
             .find(|pair| pair.pair_id == pair_id)
@@ -1547,24 +1519,10 @@ mod tests {
         assert!(!name.contains('.'));
     }
 
-    #[test]
-    fn a_device_type_introduction_yields_to_the_host_name() {
-        assert_eq!(
-            super::custodian_name("iPhone", "alpha-phone"),
-            "alpha-phone"
-        );
-        assert_eq!(super::custodian_name("iPhone", ""), "iPhone");
-        assert_eq!(
-            super::custodian_name("Alpha Phone", "Android-3"),
-            "Alpha Phone"
-        );
-    }
-
     fn service(instance: &str, txt: &[(&str, String)]) -> StreamService {
         StreamService {
             instance: instance.to_owned(),
             endpoints: vec!["192.0.2.10:47110".to_owned()],
-            host: String::new(),
             txt: txt
                 .iter()
                 .map(|(key, value)| ((*key).to_owned(), value.clone()))

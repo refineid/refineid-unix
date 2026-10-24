@@ -180,12 +180,6 @@ impl PairingRecord {
         })
     }
 
-    /// The record with the phone introduced as `peer`.
-    #[must_use]
-    pub fn with_peer(self, peer: PeerIntroduction) -> Self {
-        Self { peer, ..self }
-    }
-
     /// The record caching `auth_cert`, or none.
     #[must_use]
     pub fn with_auth_cert(self, auth_cert: Option<Vec<u8>>) -> Self {

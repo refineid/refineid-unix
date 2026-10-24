@@ -45,7 +45,7 @@ use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::profiles::{
     PROFILE_AUTHENTICATION, PROFILE_CARD_STATUS, PROFILE_DOCUMENT_SIGNING,
 };
-use refineid_rapp_core::remote::{CardRequest, RemoteError, execute_on_session};
+use refineid_rapp_core::remote::{CardRequest, RemoteError, RemoteReader, execute_on_session};
 use refineid_rapp_core::store::{MemoryPairingStore, PairingRecord, PairingStore, StoreError};
 use refineid_rapp_core::transport::{FrameTransport, MemoryTransport, TransportError};
 
@@ -57,6 +57,11 @@ const CANDIDATE: &str = "loopback-1";
 const SESSION_START_MS: u64 = 1_000_000;
 /// The code the scripted custodian shows.
 const SHOWN_CODE: &str = "7KX4M9";
+/// The name the scripted custodian introduces itself with.
+const CUSTODIAN_NAME: &str = "Phone";
+/// The name a phone introduces itself with when its system hands the app
+/// only the device type.
+const DEVICE_TYPE_NAME: &str = "iPhone";
 /// The code another phone in pairing mode shows.
 const OTHER_CODE: &str = "7KX4MA";
 /// The offer one custodian serves on each endpoint it is found on.
@@ -268,15 +273,22 @@ enum StorageConfirmation {
 /// `CPace` KC2 as responder, then `Noise_XXpsk3` under its key, then the
 /// hello, confirmation, and storage exchanges.
 fn proxy_pair<T: FrameTransport>(transport: T, shown_code: &str) -> PairRecord {
-    proxy_pair_confirming(transport, shown_code, StorageConfirmation::Confirmed)
-        .expect("the confirming custodian stores its record")
+    proxy_pair_confirming(
+        transport,
+        shown_code,
+        CUSTODIAN_NAME,
+        StorageConfirmation::Confirmed,
+    )
+    .expect("the confirming custodian stores its record")
 }
 
-/// As [`proxy_pair`]; a `Silent` custodian stores nothing and leaves the
-/// requester without its `pairing.stored`.
+/// As [`proxy_pair`], introducing the custodian as `display_name`; a
+/// `Silent` custodian stores nothing and leaves the requester without its
+/// `pairing.stored`.
 fn proxy_pair_confirming<T: FrameTransport>(
     mut transport: T,
     shown_code: &str,
+    display_name: &str,
     confirmation_mode: StorageConfirmation,
 ) -> Option<PairRecord> {
     let now_ms = SESSION_START_MS;
@@ -313,7 +325,7 @@ fn proxy_pair_confirming<T: FrameTransport>(
     let hello = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
     confirmation.receive_hello(&hello, now_ms).unwrap();
     let proxy_hello = confirmation
-        .send_hello("Phone".into(), "iOS".into())
+        .send_hello(display_name.into(), "iOS".into())
         .unwrap();
     transport.send_frame(proxy_hello.as_bytes()).unwrap();
     let requester_confirmation =
@@ -487,7 +499,7 @@ fn paired<Store: PairingStore>(
             "7k x4-m9",
             &mut OpenedConnection::new(requester_transport),
             |peer, _requested| {
-                assert_eq!(peer.display_name, "Phone");
+                assert_eq!(peer.display_name, CUSTODIAN_NAME);
                 Some(granted.to_vec())
             },
         )
@@ -528,7 +540,46 @@ fn pairing_stores_matching_records_on_both_sides() {
     let record = requester.store().get(pair_id).unwrap();
     assert_eq!(record.pairing().profiles(), granted);
     assert_eq!(record.state(), PairingState::PairedDisconnected);
-    assert_eq!(record.peer().display_name, "Phone");
+    assert_eq!(record.peer().display_name, CUSTODIAN_NAME);
+}
+
+#[test]
+fn a_phone_is_listed_under_the_name_it_gave_inside_the_pairing_channel() {
+    let directory = scratch_directory();
+    let mut requester = requester_over(FilePairingStore::open(&directory).unwrap());
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    // The phone's system hands its app only the device type, so that is
+    // the name its `pairing.hello` carries.
+    let proxy = std::thread::spawn(move || {
+        proxy_pair_confirming(
+            proxy_transport,
+            SHOWN_CODE,
+            DEVICE_TYPE_NAME,
+            StorageConfirmation::Confirmed,
+        )
+    });
+    let (pair_id, ()) = requester
+        .pair_with_code(
+            SHOWN_CODE,
+            &mut OpenedConnection::new(requester_transport),
+            |peer, requested| {
+                assert_eq!(peer.display_name, DEVICE_TYPE_NAME);
+                Some(requested.to_vec())
+            },
+        )
+        .unwrap();
+    proxy.join().unwrap().unwrap();
+    // The listed name is the one from the authenticated exchange alone;
+    // nothing a discovery record names stands in for it.
+    let reader = RemoteReader::with_store(
+        "Workstation",
+        "Linux",
+        FilePairingStore::open_without_sweep(&directory).unwrap(),
+    );
+    let phone = reader.phone().unwrap();
+    assert_eq!(phone.pair_id, pair_id);
+    assert_eq!(phone.peer_display_name, DEVICE_TYPE_NAME);
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]
@@ -536,7 +587,12 @@ fn a_custodian_that_never_confirms_its_storage_leaves_no_record() {
     let mut requester = test_requester();
     let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || {
-        proxy_pair_confirming(proxy_transport, SHOWN_CODE, StorageConfirmation::Silent)
+        proxy_pair_confirming(
+            proxy_transport,
+            SHOWN_CODE,
+            CUSTODIAN_NAME,
+            StorageConfirmation::Silent,
+        )
     });
     let outcome = requester.pair_with_code(
         SHOWN_CODE,
@@ -566,7 +622,12 @@ fn an_unconfirmed_record_found_at_start_up_is_revoked() {
     );
     let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     let proxy = std::thread::spawn(move || {
-        proxy_pair_confirming(proxy_transport, SHOWN_CODE, StorageConfirmation::Silent)
+        proxy_pair_confirming(
+            proxy_transport,
+            SHOWN_CODE,
+            CUSTODIAN_NAME,
+            StorageConfirmation::Silent,
+        )
     });
     // The computer stops after storing its record, before the record of a
     // pairing the phone never confirmed could go: it stays unconfirmed.
@@ -1211,7 +1272,7 @@ fn a_refusal_moves_on_to_the_phone_that_shows_the_code() {
     let mut requester = test_requester();
     let (mut custodians, threads) = scripted(vec![refusing(), accepting()]);
     let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |peer, requested| {
-        assert_eq!(peer.display_name, "Phone");
+        assert_eq!(peer.display_name, CUSTODIAN_NAME);
         Some(requested.to_vec())
     });
     join(threads);
