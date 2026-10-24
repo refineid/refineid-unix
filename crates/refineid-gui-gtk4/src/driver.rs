@@ -839,6 +839,8 @@ impl UiDriver for Gtk4Driver {
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
         gtk4::init().map_err(|e| GuiCoreError::Driver(e.to_string()))?;
+        glib::set_prgname(Some("refineid-gui"));
+        glib::set_application_name("RefineID");
         Self::load_css();
 
         let context = glib::MainContext::default();
