@@ -1,0 +1,28 @@
+#!/bin/sh
+# Enables pcscd with polkit disabled: FreeBSD has no logind seat, so a
+# polkit-checked pcscd answers every client "Service not available".
+# pcscd is restarted when its flags change and started when it is not
+# running. An install into an alternate root only edits that root.
+ROOT="${PKG_ROOTDIR:-/}"
+FLAG="--disable-polkit"
+
+sysrc -q -R "$ROOT" pcscd_enable=YES >/dev/null
+flags="$(sysrc -n -q -R "$ROOT" pcscd_flags 2>/dev/null || true)"
+changed=0
+case " $flags " in
+    *" $FLAG "*) ;;
+    *)
+        sysrc -q -R "$ROOT" pcscd_flags="${flags:+$flags }$FLAG" >/dev/null
+        changed=1
+        ;;
+esac
+
+[ "$ROOT" = "/" ] || exit 0
+if service pcscd status >/dev/null 2>&1; then
+    if [ "$changed" -eq 1 ]; then
+        service pcscd restart >/dev/null 2>&1 || true
+    fi
+else
+    service pcscd start >/dev/null 2>&1 || true
+fi
+exit 0

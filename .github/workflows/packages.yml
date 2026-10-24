@@ -1,0 +1,222 @@
+name: packages
+
+# A v<VERSION> tag builds the Ubuntu and FreeBSD packages, attaches them to
+# the tag's GitHub Release, and publishes the signed Ubuntu and FreeBSD
+# repositories, which index the packages of every release, to GitHub Pages.
+# A manual run builds the packages and the signed repositories and keeps
+# them as workflow artifacts; it creates no release and deploys nothing.
+# The repository and deploy jobs of tag runs share one concurrency group: a
+# newer run supersedes a pending older one, and every site indexes all
+# releases.
+# doc/packages.md describes the pipeline and its one-time setup.
+
+'on':
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CORE_REPOSITORY: https://github.com/refineid/refineid-core.git
+  CARGO_TERM_COLOR: never
+
+jobs:
+  prepare:
+    name: Version and core revision
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      core-revision: ${{ steps.resolve.outputs.core-revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: resolve
+        run: |
+          version="$(tr -d '\r\n ' < VERSION)"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not name VERSION $version"
+            exit 1
+          fi
+          core_revision="$(git ls-remote "$CORE_REPOSITORY" refs/heads/main | cut -f1)"
+          [ -n "$core_revision" ]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "core-revision=$core_revision" >> "$GITHUB_OUTPUT"
+
+  deb:
+    name: Ubuntu 26.04 ${{ matrix.arch }}
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:26.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CORE_REVISION: ${{ needs.prepare.outputs.core-revision }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git rustup build-essential cmake pkg-config dpkg-dev \
+            libpcsclite-dev libgtk-3-dev libpango1.0-dev libcairo2-dev \
+            libfontconfig-dev libx11-dev libxext-dev libxinerama-dev \
+            libxcursor-dev libxrender-dev libxfixes-dev libxft-dev libxi-dev \
+            libxrandr-dev libxkbcommon-dev libwayland-dev libgl-dev
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Track refineid-core main
+        run: cargo update --package refineid-apdu --precise "$CORE_REVISION"
+      - name: Build packages
+        run: script/package-deb.sh
+      - name: Keep one architecture-independent package
+        if: matrix.arch != 'amd64'
+        run: rm -f target/deb/*_all.deb
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deb-${{ matrix.arch }}
+          path: target/deb/*.deb
+          if-no-files-found: error
+
+  freebsd:
+    name: FreeBSD 15 amd64
+    needs: prepare
+    runs-on: ubuntu-24.04
+    env:
+      CORE_REVISION: ${{ needs.prepare.outputs.core-revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: '15.1'
+          envs: CORE_REVISION
+          prepare: |
+            pkg install -y curl git pkgconf cmake ninja evdev-proto \
+              pcsc-lite libccid p11-kit nss gtk3 pango cairo fontconfig \
+              wayland libxkbcommon dbus mesa-libs libX11 libXext libXinerama \
+              libXcursor libXrender libXfixes libXft libXi libXrandr
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          run: |
+            . "$HOME/.cargo/env"
+            cargo update --package refineid-apdu --precise "$CORE_REVISION"
+            script/package-freebsd.sh
+            mkdir dist
+            mv target/freebsd/*.pkg dist/
+            rm -rf target
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pkg-freebsd-amd64
+          path: dist/*.pkg
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: github.event_name == 'push'
+    needs: [prepare, deb, freebsd]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORE_REVISION: ${{ needs.prepare.outputs.core-revision }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "RefineID $GITHUB_REF_NAME" \
+            --notes "Built with refineid-core $CORE_REVISION."
+
+  repository:
+    name: Signed repositories
+    if: ${{ !cancelled() && !failure() }}
+    needs: [deb, freebsd, release]
+    runs-on: ubuntu-24.04
+    environment: packages
+    concurrency:
+      group: ${{ github.event_name == 'push' && 'pages' || format('dry-run-{0}', github.run_id) }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: incoming
+          merge-multiple: true
+      - name: Fetch the packages of every release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+              --json tagName --jq '.[].tagName' \
+            | while read -r tag; do
+                gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+                  --dir incoming --skip-existing \
+                  --pattern '*.deb' --pattern '*.pkg'
+              done
+          ls -l incoming
+      - name: Build the Ubuntu repository
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          command -v apt-ftparchive >/dev/null \
+            || { sudo apt-get update && sudo apt-get install -y apt-utils; }
+          key="$RUNNER_TEMP/apt-signing-key.asc"
+          trap 'rm -f "$key"' EXIT
+          ( umask 077 && printf '%s\n' "$APT_SIGNING_KEY" > "$key" )
+          script/package-repo.sh ubuntu "$key" incoming site
+      # The action passes the variables named in envs to the VM over ssh
+      # SendEnv; the key exists only in this step's environment.
+      - name: Build the FreeBSD repository
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        env:
+          PKG_SIGNING_KEY: ${{ secrets.PKG_SIGNING_KEY }}
+        with:
+          release: '15.1'
+          envs: PKG_SIGNING_KEY
+          run: |
+            key="$(mktemp /tmp/pkg-signing-key.XXXXXX)"
+            trap 'rm -f "$key"' EXIT
+            printf '%s\n' "$PKG_SIGNING_KEY" > "$key"
+            script/package-repo.sh freebsd "$key" incoming site
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: Publish to GitHub Pages
+    if: github.event_name == 'push'
+    needs: repository
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -33,6 +33,9 @@ The macOS/iPadOS app lives in
 
 See [INSTALL](INSTALL) for full installation and uninstallation instructions.
 
+- **Ubuntu 26.04 and FreeBSD 15**: signed package repositories,
+  see [doc/packages.md](doc/packages.md).
+
 - **Debian / Ubuntu (.deb package)**:
   ```sh
   script/package-deb.sh

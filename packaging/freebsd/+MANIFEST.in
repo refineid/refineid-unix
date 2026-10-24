@@ -1,0 +1,16 @@
+name: refineid
+version: "@VERSION@"
+origin: security/refineid
+comment: "FINEID middleware for Finnish identity cards"
+desc: <<EOD
+RefineID is an open-source FINEID smart-card middleware for Finnish
+identity cards: the refineid command-line tool, the RefineID desktop
+application, and a PKCS#11 module that Firefox, Chromium and p11-kit
+programs use for card login and signing.
+EOD
+maintainer: "petri.koistinen@refineid.fi"
+www: "https://github.com/refineid/refineid-unix"
+prefix: "/usr/local"
+categories: [security]
+licenselogic: single
+licenses: [APACHE20]
