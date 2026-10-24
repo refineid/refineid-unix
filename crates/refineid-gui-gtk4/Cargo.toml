@@ -1,0 +1,23 @@
+[package]
+name = "refineid-gui-gtk4"
+description = "GTK4 presentation driver for RefineID"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+refineid-gui-core = { path = "../refineid-gui-core", version = "26" }
+refineid-client = { path = "../refineid-client", version = "26" }
+refineid-lib-core.workspace = true
+refineid-rapp-core.workspace = true
+zeroize.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+gtk4 = { workspace = true }

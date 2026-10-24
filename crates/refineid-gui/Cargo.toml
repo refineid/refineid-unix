@@ -11,7 +11,17 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# GTK4 driver (Tier 1, modern desktop with Apple HIG).
+gtk4 = ["dep:refineid-gui-gtk4"]
+# FLTK driver (Tier 2, lightweight/minimal).
+fltk = ["dep:refineid-gui-fltk"]
+default = ["gtk4"]
+
 [dependencies]
 refineid-gui-core = { path = "../refineid-gui-core", version = "26" }
-refineid-gui-fltk = { path = "../refineid-gui-fltk", version = "26" }
+
+refineid-gui-fltk = { path = "../refineid-gui-fltk", version = "26", optional = true }
+refineid-gui-gtk4 = { path = "../refineid-gui-gtk4", version = "26", optional = true }
+
 refineid-lib-core.workspace = true
