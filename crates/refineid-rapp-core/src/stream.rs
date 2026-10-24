@@ -58,8 +58,6 @@ pub struct StreamService {
     pub instance: String,
     /// `ip:port` endpoints that answered for this instance.
     pub endpoints: Vec<String>,
-    /// The host name the service record names, without the local domain.
-    pub host: String,
     /// The TXT `key=value` entries as published, in order.
     pub txt: Vec<(String, String)>,
 }
@@ -382,30 +380,12 @@ impl MdnsRecords {
             found.push(StreamService {
                 instance: label,
                 endpoints,
-                host: host_label(host),
                 txt: self.texts.get(&instance).cloned().unwrap_or_default(),
             });
         }
         found
     }
 }
-
-/// The host name as the device calls itself: the SRV target without its
-/// trailing dot and local domain, which DNS matches without regard to
-/// case (RFC 6762 section 16).
-fn host_label(host: &str) -> String {
-    let trimmed = host.strip_suffix('.').unwrap_or(host);
-    let label = trimmed
-        .len()
-        .checked_sub(LOCAL_DOMAIN.len())
-        .filter(|&cut| trimmed.is_char_boundary(cut))
-        .filter(|&cut| trimmed[cut..].eq_ignore_ascii_case(LOCAL_DOMAIN))
-        .map_or(trimmed, |cut| &trimmed[..cut]);
-    label.to_owned()
-}
-
-/// The domain mDNS host names carry, with its leading dot.
-const LOCAL_DOMAIN: &str = ".local";
 
 /// Parses one mDNS response into `records`; malformed input is ignored.
 fn parse_mdns_response(data: &[u8], responder: Option<Ipv4Addr>, records: &mut MdnsRecords) {
@@ -943,19 +923,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_host_label_drops_the_local_domain() {
-        assert_eq!(super::host_label("alpha-phone.local."), "alpha-phone");
-        assert_eq!(super::host_label("alpha-desk.local"), "alpha-desk");
-        assert_eq!(super::host_label("Alpha-Desk.LOCAL."), "Alpha-Desk");
-        assert_eq!(super::host_label("bare"), "bare");
-    }
-
     fn service(txt: &[(&str, String)]) -> StreamService {
         StreamService {
             instance: INSTANCE.to_owned(),
             endpoints: vec!["192.0.2.10:47110".to_owned()],
-            host: String::new(),
             txt: txt
                 .iter()
                 .map(|(key, value)| ((*key).to_owned(), value.clone()))
