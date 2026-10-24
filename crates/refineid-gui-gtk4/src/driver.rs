@@ -2099,4 +2099,161 @@ mod tests {
             ("No card".to_string(), "status-pill-gray")
         );
     }
+
+    #[test]
+    fn test_compute_sign_sensitivity() {
+        let mut state = UiState::default();
+        // Default: no docs, no card -> false
+        assert!(!compute_sign_sensitivity(&state, 6));
+
+        // Add local card and signature support
+        state.has_local_card = true;
+        state.signature_supported = true;
+        assert!(!compute_sign_sensitivity(&state, 6)); // still no docs
+
+        // Add doc
+        state.pdf_documents.push(PathBuf::from("/tmp/doc.pdf"));
+        assert!(compute_sign_sensitivity(&state, 6)); // 6 digits -> true
+        assert!(compute_sign_sensitivity(&state, 12)); // 12 digits -> true
+        assert!(!compute_sign_sensitivity(&state, 5)); // 5 digits -> false
+        assert!(!compute_sign_sensitivity(&state, 13)); // 13 digits -> false
+
+        // Busy overrides
+        state.busy = true;
+        assert!(!compute_sign_sensitivity(&state, 6));
+        state.busy = false;
+
+        // Missing signature support
+        state.signature_supported = false;
+        assert!(!compute_sign_sensitivity(&state, 6));
+        state.signature_supported = true;
+
+        // Card removed, phone present
+        state.has_local_card = false;
+        state.phone = Some(PairedPhone {
+            pair_id: PairId::from_array(*b"pair-id-test-001"),
+            name: "Phone".to_string(),
+            platform: "iOS".to_string(),
+            certificate_cached: true,
+        });
+        assert!(compute_sign_sensitivity(&state, 6));
+    }
+
+    #[test]
+    fn test_code_boxes_in_process() {
+        if gtk4::init().is_err() {
+            eprintln!("GTK4 init skipped (no display)");
+            return;
+        }
+
+        let cb = CodeBoxes::new();
+        assert_eq!(cb.labels.len(), PAIRING_CODE_LEN);
+        for lbl in &cb.labels {
+            assert_eq!(lbl.label(), "");
+        }
+
+        // Test update
+        cb.update("7KX4M9");
+        assert_eq!(cb.labels[0].label(), "7");
+        assert_eq!(cb.labels[1].label(), "K");
+        assert_eq!(cb.labels[2].label(), "X");
+        assert_eq!(cb.labels[3].label(), "4");
+        assert_eq!(cb.labels[4].label(), "M");
+        assert_eq!(cb.labels[5].label(), "9");
+
+        // Test clear
+        cb.clear();
+        assert_eq!(cb.entry.text(), "");
+        for lbl in &cb.labels {
+            assert_eq!(lbl.label(), "");
+        }
+    }
+
+    #[test]
+    fn test_status_widgets_lifecycle_in_process() {
+        if gtk4::init().is_err() {
+            eprintln!("GTK4 init skipped (no display)");
+            return;
+        }
+
+        let app_win = gtk4::ApplicationWindow::builder().build();
+        let controller = RefineIdController::new(|_| {});
+        let (pw_win, pw_widgets) = build_pincodes_window(&controller, &app_win);
+        let key_button = gtk4::Button::builder().build();
+        let key_icon = gtk4::Image::from_icon_name("network-wireless-symbolic");
+        let (_main_box, sw) =
+            build_status_view(&controller, &app_win, &pw_win, key_button, key_icon);
+
+        // 1. Initial / Disconnected state: no reader
+        let mut state = UiState::default();
+        state.reader_connected = false;
+        Gtk4Driver::apply_status_state(&sw, &state);
+        assert_eq!(sw.holder_name_label.text(), "Connect a card reader.");
+        assert_eq!(sw.status_pill_label.text(), "No Reader");
+        assert!(!sw.sign_button.is_sensitive());
+        assert!(!sw.document_pile_box.is_visible());
+        assert!(sw.drop_invitation_box.is_visible());
+
+        // 2. Reader connected without card
+        state.reader_connected = true;
+        Gtk4Driver::apply_status_state(&sw, &state);
+        assert_eq!(
+            sw.holder_name_label.text(),
+            "Insert the card into the reader."
+        );
+        assert_eq!(sw.status_pill_label.text(), "No Card");
+
+        // 3. Card inserted
+        state.has_local_card = true;
+        state.signature_supported = true;
+        Gtk4Driver::apply_status_state(&sw, &state);
+        assert_eq!(sw.status_pill_label.text(), "Not Ready"); // No cards report yet
+        assert_eq!(*sw.remote_action.borrow(), RemoteButtonAction::OpenPinCodes);
+
+        // 4. Remote phone connected
+        state.has_local_card = false;
+        state.phone = Some(PairedPhone {
+            pair_id: PairId::from_array(*b"pair-id-test-001"),
+            name: "Pixel 9".to_string(),
+            platform: "Android".to_string(),
+            certificate_cached: true,
+        });
+        Gtk4Driver::apply_status_state(&sw, &state);
+        assert_eq!(sw.status_pill_label.text(), "Via Phone");
+        assert_eq!(sw.holder_name_label.text(), "Connected to Pixel 9");
+        assert_eq!(*sw.remote_action.borrow(), RemoteButtonAction::ForgetPhone);
+
+        // 5. Pairing ceremony active
+        state.phone = None;
+        state.pairing = Some(RappPairingState {
+            code: "7KX4M9".to_string(),
+            status: "Looking for phone...".to_string(),
+        });
+        Gtk4Driver::apply_status_state(&sw, &state);
+        assert!(sw.pairing_box.is_visible());
+        assert!(!sw.normal_identity_box.is_visible());
+        assert_eq!(sw.pairing_status_label.text(), "Looking for phone...");
+        assert_eq!(sw.pairing_code_boxes.labels[0].label(), "7");
+        assert_eq!(sw.pairing_code_boxes.labels[5].label(), "9");
+
+        // 6. Documents and signing sensitivity
+        state.pairing = None;
+        state.has_local_card = true;
+        state.pdf_documents.push(PathBuf::from("/tmp/contract.pdf"));
+        Gtk4Driver::apply_status_state(&sw, &state);
+        assert!(sw.document_pile_box.is_visible());
+        assert!(!sw.drop_invitation_box.is_visible());
+        assert!(!sw.sign_button.is_sensitive()); // PIN 2 not yet entered
+
+        // Set PIN 2 text
+        sw.pin2_entry.set_text("123456");
+        Gtk4Driver::update_sign_button_sensitivity(&sw);
+        assert!(sw.sign_button.is_sensitive());
+
+        // 7. Auxiliary PIN codes status
+        Gtk4Driver::apply_pincodes_state(&pw_widgets, &state);
+        assert!(pw_widgets.attempts_label.text().contains("PIN 1:"));
+        assert!(pw_widgets.attempts_label.text().contains("PIN 2:"));
+        assert!(pw_widgets.attempts_label.text().contains("PUK:"));
+    }
 }
