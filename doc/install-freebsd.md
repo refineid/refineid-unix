@@ -67,6 +67,9 @@ lookup answers SERVFAIL and pkg cannot resolve its mirrors; a file
 `/var/unbound/conf.d/no-dnssec.conf` with `module-config: "iterator"`
 and `service local_unbound restart` fixes it.
 
+For automatic network link failover between wired Ethernet and Wi-Fi on
+laptops or workstations, see [freebsd-network-failover.md](freebsd-network-failover.md).
+
 ## 4. Build
 
 The sources need no change. The FLTK crate builds FLTK with its Wayland
