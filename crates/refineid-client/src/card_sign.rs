@@ -34,7 +34,8 @@ use std::path::PathBuf;
 
 use refineid_lib_core::apdu::status_word::StatusWord;
 use refineid_lib_core::auth::{
-    AuthError, PinOps as _, PinPolicyReason, PinReferenceScheme, PinSlot, VerifyOutcome,
+    AuthError, PinOps as _, PinPolicyReason, PinReferenceScheme, PinSlot, RetryFloorRefusal,
+    VerifyOutcome, check_retry_floor,
 };
 use refineid_lib_core::backend::{
     ReaderAccessCap, ReaderBackend as _, ReaderBackendOps as _, ReaderPickError,
@@ -539,6 +540,10 @@ pub enum SignErrorKind {
         /// `AuthenticationFailed`, ...).
         outcome: VerifyOutcome,
     },
+    /// The retry floor refused the VERIFY: the card reports two, one or
+    /// no tries left, the PIN blocked, or no readable counter. No APDU
+    /// that can spend an attempt went out.
+    RetryFloor(RetryFloorRefusal),
     /// Local-policy rejection (PIN length / non-digit) before any
     /// APDU went out. Counter is unaffected.
     PinPolicy {
@@ -658,6 +663,7 @@ impl fmt::Display for SignErrorKind {
                 outcome: VerifyOutcome::Ok,
                 ..
             } => write!(f, "internal: PinRejected(Ok) is not an error state"),
+            Self::RetryFloor(refusal) => write!(f, "{refusal}"),
             Self::PinPolicy { slot, reason } => {
                 write!(f, "{} rejected locally: {reason}", slot.pin_label())
             }
@@ -1047,6 +1053,13 @@ fn sign_chain<T: CardTransport>(
             AuthError::Transport(t) => SignErrorKind::Transport(format!("{t}")),
             AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
         })?;
+    let status = transport
+        .pin_status_with_scheme(slot.pin_slot(), scheme)
+        .map_err(|e| match e {
+            AuthError::Transport(t) => SignErrorKind::Transport(format!("{t}")),
+            AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
+        })?;
+    check_retry_floor(slot.pin_slot(), status).map_err(SignErrorKind::RetryFloor)?;
     let outcome = transport
         .verify_pin_with_scheme(slot.pin_slot(), scheme, options.pin.clone())
         .map_err(|e| match e {

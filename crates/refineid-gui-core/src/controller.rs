@@ -26,7 +26,7 @@ use refineid_client::card_pin::{
     ActivateOptions, ChangePinOptions, PinManageSlot, UnblockPinOptions,
 };
 use refineid_client::card_sign::DEFAULT_TIMESTAMP_AUTHORITY;
-use refineid_lib_core::auth::{ChangePinOutcome, UnblockOutcome};
+use refineid_lib_core::auth::{ChangePinOutcome, PinSlot, UnblockOutcome};
 use refineid_lib_core::backend::{ReaderFilter, ReaderPickError};
 use refineid_lib_core::identity::{CredentialIdentity, TokenSerial, render_token_serial};
 use refineid_lib_core::pin::{
@@ -267,9 +267,9 @@ impl RefineIdController {
                 state.pin2_status = card.report.pin2;
                 state.puk_status = card.report.puk;
                 state.pin1_change_available =
-                    is_local && card.pin_change_available(card.report.pin1.as_ref());
+                    is_local && card.pin_change_available(PinSlot::Pin1, card.report.pin1.as_ref());
                 state.pin2_change_available =
-                    is_local && card.pin_change_available(card.report.pin2.as_ref());
+                    is_local && card.pin_change_available(PinSlot::Pin2, card.report.pin2.as_ref());
                 state.activation_available = is_local && card.activation_available();
                 state.legacy_activation = is_local && card.legacy_activation_required();
                 let (p1_rec, p2_rec) = if is_local {

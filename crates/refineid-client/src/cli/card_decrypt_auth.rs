@@ -66,6 +66,7 @@ impl DecryptAuthArgs {
                 if matches!(
                     &e,
                     crate::card_decrypt::DecryptAuthError::PinRejected(_)
+                        | crate::card_decrypt::DecryptAuthError::RetryFloor(_)
                         | crate::card_decrypt::DecryptAuthError::PinPolicy(_)
                 ) =>
             {

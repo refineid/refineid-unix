@@ -128,7 +128,7 @@ impl ActivateArgs {
                 CardActivateHelpers::activate_outcome_exit(&report)
             }
             Err(CardPinError::ReaderPick(pe)) => super::util::reader_pick_exit(CMD, &pe),
-            Err(e @ CardPinError::PinPolicy(_)) => {
+            Err(e @ (CardPinError::PinPolicy(_) | CardPinError::RetryFloor(_))) => {
                 eprintln!("{CMD}: {e}");
                 ExitStatus::CardCredentialRejected.into()
             }

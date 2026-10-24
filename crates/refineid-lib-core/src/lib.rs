@@ -96,7 +96,6 @@ pub mod ocsp;
 pub mod oid;
 pub mod pace;
 pub mod pin;
-pub mod pin_retry_risk;
 pub mod pkcs15;
 pub mod revocation;
 pub mod rng;
