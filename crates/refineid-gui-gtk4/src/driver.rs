@@ -1975,6 +1975,7 @@ fn build_pincodes_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refineid_gui_core::model::{PairId, PairedPhone, RappPairingState};
     use refineid_lib_core::apdu::status_word::PinRetries;
 
     #[test]
