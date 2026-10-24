@@ -15,7 +15,7 @@
 //!   for changing PIN 1/2, unblocking with PUK, and card activation.
 //! - Masked `PasswordEntry` with peek eye icon, zero PIN logging, and explicit buffer clearance.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -36,6 +36,12 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 
+/// Full pristine retry limit for PIN and PUK (FINEID S4-1).
+const RETRY_FULL_THRESHOLD: usize = PIN_TRY_LIMIT as usize;
+
+/// Retry counter warning threshold. Below this count, warnings are highlighted.
+const RETRY_WARN_THRESHOLD: usize = 3;
+
 /// Minimum and maximum PUK length (8..=12 digits, FINEID S4-1 §8.1.5).
 const MIN_PUK_DIGITS: usize = Puk::MIN_LENGTH;
 const MAX_PUK_DIGITS: usize = Puk::MAX_LENGTH;
@@ -54,6 +60,17 @@ const MAX_PIN2_DIGITS: usize = PinBytes::MAX_LENGTH;
 
 /// Total characters for RAPP pairing code.
 const PAIRING_CODE_LEN: usize = PAIRING_CODE_LENGTH;
+
+/// Action represented by the titlebar remote switch / key button.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RemoteButtonAction {
+    /// Card is present in local reader: button opens auxiliary PIN codes window.
+    OpenPinCodes,
+    /// No card or phone connected: button toggles the inline RAPP pairing code ceremony.
+    TogglePairing,
+    /// Remote phone is connected: button permits disconnecting / forgetting the paired phone.
+    ForgetPhone,
+}
 
 /// Safely construct [`PinBytes`] from user input.
 fn to_pin_bytes(s: &str) -> Option<PinBytes> {
@@ -81,15 +98,15 @@ fn format_pin_status(status: Option<&PinStatus>, changed: Option<bool>) -> (Stri
     match status {
         Some(PinStatus::Remaining(retries)) => {
             let count = retries.get() as usize;
-            let limit = PIN_TRY_LIMIT;
+            let limit = RETRY_FULL_THRESHOLD;
             let note = if changed == Some(false) {
                 " • Factory"
             } else {
                 ""
             };
-            if count >= 5 {
+            if count >= RETRY_FULL_THRESHOLD {
                 (format!("{count} / {limit}{note}"), "status-pill-green")
-            } else if count >= 3 {
+            } else if count >= RETRY_WARN_THRESHOLD {
                 (format!("{count} / {limit}{note}"), "status-pill-orange")
             } else {
                 (format!("{count} / {limit}{note}"), "status-pill-red")
@@ -108,9 +125,9 @@ fn format_puk_status(status: Option<&PukStatus>) -> (String, &'static str) {
     match status {
         Some(PukStatus::Remaining(retries)) => {
             let count = retries.get() as usize;
-            if count >= 5 {
+            if count >= RETRY_FULL_THRESHOLD {
                 (format!("{count} remaining"), "status-pill-green")
-            } else if count >= 3 {
+            } else if count >= RETRY_WARN_THRESHOLD {
                 (format!("{count} remaining"), "status-pill-orange")
             } else {
                 (format!("{count} remaining"), "status-pill-red")
@@ -140,19 +157,46 @@ fn show_alert(parent: &impl IsA<gtk4::Window>, message: &str) {
     dialog.present();
 }
 
+/// Helper confirmation modal dialog.
+fn show_confirm(
+    parent: &impl IsA<gtk4::Window>,
+    message: &str,
+    on_confirm: impl FnOnce() + 'static,
+) {
+    let dialog = gtk4::MessageDialog::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("RefineID")
+        .text(message)
+        .message_type(gtk4::MessageType::Question)
+        .buttons(gtk4::ButtonsType::OkCancel)
+        .build();
+    let cb = RefCell::new(Some(on_confirm));
+    dialog.connect_response(move |d, resp| {
+        if resp == gtk4::ResponseType::Ok
+            && let Some(action) = cb.borrow_mut().take()
+        {
+            action();
+        }
+        d.close();
+    });
+    dialog.present();
+}
+
 // ---------------------------------------------------------------------------
 // 6-Box Pairing Code Entry Component
 // ---------------------------------------------------------------------------
 
 struct CodeBoxes {
-    container: gtk4::Box,
+    overlay: gtk4::Overlay,
     labels: Vec<gtk4::Label>,
     entry: gtk4::Entry,
+    is_focused: Rc<Cell<bool>>,
 }
 
 impl CodeBoxes {
     fn new() -> Self {
-        let container = gtk4::Box::builder()
+        let boxes_box = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(6)
             .halign(gtk4::Align::Center)
@@ -162,56 +206,95 @@ impl CodeBoxes {
         let mut boxes = Vec::with_capacity(PAIRING_CODE_LEN);
         for i in 0..PAIRING_CODE_LEN {
             if i > 0 && i % PAIRING_CODE_GROUP_SIZE == 0 {
-                let spacer = gtk4::Box::builder().width_request(12).build();
-                container.append(&spacer);
+                let spacer = gtk4::Box::builder().width_request(14).build();
+                boxes_box.append(&spacer);
             }
             let lbl = gtk4::Label::builder()
                 .label("")
-                .width_request(40)
-                .height_request(48)
+                .width_request(44)
+                .height_request(52)
                 .halign(gtk4::Align::Center)
                 .valign(gtk4::Align::Center)
                 .build();
             lbl.add_css_class("code-box");
-            container.append(&lbl);
+            boxes_box.append(&lbl);
             boxes.push(lbl);
         }
 
         let entry = gtk4::Entry::builder()
-            .visible(true)
-            .opacity(0.0)
             .can_focus(true)
-            .width_chars(1)
-            .max_width_chars(1)
             .max_length(PAIRING_CODE_LEN as i32)
+            .halign(gtk4::Align::Fill)
+            .valign(gtk4::Align::Fill)
             .build();
-        container.append(&entry);
+        entry.add_css_class("code-box-entry-overlay");
+
+        let overlay = gtk4::Overlay::builder()
+            .halign(gtk4::Align::Center)
+            .valign(gtk4::Align::Center)
+            .child(&boxes_box)
+            .build();
+        overlay.add_overlay(&entry);
 
         let click_gesture = gtk4::GestureClick::new();
         let e_click = entry.clone();
         click_gesture.connect_pressed(move |_, _, _, _| {
             e_click.grab_focus();
+            e_click.select_region(-1, -1);
+            e_click.set_position(-1);
         });
-        container.add_controller(click_gesture);
+        overlay.add_controller(click_gesture);
+
+        let is_focused = Rc::new(Cell::new(false));
+        let focus_ctrl = gtk4::EventControllerFocus::new();
+        {
+            let foc = Rc::clone(&is_focused);
+            let e_ent = entry.clone();
+            focus_ctrl.connect_enter(move |_| {
+                foc.set(true);
+                e_ent.select_region(-1, -1);
+                e_ent.set_position(-1);
+            });
+        }
+        {
+            let foc = Rc::clone(&is_focused);
+            focus_ctrl.connect_leave(move |_| {
+                foc.set(false);
+            });
+        }
+        entry.add_controller(focus_ctrl);
 
         Self {
-            container,
+            overlay,
             labels: boxes,
             entry,
+            is_focused,
         }
     }
 
     fn update(&self, code: &str) {
-        let chars: Vec<char> = code.chars().collect();
+        let chars: Vec<char> = code.chars().filter_map(pairing_code_character).collect();
+        let current_len = chars.len();
         for (i, lbl) in self.labels.iter().enumerate() {
             if let Some(&c) = chars.get(i) {
                 lbl.set_label(&c.to_string());
                 lbl.add_css_class("code-box-filled");
+                lbl.remove_css_class("code-box-active");
             } else {
                 lbl.set_label("");
                 lbl.remove_css_class("code-box-filled");
+                if i == current_len && self.is_focused.get() {
+                    lbl.add_css_class("code-box-active");
+                } else {
+                    lbl.remove_css_class("code-box-active");
+                }
             }
         }
+    }
+
+    fn clear(&self) {
+        self.entry.set_text("");
+        self.update("");
     }
 }
 
@@ -223,6 +306,7 @@ struct StatusWidgets {
     // Top bar / Remote Use
     key_button: gtk4::Button,
     key_icon: gtk4::Image,
+    remote_action: Rc<RefCell<RemoteButtonAction>>,
 
     // Identity Section
     normal_identity_box: gtk4::Box,
@@ -235,10 +319,8 @@ struct StatusWidgets {
     pairing_status_label: gtk4::Label,
     pairing_spinner: gtk4::Spinner,
 
-    // Drop Invitation (empty)
+    // Document Section
     drop_invitation_box: gtk4::Box,
-
-    // Document Pile (queued)
     document_pile_box: gtk4::Box,
     doc_list: gtk4::ListBox,
 
@@ -250,7 +332,8 @@ struct StatusWidgets {
     sign_note_label: gtk4::Label,
     sign_button: gtk4::Button,
 
-    // Trackers
+    // State Trackers
+    current_ui_state: RefCell<UiState>,
     last_pdf_documents: RefCell<Vec<PathBuf>>,
     showing_pairing: Rc<RefCell<bool>>,
 }
@@ -317,19 +400,24 @@ impl Gtk4Driver {
 
     /// Update status widgets with new [`UiState`].
     fn apply_status_state(sw: &StatusWidgets, state: &UiState) {
+        *sw.current_ui_state.borrow_mut() = state.clone();
+
         // 1. RemoteUseButton update
         if state.has_local_card {
+            *sw.remote_action.borrow_mut() = RemoteButtonAction::OpenPinCodes;
             sw.key_icon.set_icon_name(Some("dialog-password-symbolic"));
             sw.key_button.set_tooltip_text(Some("PIN Codes"));
             sw.key_button.remove_css_class("apple-circle-button-active");
             sw.key_button.set_sensitive(!state.busy);
         } else if let Some(ref phone) = state.phone {
+            *sw.remote_action.borrow_mut() = RemoteButtonAction::ForgetPhone;
             sw.key_icon.set_icon_name(Some("network-wireless-symbolic"));
             sw.key_button
-                .set_tooltip_text(Some(&format!("{} connected", phone.name)));
+                .set_tooltip_text(Some(&format!("{} connected (click to forget)", phone.name)));
             sw.key_button.add_css_class("apple-circle-button-active");
             sw.key_button.set_sensitive(!state.busy);
         } else {
+            *sw.remote_action.borrow_mut() = RemoteButtonAction::TogglePairing;
             sw.key_icon.set_icon_name(Some("network-wireless-symbolic"));
             sw.key_button.set_tooltip_text(Some("Pair Phone"));
             sw.key_button.remove_css_class("apple-circle-button-active");
@@ -346,6 +434,10 @@ impl Gtk4Driver {
             if let Some(ref pairing) = state.pairing {
                 sw.pairing_code_boxes.update(&pairing.code);
                 sw.pairing_status_label.set_text(&pairing.status);
+            } else {
+                sw.pairing_code_boxes
+                    .update(&sw.pairing_code_boxes.entry.text());
+                sw.pairing_status_label.set_text(&state.status_message);
             }
             if state.busy {
                 sw.pairing_spinner.start();
@@ -456,13 +548,10 @@ impl Gtk4Driver {
                 SignFormat::Pades => sw.btn_format_pades.set_active(true),
                 SignFormat::AsicE => sw.btn_format_asice.set_active(true),
             }
-
-            let can_sign = (state.has_local_card || state.phone.is_some())
-                && !state.pdf_documents.is_empty()
-                && sw.pin2_entry.text().len() >= MIN_PIN2_DIGITS
-                && !state.busy;
-            sw.sign_button.set_sensitive(can_sign);
         }
+
+        // Update unified sign button sensitivity
+        Self::update_sign_button_sensitivity(sw);
 
         if state.busy {
             sw.sign_spinner.start();
@@ -479,6 +568,18 @@ impl Gtk4Driver {
         }
     }
 
+    /// Single unified source of truth for Sign button sensitivity.
+    fn update_sign_button_sensitivity(sw: &StatusWidgets) {
+        let state = sw.current_ui_state.borrow();
+        let pin_len = sw.pin2_entry.text().chars().count();
+        let can_sign = (state.has_local_card || state.phone.is_some())
+            && state.signature_supported
+            && !state.pdf_documents.is_empty()
+            && (MIN_PIN2_DIGITS..=MAX_PIN2_DIGITS).contains(&pin_len)
+            && !state.busy;
+        sw.sign_button.set_sensitive(can_sign);
+    }
+
     /// Update PIN Codes auxiliary window with [`UiState`].
     fn apply_pincodes_state(pw: &PinCodesWidgets, state: &UiState) {
         let (p1_text, _) = format_pin_status(state.pin1_status.as_ref(), state.pin1_changed);
@@ -488,9 +589,9 @@ impl Gtk4Driver {
             "PIN 1: {p1_text}  •  PIN 2: {p2_text}  •  PUK: {puk_text}"
         ));
 
-        let is_below_full = matches!(state.pin1_status, Some(PinStatus::Remaining(r)) if r.get() < 5)
-            || matches!(state.pin2_status, Some(PinStatus::Remaining(r)) if r.get() < 5)
-            || matches!(state.puk_status, Some(PukStatus::Remaining(r)) if r.get() < 5);
+        let is_below_full = matches!(state.pin1_status, Some(PinStatus::Remaining(r)) if (r.get() as usize) < RETRY_FULL_THRESHOLD)
+            || matches!(state.pin2_status, Some(PinStatus::Remaining(r)) if (r.get() as usize) < RETRY_FULL_THRESHOLD)
+            || matches!(state.puk_status, Some(PukStatus::Remaining(r)) if (r.get() as usize) < RETRY_FULL_THRESHOLD);
         pw.attempts_bar.set_visible(is_below_full);
 
         pw.change_pin1_button
@@ -628,15 +729,35 @@ impl Gtk4Driver {
                 background: #1c1c1e;
                 border: 1px solid #3a3a3c;
                 border-radius: 8px;
-                min-width: 40px;
-                min-height: 48px;
-                font-size: 22px;
+                min-width: 44px;
+                min-height: 52px;
+                font-size: 24px;
                 font-weight: 700;
                 color: #ffffff;
             }
             .code-box-filled {
                 border-color: #0a84ff;
                 background: #2c2c2e;
+            }
+            .code-box-active {
+                border-color: #0a84ff;
+                border-width: 2px;
+            }
+            .code-box-entry-overlay {
+                opacity: 0.01;
+                background: transparent;
+                border: none;
+                box-shadow: none;
+                caret-color: transparent;
+                color: transparent;
+            }
+            .code-box-entry-overlay:focus {
+                opacity: 0.01;
+                background: transparent;
+                border: none;
+                box-shadow: none;
+                caret-color: transparent;
+                color: transparent;
             }
             .status-pill {
                 border-radius: 12px;
@@ -760,7 +881,10 @@ impl UiDriver for Gtk4Driver {
                     *sw_cell.borrow().showing_pairing.borrow_mut() = true;
                     sw_cell.borrow().normal_identity_box.set_visible(false);
                     sw_cell.borrow().pairing_box.set_visible(true);
-                    sw_cell.borrow().pairing_code_boxes.entry.grab_focus();
+                    let e = sw_cell.borrow().pairing_code_boxes.entry.clone();
+                    glib::idle_add_local_once(move || {
+                        e.grab_focus();
+                    });
                 }
                 "pins" | "pin" => {
                     pincodes_win.present();
@@ -804,6 +928,8 @@ fn build_status_view(
         .margin_start(24)
         .margin_end(24)
         .build();
+
+    let remote_action = Rc::new(RefCell::new(RemoteButtonAction::TogglePairing));
 
     // -----------------------------------------------------------------------
     // Card 1: Identity / Status
@@ -871,7 +997,7 @@ fn build_status_view(
     btn_cancel_pair.add_css_class("apple-link-button");
 
     pairing_box.append(&pairing_prompt_lbl);
-    pairing_box.append(&pairing_code_boxes.container);
+    pairing_box.append(&pairing_code_boxes.overlay);
     pairing_box.append(&pairing_status_label);
     pairing_box.append(&pairing_spinner);
     pairing_box.append(&btn_cancel_pair);
@@ -918,22 +1044,6 @@ fn build_status_view(
     drop_invitation_box.append(&doc_icon);
     drop_invitation_box.append(&drop_label);
     drop_invitation_box.append(&btn_choose_empty);
-
-    // Attach DropTarget for drag-and-drop
-    let drop_target = gtk4::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);
-    {
-        let c_drop = Arc::clone(controller);
-        drop_target.connect_drop(move |_, value, _, _| {
-            if let Ok(file) = value.get::<gio::File>()
-                && let Some(path) = file.path()
-            {
-                c_drop.handle_intent(UserIntent::AddDocuments(vec![path]));
-                return true;
-            }
-            false
-        });
-    }
-    drop_invitation_box.add_controller(drop_target);
 
     // Document Pile (queued state)
     let document_pile_box = gtk4::Box::builder()
@@ -1052,6 +1162,23 @@ fn build_status_view(
 
     signing_card.append(&drop_invitation_box);
     signing_card.append(&document_pile_box);
+
+    // Attach DropTarget across the entire signing card (empty drop zone or active pile)
+    let drop_target = gtk4::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);
+    {
+        let c_drop = Arc::clone(controller);
+        drop_target.connect_drop(move |_, value, _, _| {
+            if let Ok(file) = value.get::<gio::File>()
+                && let Some(path) = file.path()
+            {
+                c_drop.handle_intent(UserIntent::AddDocuments(vec![path]));
+                return true;
+            }
+            false
+        });
+    }
+    signing_card.add_controller(drop_target);
+
     main_box.append(&signing_card);
 
     // Wire up events
@@ -1064,13 +1191,14 @@ fn build_status_view(
         let n_box = normal_identity_box.clone();
         let p_box = pairing_box.clone();
         let c_boxes = pairing_code_boxes.entry.clone();
-        key_button.connect_clicked(move |btn| {
-            if btn.has_css_class("apple-circle-button-active") {
-                // Phone connected
-            } else if btn.tooltip_text().as_deref() == Some("PIN Codes") {
+        let c_key = Arc::clone(controller);
+        let win_clone = window.clone();
+        let ra_action = Rc::clone(&remote_action);
+        key_button.connect_clicked(move |_| match *ra_action.borrow() {
+            RemoteButtonAction::OpenPinCodes => {
                 pw_win.present();
-            } else {
-                // Toggle pairing prompt
+            }
+            RemoteButtonAction::TogglePairing => {
                 let cur = *sp.borrow();
                 *sp.borrow_mut() = !cur;
                 n_box.set_visible(cur);
@@ -1078,6 +1206,16 @@ fn build_status_view(
                 if !cur {
                     c_boxes.grab_focus();
                 }
+            }
+            RemoteButtonAction::ForgetPhone => {
+                let c_forget = Arc::clone(&c_key);
+                show_confirm(
+                    &win_clone,
+                    "Disconnect and forget this paired phone?",
+                    move || {
+                        c_forget.handle_intent(UserIntent::ForgetPhone);
+                    },
+                );
             }
         });
     }
@@ -1087,11 +1225,35 @@ fn build_status_view(
         let sp = Rc::clone(&showing_pairing);
         let n_box = normal_identity_box.clone();
         let p_box = pairing_box.clone();
+        let c_boxes_clear = CodeBoxes {
+            overlay: pairing_code_boxes.overlay.clone(),
+            labels: pairing_code_boxes.labels.clone(),
+            entry: pairing_code_boxes.entry.clone(),
+            is_focused: pairing_code_boxes.is_focused.clone(),
+        };
         btn_cancel_pair.connect_clicked(move |_| {
             *sp.borrow_mut() = false;
             p_box.set_visible(false);
             n_box.set_visible(true);
+            c_boxes_clear.clear();
         });
+    }
+
+    // Attach key listener to window to focus entry automatically on any key press when pairing
+    {
+        let key_ctrl = gtk4::EventControllerKey::new();
+        let e_key = pairing_code_boxes.entry.clone();
+        let foc = Rc::clone(&pairing_code_boxes.is_focused);
+        let sp = Rc::clone(&showing_pairing);
+        key_ctrl.connect_key_pressed(move |_, _, _, _| {
+            if *sp.borrow() && !foc.get() {
+                e_key.grab_focus();
+                e_key.select_region(-1, -1);
+                e_key.set_position(-1);
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(key_ctrl);
     }
 
     // Pairing code entry
@@ -1099,24 +1261,39 @@ fn build_status_view(
         let c = Arc::clone(controller);
         let last_submitted: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let cboxes_lbls = pairing_code_boxes.labels.clone();
+        let update_labels = move |text: &str, is_focused: bool| {
+            let chars: Vec<char> = text.chars().collect();
+            let current_len = chars.len();
+            for (i, lbl) in cboxes_lbls.iter().enumerate() {
+                if let Some(&ch) = chars.get(i) {
+                    lbl.set_label(&ch.to_string());
+                    lbl.add_css_class("code-box-filled");
+                    lbl.remove_css_class("code-box-active");
+                } else {
+                    lbl.set_label("");
+                    lbl.remove_css_class("code-box-filled");
+                    if i == current_len && is_focused {
+                        lbl.add_css_class("code-box-active");
+                    } else {
+                        lbl.remove_css_class("code-box-active");
+                    }
+                }
+            }
+        };
+
+        let u1 = update_labels.clone();
+        let foc_ch = Rc::clone(&pairing_code_boxes.is_focused);
         pairing_code_boxes.entry.connect_changed(move |e| {
             let cur = e.text();
             let filtered = filter_pairing_code(&cur);
             if cur != filtered {
                 e.set_text(&filtered);
+                e.select_region(-1, -1);
+                e.set_position(-1);
                 return;
             }
-            let chars: Vec<char> = filtered.chars().collect();
-            for (i, lbl) in cboxes_lbls.iter().enumerate() {
-                if let Some(&ch) = chars.get(i) {
-                    lbl.set_label(&ch.to_string());
-                    lbl.add_css_class("code-box-filled");
-                } else {
-                    lbl.set_label("");
-                    lbl.remove_css_class("code-box-filled");
-                }
-            }
-            if filtered.len() == PAIRING_CODE_LEN {
+            u1(&filtered, foc_ch.get());
+            if filtered.chars().count() == PAIRING_CODE_LEN {
                 let mut prev = last_submitted.borrow_mut();
                 if prev.as_deref() == Some(&filtered) {
                     return;
@@ -1127,6 +1304,25 @@ fn build_status_view(
                 *last_submitted.borrow_mut() = None;
             }
         });
+
+        {
+            let u_foc = update_labels.clone();
+            let e_foc = pairing_code_boxes.entry.clone();
+            let foc_ctrl = gtk4::EventControllerFocus::new();
+            foc_ctrl.connect_enter(move |_| {
+                u_foc(&e_foc.text(), true);
+            });
+            pairing_code_boxes.entry.add_controller(foc_ctrl);
+        }
+        {
+            let u_foc = update_labels.clone();
+            let e_foc = pairing_code_boxes.entry.clone();
+            let foc_ctrl = gtk4::EventControllerFocus::new();
+            foc_ctrl.connect_leave(move |_| {
+                u_foc(&e_foc.text(), false);
+            });
+            pairing_code_boxes.entry.add_controller(foc_ctrl);
+        }
     }
 
     // File chooser helper
@@ -1176,7 +1372,7 @@ fn build_status_view(
     let cf2 = choose_files;
     btn_add_more.connect_clicked(move |_| cf2());
 
-    // Clear documents
+    // Clear documents (immediate Apple HIG action)
     {
         let c = Arc::clone(controller);
         btn_clear_docs.connect_clicked(move |_| {
@@ -1203,8 +1399,10 @@ fn build_status_view(
     }
 
     // PIN 2 Filter & Sign button sensitivity
+    let current_ui_state = RefCell::new(UiState::default());
     {
         let s_btn = sign_button.clone();
+        let p2_ent = pin2_entry.clone();
         pin2_entry.connect_changed(move |e| {
             let cur = e.text();
             let filtered = filter_digits(&cur, MAX_PIN2_DIGITS);
@@ -1212,7 +1410,10 @@ fn build_status_view(
                 e.set_text(&filtered);
                 return;
             }
-            s_btn.set_sensitive(filtered.len() >= MIN_PIN2_DIGITS);
+            let count = filtered.chars().count();
+            s_btn.set_sensitive(
+                p2_ent.is_sensitive() && (MIN_PIN2_DIGITS..=MAX_PIN2_DIGITS).contains(&count),
+            );
         });
     }
 
@@ -1223,7 +1424,8 @@ fn build_status_view(
         let win = window.clone();
         sign_button.connect_clicked(move |_| {
             let pin_text = p2_in.text();
-            if pin_text.len() < MIN_PIN2_DIGITS || pin_text.len() > MAX_PIN2_DIGITS {
+            let count = pin_text.chars().count();
+            if !(MIN_PIN2_DIGITS..=MAX_PIN2_DIGITS).contains(&count) {
                 p2_in.set_text("");
                 show_alert(
                     &win,
@@ -1245,6 +1447,7 @@ fn build_status_view(
         StatusWidgets {
             key_button,
             key_icon,
+            remote_action,
             normal_identity_box,
             holder_name_label,
             status_pill_label,
@@ -1261,6 +1464,7 @@ fn build_status_view(
             sign_spinner,
             sign_note_label,
             sign_button,
+            current_ui_state,
             last_pdf_documents: RefCell::new(Vec::new()),
             showing_pairing,
         },
@@ -1281,6 +1485,7 @@ fn build_pincodes_window(
         .modal(false)
         .default_width(500)
         .default_height(420)
+        .hide_on_close(true)
         .build();
 
     let root = gtk4::Box::builder()
@@ -1292,7 +1497,7 @@ fn build_pincodes_window(
         .margin_end(20)
         .build();
 
-    // Attempts warning bar (shown only if retry count < pristine 5)
+    // Attempts warning bar (shown only if retry count < pristine threshold)
     let attempts_bar = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(8)
@@ -1486,7 +1691,7 @@ fn build_pincodes_window(
     btn_close.add_css_class("apple-primary-button");
     let w_close = window.clone();
     btn_close.connect_clicked(move |_| {
-        w_close.close();
+        w_close.set_visible(false);
     });
     root.append(&btn_close);
 
@@ -1567,7 +1772,8 @@ fn build_pincodes_window(
                 show_alert(&win, "New PIN entries do not match.");
                 return;
             }
-            if new_v.len() < MIN_PIN1_DIGITS || new_v.len() > MAX_PIN1_DIGITS {
+            let count = new_v.chars().count();
+            if !(MIN_PIN1_DIGITS..=MAX_PIN1_DIGITS).contains(&count) {
                 new_in.set_text("");
                 conf_in.set_text("");
                 show_alert(
@@ -1608,7 +1814,8 @@ fn build_pincodes_window(
                 show_alert(&win, "New PIN entries do not match.");
                 return;
             }
-            if new_v.len() < MIN_PIN2_DIGITS || new_v.len() > MAX_PIN2_DIGITS {
+            let count = new_v.chars().count();
+            if !(MIN_PIN2_DIGITS..=MAX_PIN2_DIGITS).contains(&count) {
                 new_in.set_text("");
                 conf_in.set_text("");
                 show_alert(
@@ -1650,7 +1857,8 @@ fn build_pincodes_window(
                 show_alert(&win, "New PIN entries do not match.");
                 return;
             }
-            if puk_v.len() < MIN_PUK_DIGITS || puk_v.len() > MAX_PUK_DIGITS {
+            let puk_count = puk_v.chars().count();
+            if !(MIN_PUK_DIGITS..=MAX_PUK_DIGITS).contains(&puk_count) {
                 puk_in.set_text("");
                 show_alert(
                     &win,
@@ -1666,7 +1874,8 @@ fn build_pincodes_window(
                 PinManageSlot::Pin1 => (MIN_PIN1_DIGITS, MAX_PIN1_DIGITS),
                 PinManageSlot::Pin2 => (MIN_PIN2_DIGITS, MAX_PIN2_DIGITS),
             };
-            if new_v.len() < min_len || new_v.len() > max_len {
+            let count = new_v.chars().count();
+            if !(min_len..=max_len).contains(&count) {
                 new_in.set_text("");
                 conf_in.set_text("");
                 show_alert(
@@ -1716,21 +1925,39 @@ fn build_pincodes_window(
                 show_alert(&win, "PIN 2 entries do not match.");
                 return;
             }
-            if code_v.len() < MIN_ACTIVATION_CODE_DIGITS || code_v.len() > MAX_ACTIVATION_CODE_DIGITS {
+            let code_count = code_v.chars().count();
+            if !(MIN_ACTIVATION_CODE_DIGITS..=MAX_ACTIVATION_CODE_DIGITS).contains(&code_count) {
                 code_in.set_text("");
-                show_alert(&win, &format!("Activation code must be between {MIN_ACTIVATION_CODE_DIGITS} and {MAX_ACTIVATION_CODE_DIGITS} digits."));
+                show_alert(
+                    &win,
+                    &format!(
+                        "Activation code must be between {MIN_ACTIVATION_CODE_DIGITS} and {MAX_ACTIVATION_CODE_DIGITS} digits."
+                    ),
+                );
                 return;
             }
-            if p1_v.len() < MIN_PIN1_DIGITS || p1_v.len() > MAX_PIN1_DIGITS {
+            let p1_count = p1_v.chars().count();
+            if !(MIN_PIN1_DIGITS..=MAX_PIN1_DIGITS).contains(&p1_count) {
                 p1_in.set_text("");
                 p1_c_in.set_text("");
-                show_alert(&win, &format!("PIN 1 must be between {MIN_PIN1_DIGITS} and {MAX_PIN1_DIGITS} digits."));
+                show_alert(
+                    &win,
+                    &format!(
+                        "PIN 1 must be between {MIN_PIN1_DIGITS} and {MAX_PIN1_DIGITS} digits."
+                    ),
+                );
                 return;
             }
-            if p2_v.len() < MIN_PIN2_DIGITS || p2_v.len() > MAX_PIN2_DIGITS {
+            let p2_count = p2_v.chars().count();
+            if !(MIN_PIN2_DIGITS..=MAX_PIN2_DIGITS).contains(&p2_count) {
                 p2_in.set_text("");
                 p2_c_in.set_text("");
-                show_alert(&win, &format!("PIN 2 must be between {MIN_PIN2_DIGITS} and {MAX_PIN2_DIGITS} digits."));
+                show_alert(
+                    &win,
+                    &format!(
+                        "PIN 2 must be between {MIN_PIN2_DIGITS} and {MAX_PIN2_DIGITS} digits."
+                    ),
+                );
                 return;
             }
             if let (Some(code_b), Some(p1_b), Some(p2_b)) = (
