@@ -29,9 +29,25 @@ use refineid_rapp_core::remote::PairSummary;
 
 use crate::image::RgbaImageBuffer;
 
+/// Where a managed card is read: a reader attached to this computer, or
+/// a paired phone over RAPP.
+///
+/// Only a local card is inspected by this program. A phone's card is
+/// listed from the pairing record, its PINs are handled on the phone,
+/// and no PIN action applies to it here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardSource {
+    /// A card in a PC/SC reader attached to this computer.
+    Local,
+    /// A card served by a paired phone.
+    Phone,
+}
+
 /// A managed smart card detected on the local host or via a remote RAPP pair.
 #[derive(Clone, Debug)]
 pub struct ManagedCard {
+    /// Where the card is read.
+    pub source: CardSource,
     /// Full inspection report.
     pub report: CardCheckReport,
     /// Factory activation context for cards that require initial activation.

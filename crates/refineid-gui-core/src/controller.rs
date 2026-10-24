@@ -26,9 +26,9 @@ use refineid_client::card_pin::{
     ActivateOptions, ChangePinOptions, PinManageSlot, UnblockPinOptions,
 };
 use refineid_client::card_sign::DEFAULT_TIMESTAMP_AUTHORITY;
-use refineid_lib_core::auth::{ChangePinOutcome, PinStatus, UnblockOutcome};
+use refineid_lib_core::auth::{ChangePinOutcome, UnblockOutcome};
 use refineid_lib_core::backend::{ReaderFilter, ReaderPickError};
-use refineid_lib_core::identity::render_token_serial;
+use refineid_lib_core::identity::{CredentialIdentity, TokenSerial, render_token_serial};
 use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
@@ -40,7 +40,9 @@ use refineid_rapp_core::remote::{CardRequest, RemoteError, RemoteReader};
 
 use crate::error::GuiCoreError;
 use crate::image::{RgbaImageBuffer, decode_document_image};
-use crate::model::{ManagedCard, PairedPhone, RappPairingState, SignFormat, UiState, UserIntent};
+use crate::model::{
+    CardSource, ManagedCard, PairedPhone, RappPairingState, SignFormat, UiState, UserIntent,
+};
 
 const DENIED_PINS: &[&[u8]] = &[
     b"1122", b"1004", b"2000", b"2001", b"2002", b"2020", b"2580", b"5683", b"0852", b"112233",
@@ -240,12 +242,10 @@ impl RefineIdController {
     fn replace_cards(&self, cards: Vec<ManagedCard>) {
         let index = cards
             .iter()
-            .position(|card| !card.report.reader.starts_with(PHONE_READER_PREFIX))
+            .position(|card| card.source == CardSource::Local)
             .or_else(|| (!cards.is_empty()).then_some(0))
             .unwrap_or(0);
-        let has_local_card = cards
-            .iter()
-            .any(|card| !card.report.reader.starts_with(PHONE_READER_PREFIX));
+        let has_local_card = cards.iter().any(|card| card.source == CardSource::Local);
         self.update_state(|state| {
             state.has_local_card = has_local_card;
             state.cards = cards;
@@ -258,7 +258,7 @@ impl RefineIdController {
             if index < state.cards.len() {
                 state.selected_card = Some(index);
                 let card = &state.cards[index];
-                let is_local = !card.report.reader.starts_with(PHONE_READER_PREFIX);
+                let is_local = card.source == CardSource::Local;
                 state.selected_card_is_local = is_local;
                 state.card_serial = card.report.token_info.serial_number_hex.clone();
                 state.pin1_changed = card.report.pin1_changed;
@@ -413,11 +413,7 @@ impl RefineIdController {
         let mut attempt = 0;
         loop {
             let reports = refineid_client::card_manager::inspect_cards(None).unwrap_or_default();
-            let readers: Vec<String> = reports
-                .iter()
-                .map(|report| report.reader.clone())
-                .filter(|reader| !reader.starts_with(PHONE_READER_PREFIX))
-                .collect();
+            let readers: Vec<String> = reports.iter().map(|report| report.reader.clone()).collect();
             let cards = deduplicate_cards(reports, include_phones);
             let readers: Vec<&str> = readers.iter().map(String::as_str).collect();
             if inspection_settled(signature, &readers)
@@ -625,7 +621,7 @@ impl RefineIdController {
             (
                 card.report.reader.clone(),
                 card.key(),
-                !card.report.reader.starts_with(PHONE_READER_PREFIX),
+                card.source == CardSource::Local,
             )
         };
 
@@ -917,7 +913,8 @@ fn inspection_settled(signature: &[(String, bool)], readers: &[&str]) -> bool {
             .all(|reader| signature.iter().any(|(name, _)| name == reader))
 }
 
-/// The reader name prefix of a card served by a paired phone.
+/// The reader name of a card served by a paired phone: this prefix and
+/// the phone's display name.
 const PHONE_READER_PREFIX: &str = "Phone: ";
 
 fn validate_gui_pin(pin: &PinBytes, label: &str, minimum_length: usize) -> Result<(), String> {
@@ -974,6 +971,7 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
             let activation_context =
                 refineid_client::card_manager::prepare_activation(Some(&reader_filter)).ok();
             cards.push(ManagedCard {
+                source: CardSource::Local,
                 report,
                 activation_context,
             });
@@ -986,63 +984,65 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
         && cards.is_empty()
         && let Ok(reader) = RemoteReader::open_local()
         && let Some(pair) = reader.phone()
+        && let Some(cached_der) = pair.auth_cert
+        && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(cached_der)
     {
-        {
-            if let Some(cached_der) = pair.auth_cert
-                && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(cached_der)
-            {
-                let view = owned_cert.view();
-                let dev_name = pair.peer_display_name;
-                let reader = format!("{PHONE_READER_PREFIX}{dev_name}");
-                let serial = owned_cert.serial().to_string();
-                let token_info = refineid_lib_core::pkcs15::TokenInfo {
-                    serial_number_hex: Some(refineid_lib_core::identity::TokenSerial::new(serial)),
-                    label: Some(format!("Phone ({dev_name})")),
-                    ..Default::default()
-                };
-
-                let mut identity = refineid_lib_core::identity::CredentialIdentity::new();
-                if let Some(cn) = view.subject.common_name() {
-                    identity = identity.with_common_name(cn.clone());
-                }
-                if let Some(peuin) = view.subject.peuin() {
-                    identity = identity.with_peuin(peuin);
-                }
-
-                let report = CardCheckReport {
-                    reader,
-                    identity,
-                    atr_hex: String::new(),
-                    token_info,
-                    card_access: refineid_lib_core::card_access::CardAccess::default(),
-                    certs: Vec::new(),
-                    pin_reference_scheme: refineid_lib_core::auth::PinReferenceScheme::Citizen,
-                    pin1: Some(PinStatus::Verified),
-                    pin2: Some(PinStatus::Verified),
-                    puk: None,
-                    pin1_policy: None,
-                    pin2_policy: None,
-                    puk_policy: None,
-                    pin1_changed: Some(true),
-                    pin2_changed: Some(true),
-                    emrtd: None,
-                    emrtd_error: None,
-                    dsc_csca_check: None,
-                };
-                cards.push(ManagedCard {
-                    report,
-                    activation_context: None,
-                });
-            }
+        let view = owned_cert.view();
+        let serial = TokenSerial::new(owned_cert.serial().to_string());
+        let mut identity = CredentialIdentity::new();
+        if let Some(cn) = view.subject.common_name() {
+            identity = identity.with_common_name(cn.clone());
         }
+        if let Some(peuin) = view.subject.peuin() {
+            identity = identity.with_peuin(peuin);
+        }
+        cards.push(phone_card(&pair.peer_display_name, serial, identity));
     }
 
     cards
 }
 
+/// The card a paired phone serves, as the pairing record describes it:
+/// the holder from the cached authentication certificate and nothing
+/// from the card itself. No PIN was probed, so every PIN field is
+/// `None`.
+fn phone_card(dev_name: &str, serial: TokenSerial, identity: CredentialIdentity) -> ManagedCard {
+    let token_info = refineid_lib_core::pkcs15::TokenInfo {
+        serial_number_hex: Some(serial),
+        label: Some(format!("Phone ({dev_name})")),
+        ..Default::default()
+    };
+    let report = CardCheckReport {
+        reader: format!("{PHONE_READER_PREFIX}{dev_name}"),
+        identity,
+        atr_hex: String::new(),
+        token_info,
+        card_access: refineid_lib_core::card_access::CardAccess::default(),
+        certs: Vec::new(),
+        pin_reference_scheme: refineid_lib_core::auth::PinReferenceScheme::Citizen,
+        pin1: None,
+        pin2: None,
+        puk: None,
+        pin1_policy: None,
+        pin2_policy: None,
+        puk_policy: None,
+        pin1_changed: None,
+        pin2_changed: None,
+        emrtd: None,
+        emrtd_error: None,
+        dsc_csca_check: None,
+    };
+    ManagedCard {
+        source: CardSource::Phone,
+        report,
+        activation_context: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refineid_lib_core::auth::PinStatus;
     use refineid_rapp_core::message::ResultError;
 
     #[test]
@@ -1126,7 +1126,7 @@ mod tests {
     fn connected_card_reader_overrides_rapp_in_card_deduplication() {
         let physical_report = CardCheckReport {
             reader: "Synthetic Card Reader".to_owned(),
-            identity: refineid_lib_core::identity::CredentialIdentity::new(),
+            identity: CredentialIdentity::new(),
             atr_hex: "3b00".to_owned(),
             token_info: refineid_lib_core::pkcs15::TokenInfo::default(),
             card_access: refineid_lib_core::card_access::CardAccess::default(),
@@ -1148,11 +1148,44 @@ mod tests {
         // When a physical card is present, phone is never added even if include_phones is true
         let cards = deduplicate_cards(vec![physical_report], true);
         assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].source, CardSource::Local);
         assert_eq!(cards[0].report.reader, "Synthetic Card Reader");
 
         // When no physical card is present and include_phones is false, cards is empty
         let empty_cards = deduplicate_cards(Vec::new(), false);
         assert!(empty_cards.is_empty());
+    }
+
+    #[test]
+    fn a_phone_card_claims_no_pin_state_and_offers_no_pin_action() {
+        let card = phone_card(
+            "custodian-1",
+            TokenSerial::new("1".to_owned()),
+            CredentialIdentity::new(),
+        );
+        assert_eq!(card.source, CardSource::Phone);
+        assert_eq!(card.report.pin1, None);
+        assert_eq!(card.report.pin2, None);
+        assert_eq!(card.report.pin1_changed, None);
+        assert_eq!(card.report.pin2_changed, None);
+
+        let controller = RefineIdController::new(|_| {});
+        controller.replace_cards(vec![card]);
+        let state = controller.state();
+        assert_eq!(state.selected_card, Some(0));
+        assert!(!state.has_local_card);
+        assert!(!state.selected_card_is_local);
+        assert_eq!(state.pin1_status, None);
+        assert_eq!(state.pin2_status, None);
+        assert_eq!(state.pin1_changed, None);
+        assert_eq!(state.pin2_changed, None);
+        assert!(!state.pin1_change_available);
+        assert!(!state.pin2_change_available);
+        assert!(!state.activation_available);
+        assert!(!state.legacy_activation);
+        assert!(!state.pin1_unblock_available);
+        assert!(!state.pin2_unblock_available);
+        assert!(!state.unblock_uses_activation_code);
     }
 
     #[test]
