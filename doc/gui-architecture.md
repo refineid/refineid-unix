@@ -186,7 +186,7 @@ pub trait UiDriver: Send + 'static {
 
 ### 4.3 Workstation UX Hygiene Contract
 
-In accordance with [RAPP Transport and Discovery Hierarchy Specification](../../refineid-core/doc/protocols/rapp-transport-and-discovery-hierarchy.md):
+In accordance with [RAPP Transport and Discovery Hierarchy Specification](https://github.com/refineid/refineid-core/blob/main/doc/protocols/rapp-transport-and-discovery-hierarchy.md):
 1. **Local Card Reader Default**: Out of the box, the controller interfaces exclusively with local smart cards via `pcscd`. No background radio polling, mDNS queries, or network sockets are active.
 2. **Pairing Is the Decision**: Typing the code a phone shows is the decision to use that phone as a card reader; forgetting the last pairing is the decision to stop. There is no separate switch.
 3. **Outbound Discovery**: The workstation browses for phones only while a pairing ceremony runs, and dials the paired phone only while the pairing is usable. The card served by the phone is listed only then.
