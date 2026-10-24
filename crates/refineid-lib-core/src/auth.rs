@@ -39,8 +39,8 @@ pub mod commands;
 
 pub use refineid_auth::{
     ActivationReport, ActivationScheme, CACHE_FINGERPRINT_KEY_LEN, CACHE_FINGERPRINT_LEN,
-    CardActivationNeeds, CredentialHealthReport, ManageOutcome, PinChangeRecord, PinManageOps,
-    RetryFloorRefusal, classify_manage_sw, pin1_status_permits_reusable_cache,
+    CardActivationNeeds, CredentialHealthReport, FlooredCredential, ManageOutcome, PinChangeRecord,
+    PinManageOps, RetryFloorRefusal, classify_manage_sw, pin1_status_permits_reusable_cache,
     read_pin_change_record, read_puk_status_from_container,
 };
 
@@ -278,16 +278,33 @@ impl From<PinStatus> for refineid_auth::PinStatus {
     }
 }
 
+impl From<PinSlot> for FlooredCredential {
+    fn from(slot: PinSlot) -> Self {
+        refineid_auth::PinSlot::from(slot).into()
+    }
+}
+
 /// The retry floor from `refineid-auth`, applied to a status this crate
 /// probed: a command that can spend a `slot` attempt is sent only at
 /// five, four or three tries left, or when the PIN is already verified.
-/// A PUK-driven reset is not a PIN attempt and does not pass through
-/// here.
+/// A PUK-driven reset is gated by [`check_puk_retry_floor`] instead.
 ///
 /// # Errors
 /// [`RetryFloorRefusal`] naming the PIN and the state that refused it.
 pub fn check_retry_floor(slot: PinSlot, status: PinStatus) -> Result<(), RetryFloorRefusal> {
     refineid_auth::check_retry_floor(slot.into(), status.into())
+}
+
+/// The same retry floor applied to the PUK's own counter: anything that
+/// presents the PUK -- RESET RETRY COUNTER, or the activation code on a
+/// card that ships with blocked PINs -- is sent only at five, four or
+/// three PUK tries left. A blocked or invalidated PUK, and a counter the
+/// card did not report, are refused.
+///
+/// # Errors
+/// [`RetryFloorRefusal`] naming the PUK and the state that refused it.
+pub fn check_puk_retry_floor(status: PukStatus) -> Result<(), RetryFloorRefusal> {
+    refineid_auth::check_retry_floor(FlooredCredential::Puk, status.into())
 }
 
 /// Outcome of the counter-safe PUK retry probe through the FINEID
@@ -304,6 +321,18 @@ pub enum PukStatus {
     Invalidated,
     /// Any other status word, preserved for diagnostics.
     Other(u16),
+}
+
+impl From<PukStatus> for refineid_auth::PinStatus {
+    fn from(status: PukStatus) -> Self {
+        match status {
+            PukStatus::Remaining(retries) => refineid_apdu::PinRetries::from_nibble(retries.get())
+                .map_or(Self::NoInfo, Self::Remaining),
+            PukStatus::NoInfo => Self::NoInfo,
+            PukStatus::Locked | PukStatus::Invalidated => Self::Locked,
+            PukStatus::Other(sw) => Self::Other(refineid_apdu::StatusWord::from_u16(sw)),
+        }
+    }
 }
 
 /// Card-reported credential usage allowance from FINEID S1 v4.2
