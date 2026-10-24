@@ -30,8 +30,8 @@
 use alloc::fmt;
 
 use refineid_lib_core::auth::{
-    AuthError, ChangePinOutcome, PinOps as _, PinPolicyReason, PinSlot, PinStatus,
-    RetryFloorRefusal, UnblockOutcome, check_retry_floor,
+    AuthError, ChangePinOutcome, PinOps as _, PinPolicyReason, PinSlot, PinStatus, PukStatus,
+    RetryFloorRefusal, UnblockOutcome, check_puk_retry_floor, check_retry_floor,
 };
 use refineid_lib_core::backend::{
     ReaderAccessCap, ReaderBackend as _, ReaderFilter, ReaderPickError,
@@ -259,9 +259,9 @@ pub enum CardPinError {
         /// itself failed to return a status word.
         probe: Option<PinStatus>,
     },
-    /// The retry floor refused a command that presents the current PIN:
-    /// the card reports two, one or no tries left, the PIN blocked, or no
-    /// readable counter.
+    /// The retry floor refused a command that presents the current PIN
+    /// or the PUK: the card reports two, one or no tries left for it, the
+    /// credential blocked, or no readable counter.
     RetryFloor(RetryFloorRefusal),
 }
 
@@ -593,15 +593,26 @@ fn change_gate(slot: PinManageSlot, probe: Option<PinStatus>) -> Result<(), Card
     }
 }
 
-/// Gate for a PUK-driven reset: the slot must look activated. Setting a
-/// new PIN with the PUK spends no PIN attempt, so the retry floor does
-/// not apply and a PIN at two, one or no tries left, or blocked, passes.
-fn unblock_gate(slot: PinManageSlot, probe: Option<PinStatus>) -> Result<(), CardPinError> {
-    if pin_looks_activated(probe.as_ref()) {
-        Ok(())
-    } else {
-        Err(CardPinError::CardLooksUnactivated { slot, probe })
+/// Gate for a PUK-driven reset: the slot must look activated, and the
+/// reset presents the PUK, so the retry floor applies to the PUK's own
+/// counter. The target PIN's counter does not gate it: a PIN at two, one
+/// or no tries left, or blocked, passes while the PUK has five, four or
+/// three tries left.
+fn unblock_gate(
+    slot: PinManageSlot,
+    probe: Option<PinStatus>,
+    puk: Option<PukStatus>,
+) -> Result<(), CardPinError> {
+    if !pin_looks_activated(probe.as_ref()) {
+        return Err(CardPinError::CardLooksUnactivated { slot, probe });
     }
+    puk_gate(puk)
+}
+
+/// The retry floor for the PUK's counter; a probe that returned no
+/// status is an unreadable counter.
+fn puk_gate(puk: Option<PukStatus>) -> Result<(), CardPinError> {
+    check_puk_retry_floor(puk.unwrap_or(PukStatus::NoInfo)).map_err(CardPinError::RetryFloor)
 }
 
 /// Rotate the PIN in `options.slot`. The card's own outcome
@@ -700,10 +711,13 @@ pub(crate) fn change_pin_first_for_cli(
 /// exhausted the card is dead -- no software recovery, DVV
 /// reissue required. The card's own outcome (wrong-PUK with
 /// retries-left, PUK locked, etc.) is surfaced via
-/// [`UnblockPinReport::outcome`].
+/// [`UnblockPinReport::outcome`]. The PUK is presented only at five,
+/// four or three PUK tries left; below that, blocked or unreadable, the
+/// reset is refused before it is sent.
 ///
 /// # Errors
-/// PC/SC / PKCS#15 / local-policy / transport failures.
+/// PC/SC / PKCS#15 / local-policy / transport failures, and
+/// [`CardPinError::RetryFloor`] for a PUK below the floor.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "UnblockPinOptions embeds PUK + new-PIN PinBytes; consumed by value so both drop+zeroize at function return."
@@ -732,7 +746,11 @@ pub fn unblock_pin_first(
     re_verify_session(&mut transport, ctx.bound_serial())?;
 
     let slot = options.slot.as_pin_slot();
-    unblock_gate(options.slot, transport.pin_status(slot).ok())?;
+    unblock_gate(
+        options.slot,
+        transport.pin_status(slot).ok(),
+        transport.puk_status().ok(),
+    )?;
 
     re_verify_session(&mut transport, ctx.bound_serial())?;
 
@@ -1287,9 +1305,14 @@ fn activate_slot_setup<T: refineid_lib_core::transport::CardTransport>(
             .change_pin(slot, activation_pin_bytes, new_pin)
             .map(change_to_unblock)
             .map_err(auth_to_card_pin),
-        CardGeneration::Older => transport
-            .reset_retry_counter(slot, activation_pin_bytes, new_pin)
-            .map_err(auth_to_card_pin),
+        CardGeneration::Older => {
+            // The activation code is presented as the PUK, under the
+            // PUK's counter.
+            puk_gate(transport.puk_status().ok())?;
+            transport
+                .reset_retry_counter(slot, activation_pin_bytes, new_pin)
+                .map_err(auth_to_card_pin)
+        }
         CardGeneration::Unknown => Err(CardPinError::UnknownCardGeneration),
     }
 }
@@ -1662,13 +1685,15 @@ impl CardPinHelpers {
 mod gate_tests {
     use refineid_lib_core::apdu::status_word::PinRetries;
 
-    use super::{CardPinError, PinManageSlot, PinStatus, change_gate, unblock_gate};
+    use super::{CardPinError, PinManageSlot, PinStatus, PukStatus, change_gate, unblock_gate};
     use crate::test_util::{TestResult, check_true};
 
     /// Tries left at which a PIN attempt is served.
     const SERVED: &[u8] = &[5, 4, 3];
     /// Tries left at which a PIN attempt is refused.
     const BELOW_FLOOR: &[u8] = &[2, 1, 0];
+    /// A status word outside the modeled set.
+    const UNMODELED_SW: u16 = 0x6F00;
     /// Both PINs a change or a PUK reset can target.
     const SLOTS: &[PinManageSlot] = &[PinManageSlot::Pin1, PinManageSlot::Pin2];
 
@@ -1721,19 +1746,69 @@ mod gate_tests {
         Ok(())
     }
 
+    fn puk_remaining(count: u8) -> Result<PukStatus, &'static str> {
+        PinRetries::from_nibble(count)
+            .map(PukStatus::Remaining)
+            .ok_or("tries fit a nibble")
+    }
+
     #[test]
-    fn a_puk_reset_is_allowed_at_two_one_zero_tries_and_blocked() -> TestResult {
+    fn a_puk_reset_is_allowed_at_any_pin_counter_while_the_puk_is_served() -> TestResult {
         for &slot in SLOTS {
-            for &count in BELOW_FLOOR.iter().chain(SERVED) {
+            for &puk in SERVED {
+                for &count in BELOW_FLOOR.iter().chain(SERVED) {
+                    check_true(
+                        unblock_gate(slot, Some(remaining(count)?), Some(puk_remaining(puk)?))
+                            .is_ok(),
+                        "PUK reset",
+                    )?;
+                }
                 check_true(
-                    unblock_gate(slot, Some(remaining(count)?)).is_ok(),
-                    "PUK reset",
+                    unblock_gate(slot, Some(PinStatus::Locked), Some(puk_remaining(puk)?)).is_ok(),
+                    "blocked",
                 )?;
             }
-            check_true(
-                unblock_gate(slot, Some(PinStatus::Locked)).is_ok(),
-                "blocked",
-            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_puk_reset_is_refused_at_two_one_zero_puk_tries() -> TestResult {
+        for &slot in SLOTS {
+            for &puk in BELOW_FLOOR {
+                let refused =
+                    unblock_gate(slot, Some(PinStatus::Locked), Some(puk_remaining(puk)?));
+                check_true(
+                    matches!(refused, Err(CardPinError::RetryFloor(_))),
+                    "below the floor",
+                )?;
+                let text = refused.err().map(|e| e.to_string()).unwrap_or_default();
+                check_true(text.contains("PUK"), "names the PUK")?;
+                check_true(text.contains(&puk.to_string()), "names the tries left")?;
+                check_true(!text.contains("PIN"), "names no other credential")?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_puk_reset_is_refused_on_a_blocked_or_unreadable_puk() -> TestResult {
+        for &slot in SLOTS {
+            for puk in [
+                None,
+                Some(PukStatus::NoInfo),
+                Some(PukStatus::Locked),
+                Some(PukStatus::Invalidated),
+                Some(PukStatus::Other(UNMODELED_SW)),
+            ] {
+                check_true(
+                    matches!(
+                        unblock_gate(slot, Some(PinStatus::Locked), puk),
+                        Err(CardPinError::RetryFloor(_))
+                    ),
+                    "refused",
+                )?;
+            }
         }
         Ok(())
     }

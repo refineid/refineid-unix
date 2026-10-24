@@ -105,7 +105,10 @@ impl UnblockPinArgs {
             Err(crate::card_pin::CardPinError::ReaderPick(pe)) => {
                 super::util::reader_pick_exit(cmd, &pe)
             }
-            Err(e @ crate::card_pin::CardPinError::PinPolicy(_)) => {
+            Err(
+                e @ (crate::card_pin::CardPinError::PinPolicy(_)
+                | crate::card_pin::CardPinError::RetryFloor(_)),
+            ) => {
                 eprintln!("{cmd}: {e}");
                 ExitStatus::CardCredentialRejected.into()
             }
