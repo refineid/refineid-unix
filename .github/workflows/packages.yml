@@ -1,7 +1,7 @@
 name: packages
 
 # A v<VERSION> tag builds the Ubuntu and FreeBSD packages, attaches them to
-# the tag's GitHub Release, and publishes the signed apt and pkg
+# the tag's GitHub Release, and publishes the signed Ubuntu and FreeBSD
 # repositories, which index the packages of every release, to GitHub Pages.
 # A manual run builds the packages and the signed repositories and keeps
 # them as workflow artifacts; it creates no release and deploys nothing.
@@ -175,32 +175,30 @@ jobs:
                   --pattern '*.deb' --pattern '*.pkg'
               done
           ls -l incoming
-      - name: Build the apt repository
+      - name: Build the Ubuntu repository
         env:
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
         run: |
           command -v apt-ftparchive >/dev/null \
             || { sudo apt-get update && sudo apt-get install -y apt-utils; }
           key="$RUNNER_TEMP/apt-signing-key.asc"
+          trap 'rm -f "$key"' EXIT
           ( umask 077 && printf '%s\n' "$APT_SIGNING_KEY" > "$key" )
-          script/package-repo.sh apt "$key" incoming site
-          rm -f "$key"
-      - name: Pass the pkg signing key to the VM
+          script/package-repo.sh ubuntu "$key" incoming site
+      # The action passes the variables named in envs to the VM over ssh
+      # SendEnv; the key exists only in this step's environment.
+      - name: Build the FreeBSD repository
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         env:
           PKG_SIGNING_KEY: ${{ secrets.PKG_SIGNING_KEY }}
-        run: |
-          encoded="$(printf '%s\n' "$PKG_SIGNING_KEY" | base64 -w0)"
-          echo "::add-mask::$encoded"
-          echo "PKG_SIGNING_KEY_BASE64=$encoded" >> "$GITHUB_ENV"
-      - uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           release: '15.1'
-          envs: PKG_SIGNING_KEY_BASE64
+          envs: PKG_SIGNING_KEY
           run: |
             key="$(mktemp /tmp/pkg-signing-key.XXXXXX)"
-            printf '%s' "$PKG_SIGNING_KEY_BASE64" | openssl base64 -d -A > "$key"
+            trap 'rm -f "$key"' EXIT
+            printf '%s\n' "$PKG_SIGNING_KEY" > "$key"
             script/package-repo.sh freebsd "$key" incoming site
-            rm -f "$key"
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site

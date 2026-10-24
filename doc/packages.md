@@ -1,8 +1,9 @@
 # Packages
 
-RefineID publishes signed package repositories at `https://pkg.refineid.fi`
-for Ubuntu 26.04 LTS (amd64, arm64) and FreeBSD 15 (amd64). A new release
-arrives through `apt upgrade` and `pkg upgrade`.
+RefineID publishes signed package repositories at `https://pkg.refineid.fi`,
+one path per distribution: `/ubuntu` for Ubuntu 26.04 LTS (amd64, arm64)
+and `/freebsd` for FreeBSD 15 (amd64). `/debian` is reserved for Debian.
+A new release arrives through `apt upgrade` and `pkg upgrade`.
 
 ## Install
 
@@ -10,10 +11,10 @@ arrives through `apt upgrade` and `pkg upgrade`.
 
 ```sh
 sudo install -d -m 0755 /etc/apt/keyrings
-sudo curl -fsSLo /etc/apt/keyrings/refineid.asc https://pkg.refineid.fi/apt/refineid.asc
+sudo curl -fsSLo /etc/apt/keyrings/refineid.asc https://pkg.refineid.fi/ubuntu/refineid.asc
 sudo tee /etc/apt/sources.list.d/refineid.sources >/dev/null <<'EOF'
 Types: deb
-URIs: https://pkg.refineid.fi/apt
+URIs: https://pkg.refineid.fi/ubuntu
 Suites: resolute
 Components: main
 Signed-By: /etc/apt/keyrings/refineid.asc
@@ -22,9 +23,50 @@ sudo apt update
 sudo apt install refineid
 ```
 
+The same source as one line, in `/etc/apt/sources.list.d/refineid.list`
+instead of `refineid.sources`:
+
+```
+deb [signed-by=/etc/apt/keyrings/refineid.asc] https://pkg.refineid.fi/ubuntu resolute main
+```
+
 `curl` is `sudo apt install curl` where it is missing. `refineid` installs
 the CLI, the desktop application and the PKCS#11 module, with pcscd and
 the CCID driver.
+
+#### Firefox
+
+Ubuntu's Firefox is a snap, and a snap cannot load a PKCS#11 module from
+the host ([#74](https://github.com/refineid/refineid-unix/issues/74)).
+Install Firefox from Mozilla's APT repository instead, with the steps
+[Mozilla documents](https://support.mozilla.org/en-US/kb/install-firefox-linux#w_install-firefox-deb-package-for-debian-based-and-ubuntu-based-distributions-recommended):
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O- | sudo tee /etc/apt/keyrings/packages.mozilla.org.asc > /dev/null
+gpg -n -q --import --import-options import-show /etc/apt/keyrings/packages.mozilla.org.asc | awk '/pub/{getline; gsub(/^ +| +$/,""); if($0 == "35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3") print "\nThe key fingerprint matches ("$0").\n"; else print "\nVerification failed: the fingerprint ("$0") does not match the expected one.\n"}'
+sudo tee /etc/apt/sources.list.d/mozilla.sources > /dev/null << EOF
+Types: deb
+URIs: https://packages.mozilla.org/apt
+Suites: mozilla
+Components: main
+Signed-By: /etc/apt/keyrings/packages.mozilla.org.asc
+EOF
+sudo tee /etc/apt/preferences.d/mozilla > /dev/null << EOF
+Package: *
+Pin: origin packages.mozilla.org
+Pin-Priority: 1000
+EOF
+sudo apt-get update
+sudo apt-get install firefox
+```
+
+The third command must report that the fingerprint matches. The pin
+makes Mozilla's `firefox` deb win over Ubuntu's `firefox` package, which
+only installs the snap. Mozilla's page also describes moving the snap
+profile (Data migration); after that, `sudo snap remove firefox` removes
+the snap. The Firefox policy in the `refineid` package loads the module
+into the deb Firefox.
 
 ### FreeBSD 15
 
@@ -53,11 +95,10 @@ describes; the package does not move the CCID driver aside.
 
 ### Known limits
 
-- Ubuntu's Firefox and Chromium are snaps, and a snap cannot load a
-  PKCS#11 module from the host
+- Ubuntu's Chromium is a snap and cannot load the module
   ([#74](https://github.com/refineid/refineid-unix/issues/74)). The
-  policy and the NSS autostart entry the package installs reach a
-  Firefox or Chromium installed as a deb, the CLI, and p11-kit programs.
+  NSS autostart entry the package installs reaches a Chromium installed
+  as a deb.
 
 ## Pipeline
 
@@ -84,10 +125,10 @@ release notes record it.
 Repository layout:
 
 ```
-apt/refineid.asc                       public key (OpenPGP, armored)
-apt/dists/resolute/{InRelease,Release,Release.gpg}
-apt/dists/resolute/main/binary-{amd64,arm64}/Packages{,.gz,.xz}
-apt/pool/main/r/refineid/*.deb
+ubuntu/refineid.asc                    public key (OpenPGP, armored)
+ubuntu/dists/resolute/{InRelease,Release,Release.gpg}
+ubuntu/dists/resolute/main/binary-{amd64,arm64}/Packages{,.gz,.xz}
+ubuntu/pool/main/r/refineid/*.deb
 freebsd/refineid.pub                   public key (RSA, PEM)
 freebsd/FreeBSD:15:amd64/{meta.conf,packagesite.pkg,data.pkg,...}
 freebsd/FreeBSD:15:amd64/All/*.pkg
@@ -164,7 +205,7 @@ only the `repository` job sees them.
    with `gh secret set`.
 2. Push a tag, or re-run the `repository` job of the last tag's run: the
    repository is re-signed with the new key, and the new public key replaces
-   `apt/refineid.asc` or `freebsd/refineid.pub`.
+   `ubuntu/refineid.asc` or `freebsd/refineid.pub`.
 3. Every user repeats the key download line of the install snippet;
    until then `apt update` and `pkg update` reject the repository.
    Announce the new fingerprint on the beta page.

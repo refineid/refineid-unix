@@ -15,9 +15,9 @@
 
 # Build a signed package repository from every package in a directory.
 #
-#   apt:     <site>/apt with pool/main/r/refineid, dists/<suite>/main/
+#   ubuntu:  <site>/ubuntu with pool/main/r/refineid, dists/<suite>/main/
 #            binary-<arch>/Packages{,.gz,.xz}, Release signed into InRelease
-#            and Release.gpg, and the public key <site>/apt/refineid.asc.
+#            and Release.gpg, and the public key <site>/ubuntu/refineid.asc.
 #            Runs on Debian or Ubuntu (apt-ftparchive, gpg, gpgv).
 #   freebsd: <site>/freebsd/<ABI>/All/*.pkg indexed by `pkg repo` and signed
 #            with the RSA key, and the public key <site>/freebsd/refineid.pub.
@@ -27,19 +27,19 @@
 # script returns.
 #
 # Usage:
-#   script/package-repo.sh apt     <secret-key.asc> <package-dir> <site-dir>
+#   script/package-repo.sh ubuntu  <secret-key.asc> <package-dir> <site-dir>
 #   script/package-repo.sh freebsd <rsa-key.pem>    <package-dir> <site-dir>
 
 set -eu
 
-APT_SUITE="resolute"
+UBUNTU_SUITE="resolute"
 APT_COMPONENT="main"
 APT_ARCHITECTURES="amd64 arm64"
 APT_POOL="pool/main/r/refineid"
 REPO_LABEL="RefineID"
 
 usage() {
-    echo "usage: $0 apt|freebsd <key> <package-dir> <site-dir>" >&2
+    echo "usage: $0 ubuntu|freebsd <key> <package-dir> <site-dir>" >&2
     exit 2
 }
 
@@ -54,8 +54,8 @@ SITE="$4"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
-apt_repo() {
-    root="$SITE/apt"
+ubuntu_repo() {
+    root="$SITE/ubuntu"
     rm -rf "$root"
     mkdir -p "$root/$APT_POOL"
     found=0
@@ -74,7 +74,7 @@ apt_repo() {
         | awk -F: '$1 == "fpr" { print $10; exit }')"
     [ -n "$fingerprint" ] || { echo "error: $KEY holds no secret key" >&2; exit 1; }
 
-    dists="dists/$APT_SUITE"
+    dists="dists/$UBUNTU_SUITE"
     for arch in $APT_ARCHITECTURES; do
         dir="$dists/$APT_COMPONENT/binary-$arch"
         mkdir -p "$root/$dir"
@@ -87,8 +87,8 @@ apt_repo() {
     (cd "$root" && apt-ftparchive \
         -o APT::FTPArchive::Release::Origin="$REPO_LABEL" \
         -o APT::FTPArchive::Release::Label="$REPO_LABEL" \
-        -o APT::FTPArchive::Release::Suite="$APT_SUITE" \
-        -o APT::FTPArchive::Release::Codename="$APT_SUITE" \
+        -o APT::FTPArchive::Release::Suite="$UBUNTU_SUITE" \
+        -o APT::FTPArchive::Release::Codename="$UBUNTU_SUITE" \
         -o APT::FTPArchive::Release::Architectures="$APT_ARCHITECTURES" \
         -o APT::FTPArchive::Release::Components="$APT_COMPONENT" \
         release "$dists") > "$WORK/Release"
@@ -102,7 +102,7 @@ apt_repo() {
     gpg --batch --dearmor < "$root/refineid.asc" > "$WORK/public.gpg"
     gpgv --keyring "$WORK/public.gpg" "$root/$dists/InRelease"
     gpgv --keyring "$WORK/public.gpg" "$root/$dists/Release.gpg" "$root/$dists/Release"
-    echo "apt repository: $root (signing key $fingerprint)"
+    echo "Ubuntu repository: $root (signing key $fingerprint)"
 }
 
 freebsd_repo() {
@@ -136,14 +136,14 @@ freebsd_repo() {
     pkg -o PKG_DBDIR="$WORK/db" -o PKG_CACHEDIR="$WORK/cache" \
         -o REPOS_DIR="$WORK/repos" update -q -f
     listed="$(pkg -o PKG_DBDIR="$WORK/db" -o PKG_CACHEDIR="$WORK/cache" \
-        -o REPOS_DIR="$WORK/repos" rquery -r "$REPO_LABEL" '%n-%v' 2>/dev/null || true)"
+        -o REPOS_DIR="$WORK/repos" rquery -r "$REPO_LABEL" '%n-%v' || true)"
     [ -n "$listed" ] || { echo "error: $root/$abi does not verify with refineid.pub" >&2; exit 1; }
     printf '%s\n' "$listed"
     echo "FreeBSD repository: $root"
 }
 
 case "$KIND" in
-    apt) apt_repo ;;
+    ubuntu) ubuntu_repo ;;
     freebsd) freebsd_repo ;;
     *) usage ;;
 esac
