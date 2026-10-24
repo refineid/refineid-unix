@@ -37,8 +37,7 @@
 //!    OCSP response, both signature-verified.
 //! 5. [`PurposeBoundCert<P>`] -- the cert's `KeyUsage` and
 //!    `ExtendedKeyUsage` extensions bind it to the typed
-//!    purpose `P` (one of [`AuthPurpose`], [`NonRepPurpose`],
-//!    [`CscaPurpose`], [`DscPurpose`], [`MlsPurpose`]). A cert
+//!    purpose `P` (one of [`AuthPurpose`], [`NonRepPurpose`]). A cert
 //!    bound to `AuthPurpose` cannot be passed to a function
 //!    expecting `NonRepPurpose`.
 //!
@@ -517,53 +516,6 @@ impl CertPurpose for NonRepPurpose {
     #[inline]
     fn label() -> &'static str {
         "non-repudiation (nonRepudiation only)"
-    }
-}
-
-/// CSCA certificate (eMRTD passive authentication trust
-/// anchor). Per ICAO Doc 9303 §12: `keyCertSign + cRLSign`.
-#[derive(Debug, Clone, Copy)]
-pub struct CscaPurpose;
-impl CertPurpose for CscaPurpose {
-    #[inline]
-    fn matches_key_usage(usage: &KeyUsage) -> bool {
-        usage.key_cert_sign && usage.crl_sign
-    }
-    #[inline]
-    fn label() -> &'static str {
-        "CSCA (keyCertSign + cRLSign)"
-    }
-}
-
-/// Document Signer Certificate (eMRTD Passive Authentication
-/// signer). Per ICAO Doc 9303 §12: `digitalSignature` only
-/// (critical).
-#[derive(Debug, Clone, Copy)]
-pub struct DscPurpose;
-impl CertPurpose for DscPurpose {
-    #[inline]
-    fn matches_key_usage(usage: &KeyUsage) -> bool {
-        usage.digital_signature && !usage.non_repudiation && !usage.key_cert_sign && !usage.crl_sign
-    }
-    #[inline]
-    fn label() -> &'static str {
-        "DSC (digitalSignature only)"
-    }
-}
-
-/// Master List Signer certificate (ICAO PKD). Per Doc 9303
-/// §12: `digitalSignature` + EKU `id-icao-mlSigner`. The EKU
-/// is checked separately; this trait only covers `KeyUsage`.
-#[derive(Debug, Clone, Copy)]
-pub struct MlsPurpose;
-impl CertPurpose for MlsPurpose {
-    #[inline]
-    fn matches_key_usage(usage: &KeyUsage) -> bool {
-        usage.digital_signature
-    }
-    #[inline]
-    fn label() -> &'static str {
-        "ML Signer (digitalSignature; EKU id-icao-mlSigner checked separately)"
     }
 }
 

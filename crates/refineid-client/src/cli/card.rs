@@ -39,8 +39,7 @@ pub enum CardCanArg {
 }
 
 /// Parsed `card [--offline] [--reader SUBSTR] [--can NNNNNN |
-/// --no-can] [--crl-file PATH] [--save-cert DIR] [--icao-pkd
-/// PATH]` arguments.
+/// --no-can] [--crl-file PATH] [--save-cert DIR]` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardArgs {
     /// Optional reader-name substring (`--reader SUBSTR`).
@@ -58,9 +57,6 @@ pub struct CardArgs {
     /// Directory to dump each slot's cert DER to
     /// (`--save-cert DIR`).
     pub save_cert_dir: Option<PathBuf>,
-    /// ICAO PKD input file (`--icao-pkd PATH`); either a signed
-    /// `*.ml` DER or an LDIF carrying per-state Master Lists.
-    pub icao_pkd: Option<PathBuf>,
     /// Force checking paired remote card reader (`--remote`).
     pub remote: bool,
 }
@@ -75,7 +71,6 @@ impl CardArgs {
             can,
             crl_file,
             save_cert_dir,
-            icao_pkd,
             remote,
         } = self;
 
@@ -98,7 +93,6 @@ impl CardArgs {
             can: can.as_ref(),
             crl_file,
             save_cert_dir,
-            icao_pkd,
             now: None,
         };
         match crate::card_check::check_all(backend, &options) {
@@ -229,7 +223,6 @@ impl CardArgs {
         let mut no_can = false;
         let mut crl_file: Option<PathBuf> = None;
         let mut save_cert_dir: Option<PathBuf> = None;
-        let mut icao_pkd: Option<PathBuf> = None;
         let mut remote = false;
         let tokens = argv.into_vec();
         let mut iter = tokens.iter();
@@ -279,13 +272,6 @@ impl CardArgs {
                     })?;
                     save_cert_dir = Some(PathBuf::from(value));
                 }
-                "--icao-pkd" => {
-                    let value = iter.next().ok_or(ArgParseError::MissingValue {
-                        cmd: VerbTag::CardCheck,
-                        flag: "--icao-pkd",
-                    })?;
-                    icao_pkd = Some(PathBuf::from(value));
-                }
                 "--remote" => remote = true,
                 other => {
                     return Err(ArgParseError::Unexpected {
@@ -313,7 +299,6 @@ impl CardArgs {
             can,
             crl_file,
             save_cert_dir,
-            icao_pkd,
             remote,
         })
     }
@@ -395,8 +380,6 @@ mod tests {
             "/c.crl",
             "--save-cert",
             "/certs",
-            "--icao-pkd",
-            "/pkd.ldif",
         ]))?;
         check(
             &a.reader_filter.as_deref(),
@@ -409,7 +392,6 @@ mod tests {
             &Some(PathBuf::from("/certs")),
             "save_cert_dir",
         )?;
-        check(&a.icao_pkd, &Some(PathBuf::from("/pkd.ldif")), "icao_pkd")?;
         Ok(())
     }
 }

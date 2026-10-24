@@ -62,9 +62,6 @@ use refineid_lib_core::cert_state::CertDer;
 use refineid_lib_core::crl::OwnedCrl;
 use refineid_lib_core::crypto::digest::Sha256;
 use refineid_lib_core::emrtd::{EmrtdError, EmrtdPersonalData, read_personal_data};
-use refineid_lib_core::icao_pkd::{
-    CscaEntry, IcaoMasterList, extract_master_list_ders_from_ldif, parse_master_list,
-};
 use refineid_lib_core::identity::CredentialIdentity;
 use refineid_lib_core::ocsp::{self, OcspResponseStatus};
 use refineid_lib_core::pkcs15::{
@@ -75,17 +72,16 @@ use refineid_lib_core::revocation::{
 };
 use refineid_lib_core::secure_messaging::SmTransport;
 use refineid_lib_core::x509::{
-    Certificate, DateTime, KeyUsage, Name, OID_ICAO_ML_SIGNER, OwnedCert, PublicKeyAlgorithm,
-    SignatureAlgorithm, extract_basic_constraints, extract_ca_issuers_urls,
-    extract_crl_distribution_urls, extract_extended_key_usage, extract_extended_key_usage_meta,
-    extract_key_usage, extract_key_usage_meta, extract_ocsp_urls, extract_subject_alt_emails,
+    Certificate, DateTime, KeyUsage, Name, OwnedCert, PublicKeyAlgorithm, SignatureAlgorithm,
+    extract_ca_issuers_urls, extract_crl_distribution_urls, extract_extended_key_usage,
+    extract_key_usage, extract_ocsp_urls, extract_subject_alt_emails,
     parse_subject_public_key_info,
 };
 use refineid_lib_pcsc::{PcscBackend, PcscError};
 use sha1::{Digest as Sha1Digest, Sha1};
 
 use crate::http;
-use crate::trust_roots::{ICAO_PKD_ROOT_PEMS, ICAO_PKD_ROOT_SHA256, is_pinned_root};
+use crate::trust_roots::is_pinned_root;
 use crate::user_agent;
 
 /// Hard ceiling on a fetched CRL response body. Real DVV CRLs
@@ -93,8 +89,6 @@ use crate::user_agent;
 const CRL_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// Issuer certs and OCSP responses are small (<= 8 KiB).
 const SMALL_HTTP_MAX_BYTES: usize = 64 * 1024;
-/// ASN.1 DER SEQUENCE tag, used for coarse CMS/LDIF sniffing.
-const DER_SEQUENCE_TAG: u8 = 0x30;
 /// SHA-1 output width in bytes.
 const SHA1_OUTPUT_LEN: usize = 20;
 
@@ -115,15 +109,6 @@ pub struct CardCheckOptions<'a> {
     pub crl_file: Option<PathBuf>,
     /// Directory to dump each slot's cert DER to.
     pub save_cert_dir: Option<PathBuf>,
-    /// Path to ICAO PKD input -- either a single signed Master
-    /// List `*.ml` file (DER, CMS-wrapped) or a `*.ldif` file
-    /// from the canonical PKD distribution (typically
-    /// `icaopkd-002-complete-N.ldif` carrying N per-state
-    /// Master Lists). The format is sniffed at load time. Used
-    /// as the DSC trust anchor source for Passive
-    /// Authentication's DSC -> CSCA hop. Useful when combined
-    /// with --can.
-    pub icao_pkd: Option<PathBuf>,
     /// "Now" used for freshness + days-until-expiry. Defaults
     /// to the system clock through [`now_date_time`].
     pub now: Option<DateTime>,
@@ -200,172 +185,6 @@ pub struct CardCheckReport {
     /// (`BadCan`, SM glitch, parse error). The report still
     /// ships so the rest of the per-card data is visible.
     pub emrtd_error: Option<String>,
-    /// DSC -> CSCA verification outcome when --icao-pkd was
-    /// supplied and the eMRTD read produced a DSC. `None` when
-    /// either input is absent.
-    pub dsc_csca_check: Option<DscCscaCheck>,
-}
-
-/// Per-card outcome of the DSC -> CSCA hop, using the trusted
-/// Master List CSCAs from the `--icao-pkd` pool as the
-/// candidate trust anchors.
-#[derive(Debug, Clone)]
-pub enum DscCscaCheck {
-    /// DSC cleared Doc 9303 §7.1.1 `KeyUsage` compliance AND
-    /// chained to a trusted CSCA from the pool.
-    Ok {
-        /// Common Name attribute (RFC 5280 §4.1.2.6) extracted
-        /// from the verifying CSCA's subject DN. `None` when the
-        /// CN attribute is absent or unparseable.
-        csca_subject_cn: Option<refineid_lib_core::identity::CommonName>,
-        /// ISO 3166-1 alpha-2 country code from the CSCA's
-        /// subject DN `C=` attribute (Doc 9303-12 §4.2). `None`
-        /// when the C= attribute is absent.
-        csca_country: Option<refineid_lib_core::country::IsoAlpha2>,
-        /// SHA-256 of the verifying CSCA's full DER encoding,
-        /// per the operator-pin fingerprint convention.
-        csca_sha256: Sha256,
-    },
-    /// DSC failed Doc 9303 §7.1.1 `KeyUsage` compliance. The
-    /// CSCA chain check was *not* attempted -- a non-compliant
-    /// DSC fails Passive Authentication regardless of which
-    /// CSCA issued it.
-    KeyUsageNonCompliant(DscKeyUsageCheck),
-    /// CSCA candidate(s) for the country exist but no signature
-    /// verification succeeded against them.
-    NoMatch {
-        /// ISO 3166-1 alpha-2 country extracted from the DSC's
-        /// issuer DN. Equal to the key used to look up candidates.
-        country_iso: refineid_lib_core::country::IsoAlpha2,
-        /// Number of CSCAs in the pool with this country code
-        /// that were tried before giving up. Tier 0 `usize` --
-        /// arithmetic count, no domain meaning beyond "how many
-        /// signatures were attempted".
-        candidates: usize,
-    },
-    /// The ML had no CSCAs for the DSC's issuing country at all.
-    CountryAbsent {
-        /// ISO 3166-1 alpha-2 country extracted from the DSC's
-        /// issuer DN that wasn't represented in the trust pool.
-        country_iso: refineid_lib_core::country::IsoAlpha2,
-    },
-    /// The DSC didn't expose a country we could look up.
-    DscCountryUnknown,
-    /// EF.SOD didn't carry a DSC to verify.
-    NoDscInSod,
-    /// DSC was present but couldn't be parsed as X.509.
-    DscParseFailed,
-}
-
-/// Doc 9303 §7.1.1 Key Usage compliance check on a DSC.
-/// Informational; future versions may promote to blocking.
-#[derive(Debug, Clone)]
-pub enum DscKeyUsageCheck {
-    /// KU extension present, critical, asserts exactly
-    /// `digitalSignature` and nothing else.
-    Compliant,
-    /// KU extension absent.
-    ExtensionMissing,
-    /// KU extension present but not marked critical.
-    NotCritical,
-    /// KU present and critical but missing `digitalSignature`.
-    MissingDigitalSignature,
-    /// KU present and critical and includes `digitalSignature`
-    /// but also asserts other bits. The `extra` string lists
-    /// the offending bit labels.
-    ExtraBitsAsserted {
-        /// Comma-joined list of RFC 5280 §4.2.1.3 `KeyUsage` bit
-        /// names that are asserted alongside `digitalSignature`
-        /// (e.g. "keyCertSign, cRLSign"). Tier 0 `String` --
-        /// presentational; the bit-typed form is `KeyUsage`
-        /// with the individual flags.
-        extra: String,
-    },
-}
-
-impl DscKeyUsageCheck {
-    /// Render the DSC `keyUsage` check outcome as a one-line
-    /// human string for the report.
-    ///
-    /// ICAO 9303 Part 12 §7.1.1 requires DSCs to assert exactly
-    /// `digitalSignature` with the extension critical; the
-    /// strings here mirror the spec language so a reader can
-    /// cross-reference. Used only for the `card check` CLI
-    /// output, not parsed by anything.
-    fn describe(&self) -> String {
-        match self {
-            Self::Compliant => "ok (digitalSignature critical, only)".to_owned(),
-            Self::ExtensionMissing => {
-                "MISSING -- Doc 9303 \u{00a7}7.1.1 requires KU on DSC".to_owned()
-            }
-            Self::NotCritical => {
-                "NOT CRITICAL -- Doc 9303 \u{00a7}7.1.1 requires critical KU".to_owned()
-            }
-            Self::MissingDigitalSignature => {
-                "MISSING digitalSignature -- DSC must assert it".to_owned()
-            }
-            Self::ExtraBitsAsserted { extra } => {
-                format!("FAIL -- KU asserts non-digitalSignature bits: {extra}")
-            }
-        }
-    }
-}
-
-impl CardCheckHelpers {
-    /// Inspect a DSC's `keyUsage` extension and classify it for
-    /// the ICAO 9303 Part 12 §7.1.1 conformance check.
-    ///
-    /// Returns the most-specific failure variant: missing
-    /// extension -> not critical -> missing `digitalSignature`
-    /// bit -> extra non-`digitalSignature` bits asserted. The
-    /// `Compliant` case is reserved for DSCs that assert
-    /// exactly `digitalSignature` and nothing else.
-    fn check_dsc_key_usage(dsc: &Certificate<'_>) -> DscKeyUsageCheck {
-        let Some(extensions) = dsc.extensions else {
-            return DscKeyUsageCheck::ExtensionMissing;
-        };
-        let Some(ku_meta) = extract_key_usage_meta(extensions) else {
-            return DscKeyUsageCheck::ExtensionMissing;
-        };
-        if !ku_meta.critical {
-            return DscKeyUsageCheck::NotCritical;
-        }
-        let ku = &ku_meta.key_usage;
-        if !ku.digital_signature {
-            return DscKeyUsageCheck::MissingDigitalSignature;
-        }
-        let mut extra_bits: Vec<&str> = Vec::new();
-        if ku.non_repudiation {
-            extra_bits.push("nonRepudiation");
-        }
-        if ku.key_encipherment {
-            extra_bits.push("keyEncipherment");
-        }
-        if ku.data_encipherment {
-            extra_bits.push("dataEncipherment");
-        }
-        if ku.key_agreement {
-            extra_bits.push("keyAgreement");
-        }
-        if ku.key_cert_sign {
-            extra_bits.push("keyCertSign");
-        }
-        if ku.crl_sign {
-            extra_bits.push("cRLSign");
-        }
-        if ku.encipher_only {
-            extra_bits.push("encipherOnly");
-        }
-        if ku.decipher_only {
-            extra_bits.push("decipherOnly");
-        }
-        if !extra_bits.is_empty() {
-            return DscKeyUsageCheck::ExtraBitsAsserted {
-                extra: extra_bits.join(", "),
-            };
-        }
-        DscKeyUsageCheck::Compliant
-    }
 }
 
 /// One certificate slot's worth of output.
@@ -532,22 +351,6 @@ pub enum CardCheckError {
         /// `PermissionDenied`, ...).
         source: std::io::Error,
     },
-    /// `--icao-pkd` file read failed before any parse was tried.
-    IcaoPkdRead {
-        /// Filesystem path the read was attempted against.
-        path: PathBuf,
-        /// Underlying `std::io::Error`.
-        source: std::io::Error,
-    },
-    /// `--icao-pkd` file parsed unsuccessfully (DER vs LDIF sniff
-    /// produced no usable Master Lists).
-    IcaoPkdParse {
-        /// Filesystem path the parse was attempted against.
-        path: PathBuf,
-        /// Human-readable BER / LDIF parser error. Tier 0
-        /// `String`; presentational copy of the upstream error.
-        source: String,
-    },
 }
 
 impl fmt::Display for CardCheckError {
@@ -560,12 +363,6 @@ impl fmt::Display for CardCheckError {
             Self::Rng(s) => write!(f, "OS RNG unavailable: {s}"),
             Self::CrlRead { path, source } => {
                 write!(f, "CRL read {}: {source}", path.display())
-            }
-            Self::IcaoPkdRead { path, source } => {
-                write!(f, "ICAO PKD read {}: {source}", path.display())
-            }
-            Self::IcaoPkdParse { path, source } => {
-                write!(f, "ICAO PKD parse {}: {source}", path.display())
             }
             Self::NeedCan => write!(
                 f,
@@ -627,14 +424,6 @@ pub fn check_all(
     backend: PcscBackend,
     options: &CardCheckOptions<'_>,
 ) -> Result<Vec<CardCheckReport>, CardCheckError> {
-    // Pre-load + verify the ICAO PKD input once for the whole
-    // walk so a bad bundle fails fast (before any card I/O) and
-    // the parsed tree is shared across every per-card check.
-    let icao_pkd: Option<IcaoTrustPool> = match &options.icao_pkd {
-        Some(path) => Some(CardCheckHelpers::load_icao_pkd(path)?),
-        None => None,
-    };
-
     let filter = options
         .reader_filter
         .clone()
@@ -660,345 +449,9 @@ pub fn check_all(
     }
     let mut out = Vec::with_capacity(picks.len());
     for pick in picks {
-        out.push(check_for_reader(backend, pick, options, icao_pkd.as_ref())?);
+        out.push(check_for_reader(backend, pick, options)?);
     }
     Ok(out)
-}
-
-/// One Master List that has been parsed and trust-checked.
-/// Kept around per-source so the report can attribute each CSCA
-/// to its source ML and signer if needed.
-#[derive(Debug, Clone)]
-struct LoadedMl {
-    /// Parsed CSCA Master List body (RFC 5652 `SignedData` with
-    /// `cscaMasterListData` `eContentType` per ICAO 9303 Part 12
-    /// §6.4).
-    ml: IcaoMasterList,
-    /// Result of chaining the ML signer back to a pinned ICAO
-    /// PKD root. `Pinned` is the only outcome that lets the
-    /// ML's CSCAs feed the trust pool.
-    trust: MlSignerTrust,
-    /// Whether the signer asserts the critical `id-icao-mlSigner`
-    /// EKU per ICAO 9303 Part 12 §7.1.4 -- a hard requirement
-    /// for ML acceptance.
-    eku: SignerEkuCheck,
-    /// Whether the signer's `BasicConstraints` extension is
-    /// either absent or `CA=false`; an `mlSigner` cert acting
-    /// as a CA is a Doc 9303 violation.
-    basic_constraints: SignerBasicConstraintsCheck,
-}
-
-/// In-memory trust pool assembled from one `--icao-pkd PATH`
-/// argument. Either:
-///
-/// - exactly one `LoadedMl` when the path was a single signed
-///   `*.ml` (DER) file, or
-/// - N `LoadedMl`s when the path was an LDIF carrying N
-///   per-state Master Lists.
-///
-/// `trusted_cscas` only returns CSCA entries whose source ML
-/// passed every Doc 9303 §12 gate -- chain to a pinned ICAO PKD
-/// root, EKU `id-icao-mlSigner` critical present, and
-/// `BasicConstraints` CA not asserted. Untrusted MLs are still
-/// retained so the load-line summary can report what failed.
-#[derive(Debug, Clone)]
-pub struct IcaoTrustPool {
-    /// All Master Lists loaded from one `--icao-pkd PATH`
-    /// invocation. Holds both trusted and untrusted entries so
-    /// the report can attribute load-line outcomes; only the
-    /// trusted-ML subset feeds [`Self::trusted_cscas`].
-    mls: Vec<LoadedMl>,
-}
-
-impl IcaoTrustPool {
-    /// Yield every CSCA from every fully-trusted ML in the pool.
-    ///
-    /// "Fully trusted" means the ML chains to a pinned ICAO PKD
-    /// root, asserts the critical `id-icao-mlSigner` EKU, and
-    /// does not assert CA in `BasicConstraints`. CSCAs from
-    /// untrusted MLs never reach a card's trust chain --
-    /// surfacing them would defeat the pinning guarantee.
-    fn trusted_cscas(&self) -> impl Iterator<Item = &CscaEntry> {
-        self.mls
-            .iter()
-            .filter(|m| is_ml_fully_trusted(m))
-            .flat_map(|m| m.ml.cscas.iter())
-    }
-}
-
-/// Raw bytes read from the operator-supplied ICAO PKD input path.
-struct IcaoPkdFileBytes {
-    /// Verbatim file contents, format not yet classified.
-    bytes: Vec<u8>,
-}
-
-impl IcaoPkdFileBytes {
-    /// Heuristic file-format sniff: DER CMS starts with SEQUENCE.
-    fn looks_like_der_sequence(&self) -> bool {
-        self.bytes.first() == Some(&DER_SEQUENCE_TAG)
-    }
-
-    /// Borrow the file bytes for UTF-8/LDIF parsing.
-    const fn as_bytes(&self) -> &[u8] {
-        self.bytes.as_slice()
-    }
-
-    /// Consume the file bytes after the DER sniff has classified them.
-    fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-}
-
-/// `true` iff the ML passes every gate required to feed its
-/// CSCAs into the trust pool: pinned-root chain + Doc 9303
-/// EKU + Doc 9303 `BasicConstraints`.
-const fn is_ml_fully_trusted(m: &LoadedMl) -> bool {
-    matches!(m.trust, MlSignerTrust::Pinned { .. })
-        && matches!(m.eku, SignerEkuCheck::Compliant)
-        && matches!(m.basic_constraints, SignerBasicConstraintsCheck::Compliant)
-}
-
-/// Read the path, sniff DER vs LDIF, parse all Master Lists
-/// it contains, run the signer-trust check on each, return the
-/// combined pool.
-impl CardCheckHelpers {
-    /// Load and parse a `--icao-pkd PATH` argument into an
-    /// [`IcaoTrustPool`].
-    ///
-    /// Auto-sniffs DER (single `cscaMasterListData` blob) vs
-    /// LDIF (per-state attribute records carrying N Master
-    /// Lists). DER failures abort the load -- the operator
-    /// gave us one file and there's nothing to fall back on.
-    /// LDIF failures are per-record lenient -- partial loads
-    /// are useful when only a few states' MLs are malformed.
-    fn load_icao_pkd(path: &std::path::Path) -> Result<IcaoTrustPool, CardCheckError> {
-        let input = IcaoPkdFileBytes {
-            bytes: std::fs::read(path).map_err(|source| CardCheckError::IcaoPkdRead {
-                path: path.to_path_buf(),
-                source,
-            })?,
-        };
-        let is_der = input.looks_like_der_sequence();
-        let mls_der: Vec<Vec<u8>> = if is_der {
-            vec![input.into_bytes()]
-        } else {
-            let text = core::str::from_utf8(input.as_bytes()).map_err(|e| {
-                CardCheckError::IcaoPkdParse {
-                    path: path.to_path_buf(),
-                    source: format!("not DER and not UTF-8 text: {e}"),
-                }
-            })?;
-            extract_master_list_ders_from_ldif(text).map_err(|e| CardCheckError::IcaoPkdParse {
-                path: path.to_path_buf(),
-                source: format!("{e}"),
-            })?
-        };
-        let source_label = if is_der {
-            format!("DER .ml: {}", path.display())
-        } else {
-            format!("LDIF: {}", path.display())
-        };
-
-        // Per-ML failure handling differs by source kind:
-        //
-        // - DER input (single ML): fail the whole load. Operator's
-        //   one file was bad; there's nothing salvageable.
-        // - LDIF input (N MLs): be lenient. Per-state Master Lists
-        //   in the 002 LDIF use a variety of signature algorithms
-        //   (ECC curves we don't implement, RSA-PSS variants, etc.)
-        //   and one country's malformed ML shouldn't void the
-        //   bundle. Log the failure to stderr and keep the rest.
-        let mut loaded: Vec<LoadedMl> = Vec::with_capacity(mls_der.len());
-        let mut load_failures: Vec<String> = Vec::new();
-        for (idx, der) in mls_der.iter().enumerate() {
-            match parse_master_list(der) {
-                Ok(ml) => {
-                    let trust = Self::check_ml_signer_trust(&ml);
-                    let (eku, basic_constraints) = OwnedCert::from_der(&ml.signer_cert_der).map_or(
-                        (
-                            SignerEkuCheck::ExtensionMissing,
-                            SignerBasicConstraintsCheck::Compliant,
-                        ),
-                        |signer_owned| {
-                            let signer = signer_owned.view();
-                            (
-                                Self::check_signer_eku(&signer),
-                                Self::check_signer_basic_constraints(&signer),
-                            )
-                        },
-                    );
-                    loaded.push(LoadedMl {
-                        ml,
-                        trust,
-                        eku,
-                        basic_constraints,
-                    });
-                }
-                Err(e) => {
-                    if is_der {
-                        return Err(CardCheckError::IcaoPkdParse {
-                            path: path.to_path_buf(),
-                            source: format!("{e}"),
-                        });
-                    }
-                    load_failures.push(format!("ML #{idx}: {e}"));
-                }
-            }
-        }
-
-        let total = loaded.len();
-        let trusted_count = loaded.iter().filter(|m| is_ml_fully_trusted(m)).count();
-        let total_cscas: usize = loaded.iter().map(|m| m.ml.cscas.len()).sum();
-
-        if let (1, true, Some(m)) = (total, load_failures.is_empty(), loaded.first()) {
-            eprintln!(
-                "ICAO PKD loaded ({source_label}): 1 ML, {} CSCAs",
-                m.ml.cscas.len()
-            );
-            eprintln!(
-                "  signer:               {}",
-                m.ml.signer_subject_cn.as_deref().unwrap_or("<unparsed>")
-            );
-            eprintln!("  trust:                {}", m.trust.describe());
-            eprintln!("  Doc 9303 EKU:         {}", m.eku.describe());
-            eprintln!("  Doc 9303 BasicCons:   {}", m.basic_constraints.describe());
-        } else {
-            eprintln!(
-                "ICAO PKD loaded ({source_label}): {total} MLs ({trusted_count} trusted, \
-             {} unparseable), {total_cscas} CSCAs total before dedup",
-                load_failures.len(),
-            );
-            for (idx, m) in loaded.iter().enumerate() {
-                eprintln!(
-                    "  ML #{idx}: {} CSCAs, signer {} ({}; EKU: {}; BC: {})",
-                    m.ml.cscas.len(),
-                    m.ml.signer_subject_cn.as_deref().unwrap_or("<unparsed>"),
-                    m.trust.describe(),
-                    m.eku.describe(),
-                    m.basic_constraints.describe(),
-                );
-            }
-            for f in &load_failures {
-                eprintln!("  skipped: {f}");
-            }
-        }
-
-        Ok(IcaoTrustPool { mls: loaded })
-    }
-}
-
-/// Outcome of verifying the ML signer cert's chain to a pinned
-/// ICAO PKD root.
-///
-/// Computed once per ML load and surfaced in the "ICAO ML
-/// loaded" startup line so the operator immediately sees
-/// whether the bundle's *signer* (not just structure) is
-/// trustworthy.
-#[derive(Debug, Clone, Copy)]
-pub enum MlSignerTrust {
-    /// Signer cert verifies against a pinned root and the
-    /// pinned root's SHA-256 cross-check passes.
-    Pinned {
-        /// Human-readable name of the matching pinned root (e.g.
-        /// "ICAO CSCA Master List Signer"). Sourced from the
-        /// paired entry in `ICAO_PKD_ROOT_PEMS`; the value is a
-        /// compile-time string set so the Tier 0 `&'static str`
-        /// is acceptable.
-        root_label: &'static str,
-    },
-    /// Bundled PEM is present but its actual SHA-256 doesn't
-    /// match the paired pin -- a tamper signal on the source
-    /// tree. Refuse the trust verdict.
-    PinHashMismatch,
-    /// Signer cert's issuer DN didn't match any pinned root's
-    /// subject DN.
-    NoMatchingIssuer,
-    /// Issuer was found but signer-signed-by-issuer didn't
-    /// verify cryptographically.
-    SignatureFailed,
-}
-
-impl MlSignerTrust {
-    /// Render the trust-evaluation outcome as a one-line
-    /// human string for the ICAO-PKD load-line report.
-    ///
-    /// Each variant carries enough context to identify the
-    /// failure mode at a glance (pinned root label, hash
-    /// mismatch, no matching issuer, signature failure).
-    fn describe(&self) -> String {
-        match self {
-            Self::Pinned { root_label } => format!("signer trusts to pinned {root_label}"),
-            Self::PinHashMismatch => {
-                "BUNDLED-PIN HASH MISMATCH -- refusing to assert trust".to_owned()
-            }
-            Self::NoMatchingIssuer => "UNPINNED -- signer's issuer not in trust_roots".to_owned(),
-            Self::SignatureFailed => {
-                "UNPINNED -- candidate root found but signer signature did not verify".to_owned()
-            }
-        }
-    }
-}
-
-/// Doc 9303 §12 Extended Key Usage compliance check on the ML
-/// signer cert. Informational alongside [`MlSignerTrust`] for
-/// now; failures don't block trust yet.
-#[derive(Debug, Clone, Copy)]
-pub enum SignerEkuCheck {
-    /// EKU extension present, marked critical, contains
-    /// `id-icao-mlSigner` (2.23.136.1.1.3).
-    Compliant,
-    /// EKU extension absent. Doc 9303 §12 requires it.
-    ExtensionMissing,
-    /// EKU extension present but not marked critical.
-    NotCritical,
-    /// EKU extension present and critical but doesn't include
-    /// `id-icao-mlSigner`.
-    MissingMlSignerOid,
-}
-
-impl SignerEkuCheck {
-    /// One-line human string identifying the EKU compliance
-    /// outcome, sourced verbatim into the load-line report.
-    ///
-    /// ICAO 9303 Part 12 §7.1.4 spells out the requirement
-    /// (`id-icao-mlSigner` present, critical); the variant
-    /// strings name each failure mode so the operator can
-    /// fix it directly.
-    const fn describe(self) -> &'static str {
-        match self {
-            Self::Compliant => "ok (id-icao-mlSigner critical)",
-            Self::ExtensionMissing => "MISSING -- Doc 9303 \u{00a7}12 requires EKU on MLS",
-            Self::NotCritical => "NOT CRITICAL -- Doc 9303 \u{00a7}12 requires critical EKU",
-            Self::MissingMlSignerOid => {
-                "WRONG -- EKU present but does not include id-icao-mlSigner"
-            }
-        }
-    }
-}
-
-/// Doc 9303 §12 `BasicConstraints` compliance check on the MLS.
-#[derive(Debug, Clone, Copy)]
-pub enum SignerBasicConstraintsCheck {
-    /// CA flag not asserted (extension absent, or present with
-    /// CA=false). Either form is acceptable for a leaf MLS.
-    Compliant,
-    /// CA=true asserted -- non-compliant per Doc 9303 §12.
-    CaAsserted,
-}
-
-impl SignerBasicConstraintsCheck {
-    /// Human label for the MLS `BasicConstraints` outcome.
-    ///
-    /// ICAO 9303 Part 12 forbids `CA=true` on an MLS leaf cert;
-    /// a `Compliant` variant covers both "extension absent"
-    /// and "extension present with CA=false" because the
-    /// audit reader cares only about whether CA is asserted.
-    const fn describe(self) -> &'static str {
-        match self {
-            Self::Compliant => "ok (CA not asserted)",
-            Self::CaAsserted => "FAIL -- BasicConstraints CA=true on MLS cert",
-        }
-    }
 }
 
 /// EF.SOD DER bytes from a parsed eMRTD read.
@@ -1017,147 +470,6 @@ impl<'a> SodDer<'a> {
     /// Borrow the EF.SOD DER bytes for the CMS parser boundary.
     const fn as_bytes(self) -> &'a [u8] {
         self.bytes
-    }
-}
-
-impl CardCheckHelpers {
-    /// Classify the ML signer's EKU extension against ICAO 9303
-    /// Part 12 §7.1.4.
-    ///
-    /// Returns the most-specific failure variant in order:
-    /// missing -> not critical -> wrong-OID-list. The trust
-    /// pipeline (`is_ml_fully_trusted`) only accepts the
-    /// `Compliant` variant; other outcomes leave the ML in
-    /// the report but exclude its CSCAs.
-    fn check_signer_eku(signer: &Certificate<'_>) -> SignerEkuCheck {
-        let Some(extensions) = signer.extensions else {
-            return SignerEkuCheck::ExtensionMissing;
-        };
-        let Some(eku) = extract_extended_key_usage_meta(extensions) else {
-            return SignerEkuCheck::ExtensionMissing;
-        };
-        if !eku.critical {
-            return SignerEkuCheck::NotCritical;
-        }
-        if !eku.contains(OID_ICAO_ML_SIGNER) {
-            return SignerEkuCheck::MissingMlSignerOid;
-        }
-        SignerEkuCheck::Compliant
-    }
-}
-
-impl CardCheckHelpers {
-    /// Classify the ML signer's `BasicConstraints` against ICAO
-    /// 9303 Part 12 §7.1.3.
-    ///
-    /// Absent extension and present-with-`CA=false` are both
-    /// `Compliant`; only an asserted CA flag fails. The MLS is a
-    /// leaf-only cert -- treating it as a CA would let it
-    /// issue further certs, breaking the trust model.
-    fn check_signer_basic_constraints(signer: &Certificate<'_>) -> SignerBasicConstraintsCheck {
-        let Some(extensions) = signer.extensions else {
-            return SignerBasicConstraintsCheck::Compliant;
-        };
-        let bc = extract_basic_constraints(extensions);
-        if bc.ca {
-            SignerBasicConstraintsCheck::CaAsserted
-        } else {
-            SignerBasicConstraintsCheck::Compliant
-        }
-    }
-}
-
-/// Verify the ML signer cert chains to a pinned ICAO PKD root.
-///
-/// Algorithm:
-///
-/// 1. Cross-check each `ICAO_PKD_ROOT_PEMS` entry's actual
-///    SHA-256 against the paired `ICAO_PKD_ROOT_SHA256` pin. A
-///    mismatch is a tamper signal; the bundled PEM is ignored
-///    for trust purposes but the pin still applies.
-/// 2. Walk the ML's `embedded_certs_der` and treat any cert
-///    whose SHA-256 matches one of the surviving pins as a
-///    candidate root.
-/// 3. For each candidate, try
-///    `verify_certificate_signed_by(signer, root)`. First
-///    success wins.
-///
-/// Step 2 looks up the root *by fingerprint*, not by DN
-/// matching, so it stays robust even when the signer cert's
-/// embedded issuer DN encodes string types differently from the
-/// bundled PEM's subject DN (which happens in practice -- the
-/// bundled "United Nations CSCA 2.pem" encodes some attributes
-/// as `UTF8String` whereas the ML-embedded copy encodes them
-/// as `PrintableString`).
-impl CardCheckHelpers {
-    /// Run the three-step pin-based trust check on a Master
-    /// List's signer.
-    ///
-    /// See the module-level comment above for the algorithm.
-    /// Key property: the candidate root is identified by
-    /// SHA-256 fingerprint, not by DN equality, so the check
-    /// survives the practical DN-encoding mismatches that occur
-    /// when the bundled root PEM and the ML-embedded root
-    /// disagree on `UTF8String` vs `PrintableString`.
-    fn check_ml_signer_trust(ml: &IcaoMasterList) -> MlSignerTrust {
-        let Ok(signer_owned) = OwnedCert::from_der(&ml.signer_cert_der) else {
-            return MlSignerTrust::SignatureFailed;
-        };
-        let signer = signer_owned.view();
-        let mut hash_mismatch = false;
-        let mut surviving_pins: Vec<(&str, CertSha256)> = Vec::new();
-        for ((label, pem_bytes), (_label_pin, expected_fp)) in
-            ICAO_PKD_ROOT_PEMS.iter().zip(ICAO_PKD_ROOT_SHA256.iter())
-        {
-            match crate::text::decode_cert_pem_or_der(pem_bytes) {
-                Some(der) if CertSha256::of(&der) == *expected_fp => {
-                    surviving_pins.push((label, *expected_fp));
-                }
-                Some(_) => {
-                    hash_mismatch = true;
-                }
-                None => {
-                    // Couldn't decode the bundled PEM; still keep the
-                    // SHA-256 pin alive so an ML that embeds a matching
-                    // cert can verify.
-                    surviving_pins.push((label, *expected_fp));
-                }
-            }
-        }
-        if surviving_pins.is_empty() {
-            return if hash_mismatch {
-                MlSignerTrust::PinHashMismatch
-            } else {
-                MlSignerTrust::NoMatchingIssuer
-            };
-        }
-        let mut found_match = false;
-        for cand_der in &ml.embedded_certs_der {
-            let actual_fp = CertSha256::of(cand_der);
-            let Some((root_label, _pin_fp)) =
-                surviving_pins.iter().find(|(_, pin)| pin == &actual_fp)
-            else {
-                continue;
-            };
-            found_match = true;
-            let Ok(root_owned) = OwnedCert::from_der(cand_der) else {
-                continue;
-            };
-            let root = root_owned.view();
-            if signer.verify_signed_by(root).is_ok() {
-                return MlSignerTrust::Pinned { root_label };
-            }
-        }
-        // If found_match is true at this point, a candidate matched
-        // a pinned root by SHA-256 but the signature did NOT verify
-        // (we'd have returned MlSignerTrust::Pinned otherwise). The
-        // post-loop branch reflects that contract: matched-but-
-        // unverified collapses to SignatureFailed.
-        if found_match {
-            MlSignerTrust::SignatureFailed
-        } else {
-            MlSignerTrust::NoMatchingIssuer
-        }
     }
 }
 
@@ -1431,15 +743,10 @@ fn read_emrtd_section_for(
 ///      open because PACE consumes a fresh card state and we
 ///      want the rest of the report to ship even if the eMRTD
 ///      read fails (wrong CAN, missing card profile, etc.).
-///
-/// The optional DSC->CSCA hop runs only when both an ICAO PKD
-/// trust pool is supplied and the eMRTD read produced a SOD;
-/// otherwise the field stays `None`.
 pub(crate) fn check_for_reader(
     backend: PcscBackend,
     pick: FineidReaderPick,
     options: &CardCheckOptions<'_>,
-    icao_pkd: Option<&IcaoTrustPool>,
 ) -> Result<CardCheckReport, CardCheckError> {
     let FineidReaderPick {
         reader_id,
@@ -1519,13 +826,6 @@ pub(crate) fn check_for_reader(
     // BadCan against a wrong-card guess in multi-card mode).
     let (emrtd, emrtd_error) = read_emrtd_section_for(backend, &reader_id, options.can.copied());
 
-    // DSC -> CSCA hop, gated on both an ICAO PKD pool being
-    // supplied *and* the eMRTD read having produced a usable SOD.
-    let dsc_csca_check = match (icao_pkd, emrtd.as_ref()) {
-        (Some(pool), Some(data)) => Some(CardCheckHelpers::run_dsc_csca_check(data, pool)),
-        _ => None,
-    };
-
     Ok(CardCheckReport {
         reader: reader_id.as_str().to_owned(),
         identity,
@@ -1544,107 +844,7 @@ pub(crate) fn check_for_reader(
         pin2_changed,
         emrtd,
         emrtd_error,
-        dsc_csca_check,
     })
-}
-
-/// Look up the DSC in the SOD, try to verify it against the
-/// combined pool of trusted CSCAs. Returns one of the
-/// [`DscCscaCheck`] variants without ever failing the whole
-/// report -- the result is informational.
-impl CardCheckHelpers {
-    /// Resolve the DSC inside the SOD and verify its signature
-    /// against the trust pool's CSCAs.
-    ///
-    /// Steps:
-    ///   1. Parse SOD `SignedData`; the first embedded cert is
-    ///      the DSC (ICAO 9303 Part 10 §4.6.2.2).
-    ///   2. Apply the Doc 9303 §7.1.1 DSC `keyUsage` gate; a
-    ///      non-compliant DSC short-circuits the chain walk.
-    ///   3. Filter trusted CSCAs by ISO country; refuse the
-    ///      chain if the DSC's issuing country has no CSCA in
-    ///      the pool.
-    ///   4. Try each candidate (DN equality first, then signature
-    ///      verification). First success wins.
-    ///
-    /// Returns one of the [`DscCscaCheck`] variants; never
-    /// fails the surrounding report.
-    fn run_dsc_csca_check(data: &EmrtdPersonalData, pool: &IcaoTrustPool) -> DscCscaCheck {
-        // The DSC -> CSCA verdict depends only on the EF.SOD bytes,
-        // so delegate to the narrower [`Self::dsc_csca_check_for_sod`].
-        // The narrower signature is both the honest dependency and the
-        // unit-testable surface (no need to build a whole
-        // `EmrtdPersonalData` to exercise the chain walk).
-        Self::dsc_csca_check_for_sod(SodDer::from_personal_data(data), pool)
-    }
-
-    /// Resolve the DSC inside `sod_der` (the EF.SOD CMS `SignedData`
-    /// bytes) and verify its signature against the trust pool's
-    /// CSCAs.
-    ///
-    /// Carries the full algorithm documented on
-    /// [`Self::run_dsc_csca_check`]; the wrapper exists only to
-    /// project an [`EmrtdPersonalData`] down to its EF.SOD bytes.
-    fn dsc_csca_check_for_sod(sod_der: Option<SodDer<'_>>, pool: &IcaoTrustPool) -> DscCscaCheck {
-        let Some(sod) = sod_der else {
-            return DscCscaCheck::NoDscInSod;
-        };
-        let Ok(signed_owned) = refineid_lib_core::cms::OwnedSignedData::from_der(sod.as_bytes())
-        else {
-            return DscCscaCheck::NoDscInSod;
-        };
-        let signed = signed_owned.view();
-        let Some(dsc_der) = signed.certificates_der.first() else {
-            return DscCscaCheck::NoDscInSod;
-        };
-        let Ok(dsc_owned) = OwnedCert::from_der(dsc_der) else {
-            return DscCscaCheck::DscParseFailed;
-        };
-        let dsc = dsc_owned.view();
-
-        // Doc 9303 §7.1.1 KeyUsage compliance is a precondition on
-        // the DSC -- a non-compliant DSC fails PA regardless of
-        // which CSCA issued it. Short-circuit before the chain walk.
-        let ku = Self::check_dsc_key_usage(&dsc);
-        if !matches!(ku, DscKeyUsageCheck::Compliant) {
-            return DscCscaCheck::KeyUsageNonCompliant(ku);
-        }
-
-        let Some(country) = dsc.issuer.country() else {
-            return DscCscaCheck::DscCountryUnknown;
-        };
-
-        let candidates: Vec<&CscaEntry> = pool
-            .trusted_cscas()
-            .filter(|c| c.country_iso.as_ref() == Some(&country))
-            .collect();
-        if candidates.is_empty() {
-            return DscCscaCheck::CountryAbsent {
-                country_iso: country,
-            };
-        }
-
-        for cand in &candidates {
-            let Ok(csca_cert_owned) = OwnedCert::from_der(&cand.der) else {
-                continue;
-            };
-            let csca_cert = csca_cert_owned.view();
-            if csca_cert.subject != dsc.issuer {
-                continue;
-            }
-            if dsc.verify_signed_by(csca_cert).is_ok() {
-                return DscCscaCheck::Ok {
-                    csca_subject_cn: cand.subject_cn.clone(),
-                    csca_country: cand.country_iso.clone(),
-                    csca_sha256: cand.sha256,
-                };
-            }
-        }
-        DscCscaCheck::NoMatch {
-            country_iso: country,
-            candidates: candidates.len(),
-        }
-    }
 }
 
 /// Parsed AIA caIssuers certificate fetched for a leaf slot.
@@ -2305,7 +1505,7 @@ impl CardCheckReport {
     }
 
     /// Write the optional eMRTD section (MRZ, DG11/12 fields,
-    /// images, DSC->CSCA outcome).
+    /// images, security files).
     ///
     /// Three states: present + parsed (emit the full eMRTD
     /// block), absent + error (emit a "FAILED:" line so the
@@ -2315,15 +1515,7 @@ impl CardCheckReport {
         match (&self.emrtd, &self.emrtd_error) {
             (Some(emrtd), _) => {
                 writeln!(f)?;
-                CardCheckHelpers::write_emrtd_section(f, emrtd)?;
-                if let Some(check) = &self.dsc_csca_check {
-                    writeln!(
-                        f,
-                        "DSC -> CSCA:         {}",
-                        CardCheckHelpers::render_dsc_csca(check)
-                    )?;
-                }
-                Ok(())
+                CardCheckHelpers::write_emrtd_section(f, emrtd)
             }
             (None, Some(err)) => {
                 writeln!(f)?;
@@ -2343,50 +1535,6 @@ impl fmt::Display for CardCheckReport {
         self.fmt_cert_slots(f)?;
         self.fmt_pin_counters(f)?;
         self.fmt_emrtd_block(f)
-    }
-}
-
-impl CardCheckHelpers {
-    /// Render the DSC->CSCA verification outcome as a one-line
-    /// human string for the eMRTD section.
-    ///
-    /// Each variant produces a different shape so the operator
-    /// can immediately see whether trust closed, which CSCA
-    /// did the closing, and (on failure) why -- DSC keyUsage
-    /// non-compliance, no matching CSCA, missing country, no
-    /// DSC in SOD, etc.
-    fn render_dsc_csca(check: &DscCscaCheck) -> String {
-        match check {
-            DscCscaCheck::Ok {
-                csca_subject_cn,
-                csca_country,
-                csca_sha256,
-            } => format!(
-                "ok via {} ({}) sha256 {csca_sha256}",
-                csca_subject_cn.as_deref().unwrap_or("<unparsed CN>"),
-                csca_country.as_ref().map_or("??", |c| c.as_str()),
-            ),
-            DscCscaCheck::KeyUsageNonCompliant(ku) => {
-                format!(
-                    "FAILED -- Doc 9303 §7.1.1 DSC KeyUsage non-compliant: {}",
-                    ku.describe()
-                )
-            }
-            DscCscaCheck::NoMatch {
-                country_iso,
-                candidates,
-            } => format!(
-                "FAILED -- {candidates} candidate(s) for {country_iso} in ML, none verified the DSC"
-            ),
-            DscCscaCheck::CountryAbsent { country_iso } => {
-                format!("ML has no CSCA for {country_iso}")
-            }
-            DscCscaCheck::DscCountryUnknown => {
-                "DSC issuer DN has no countryName -- can't index into ML".to_owned()
-            }
-            DscCscaCheck::NoDscInSod => "EF.SOD carried no DSC".to_owned(),
-            DscCscaCheck::DscParseFailed => "DSC failed to parse as X.509".to_owned(),
-        }
     }
 }
 
@@ -2476,8 +1624,8 @@ impl CardCheckHelpers {
     /// Write the eMRTD security section: SOD / DG14 / DG15
     /// presence + parsed contents, plus AA and CA outcomes.
     ///
-    /// ICAO 9303 Part 10 §4 -- SOD carries the DSC and
-    /// passive-authentication digests, DG14 holds chip-auth
+    /// ICAO 9303 Part 10 §4 -- SOD carries the DSC and the
+    /// data-group digests, DG14 holds chip-auth
     /// security infos, DG15 the AA public key. Each block
     /// surfaces a byte count + structured parse so the
     /// operator can audit coverage at a glance.
@@ -2516,8 +1664,7 @@ impl CardCheckHelpers {
     ///
     /// Composes the MRZ -> images -> security sub-blocks in
     /// that order; called once from [`CardCheckReport::fmt_emrtd_block`]
-    /// when both an `EmrtdPersonalData` and (optionally) a
-    /// DSC->CSCA outcome are present.
+    /// when an `EmrtdPersonalData` is present.
     fn write_emrtd_section(f: &mut fmt::Formatter<'_>, emrtd: &EmrtdPersonalData) -> fmt::Result {
         writeln!(f, "=== eMRTD (read via PACE / --can) ===")?;
         Self::write_emrtd_mrz(f, emrtd)?;
@@ -2960,16 +2107,13 @@ impl CardCheckHelpers {
 #[cfg(test)]
 mod tests {
     //! Unit tests for the pure policy/orchestration logic in
-    //! `card_check`: DSC `keyUsage` compliance, Master List signer
-    //! trust evaluation, trust-anchor pinning (chain walk),
-    //! CRL verdict orchestration, the DSC -> CSCA hop, and the
-    //! human-string renderers.
+    //! `card_check`: trust-anchor pinning (chain walk), CRL
+    //! verdict orchestration, and the human-string renderers.
     //!
-    //! No card or network is touched. Certificates / CRLs / EF.SOD
-    //! CMS blobs are built as DER in-process; the few signature
-    //! verifications that must succeed reuse the real self-signed
-    //! pinned roots (DVV G3 RSA/ECC, UN CSCA 2) shipped in
-    //! `trust-anchors/`, since a self-signed root verifies against
+    //! No card or network is touched. Certificates and CRLs are
+    //! built as DER in-process; the few signature verifications
+    //! that must succeed reuse the real self-signed pinned roots
+    //! (DVV G3 RSA/ECC) shipped in `trust-anchors/`, since a self-signed root verifies against
     //! itself. Crate-private typed values (`CommonName`,
     //! `IsoAlpha2`, `CertSerial`) are obtained by parsing built
     //! certs, exactly as production does -- their constructors are
@@ -2980,13 +2124,11 @@ mod tests {
 
     use super::{
         AiaIssuerCert, AiaIssuerCertStatus, CardCheckError, CardCheckHelpers, CheckOutcome,
-        CheckOutcomeSection, DER_SEQUENCE_TAG, DscCscaCheck, DscKeyUsageCheck, IcaoPkdFileBytes,
-        IcaoTrustPool, LoadedMl, MlSignerTrust, SignatureCheck, SignerBasicConstraintsCheck,
-        SignerEkuCheck, SodDer, VerifyContext, days_between, fmt_check_outcome,
-        is_ml_fully_trusted, now_date_time, run_chain_check, verify_crl,
+        CheckOutcomeSection, SignatureCheck, VerifyContext, days_between, fmt_check_outcome,
+        now_date_time, run_chain_check, verify_crl,
     };
     use crate::test_util::{TestResult, check, check_true};
-    use crate::trust_roots::{ICAO_PKD_ROOT_PEMS, PINNED_ROOT_DER};
+    use crate::trust_roots::PINNED_ROOT_DER;
     use alloc::fmt;
     use refineid_lib_core::aa::AaOutcome;
     use refineid_lib_core::apdu::status_word::PinRetries;
@@ -2994,11 +2136,8 @@ mod tests {
         CredentialPolicyCounters, PinStatus, PukStatus, UnblockingCounter, UsageCounter,
     };
     use refineid_lib_core::ca::CaOutcome;
-    use refineid_lib_core::cms::OwnedSignedData;
     use refineid_lib_core::crl::OwnedCrl;
-    use refineid_lib_core::crypto::digest::Sha256;
     use refineid_lib_core::crypto::rsa::HashAlg;
-    use refineid_lib_core::icao_pkd::{CscaEntry, IcaoMasterList};
     use refineid_lib_core::identity::MrzDate;
     use refineid_lib_core::revocation::{InapplicableReason, RevocationStatus};
     use refineid_lib_core::x509::{DateTime, OwnedCert};
@@ -3013,54 +2152,22 @@ mod tests {
 
     /// `id-at-commonName` OID body (2.5.4.3).
     const OID_CN: [u8; 3] = [0x55, 0x04, 0x03];
-    /// `id-at-countryName` OID body (2.5.4.6).
-    const OID_C: [u8; 3] = [0x55, 0x04, 0x06];
-    /// `id-ce-keyUsage` OID body (2.5.29.15).
-    const OID_KU: [u8; 3] = [0x55, 0x1D, 0x0F];
-    /// `id-ce-extKeyUsage` OID body (2.5.29.37).
-    const OID_EKU: [u8; 3] = [0x55, 0x1D, 0x25];
-    /// `id-ce-basicConstraints` OID body (2.5.29.19).
-    const OID_BC: [u8; 3] = [0x55, 0x1D, 0x13];
-    /// `id-icao-mlSigner` OID body (2.23.136.1.1.3).
-    const OID_ML_SIGNER: [u8; 6] = [0x67, 0x81, 0x08, 0x01, 0x01, 0x03];
-    /// `id-kp-serverAuth` OID body (1.3.6.1.5.5.7.3.1) -- a
-    /// recognised but non-mlSigner EKU OID.
-    const OID_SERVER_AUTH: [u8; 8] = [0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
-    /// `id-signedData` OID body (1.2.840.113549.1.7.2).
-    const OID_SIGNED_DATA: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
-    /// `id-data` OID body (1.2.840.113549.1.7.1) -- arbitrary
-    /// eContentType for the synthetic EF.SOD.
-    const OID_ID_DATA: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01];
-    /// `id-sha256` OID body (2.16.840.1.101.3.4.2.1).
-    const OID_SHA256: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
     /// `sha256WithRSAEncryption` OID body (1.2.840.113549.1.1.11).
     const OID_SHA256_RSA: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
     const DER_SHORT_FORM_LIMIT: usize = 0x80;
     const DER_LEN_LONG_ONE: u8 = 0x81;
     const DER_LEN_LONG_TWO: u8 = 0x82;
-    const DER_TAG_BOOLEAN: u8 = 0x01;
     const DER_TAG_INTEGER: u8 = 0x02;
-    const DER_TAG_BIT_STRING: u8 = 0x03;
-    const DER_TAG_OCTET_STRING: u8 = 0x04;
     const DER_TAG_OBJECT_IDENTIFIER: u8 = 0x06;
     const DER_TAG_UTF8_STRING: u8 = 0x0C;
-    const DER_TAG_PRINTABLE_STRING: u8 = 0x13;
     const DER_TAG_UTC_TIME: u8 = 0x17;
     const DER_TAG_SEQUENCE: u8 = 0x30;
     const DER_TAG_SET: u8 = 0x31;
-    const DER_TAG_CONTEXT_0: u8 = 0xA0;
     const DER_TAG_CONTEXT_3: u8 = 0xA3;
     const DER_NULL: [u8; 2] = [0x05, 0x00];
-    const DER_TRUE: [u8; 1] = [0xFF];
-    const DER_FALSE_BYTE: u8 = 0x00;
-    const DER_UNUSED_BITS_ZERO: u8 = 0x00;
     const CERT_VERSION_V3: [u8; 5] = [0xA0, 0x03, 0x02, 0x01, 0x02];
     const FIXTURE_SPKI_BITS: [u8; 7] = [0x03, 0x05, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
     const FIXTURE_SIGNATURE_BITS: [u8; 7] = [0x03, 0x05, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
-    const CERT_SERIAL_ONE: u8 = 0x01;
-    const CMS_SIGNED_DATA_VERSION: [u8; 1] = [0x03];
-    const CMS_SIGNER_INFO_VERSION: [u8; 1] = [0x01];
-    const CMS_ISSUER_SERIAL_PLACEHOLDER: [u8; 1] = [0x00];
     const CRL_VERSION_V2: [u8; 1] = [0x01];
 
     /// Shared DER byte builder for synthetic test fixtures.
@@ -3080,10 +2187,6 @@ mod tests {
             self.0.as_slice()
         }
 
-        fn into_vec(self) -> Vec<u8> {
-            self.0
-        }
-
         fn len(&self) -> usize {
             self.0.len()
         }
@@ -3094,21 +2197,6 @@ mod tests {
 
         fn push_array<const N: usize>(&mut self, bytes: [u8; N]) {
             self.0.extend_from_slice(&bytes);
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    enum EkuFixtureOid {
-        MlSigner,
-        ServerAuth,
-    }
-
-    impl EkuFixtureOid {
-        fn to_tlv(self) -> FixtureDer {
-            match self {
-                Self::MlSigner => oid_tlv(&OID_ML_SIGNER),
-                Self::ServerAuth => oid_tlv(&OID_SERVER_AUTH),
-            }
         }
     }
 
@@ -3187,63 +2275,11 @@ mod tests {
         tlv(DER_TAG_SEQUENCE, &rdn(&OID_CN, DER_TAG_UTF8_STRING, cn))
     }
 
-    /// `RDNSequence` carrying `CN=cn` then `C=country`
-    /// (`PrintableString` country).
-    fn dn_cn_country<const CN_LEN: usize, const COUNTRY_LEN: usize>(
-        cn: &[u8; CN_LEN],
-        country: &[u8; COUNTRY_LEN],
-    ) -> FixtureDer {
-        let mut body = rdn(&OID_CN, DER_TAG_UTF8_STRING, cn);
-        body.push_der(&rdn(&OID_C, DER_TAG_PRINTABLE_STRING, country));
-        tlv(DER_TAG_SEQUENCE, &body)
-    }
-
     /// A `UTCTime` TLV from a `YYMMDDHHMMSS` string (Z-terminated).
     fn utc_time<const N: usize>(yymmddhhmmss: &[u8; N]) -> FixtureDer {
         let mut body = yymmddhhmmss.to_vec();
         body.push(b'Z');
         tlv(DER_TAG_UTC_TIME, &FixtureDer(body))
-    }
-
-    /// One X.509 `Extension` (`extnID` + optional critical BOOLEAN
-    /// + `extnValue` OCTET STRING wrapping `inner`).
-    fn ext<const N: usize>(oid_body: &[u8; N], critical: bool, inner: &FixtureDer) -> FixtureDer {
-        let mut body = oid_tlv(oid_body);
-        if critical {
-            body.push_der(&tlv_array(DER_TAG_BOOLEAN, DER_TRUE));
-        }
-        body.push_der(&tlv(DER_TAG_OCTET_STRING, inner));
-        tlv(DER_TAG_SEQUENCE, &body)
-    }
-
-    /// A `keyUsage` extension. `first_byte` carries named bits 0..7
-    /// (MSB = `digitalSignature`); `second_byte` carries bit 8
-    /// (`decipherOnly`) when present. The unused-bits count is left
-    /// at 0 -- the extractor skips it.
-    fn ku_ext(critical: bool, first_byte: u8, second_byte: Option<u8>) -> FixtureDer {
-        let mut bits = FixtureDer(vec![DER_UNUSED_BITS_ZERO, first_byte]);
-        if let Some(extra) = second_byte {
-            bits.0.push(extra);
-        }
-        let inner = tlv(DER_TAG_BIT_STRING, &bits);
-        ext(&OID_KU, critical, &inner)
-    }
-
-    /// An `extKeyUsage` extension listing `oid_bodies`.
-    fn eku_ext<const N: usize>(critical: bool, oid_bodies: [EkuFixtureOid; N]) -> FixtureDer {
-        let mut seq = FixtureDer::empty();
-        for body in oid_bodies {
-            seq.push_der(&body.to_tlv());
-        }
-        let inner = tlv(DER_TAG_SEQUENCE, &seq);
-        ext(&OID_EKU, critical, &inner)
-    }
-
-    /// A `basicConstraints` extension asserting the given `cA` flag.
-    fn bc_ext(critical: bool, ca: bool) -> FixtureDer {
-        let ca_byte = if ca { DER_TRUE } else { [DER_FALSE_BYTE] };
-        let inner = tlv(DER_TAG_SEQUENCE, &tlv_array(DER_TAG_BOOLEAN, ca_byte));
-        ext(&OID_BC, critical, &inner)
     }
 
     /// Build the smallest parseable v3 certificate DER from the
@@ -3288,56 +2324,6 @@ mod tests {
         tlv(DER_TAG_SEQUENCE, &outer)
     }
 
-    /// Build a minimal parseable CMS `SignedData` (`ContentInfo`
-    /// wrapper) embedding `certs` in the `certificates [0]` field.
-    /// The `signerInfo` and signature are structural padding -- the
-    /// DSC -> CSCA check only reads the first embedded certificate.
-    fn build_sod(certs: &[&FixtureDer]) -> FixtureDer {
-        let version = tlv_array(DER_TAG_INTEGER, CMS_SIGNED_DATA_VERSION);
-        let digest_algos = tlv(DER_TAG_SET, &tlv(DER_TAG_SEQUENCE, &oid_tlv(&OID_SHA256)));
-        let encap = {
-            let mut body = oid_tlv(&OID_ID_DATA);
-            body.push_der(&tlv(
-                DER_TAG_CONTEXT_0,
-                &tlv(DER_TAG_OCTET_STRING, &FixtureDer::empty()),
-            ));
-            tlv(DER_TAG_SEQUENCE, &body)
-        };
-        let signer_info = {
-            let mut sid = tlv(DER_TAG_SEQUENCE, &FixtureDer::empty());
-            sid.push_der(&tlv_array(DER_TAG_INTEGER, CMS_ISSUER_SERIAL_PLACEHOLDER));
-            let mut body = tlv_array(DER_TAG_INTEGER, CMS_SIGNER_INFO_VERSION);
-            body.push_der(&tlv(DER_TAG_SEQUENCE, &sid));
-            body.push_der(&tlv(DER_TAG_SEQUENCE, &oid_tlv(&OID_SHA256)));
-            body.push_der(&tlv(DER_TAG_SEQUENCE, &oid_tlv(&OID_SHA256_RSA)));
-            body.push_der(&tlv(DER_TAG_OCTET_STRING, &FixtureDer::empty()));
-            tlv(DER_TAG_SEQUENCE, &body)
-        };
-        let signer_infos = tlv(DER_TAG_SET, &signer_info);
-        let mut sd_body = version;
-        sd_body.push_der(&digest_algos);
-        sd_body.push_der(&encap);
-        if !certs.is_empty() {
-            let mut cert_field = FixtureDer::empty();
-            for c in certs {
-                cert_field.push_der(c);
-            }
-            sd_body.push_der(&tlv(DER_TAG_CONTEXT_0, &cert_field));
-        }
-        sd_body.push_der(&signer_infos);
-        let signed_data = tlv(DER_TAG_SEQUENCE, &sd_body);
-        let mut ci_body = oid_tlv(&OID_SIGNED_DATA);
-        ci_body.push_der(&tlv(DER_TAG_CONTEXT_0, &signed_data));
-        tlv(DER_TAG_SEQUENCE, &ci_body)
-    }
-
-    /// Borrow a synthetic EF.SOD fixture through the production SOD type.
-    fn sod_der(sod: &FixtureDer) -> SodDer<'_> {
-        SodDer {
-            bytes: sod.as_slice(),
-        }
-    }
-
     /// Build a minimal parseable CRL whose `issuer` is `issuer_dn`.
     /// (`thisUpdate`/`nextUpdate` are present for structural validity;
     /// freshness is consulted by `check_against_crl`, not by the
@@ -3358,57 +2344,13 @@ mod tests {
 
     // ---------- fixture helpers ----------
 
-    /// Parse `der` into an owning certificate, surfacing the parse
-    /// error as a `String` for `?` propagation.
-    fn parse_cert(der: &FixtureDer) -> Result<OwnedCert, String> {
-        OwnedCert::from_der(der.as_slice()).map_err(|e| format!("cert parse: {e}"))
-    }
-
-    /// Build a [`CscaEntry`] from cert DER, deriving the typed
-    /// indexing fields by parsing (the constructors are crate-
-    /// private to `refineid-lib-core`).
-    fn csca_entry(der: FixtureDer) -> Result<CscaEntry, String> {
-        let owned = parse_cert(&der)?;
-        let view = owned.view();
-        let sha256 = Sha256::of(der.as_slice());
-        Ok(CscaEntry {
-            country_iso: view.subject.country(),
-            subject_cn: view.subject.common_name(),
-            serial: view.serial(),
-            sha256,
-            not_before: view.not_before,
-            not_after: view.not_after,
-            der: der.into_vec(),
-        })
-    }
-
-    /// A fully-trusted Master List carrying `cscas` (pinned signer,
-    /// compliant EKU + `BasicConstraints`), so its CSCAs feed the
-    /// trust pool.
-    fn trusted_ml(cscas: Vec<CscaEntry>) -> LoadedMl {
-        LoadedMl {
-            ml: IcaoMasterList {
-                signer_subject_cn: None,
-                signer_country: None,
-                signer_cert_der: Vec::new(),
-                embedded_certs_der: Vec::new(),
-                cscas,
-            },
-            trust: MlSignerTrust::Pinned {
-                root_label: "test root",
-            },
-            eku: SignerEkuCheck::Compliant,
-            basic_constraints: SignerBasicConstraintsCheck::Compliant,
-        }
-    }
-
-    /// The decoded DER of the pinned UN CSCA 2 root (self-signed).
+    /// The decoded DER of the self-signed UN CSCA 2 test vector
+    /// (a public self-signed RSA root outside the pin table).
     fn un_root_der() -> Result<Vec<u8>, String> {
-        let pem = ICAO_PKD_ROOT_PEMS
-            .first()
-            .map(|entry| entry.1)
-            .ok_or_else(|| "no UN root PEM pinned".to_owned())?;
-        crate::text::decode_cert_pem_or_der(pem).ok_or_else(|| "decode UN root PEM".to_owned())
+        crate::text::decode_cert_pem_or_der(include_bytes!(
+            "../test-vectors/icao-pkd-un-csca-2.pem"
+        ))
+        .ok_or_else(|| "decode UN root PEM".to_owned())
     }
 
     /// DER of a pinned DVV G3 root whose label contains `needle`.
@@ -3447,482 +2389,6 @@ mod tests {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             fmt_check_outcome(f, CheckOutcomeSection::Crl, self.0)
         }
-    }
-
-    // ---------- DSC KeyUsage compliance (Doc 9303 Part 12 sec.7.1.1) ----------
-
-    #[test]
-    fn dsc_key_usage_compliant_when_digital_signature_only_and_critical() -> TestResult {
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Issuer"),
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(true, 0x80, None)),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_dsc_key_usage(&cert),
-                DscKeyUsageCheck::Compliant
-            ),
-            "digitalSignature-only critical KU is compliant",
-        )
-    }
-
-    #[test]
-    fn dsc_key_usage_extension_missing_when_no_extensions() -> TestResult {
-        let der = build_cert([0x01], &dn_cn(b"Issuer"), &dn_cn(b"DSC"), None);
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_dsc_key_usage(&cert),
-                DscKeyUsageCheck::ExtensionMissing
-            ),
-            "no extensions -> ExtensionMissing",
-        )
-    }
-
-    #[test]
-    fn dsc_key_usage_not_critical_flagged() -> TestResult {
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Issuer"),
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(false, 0x80, None)),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_dsc_key_usage(&cert),
-                DscKeyUsageCheck::NotCritical
-            ),
-            "non-critical KU -> NotCritical",
-        )
-    }
-
-    #[test]
-    fn dsc_key_usage_missing_digital_signature_flagged() -> TestResult {
-        // nonRepudiation (bit 1 = 0x40) only, critical, no digitalSignature.
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Issuer"),
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(true, 0x40, None)),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_dsc_key_usage(&cert),
-                DscKeyUsageCheck::MissingDigitalSignature
-            ),
-            "critical KU without digitalSignature -> MissingDigitalSignature",
-        )
-    }
-
-    #[test]
-    fn dsc_key_usage_extra_bits_listed() -> TestResult {
-        // digitalSignature (0x80) + keyCertSign (0x04) + cRLSign (0x02).
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Issuer"),
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(true, 0x86, None)),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        let outcome = CardCheckHelpers::check_dsc_key_usage(&cert);
-        if let DscKeyUsageCheck::ExtraBitsAsserted { extra } = &outcome {
-            check_true(extra.contains("keyCertSign"), "extra lists keyCertSign")?;
-            check_true(extra.contains("cRLSign"), "extra lists cRLSign")
-        } else {
-            Err(format!("expected ExtraBitsAsserted, got {outcome:?}").into())
-        }
-    }
-
-    #[test]
-    fn dsc_key_usage_extra_bits_lists_every_offending_label() -> TestResult {
-        // All eight first-byte bits set (0xFF, so digitalSignature plus
-        // every other named bit through encipherOnly) plus the
-        // second-byte decipherOnly (0x80) -- the only test that drives
-        // the second KU byte and every individual extra-bit arm.
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Issuer"),
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(true, 0xFF, Some(0x80))),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        let outcome = CardCheckHelpers::check_dsc_key_usage(&cert);
-        if let DscKeyUsageCheck::ExtraBitsAsserted { extra } = &outcome {
-            for label in [
-                "nonRepudiation",
-                "keyEncipherment",
-                "dataEncipherment",
-                "keyAgreement",
-                "keyCertSign",
-                "cRLSign",
-                "encipherOnly",
-                "decipherOnly",
-            ] {
-                check_true(extra.contains(label), label)?;
-            }
-            Ok(())
-        } else {
-            Err(format!("expected ExtraBitsAsserted, got {outcome:?}").into())
-        }
-    }
-
-    #[test]
-    fn dsc_key_usage_describe_strings_match_spec_language() -> TestResult {
-        check(
-            DscKeyUsageCheck::Compliant.describe().as_str(),
-            "ok (digitalSignature critical, only)",
-            "Compliant describe",
-        )?;
-        check_true(
-            DscKeyUsageCheck::ExtensionMissing
-                .describe()
-                .contains("MISSING"),
-            "ExtensionMissing describe mentions MISSING",
-        )?;
-        check_true(
-            DscKeyUsageCheck::NotCritical
-                .describe()
-                .contains("NOT CRITICAL"),
-            "NotCritical describe mentions NOT CRITICAL",
-        )?;
-        check_true(
-            DscKeyUsageCheck::ExtraBitsAsserted {
-                extra: "keyCertSign".to_owned(),
-            }
-            .describe()
-            .contains("keyCertSign"),
-            "ExtraBitsAsserted describe embeds the offending bits",
-        )
-    }
-
-    // ---------- Master List signer trust evaluation (Doc 9303 Part 12) ----------
-
-    #[test]
-    fn signer_eku_compliant_with_critical_ml_signer_oid() -> TestResult {
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Root"),
-            &dn_cn(b"MLS"),
-            Some(&eku_ext(true, [EkuFixtureOid::MlSigner])),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_signer_eku(&cert),
-                SignerEkuCheck::Compliant
-            ),
-            "critical id-icao-mlSigner EKU is compliant",
-        )
-    }
-
-    #[test]
-    fn signer_eku_extension_missing_when_no_eku() -> TestResult {
-        let der = build_cert([0x01], &dn_cn(b"Root"), &dn_cn(b"MLS"), None);
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_signer_eku(&cert),
-                SignerEkuCheck::ExtensionMissing
-            ),
-            "no EKU -> ExtensionMissing",
-        )
-    }
-
-    #[test]
-    fn signer_eku_not_critical_flagged() -> TestResult {
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Root"),
-            &dn_cn(b"MLS"),
-            Some(&eku_ext(false, [EkuFixtureOid::MlSigner])),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_signer_eku(&cert),
-                SignerEkuCheck::NotCritical
-            ),
-            "non-critical EKU -> NotCritical",
-        )
-    }
-
-    #[test]
-    fn signer_eku_missing_ml_signer_oid_flagged() -> TestResult {
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Root"),
-            &dn_cn(b"MLS"),
-            Some(&eku_ext(true, [EkuFixtureOid::ServerAuth])),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_signer_eku(&cert),
-                SignerEkuCheck::MissingMlSignerOid
-            ),
-            "critical EKU without id-icao-mlSigner -> MissingMlSignerOid",
-        )
-    }
-
-    #[test]
-    fn signer_basic_constraints_ca_true_is_noncompliant() -> TestResult {
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Root"),
-            &dn_cn(b"MLS"),
-            Some(&bc_ext(true, true)),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_signer_basic_constraints(&cert),
-                SignerBasicConstraintsCheck::CaAsserted
-            ),
-            "CA=true on MLS -> CaAsserted",
-        )
-    }
-
-    #[test]
-    fn signer_basic_constraints_ca_false_is_compliant() -> TestResult {
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Root"),
-            &dn_cn(b"MLS"),
-            Some(&bc_ext(true, false)),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_signer_basic_constraints(&cert),
-                SignerBasicConstraintsCheck::Compliant
-            ),
-            "CA=false -> Compliant",
-        )
-    }
-
-    #[test]
-    fn signer_basic_constraints_absent_is_compliant() -> TestResult {
-        // Has an (unrelated) KU extension but no BasicConstraints.
-        let der = build_cert(
-            [0x01],
-            &dn_cn(b"Root"),
-            &dn_cn(b"MLS"),
-            Some(&ku_ext(true, 0x80, None)),
-        );
-        let owned = parse_cert(&der)?;
-        let cert = owned.view();
-        check_true(
-            matches!(
-                CardCheckHelpers::check_signer_basic_constraints(&cert),
-                SignerBasicConstraintsCheck::Compliant
-            ),
-            "absent BasicConstraints -> Compliant",
-        )
-    }
-
-    #[test]
-    fn ml_signer_trust_pinned_for_self_signed_un_root() -> TestResult {
-        // The UN CSCA 2 root is self-signed: using it as both the
-        // ML signer and the (pin-matching) embedded issuer drives
-        // the real signature verification to success.
-        let un = un_root_der()?;
-        let ml = IcaoMasterList {
-            signer_subject_cn: None,
-            signer_country: None,
-            signer_cert_der: un.clone(),
-            embedded_certs_der: vec![un],
-            cscas: Vec::new(),
-        };
-        check_true(
-            matches!(
-                CardCheckHelpers::check_ml_signer_trust(&ml),
-                MlSignerTrust::Pinned { .. }
-            ),
-            "self-signed UN root verifies and pins",
-        )
-    }
-
-    #[test]
-    fn ml_signer_trust_signature_failed_when_pinned_root_did_not_sign_signer() -> TestResult {
-        // Embedded root matches a pin by fingerprint, but the
-        // signer was not issued by it -> matched-but-unverified.
-        let un = un_root_der()?;
-        let signer = build_cert([0x09], &dn_cn(b"Other"), &dn_cn(b"Other"), None);
-        let ml = IcaoMasterList {
-            signer_subject_cn: None,
-            signer_country: None,
-            signer_cert_der: signer.into_vec(),
-            embedded_certs_der: vec![un],
-            cscas: Vec::new(),
-        };
-        check_true(
-            matches!(
-                CardCheckHelpers::check_ml_signer_trust(&ml),
-                MlSignerTrust::SignatureFailed
-            ),
-            "pin-matched embedded root that did not sign signer -> SignatureFailed",
-        )
-    }
-
-    #[test]
-    fn ml_signer_trust_no_matching_issuer_when_no_embedded_pin_match() -> TestResult {
-        let signer = build_cert([0x09], &dn_cn(b"Other"), &dn_cn(b"Other"), None);
-        let ml = IcaoMasterList {
-            signer_subject_cn: None,
-            signer_country: None,
-            signer_cert_der: signer.into_vec(),
-            embedded_certs_der: Vec::new(),
-            cscas: Vec::new(),
-        };
-        check_true(
-            matches!(
-                CardCheckHelpers::check_ml_signer_trust(&ml),
-                MlSignerTrust::NoMatchingIssuer
-            ),
-            "no embedded cert matching a pin -> NoMatchingIssuer",
-        )
-    }
-
-    #[test]
-    fn ml_signer_trust_signature_failed_when_signer_der_unparseable() -> TestResult {
-        let ml = IcaoMasterList {
-            signer_subject_cn: None,
-            signer_country: None,
-            signer_cert_der: vec![0x00, 0x01, 0x02],
-            embedded_certs_der: Vec::new(),
-            cscas: Vec::new(),
-        };
-        check_true(
-            matches!(
-                CardCheckHelpers::check_ml_signer_trust(&ml),
-                MlSignerTrust::SignatureFailed
-            ),
-            "unparseable signer DER -> SignatureFailed",
-        )
-    }
-
-    #[test]
-    fn is_ml_fully_trusted_requires_all_three_gates() -> TestResult {
-        let pass = trusted_ml(Vec::new());
-        check_true(
-            is_ml_fully_trusted(&pass),
-            "all three gates pass -> trusted",
-        )?;
-
-        let bad_trust = LoadedMl {
-            trust: MlSignerTrust::NoMatchingIssuer,
-            ..trusted_ml(Vec::new())
-        };
-        check_true(
-            !is_ml_fully_trusted(&bad_trust),
-            "unpinned signer -> not trusted",
-        )?;
-
-        let bad_eku = LoadedMl {
-            eku: SignerEkuCheck::ExtensionMissing,
-            ..trusted_ml(Vec::new())
-        };
-        check_true(!is_ml_fully_trusted(&bad_eku), "missing EKU -> not trusted")?;
-
-        let bad_bc = LoadedMl {
-            basic_constraints: SignerBasicConstraintsCheck::CaAsserted,
-            ..trusted_ml(Vec::new())
-        };
-        check_true(
-            !is_ml_fully_trusted(&bad_bc),
-            "CA-asserted MLS -> not trusted",
-        )
-    }
-
-    #[test]
-    fn trust_pool_only_yields_cscas_from_fully_trusted_mls() -> TestResult {
-        let fi_a = csca_entry(build_cert(
-            [0x01],
-            &dn_cn(b"Root"),
-            &dn_cn_country(b"CSCA FI A", b"FI"),
-            None,
-        ))?;
-        let fi_b = csca_entry(build_cert(
-            [0x02],
-            &dn_cn(b"Root"),
-            &dn_cn_country(b"CSCA FI B", b"FI"),
-            None,
-        ))?;
-        let de = csca_entry(build_cert(
-            [0x03],
-            &dn_cn(b"Root"),
-            &dn_cn_country(b"CSCA DE", b"DE"),
-            None,
-        ))?;
-        let untrusted = LoadedMl {
-            trust: MlSignerTrust::NoMatchingIssuer,
-            ..trusted_ml(vec![de])
-        };
-        let pool = IcaoTrustPool {
-            mls: vec![trusted_ml(vec![fi_a, fi_b]), untrusted],
-        };
-        check(
-            &pool.trusted_cscas().count(),
-            &2,
-            "only the 2 CSCAs from the trusted ML are yielded",
-        )
-    }
-
-    #[test]
-    fn ml_trust_describe_strings_identify_each_outcome() -> TestResult {
-        check_true(
-            MlSignerTrust::Pinned {
-                root_label: "United Nations CSCA 2",
-            }
-            .describe()
-            .contains("United Nations CSCA 2"),
-            "Pinned describe names the root",
-        )?;
-        check_true(
-            MlSignerTrust::PinHashMismatch
-                .describe()
-                .contains("HASH MISMATCH"),
-            "PinHashMismatch describe",
-        )?;
-        check_true(
-            MlSignerTrust::NoMatchingIssuer
-                .describe()
-                .contains("UNPINNED"),
-            "NoMatchingIssuer describe",
-        )?;
-        check_true(
-            MlSignerTrust::SignatureFailed
-                .describe()
-                .contains("did not verify"),
-            "SignatureFailed describe",
-        )?;
-        check(
-            SignerEkuCheck::Compliant.describe(),
-            "ok (id-icao-mlSigner critical)",
-            "EKU Compliant describe",
-        )?;
-        check(
-            SignerBasicConstraintsCheck::CaAsserted.describe(),
-            "FAIL -- BasicConstraints CA=true on MLS cert",
-            "BC CaAsserted describe",
-        )
     }
 
     // ---------- Trust-anchor pinning: the chain walk ----------
@@ -4058,288 +2524,6 @@ mod tests {
         } else {
             Err(format!("expected Failed, got {outcome:?}").into())
         }
-    }
-
-    // ---------- DSC -> CSCA chaining ----------
-
-    #[test]
-    fn dsc_csca_no_dsc_when_sod_absent() -> TestResult {
-        let pool = IcaoTrustPool { mls: Vec::new() };
-        check_true(
-            matches!(
-                CardCheckHelpers::dsc_csca_check_for_sod(None, &pool),
-                DscCscaCheck::NoDscInSod
-            ),
-            "absent SOD -> NoDscInSod",
-        )
-    }
-
-    #[test]
-    fn dsc_csca_no_dsc_when_sod_unparseable() -> TestResult {
-        // Deliberately not a DER SEQUENCE, so the CMS parse fails.
-        const NOT_CMS: [u8; 3] = [0x01, 0x02, 0x03];
-        let pool = IcaoTrustPool { mls: Vec::new() };
-        check_true(
-            matches!(
-                CardCheckHelpers::dsc_csca_check_for_sod(Some(SodDer { bytes: &NOT_CMS }), &pool,),
-                DscCscaCheck::NoDscInSod
-            ),
-            "unparseable CMS -> NoDscInSod",
-        )
-    }
-
-    #[test]
-    fn dsc_csca_no_dsc_when_sod_has_no_certificates() -> TestResult {
-        let pool = IcaoTrustPool { mls: Vec::new() };
-        let sod = build_sod(&[]);
-        // Guard: the empty SOD really parses as CMS with zero certs, so
-        // the NoDscInSod verdict below is reached via the empty-cert-list
-        // branch -- not via a CMS parse failure, which returns the same
-        // variant and would otherwise mask a regression in build_sod.
-        let signed = OwnedSignedData::from_der(sod.as_slice())
-            .map_err(|e| format!("empty SOD must parse: {e}"))?;
-        check_true(
-            signed.view().certificates_der.is_empty(),
-            "empty SOD parses with zero embedded certs",
-        )?;
-        check_true(
-            matches!(
-                CardCheckHelpers::dsc_csca_check_for_sod(Some(sod_der(&sod)), &pool),
-                DscCscaCheck::NoDscInSod
-            ),
-            "SOD with no embedded cert -> NoDscInSod",
-        )
-    }
-
-    #[test]
-    fn dsc_csca_parse_failed_when_embedded_cert_not_x509() -> TestResult {
-        let pool = IcaoTrustPool { mls: Vec::new() };
-        // A SEQUENCE that is structurally a cert slot but not a cert.
-        let fake_cert = tlv(
-            DER_TAG_SEQUENCE,
-            &tlv_array(DER_TAG_INTEGER, [CERT_SERIAL_ONE]),
-        );
-        let sod = build_sod(&[&fake_cert]);
-        check_true(
-            matches!(
-                CardCheckHelpers::dsc_csca_check_for_sod(Some(sod_der(&sod)), &pool),
-                DscCscaCheck::DscParseFailed
-            ),
-            "embedded non-cert SEQUENCE -> DscParseFailed",
-        )
-    }
-
-    #[test]
-    fn dsc_csca_key_usage_noncompliant_short_circuits() -> TestResult {
-        let pool = IcaoTrustPool { mls: Vec::new() };
-        // DSC with a CA-style KU (digitalSignature + keyCertSign).
-        let dsc = build_cert(
-            [0x01],
-            &dn_cn_country(b"DSC issuer", b"FI"),
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(true, 0x84, None)),
-        );
-        let sod = build_sod(&[&dsc]);
-        check_true(
-            matches!(
-                CardCheckHelpers::dsc_csca_check_for_sod(Some(sod_der(&sod)), &pool),
-                DscCscaCheck::KeyUsageNonCompliant(_)
-            ),
-            "non-compliant DSC KU short-circuits before the chain walk",
-        )
-    }
-
-    #[test]
-    fn dsc_csca_country_unknown_when_issuer_has_no_country() -> TestResult {
-        let pool = IcaoTrustPool { mls: Vec::new() };
-        let dsc = build_cert(
-            [0x01],
-            &dn_cn(b"DSC issuer no country"),
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(true, 0x80, None)),
-        );
-        let sod = build_sod(&[&dsc]);
-        check_true(
-            matches!(
-                CardCheckHelpers::dsc_csca_check_for_sod(Some(sod_der(&sod)), &pool),
-                DscCscaCheck::DscCountryUnknown
-            ),
-            "compliant DSC without issuer country -> DscCountryUnknown",
-        )
-    }
-
-    #[test]
-    fn dsc_csca_country_absent_when_pool_lacks_the_country() -> TestResult {
-        // DSC issued by FI, but the pool only carries a DE CSCA.
-        let de = csca_entry(build_cert(
-            [0x03],
-            &dn_cn(b"Root"),
-            &dn_cn_country(b"CSCA DE", b"DE"),
-            None,
-        ))?;
-        let pool = IcaoTrustPool {
-            mls: vec![trusted_ml(vec![de])],
-        };
-        let dsc = build_cert(
-            [0x01],
-            &dn_cn_country(b"DSC issuer", b"FI"),
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(true, 0x80, None)),
-        );
-        let sod = build_sod(&[&dsc]);
-        let outcome = CardCheckHelpers::dsc_csca_check_for_sod(Some(sod_der(&sod)), &pool);
-        if let DscCscaCheck::CountryAbsent { country_iso } = &outcome {
-            check(country_iso.as_str(), "FI", "country absent reports FI")
-        } else {
-            Err(format!("expected CountryAbsent, got {outcome:?}").into())
-        }
-    }
-
-    // NOTE: the positive `DscCscaCheck::Ok` verdict is intentionally not
-    // unit-tested here. Reaching it needs `dsc.verify_signed_by(csca)` to
-    // succeed, i.e. a DSC carrying a real CSCA signature AND a compliant
-    // `digitalSignature`-only KU. The only self-verifying certificates
-    // available in-process are the pinned CA roots, which assert
-    // `keyCertSign`/`cRLSign` and so fail the Doc 9303 sec.7.1.1 KU gate
-    // before the chain walk. A faithful Ok test needs either a checked-in
-    // real DSC+CSCA fixture pair or an in-crate signing helper (the crypto
-    // layer is verify-only by design); it belongs in an integration test.
-
-    #[test]
-    fn dsc_csca_no_match_when_candidate_dn_differs() -> TestResult {
-        // The pool has an FI CSCA, but its subject DN differs from the
-        // DSC issuer DN, so every candidate is dropped at the DN gate
-        // before any signature check.
-        let fi = csca_entry(build_cert(
-            [0x02],
-            &dn_cn(b"Root"),
-            &dn_cn_country(b"Some other FI CSCA", b"FI"),
-            None,
-        ))?;
-        let pool = IcaoTrustPool {
-            mls: vec![trusted_ml(vec![fi])],
-        };
-        let dsc = build_cert(
-            [0x01],
-            &dn_cn_country(b"DSC issuer", b"FI"),
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(true, 0x80, None)),
-        );
-        let sod = build_sod(&[&dsc]);
-        let outcome = CardCheckHelpers::dsc_csca_check_for_sod(Some(sod_der(&sod)), &pool);
-        if let DscCscaCheck::NoMatch {
-            country_iso,
-            candidates,
-        } = &outcome
-        {
-            check(country_iso.as_str(), "FI", "no-match reports FI")?;
-            check(candidates, &1, "one FI candidate was tried")
-        } else {
-            Err(format!("expected NoMatch, got {outcome:?}").into())
-        }
-    }
-
-    #[test]
-    fn dsc_csca_no_match_when_candidate_signature_fails() -> TestResult {
-        // The CSCA subject DN is byte-identical to the DSC issuer DN, so
-        // the DN-equality gate passes and the candidate reaches the real
-        // `verify_signed_by` step -- which fails (padding signature). This
-        // exercises the signature-verify branch of NoMatch that the
-        // DN-differs case never reaches.
-        let issuer_dn = dn_cn_country(b"DSC issuer", b"FI");
-        let fi = csca_entry(build_cert([0x02], &dn_cn(b"Root"), &issuer_dn, None))?;
-        let pool = IcaoTrustPool {
-            mls: vec![trusted_ml(vec![fi])],
-        };
-        let dsc = build_cert(
-            [0x01],
-            &issuer_dn,
-            &dn_cn(b"DSC"),
-            Some(&ku_ext(true, 0x80, None)),
-        );
-        let sod = build_sod(&[&dsc]);
-        let outcome = CardCheckHelpers::dsc_csca_check_for_sod(Some(sod_der(&sod)), &pool);
-        if let DscCscaCheck::NoMatch {
-            country_iso,
-            candidates,
-        } = &outcome
-        {
-            check(country_iso.as_str(), "FI", "no-match reports FI")?;
-            check(candidates, &1, "the one DN-matching candidate was tried")
-        } else {
-            Err(format!("expected NoMatch, got {outcome:?}").into())
-        }
-    }
-
-    #[test]
-    fn render_dsc_csca_covers_every_variant() -> TestResult {
-        // Typed CommonName / IsoAlpha2 come from parsing a built cert
-        // (their constructors are crate-private to refineid-lib-core).
-        let owned = parse_cert(&build_cert(
-            [0x01],
-            &dn_cn(b"Root"),
-            &dn_cn_country(b"CSCA FI", b"FI"),
-            None,
-        ))?;
-        let view = owned.view();
-        let cn = view.subject.common_name();
-        let country = view.subject.country();
-        let iso = country
-            .clone()
-            .ok_or_else(|| "FI country parses".to_owned())?;
-
-        // Ok with populated CN + country exercises the non-fallback
-        // format path (not the "<unparsed CN>" / "??" arms).
-        let ok_rendered = CardCheckHelpers::render_dsc_csca(&DscCscaCheck::Ok {
-            csca_subject_cn: cn,
-            csca_country: country,
-            csca_sha256: Sha256::of(b"csca"),
-        });
-        check_true(ok_rendered.starts_with("ok via"), "Ok render prefix")?;
-        check_true(
-            ok_rendered.contains("CSCA FI"),
-            "Ok render names the CSCA CN",
-        )?;
-        check_true(
-            ok_rendered.contains("(FI)"),
-            "Ok render names the CSCA country",
-        )?;
-
-        check_true(
-            CardCheckHelpers::render_dsc_csca(&DscCscaCheck::KeyUsageNonCompliant(
-                DscKeyUsageCheck::ExtensionMissing,
-            ))
-            .contains("KeyUsage non-compliant"),
-            "KeyUsageNonCompliant render",
-        )?;
-        let no_match = CardCheckHelpers::render_dsc_csca(&DscCscaCheck::NoMatch {
-            country_iso: iso.clone(),
-            candidates: 3,
-        });
-        check_true(
-            no_match.contains("3 candidate"),
-            "NoMatch render names the count",
-        )?;
-        check_true(no_match.contains("FI"), "NoMatch render names the country")?;
-        check_true(
-            CardCheckHelpers::render_dsc_csca(&DscCscaCheck::CountryAbsent { country_iso: iso })
-                .contains("FI"),
-            "CountryAbsent render names the country",
-        )?;
-        check_true(
-            CardCheckHelpers::render_dsc_csca(&DscCscaCheck::DscCountryUnknown)
-                .contains("no countryName"),
-            "DscCountryUnknown render",
-        )?;
-        check_true(
-            CardCheckHelpers::render_dsc_csca(&DscCscaCheck::NoDscInSod).contains("no DSC"),
-            "NoDscInSod render",
-        )?;
-        check_true(
-            CardCheckHelpers::render_dsc_csca(&DscCscaCheck::DscParseFailed)
-                .contains("failed to parse"),
-            "DscParseFailed render",
-        )
     }
 
     // ---------- CRL verdict orchestration ----------
@@ -4634,20 +2818,6 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_der_sequence_sniffs_first_byte() -> TestResult {
-        let der = IcaoPkdFileBytes {
-            bytes: vec![DER_SEQUENCE_TAG, 0x82, 0x01, 0x00],
-        };
-        let ldif = IcaoPkdFileBytes {
-            bytes: b"version: 1\n".to_vec(),
-        };
-        let empty = IcaoPkdFileBytes { bytes: Vec::new() };
-        check_true(der.looks_like_der_sequence(), "leading SEQUENCE tag -> DER")?;
-        check_true(!ldif.looks_like_der_sequence(), "ASCII LDIF -> not DER")?;
-        check_true(!empty.looks_like_der_sequence(), "empty input -> not DER")
-    }
-
-    #[test]
     fn now_date_time_is_a_sane_recent_instant() -> TestResult {
         let now = now_date_time();
         check_true(now.year() >= 2024, "clock is not before 2024")?;
@@ -4670,49 +2840,6 @@ mod tests {
             CardCheckHelpers::render_mrz_expiry(&past).contains("EXPIRED"),
             "past expiry reads as EXPIRED",
         )
-    }
-
-    // ---------- load_icao_pkd error paths ----------
-
-    #[test]
-    fn load_icao_pkd_surfaces_read_error_for_missing_file() -> TestResult {
-        let path = std::path::Path::new("/nonexistent/refineid/card-check/does-not-exist.ml");
-        match CardCheckHelpers::load_icao_pkd(path) {
-            Err(CardCheckError::IcaoPkdRead { .. }) => Ok(()),
-            Err(other) => Err(format!("expected IcaoPkdRead, got {other:?}").into()),
-            Ok(_) => Err("loading a missing file unexpectedly succeeded".into()),
-        }
-    }
-
-    #[test]
-    fn load_icao_pkd_rejects_der_that_fails_to_parse() -> TestResult {
-        // Leading 0x30 -> sniffed as DER, but the body is not a valid
-        // CMS Master List, so the single-DER load aborts with IcaoPkdParse.
-        let path = std::env::temp_dir().join("refineid_card_check_der_junk.ml");
-        std::fs::write(&path, [0x30_u8, 0x03, 0x02, 0x01, 0x01])
-            .map_err(|e| format!("write: {e}"))?;
-        let result = CardCheckHelpers::load_icao_pkd(&path);
-        std::fs::remove_file(&path).map_err(|e| format!("cleanup: {e}"))?;
-        match result {
-            Err(CardCheckError::IcaoPkdParse { .. }) => Ok(()),
-            Err(other) => Err(format!("expected IcaoPkdParse, got {other:?}").into()),
-            Ok(_) => Err("DER junk unexpectedly loaded".into()),
-        }
-    }
-
-    #[test]
-    fn load_icao_pkd_rejects_input_that_is_neither_der_nor_utf8() -> TestResult {
-        // Leading byte != 0x30 -> not DER; the bytes are not valid UTF-8
-        // either, so the LDIF text decode fails with IcaoPkdParse.
-        let path = std::env::temp_dir().join("refineid_card_check_non_utf8.ml");
-        std::fs::write(&path, [0xFF_u8, 0xFE, 0x00, 0x01]).map_err(|e| format!("write: {e}"))?;
-        let result = CardCheckHelpers::load_icao_pkd(&path);
-        std::fs::remove_file(&path).map_err(|e| format!("cleanup: {e}"))?;
-        match result {
-            Err(CardCheckError::IcaoPkdParse { .. }) => Ok(()),
-            Err(other) => Err(format!("expected IcaoPkdParse, got {other:?}").into()),
-            Ok(_) => Err("non-DER non-UTF8 input unexpectedly loaded".into()),
-        }
     }
 
     #[test]

@@ -131,7 +131,6 @@ pub fn inspect_cards(
         can: None,
         crl_file: None,
         save_cert_dir: None,
-        icao_pkd: None,
         now: None,
     };
     crate::card_check::check_all(PcscBackend, &options)
@@ -152,10 +151,7 @@ pub fn read_images(
     let options = EmrtdReadOptions {
         can,
         save_face: None,
-        save_sod: None,
-        save_dsc: None,
         save_signature: None,
-        csca_dir: None,
         reader_filter,
     };
     crate::card_emrtd::read_first(PcscBackend, &options)

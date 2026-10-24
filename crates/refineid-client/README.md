@@ -18,7 +18,7 @@ Client library and the `refineid` command-line tool.
 - `cli/` + `cli.rs` -- hand-rolled typed argv parsing (no clap; typed `ArgParseError`, per-subcommand parsers)
   and the verb dispatcher.
 - `card_check.rs` -- the full card report:
-  chain building, CRL/OCSP verification, ICAO PKD / CSCA trust for the eMRTD layer.
+  chain building, CRL/OCSP verification, and the eMRTD section.
 - `card_sign.rs` / `card_decrypt.rs` / `card_pin.rs` / `card_pubkey.rs` / `card_emrtd.rs` / `card_export.rs`
   -- per-command card operations.
 - `http.rs` -- a deliberately minimal plain-HTTP client for CRL/OCSP fetches
