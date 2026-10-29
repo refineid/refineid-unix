@@ -35,13 +35,13 @@ use std::time::{Duration, Instant};
 use crate::addresses;
 
 use crate::engine::{
-    AdmissionError, OperationOutcome, PairingCandidateSource, PairingSearchError, Requester,
-    RequesterConfig, Session, SessionEnd, SessionError, Withdrawal, current_time_ms, read_offer,
+    AdmissionError, OperationOutcome, PairingCandidateSource, PairingConnection,
+    PairingSearchError, Requester, RequesterConfig, Session, SessionEnd, SessionError, Withdrawal,
+    current_time_ms,
 };
 use crate::file_store::FilePairingStore;
 use crate::ids::{CertificateFingerprint, PairId};
 use crate::message::{CardPresence, CardReader, CardStatusMessage, CloseReason};
-use crate::offer::PairingOffer;
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
 use crate::session_lock::{LockError, SessionLock, ceremony_lock_path, session_lock_path};
 use crate::store::{PairingRecord, PairingStore, StoreError};
@@ -160,17 +160,16 @@ impl PairingCandidateSource for PairingServices {
         Some(instances)
     }
 
-    fn open(&mut self, instance: &String) -> Option<(TcpFrameTransport, PairingOffer)> {
+    fn open(&mut self, instance: &String) -> Option<PairingConnection<TcpFrameTransport>> {
         let service = self.service(instance)?;
-        let mut transport = dial(
+        let transport = dial(
             &service.endpoints,
             STREAM_CANDIDATE_ID,
             PAIRING_RECEIVE_DEADLINE,
             &RoutingPreamble::Pairing,
         )
         .ok()?;
-        let offer = read_offer(&mut transport).ok()?;
-        Some((transport, offer))
+        PairingConnection::read(transport).ok()
     }
 }
 
