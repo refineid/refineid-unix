@@ -1,4 +1,4 @@
-//! The requester engine: the workstation side of RAPP v26.10.22.
+//! The requester engine: the workstation side of RAPP v26.10.29.
 //!
 //! The engine drives pairing, sessions, and operations through the
 //! canonical protocol boundaries of `refineid_rapp`: the tries of a typed
@@ -58,11 +58,11 @@ const WITHDRAWAL_POLL: Duration =
 const SECONDS_PER_DAY: u64 = 86_400;
 
 /// How often a program that runs sweeps its pairings for idle expiry, and
-/// notes the time of a session it holds open: once a day (RAPP v26.10.22
+/// notes the time of a session it holds open: once a day (RAPP v26.10.29
 /// section 4.6 item 5).
 pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(SECONDS_PER_DAY);
 
-/// This computer's withdrawal from remote use (RAPP v26.10.22 section 4.5
+/// This computer's withdrawal from remote use (RAPP v26.10.29 section 4.5
 /// item 8), raised once from any thread. A requester that follows it closes
 /// its open session with `service_withdrawn` within a quarter of
 /// `QUIT_WITHDRAWAL_BOUND_MS` of the raise, whatever the session waits for,
@@ -99,7 +99,7 @@ pub struct RequesterConfig {
 }
 
 /// Uniform bytes drawn for the `CPace` initiator's scalar (RAPP
-/// v26.10.22 section 6.1.1: 64 uniform bytes reduced modulo the group
+/// v26.10.29 section 6.1.1: 64 uniform bytes reduced modulo the group
 /// order).
 const CPACE_SCALAR_ENTROPY_BYTES: usize = 64;
 
@@ -174,7 +174,7 @@ impl core::fmt::Display for PairingError {
 
 impl core::error::Error for PairingError {}
 
-/// Why a typed code paired with no custodian (RAPP v26.10.22 section 4.2,
+/// Why a typed code paired with no custodian (RAPP v26.10.29 section 4.2,
 /// "Trying Each Custodian in Pairing Mode").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairingSearchError {
@@ -207,7 +207,7 @@ impl core::error::Error for PairingSearchError {}
 /// Where a requester finds the custodians a typed code is tried with.
 ///
 /// A source names the endpoints it finds in pairing mode and opens a
-/// pairing connection to one (RAPP v26.10.22 section 4.2, "Trying Each
+/// pairing connection to one (RAPP v26.10.29 section 4.2, "Trying Each
 /// Custodian in Pairing Mode").
 pub trait PairingCandidateSource {
     /// How the source names an endpoint it found.
@@ -351,7 +351,7 @@ impl core::fmt::Display for AdmissionError {
 
 impl core::error::Error for AdmissionError {}
 
-/// How a finished operation ended (RAPP v26.10.22 section 8).
+/// How a finished operation ended (RAPP v26.10.29 section 8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationOutcome {
     /// The result arrived and answers the request.
@@ -519,7 +519,7 @@ impl<Store: PairingStore> Requester<Store> {
     }
 
     /// Pairs with the custodian showing `code`, trying in turn each
-    /// custodian `source` finds in pairing mode (RAPP v26.10.22 sections 3,
+    /// custodian `source` finds in pairing mode (RAPP v26.10.29 sections 3,
     /// 4.2 and 6), and returns the pairing with the endpoint it was made
     /// on.
     ///

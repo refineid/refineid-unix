@@ -3,7 +3,7 @@
 //!
 //! The custodian here is test scaffolding, not a product: the real
 //! custodians are the holder's phones. It speaks the exact wire of RAPP
-//! v26.10.22 so the requester is exercised end to end - code pairing
+//! v26.10.29 so the requester is exercised end to end - code pairing
 //! through `CPace` KC2 and `Noise_XXpsk3` with grant agreement, `Noise_KK`
 //! sessions opened by the custodian's `session.ready`, card reports with
 //! the certificate fingerprint, operations and their results, the

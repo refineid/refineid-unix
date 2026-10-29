@@ -17,7 +17,7 @@
 //! One thread holds the session to the phone: it reads the pairing
 //! record another program keeps, dials while the record is usable, and
 //! keeps the session open, answering the phone's pings and reading its
-//! card reports (RAPP v26.10.22 sections 8.3 and 8.4). The slot's token is
+//! card reports (RAPP v26.10.29 sections 8.3 and 8.4). The slot's token is
 //! the authentication certificate the record caches, confirmed against
 //! the fingerprint the phone reports for its card and read from the card
 //! afresh when the record lacks it or the phone serves another card. The
@@ -424,7 +424,7 @@ impl RemoteTokenSource for PhoneSource {
         }
     }
 
-    /// This computer withdraws (RAPP v26.10.22 section 4.5 item 8): the
+    /// This computer withdraws (RAPP v26.10.29 section 4.5 item 8): the
     /// thread writes the `service_withdrawn` close of its open session
     /// within a quarter of the quit bound and ends; a dial in progress ends
     /// at its next step without a notice.
@@ -766,7 +766,7 @@ enum HeldRecord {
     /// The record still names the pairing as usable.
     Usable,
     /// This computer's user forgot the pairing, or a new pairing
-    /// superseded it (RAPP v26.10.22 section 4.6): the phone is told.
+    /// superseded it (RAPP v26.10.29 section 4.6): the phone is told.
     Forgotten,
     /// The store reads but holds no usable record of the pairing: the
     /// record is gone or no longer decodes. That is no forget, so the

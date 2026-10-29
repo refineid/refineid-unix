@@ -1,5 +1,5 @@
-//! The `fi.refineid.stream` transport tier (RAPP v26.10.22 section 2.2.2;
-//! RAPP transport and discovery hierarchy, sections 3.3 and 4).
+//! The `fi.refineid.stream` transport tier (RAPP v26.10.29 section 2.2.2;
+//! RAPP transport and discovery hierarchy, sections 3.2 and 4).
 //!
 //! The custodian (the phone) listens on an ephemeral TCP port and advertises
 //! `_refineid-stream._tcp.local.` under a fresh random instance name, with a

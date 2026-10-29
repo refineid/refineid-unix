@@ -1,4 +1,4 @@
-//! The transport-profile contract of RAPP v26.10.22 section 2.2.
+//! The transport-profile contract of RAPP v26.10.29 section 2.2.
 //!
 //! A transport delivers bounded binary frames in order, reports EOF and
 //! failure distinctly, and names the candidate both endpoints later echo
@@ -8,7 +8,7 @@
 //!
 //! Two implementations ship with the crate: an in-memory pair for loopback
 //! conformance tests, and the length-prefixed framing of the stream
-//! transport profile `fi.refineid.stream` (RAPP v26.10.22 section 2.2.2).
+//! transport profile `fi.refineid.stream` (RAPP v26.10.29 section 2.2.2).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -143,7 +143,7 @@ impl FrameTransport for MemoryTransport {
     }
 
     /// The in-process stand-in for a stream connection binds the stream
-    /// profile: v26.10.22 binds only registered transport profiles.
+    /// profile: v26.10.29 binds only registered transport profiles.
     fn profile(&self) -> &str {
         STREAM_PROFILE
     }
