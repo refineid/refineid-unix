@@ -22,7 +22,8 @@ use refineid_pkcs11::ck::{CkFunctionListPtrPtr, CkRv};
 
 /// The one symbol a PKCS#11 host resolves by name (OASIS PKCS#11 v2.40
 /// s5.6.4). The phone source is installed on the first call, before the
-/// function list is handed out, so every later call can find it.
+/// function list is handed out, so every later call can find it. A
+/// process with no per-user configuration directory gets no phone source.
 ///
 /// # Safety
 /// `list` must be a valid, writable location for one
@@ -35,7 +36,9 @@ use refineid_pkcs11::ck::{CkFunctionListPtrPtr, CkRv};
 pub unsafe extern "system" fn C_GetFunctionList(list: CkFunctionListPtrPtr) -> CkRv {
     // A second call finds the source installed already; that is the
     // same source, so the refusal carries nothing.
-    let _ = refineid_pkcs11::remote::install_remote_source(Box::new(phone::PhoneSource::new()));
+    if let Some(source) = phone::PhoneSource::for_this_user() {
+        let _ = refineid_pkcs11::remote::install_remote_source(Box::new(source));
+    }
     // SAFETY: `list` validity is the caller's PKCS#11 contract; the
     // core entry point null-checks it before writing.
     unsafe { refineid_pkcs11::get_function_list(list) }

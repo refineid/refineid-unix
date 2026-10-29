@@ -6,8 +6,9 @@
 # module registered system-wide for p11-kit consumers, the pcscd
 # smart-card daemon, Chromium card login through the user's NSS
 # database, and (when Firefox is managed by NixOS) Firefox card login
-# via the SecurityDevices policy.
-{ refineidPackage }:
+# via the SecurityDevices policy. Card login through pam_pkcs11 is
+# programs.refineid.cardLogin, in card-login.nix.
+{ refineidPackage, pamPkcs11Package }:
 {
   config,
   lib,
@@ -33,6 +34,8 @@ let
   '';
 in
 {
+  imports = [ (import ./card-login.nix { inherit pamPkcs11Package; }) ];
+
   options.programs.refineid = {
     enable = lib.mkEnableOption "RefineID Finnish identity card middleware";
 

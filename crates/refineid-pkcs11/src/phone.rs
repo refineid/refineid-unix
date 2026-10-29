@@ -38,6 +38,7 @@
 //! dial not yet open without a notice, keeps the pairing, and ends before
 //! `C_Finalize` returns.
 
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -327,18 +328,15 @@ impl core::fmt::Debug for PhoneSource {
     }
 }
 
-impl Default for PhoneSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl PhoneSource {
     /// A source over this user's pairing store that starts its session
-    /// thread at the first slot refresh.
+    /// thread at the first slot refresh, or `None` when no per-user
+    /// configuration directory resolves or the store is not this
+    /// process's: owned by its effective uid, or missing while it is not root.
     #[must_use]
-    pub fn new() -> Self {
-        Self::over_store(FilePairingStore::default_directory())
+    pub fn for_this_user() -> Option<Self> {
+        let store = FilePairingStore::default_directory()?;
+        store_is_ours(StoreOwner::of(&store), effective_uid()).then(|| Self::over_store(store))
     }
 
     /// A source over the pairing store in `store` that starts its session
@@ -447,6 +445,54 @@ impl RemoteTokenSource for PhoneSource {
         }
         self.shared.renew_withdrawal();
     }
+}
+
+/// The superuser's uid.
+const ROOT_UID: libc::uid_t = 0;
+
+/// Who owns the pairing store's directory, as its metadata reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreOwner {
+    /// The directory does not exist.
+    Missing,
+    /// The directory exists and this uid owns it.
+    Uid(libc::uid_t),
+    /// The directory's metadata cannot be read.
+    Unreadable,
+}
+
+impl StoreOwner {
+    /// The owner of `directory`.
+    fn of(directory: &Path) -> Self {
+        match std::fs::metadata(directory) {
+            Ok(metadata) => Self::Uid(metadata.uid()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(_) => Self::Unreadable,
+        }
+    }
+}
+
+/// Whether the process running as `effective_uid` serves the phone from
+/// the store `owner` describes: a store it owns; a missing store unless
+/// it runs as root, so the owner's first pairing still creates it; never
+/// a store it cannot read.
+fn store_is_ours(owner: StoreOwner, effective_uid: libc::uid_t) -> bool {
+    match owner {
+        StoreOwner::Uid(uid) => uid == effective_uid,
+        StoreOwner::Missing => effective_uid != ROOT_UID,
+        StoreOwner::Unreadable => false,
+    }
+}
+
+/// The process's effective uid.
+#[allow(
+    unsafe_code,
+    reason = "geteuid(2) is the only source of the effective uid; the call takes no arguments"
+)]
+fn effective_uid() -> libc::uid_t {
+    // SAFETY: geteuid has no preconditions and always succeeds
+    // (POSIX.1-2017, geteuid).
+    unsafe { libc::geteuid() }
 }
 
 /// The context every request carries: this computer, by name, and
@@ -1367,6 +1413,42 @@ mod tests {
             }
             thread::sleep(SWEEP_LOOK);
         }
+    }
+
+    /// A synthetic ordinary user's uid.
+    const USER_UID: libc::uid_t = 1000;
+    /// Another synthetic ordinary user's uid.
+    const OTHER_UID: libc::uid_t = 1001;
+
+    #[test]
+    fn only_a_store_this_process_owns_or_may_create_is_served() {
+        assert!(store_is_ours(StoreOwner::Uid(USER_UID), USER_UID));
+        assert!(store_is_ours(StoreOwner::Uid(ROOT_UID), ROOT_UID));
+        assert!(!store_is_ours(StoreOwner::Uid(USER_UID), ROOT_UID));
+        assert!(!store_is_ours(StoreOwner::Uid(OTHER_UID), USER_UID));
+        assert!(store_is_ours(StoreOwner::Missing, USER_UID));
+        assert!(!store_is_ours(StoreOwner::Missing, ROOT_UID));
+        assert!(!store_is_ours(StoreOwner::Unreadable, USER_UID));
+        assert!(!store_is_ours(StoreOwner::Unreadable, ROOT_UID));
+    }
+
+    #[test]
+    fn the_owner_of_a_store_reads_from_its_directory() {
+        let store = scratch_store();
+        assert_eq!(StoreOwner::of(&store), StoreOwner::Missing);
+        std::fs::create_dir_all(&store).expect("the test's store");
+        let owner = std::fs::metadata(&store).expect("metadata").uid();
+        assert_eq!(StoreOwner::of(&store), StoreOwner::Uid(owner));
+        std::fs::remove_dir_all(&store).expect("the test's store is removed");
+    }
+
+    #[test]
+    fn a_source_over_a_missing_store_offers_nothing_and_creates_nothing() {
+        let store = scratch_store();
+        let source = PhoneSource::over_store(store.clone());
+        assert!(source.offered().is_none());
+        source.stop();
+        assert!(!store.exists());
     }
 
     #[test]

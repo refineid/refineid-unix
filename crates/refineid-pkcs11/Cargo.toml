@@ -26,6 +26,5 @@ refineid-pkcs11.workspace = true
 refineid-rapp.workspace = true
 refineid-rapp-core.workspace = true
 refineid-remote.workspace = true
-
-[dev-dependencies]
+# geteuid(2), for whether the pairing store belongs to this process.
 libc = "0.2"

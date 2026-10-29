@@ -199,6 +199,70 @@ modutil -dbdir sql:$HOME/.mozilla/firefox/<profile> \
         -libfile "$(nix build github:refineid/refineid-unix --print-out-paths --no-link)/lib/librefineid_pkcs11.so"
 ```
 
+### Card login
+
+`programs.refineid.cardLogin` logs a user in with the card through
+pam_pkcs11 (from the OpenSC project, packaged in this flake) and the
+RefineID PKCS#11 module.
+
+Get the fingerprint of the card's authentication certificate with the
+card in the reader:
+
+```sh
+refineid card
+```
+
+and copy the `sha256:` line of the authentication certificate. Then,
+in the system configuration:
+
+```nix
+  programs.refineid.cardLogin = {
+    enable = true;
+    users.alice = [
+      "sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    ];
+  };
+```
+
+A fingerprint is accepted as `refineid card` prints it or with colons
+between bytes, in either case; a login may list several cards. The
+module writes them to `/etc/pam_pkcs11/digest_mapping` as
+`AA:BB:...:FF -> alice` lines.
+
+Card login covers:
+
+- console login, and SDDM and GDM's password login, which stack on
+  the `login` service;
+- `sudo` (and `sudo -i` under sudo-rs);
+- the KDE lock screen, when Plasma 6 is enabled. The Plasma 6.6 lock
+  screen answers prompts only on its password service `kde`, which
+  therefore carries the card rule; its `kde-smartcard` service runs
+  beside it but cannot ask for a PIN;
+- GDM's smartcard flow (service `gdm-smartcard`), when GDM is enabled.
+  GDM offers it on card insertion only when the PKCS#11 module reports
+  reader slots before a card is present, which is a separate change
+  to the core module.
+
+With a card in the reader the prompt asks for PIN 1, the card signs a
+random challenge with its authentication key, and the login succeeds
+when the certificate's fingerprint is mapped to the login name. The
+PIN is asked before the map is read, so a card mapped to someone else
+is asked for its PIN too and then refused. A wrong PIN uses one of the
+card's PIN 1 attempts, and the module stops offering PIN entry when few
+attempts are left. Without a card, or when card login fails, the
+password is asked as before; a forgotten or blocked card never locks the
+account out.
+
+No chain, validity period or revocation check is made at login: the map
+line is the authorization. Removing a card's line, and rebuilding,
+withdraws it.
+
+The PAM rules are set through `security.pam.services.<name>.rules`,
+which nixpkgs marks as experimental: its rule order values may change
+between releases, so check the generated `/etc/pam.d/login` after a
+nixpkgs update. The safety analysis is in
+[security/card-login-stpa.md](security/card-login-stpa.md).
+
 ## 2. Single-user install (manual Firefox setup)
 
 The system-wide install is the recommended path: it wires Firefox
