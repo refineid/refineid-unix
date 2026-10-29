@@ -59,7 +59,7 @@ so add it only if it is missing.
 One rebuild later the system has the `refineid` CLI, the
 GUI (in the application menu as "RefineID"), pcscd with the CCID
 driver, the PKCS#11 module registered for p11-kit consumers, and
-Firefox card login. Plug in a reader and run `refineid card`.
+Firefox and Chromium card login. Plug in a reader and run `refineid card`.
 
 ## Updating
 
@@ -175,6 +175,10 @@ sudo NIX_CONFIG="experimental-features = nix-command flakes" nixos-rebuild switc
   `programs.firefox.enable = true`**. Insert the card, open a
   card-login service, pick the certificate, enter PIN 1. Set
   `programs.refineid.firefoxIntegration = false` to opt out.
+- Chromium card login: the autostart entry
+  `/etc/xdg/autostart/refineid-browser-token.desktop` registers the
+  module in the signed-in user's NSS database (`~/.pki/nssdb`) at each
+  desktop login, which Chromium and every other NSS program read.
 
 ### Firefox installed some other way
 
