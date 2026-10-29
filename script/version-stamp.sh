@@ -23,7 +23,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-today="$(date -u '+%y.%-m.%-d')"
+read -r year month day < <(date -u '+%y %m %d')
+today="$year.$((10#$month)).$((10#$day))"
 old="$(script/version.sh)"
 
 old_ifs=$IFS
