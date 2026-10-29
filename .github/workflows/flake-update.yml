@@ -1,0 +1,50 @@
+name: flake-update
+
+# Refreshes flake.lock so the Nix build follows the current stable Rust
+# (rust-overlay), nixpkgs and crane, builds with the new lock, and opens
+# a pull request with the result.
+'on':
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    name: Update flake.lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Update the lock
+        run: nix flake update
+      - name: Stop when the lock is current
+        id: changed
+        run: |
+          if git diff --quiet flake.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build with the new lock
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          nix flake check --no-update-lock-file -L
+          nix build --no-update-lock-file --no-link -L
+      - name: Open the pull request
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body="$(jq -r '.nodes | to_entries[] | select(.value.locked.rev) | "\(.key): \(.value.locked.rev[0:10]) (\(.value.locked.lastModified | todate))"' flake.lock)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B flake-update
+          git commit -am "Update flake.lock"
+          git push --force origin flake-update
+          if [ -z "$(gh pr list --head flake-update --state open --json number --jq '.[].number')" ]; then
+            gh pr create --head flake-update --title "Update flake.lock" --body "$body"
+          fi
