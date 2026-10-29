@@ -15,25 +15,25 @@ build compiles everything: the dependency build is kept in the local
 Nix store and reused, so following the repository rebuilds just the
 RefineID crates.
 
-## Fresh machine, shortest path (not recommended)
+## Fresh machine, one command
 
-Nix flakes with Git dependencies require `git` on the host during evaluation.
-On a fresh NixOS install where `git` is not yet installed, enable `git` and flakes first:
+On a fresh NixOS install, as root, this adds RefineID to
+`/etc/nixos/configuration.nix` and builds it:
 
-```nix
-  programs.git.enable = true;
-  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+```sh
+sed -i -e "s|^\(\s*\)\./hardware-configuration\.nix|&\n\1((builtins.getFlake \"github:refineid/refineid-unix\").nixosModules.default)|" -e "s|^}\$|  programs.git.enable = true;\n  programs.refineid.enable = true;\n  nix.settings = { experimental-features = [ \"nix-command\" \"flakes\" ]; keep-outputs = true; };\n}|" /etc/nixos/configuration.nix && NIX_CONFIG="experimental-features = nix-command flakes" nix-shell -p git --run "nixos-rebuild switch"
 ```
 
-and activate them with `sudo nixos-rebuild switch`.
-
-Once `git` and flakes are active, add RefineID to `/etc/nixos/configuration.nix`:
+It expects the generated configuration: an `imports` list with
+`./hardware-configuration.nix` and a closing `}` on its own line.
+The result is this configuration:
 
 ```nix
   imports = [
     ./hardware-configuration.nix
     ((builtins.getFlake "github:refineid/refineid-unix").nixosModules.default)
   ];
+  programs.git.enable = true;
   programs.refineid.enable = true;
   nix.settings = {
     experimental-features = [ "nix-command" "flakes" ];
@@ -43,15 +43,17 @@ Once `git` and flakes are active, add RefineID to `/etc/nixos/configuration.nix`
   };
 ```
 
+Flakes and `git` are needed while the configuration is evaluated, before
+the configuration can provide them, so the first rebuild gets flakes
+from `NIX_CONFIG` and `git` from `nix-shell`. Every later rebuild is a
+plain `sudo nixos-rebuild switch`. The flake inputs are GitHub tarballs,
+but Cargo.lock pulls `refineid-core` from its Git repository, and Nix
+fetches that with `git`; without it the evaluation fails with
+`Failed to fetch git repository 'https://github.com/refineid/refineid-core.git'`.
+
 Browser card login needs `programs.firefox.enable = true;` -- already
 present in the generated `configuration.nix` of a graphical install,
 so add it only if it is missing.
-
-then run:
-
-```sh
-sudo nixos-rebuild switch
-```
 
 One rebuild later the system has the `refineid` CLI, the
 GUI (in the application menu as "RefineID"), pcscd with the CCID
@@ -91,11 +93,11 @@ system configuration).
 
 ## 1. System-wide install (recommended)
 
-Works on any NixOS 26.05 or newer with flakes enabled.
-If flakes are not enabled, add to
-`/etc/nixos/configuration.nix`:
+Works on any NixOS 26.05 or newer with flakes and `git` enabled.
+If they are not, add to `/etc/nixos/configuration.nix`:
 
 ```nix
+programs.git.enable = true;
 nix.settings.experimental-features = [ "nix-command" "flakes" ];
 ```
 
