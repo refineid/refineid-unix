@@ -12,6 +12,7 @@
 //! revision in this directory belongs to an earlier protocol version: it
 //! is removed, and its pairing is made again.
 
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
@@ -28,6 +29,18 @@ use crate::store::{PairingRecord, PairingStore, StoreError};
 const RECORD_EXTENSION: &str = "pair";
 /// File extension of a record being written.
 const TEMPORARY_EXTENSION: &str = "tmp";
+/// The Snap user-common directory variable.
+const SNAP_USER_COMMON: &str = "SNAP_USER_COMMON";
+/// The XDG base-directory configuration variable.
+const XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
+/// The home directory variable.
+const HOME: &str = "HOME";
+/// The configuration directory under a home directory.
+const CONFIG_DIRECTORY: &str = ".config";
+/// The application's directory under the configuration directory.
+const APPLICATION_DIRECTORY: &str = "refineid";
+/// The store's directory under the application's.
+const STORE_DIRECTORY: &str = "rapp-pairs";
 /// Owner-only directory permissions.
 const DIRECTORY_MODE: u32 = 0o700;
 /// Owner-only file permissions.
@@ -54,15 +67,11 @@ pub struct FilePairingStore {
 impl FilePairingStore {
     /// The per-user directory: `$XDG_CONFIG_HOME/refineid/rapp-pairs`, or
     /// `$HOME/.config/refineid/rapp-pairs`. Under a Snap the user-common
-    /// directory replaces the home directory.
+    /// directory replaces the home directory. A variable that is unset,
+    /// empty or relative does not count; `None` when none counts.
     #[must_use]
-    pub fn default_directory() -> PathBuf {
-        let config = std::env::var_os("SNAP_USER_COMMON")
-            .map(|common| PathBuf::from(common).join(".config"))
-            .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .unwrap_or_else(|| PathBuf::from(".config"));
-        config.join("refineid").join("rapp-pairs")
+    pub fn default_directory() -> Option<PathBuf> {
+        directory_from(|name| std::env::var_os(name))
     }
 
     /// Opens (creating if needed) the store in `directory` and loads every
@@ -74,26 +83,35 @@ impl FilePairingStore {
     /// [`StoreError::WriteRefused`] when the directory cannot be created or
     /// read.
     pub fn open(directory: &Path) -> Result<Self, StoreError> {
-        Self::load(directory, Sweep::Remove)
-    }
-
-    /// Opens (creating if needed) the store in `directory` and loads every
-    /// usable record, leaving the files of other records in place: a
-    /// program that reads the store beside the one that owns it opens it
-    /// this way, and never deletes a record.
-    ///
-    /// # Errors
-    /// As [`Self::open`].
-    pub fn open_without_sweep(directory: &Path) -> Result<Self, StoreError> {
-        Self::load(directory, Sweep::Keep)
-    }
-
-    fn load(directory: &Path, sweep: Sweep) -> Result<Self, StoreError> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(DIRECTORY_MODE)
             .create(directory)
             .map_err(|_| StoreError::WriteRefused)?;
+        Self::load(directory, Sweep::Remove)
+    }
+
+    /// Opens the store in `directory` and loads every usable record,
+    /// leaving the files of other records in place: a program that reads
+    /// the store beside the one that owns it opens it this way, and never
+    /// deletes a record. A directory that does not exist is an empty
+    /// store and is not created.
+    ///
+    /// # Errors
+    /// [`StoreError::WriteRefused`] when the directory exists but cannot
+    /// be read.
+    pub fn open_without_sweep(directory: &Path) -> Result<Self, StoreError> {
+        if fs::metadata(directory).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(Self {
+                directory: directory.to_path_buf(),
+                records: Vec::new(),
+            });
+        }
+        Self::load(directory, Sweep::Keep)
+    }
+
+    fn load(directory: &Path, sweep: Sweep) -> Result<Self, StoreError> {
         let mut loaded = Vec::new();
         for entry in fs::read_dir(directory).map_err(|_| StoreError::WriteRefused)? {
             let Ok(entry) = entry else { continue };
@@ -134,10 +152,26 @@ impl FilePairingStore {
     /// Opens the store in [`Self::default_directory`].
     ///
     /// # Errors
-    /// As [`Self::open`].
+    /// [`StoreError::NoUserDirectory`] when no per-user directory
+    /// resolves; otherwise as [`Self::open`].
     pub fn open_default() -> Result<Self, StoreError> {
-        Self::open(&Self::default_directory())
+        Self::open(&Self::default_directory().ok_or(StoreError::NoUserDirectory)?)
     }
+}
+
+/// [`FilePairingStore::default_directory`] over the environment `variable`
+/// reads.
+fn directory_from(variable: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let absolute = |name: &str| {
+        variable(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let config = absolute(SNAP_USER_COMMON)
+        .map(|common| common.join(CONFIG_DIRECTORY))
+        .or_else(|| absolute(XDG_CONFIG_HOME))
+        .or_else(|| absolute(HOME).map(|home| home.join(CONFIG_DIRECTORY)))?;
+    Some(config.join(APPLICATION_DIRECTORY).join(STORE_DIRECTORY))
 }
 
 /// The file of `pair_id`'s record: the identifier in lowercase hex.
@@ -308,7 +342,13 @@ mod tests {
 
     use refineid_rapp::{PAIRING_IDLE_EXPIRY_MS, PairingState, SweepError, SweepOutcome};
 
-    use super::{FilePairingStore, path_for};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::{
+        APPLICATION_DIRECTORY, CONFIG_DIRECTORY, FilePairingStore, HOME, SNAP_USER_COMMON,
+        STORE_DIRECTORY, XDG_CONFIG_HOME, directory_from, path_for,
+    };
     use crate::ids::PairId;
     use crate::persistence::{PAIRING_BLOB_MAGIC, PAIRING_BLOB_VERSION};
     use crate::store::fixtures::{CREATED_AT_MS, record};
@@ -336,7 +376,7 @@ mod tests {
     /// The mode of each record file.
     const FILE_MODE: u32 = 0o600;
 
-    fn scratch() -> std::path::PathBuf {
+    fn scratch() -> PathBuf {
         let suffix = getrandom::u64().unwrap();
         std::env::temp_dir().join(format!("refineid-rapp-store-{suffix:x}"))
     }
@@ -347,6 +387,64 @@ mod tests {
         blob.push(EARLIER_REVISION);
         blob.extend_from_slice(EARLIER_BODY);
         blob
+    }
+
+    /// A synthetic home directory.
+    const SYNTHETIC_HOME: &str = "/home/synthetic";
+    /// A synthetic XDG configuration directory.
+    const SYNTHETIC_CONFIG: &str = "/var/synthetic/config";
+    /// A synthetic Snap user-common directory.
+    const SYNTHETIC_SNAP: &str = "/var/synthetic/snap";
+    /// A relative path, which no variable may name.
+    const RELATIVE: &str = "synthetic";
+
+    /// The directory resolved from the `(variable, value)` pairs.
+    fn resolved(environment: &[(&str, &str)]) -> Option<PathBuf> {
+        directory_from(|name| {
+            environment
+                .iter()
+                .find(|(variable, _)| *variable == name)
+                .map(|(_, value)| OsString::from(value))
+        })
+    }
+
+    #[test]
+    fn the_user_directory_resolves_from_absolute_variables_only() {
+        let store = |config: PathBuf| config.join(APPLICATION_DIRECTORY).join(STORE_DIRECTORY);
+        let home_config = || PathBuf::from(SYNTHETIC_HOME).join(CONFIG_DIRECTORY);
+        let snap_config = PathBuf::from(SYNTHETIC_SNAP).join(CONFIG_DIRECTORY);
+        assert_eq!(
+            resolved(&[(HOME, SYNTHETIC_HOME)]),
+            Some(store(home_config()))
+        );
+        assert_eq!(
+            resolved(&[(HOME, SYNTHETIC_HOME), (XDG_CONFIG_HOME, SYNTHETIC_CONFIG)]),
+            Some(store(PathBuf::from(SYNTHETIC_CONFIG)))
+        );
+        assert_eq!(
+            resolved(&[
+                (HOME, SYNTHETIC_HOME),
+                (XDG_CONFIG_HOME, SYNTHETIC_CONFIG),
+                (SNAP_USER_COMMON, SYNTHETIC_SNAP),
+            ]),
+            Some(store(snap_config))
+        );
+        assert_eq!(
+            resolved(&[(HOME, SYNTHETIC_HOME), (XDG_CONFIG_HOME, RELATIVE)]),
+            Some(store(home_config()))
+        );
+        assert_eq!(resolved(&[(HOME, RELATIVE)]), None);
+        assert_eq!(resolved(&[(HOME, "")]), None);
+        assert_eq!(resolved(&[]), None);
+    }
+
+    #[test]
+    fn an_open_without_sweep_of_a_missing_directory_is_empty_and_creates_nothing() {
+        let directory = scratch().join(APPLICATION_DIRECTORY).join(STORE_DIRECTORY);
+        let store = FilePairingStore::open_without_sweep(&directory).unwrap();
+        assert!(store.pair_ids().is_empty());
+        assert!(!directory.exists());
+        assert!(!directory.parent().unwrap().exists());
     }
 
     #[test]

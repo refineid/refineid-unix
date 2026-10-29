@@ -32,15 +32,20 @@
       packageFor = pkgs: pkgs.callPackage ./nix/package.nix {
         craneLib = (crane.mkLib pkgs).overrideToolchain (toolchainFor pkgs);
       };
+      pamPkcs11For = pkgs: pkgs.callPackage ./nix/pam_pkcs11.nix { };
     in
     {
       packages = forAllSystems (pkgs: rec {
         refineid = packageFor pkgs;
+        pam_pkcs11 = pamPkcs11For pkgs;
         default = refineid;
       });
 
       nixosModules = {
-        refineid = import ./nix/module.nix { refineidPackage = packageFor; };
+        refineid = import ./nix/module.nix {
+          refineidPackage = packageFor;
+          pamPkcs11Package = pamPkcs11For;
+        };
         default = self.nixosModules.refineid;
       };
 

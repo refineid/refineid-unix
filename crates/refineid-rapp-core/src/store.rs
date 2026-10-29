@@ -194,6 +194,10 @@ pub enum StoreError {
     Unknown,
     /// The backing store refused the write.
     WriteRefused,
+    /// No per-user configuration directory resolves: none of
+    /// `SNAP_USER_COMMON`, `XDG_CONFIG_HOME` or `HOME` names an absolute
+    /// path.
+    NoUserDirectory,
 }
 
 /// Durable storage for pairing records.
