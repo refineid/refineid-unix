@@ -28,7 +28,9 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-EXPECTED_VERSION="$(cat VERSION 2>/dev/null || true)"
+# The workspace version YY.M.D; the binary carries it followed by the
+# build number of the build on the target.
+EXPECTED_VERSION="$(script/version.sh)"
 TARGET="${1:-}"
 
 SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
@@ -98,16 +100,17 @@ if [ -z "$BIN_TARGET" ]; then
 fi
 echo "   Binary resolves to: $BIN_TARGET"
 
-# 5. Check version string if available
-if [ -n "$EXPECTED_VERSION" ]; then
-    echo "-> Checking version in binary matches $EXPECTED_VERSION..."
-    FOUND_VER="$(run_cmd "grep -ao '$EXPECTED_VERSION' /run/current-system/sw/bin/refineid-gui 2>/dev/null | head -n1 || true")"
-    if [ "$FOUND_VER" = "$EXPECTED_VERSION" ]; then
+# 5. Check the version: the CLI help starts with "RefineID YY.M.D.B"
+echo "-> Checking the installed version starts with $EXPECTED_VERSION..."
+FOUND_VER="$(run_cmd '/run/current-system/sw/bin/refineid --help 2>&1 | head -n1' || true)"
+case "$FOUND_VER" in
+    "RefineID $EXPECTED_VERSION".*)
         echo "   Version verified: $FOUND_VER"
-    else
-        echo "   Notice: version $EXPECTED_VERSION not found in binary, continuing..."
-    fi
-fi
+        ;;
+    *)
+        echo "   Notice: installed version is '$FOUND_VER', not $EXPECTED_VERSION.<build>, continuing..."
+        ;;
+esac
 
 # 6. Verify and refresh running desktop panels
 echo "-> Verifying running desktop panels..."

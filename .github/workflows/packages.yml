@@ -1,8 +1,9 @@
 name: packages
 
-# A v<VERSION> tag builds the Ubuntu and FreeBSD packages, attaches them to
-# the tag's GitHub Release, and publishes the signed Ubuntu and FreeBSD
-# repositories, which index the packages of every release, to GitHub Pages.
+# A v<YY.M.D> tag, naming the workspace version in Cargo.toml, builds the
+# Ubuntu and FreeBSD packages, attaches them to the tag's GitHub Release,
+# and publishes the signed Ubuntu and FreeBSD repositories, which index the
+# packages of every release, to GitHub Pages.
 # A manual run builds the packages and the signed repositories and keeps
 # them as workflow artifacts; it creates no release and deploys nothing.
 # The repository and deploy jobs of tag runs share one concurrency group: a
@@ -35,9 +36,9 @@ jobs:
           persist-credentials: false
       - id: resolve
         run: |
-          version="$(tr -d '\r\n ' < VERSION)"
+          version="$(script/version.sh)"
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not name VERSION $version"
+            echo "::error::tag $GITHUB_REF_NAME does not name the workspace version $version"
             exit 1
           fi
           core_revision="$(git ls-remote "$CORE_REPOSITORY" refs/heads/main | cut -f1)"

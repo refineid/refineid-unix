@@ -100,14 +100,27 @@ describes; the package does not move the CCID driver aside.
   NSS autostart entry the package installs reaches a Chromium installed
   as a deb.
 
+## Version
+
+The project version is `YY.M.D.B`, in UTC. The date `YY.M.D` is the
+workspace version in `Cargo.toml` and says when the code was last touched:
+the pre-commit hook (`script/version-stamp.sh`) moves it to the commit's
+day, so it changes at most once a day. The build number `B` is the time
+of day of the build as hour * 100 + minute (7 at 00:07, 2105 at 21:05)
+and says how fresh the binary is; `crates/refineid-lib-core/build.rs`
+takes it from the clock on every build, or from `REFINEID_BUILD_NUMBER`
+when set, and nothing in the repository records it. Build numbers tell
+same-day development builds apart: package versions and the Nix store
+path carry the date alone, `script/version.sh` prints it.
+
 ## Pipeline
 
-`.github/workflows/packages.yml` runs on a pushed `v<VERSION>` tag, where
-`<VERSION>` is the content of `VERSION`, and on a manual run.
+`.github/workflows/packages.yml` runs on a pushed `v<YY.M.D>` tag, where
+`<YY.M.D>` is the workspace version in `Cargo.toml`, and on a manual run.
 
 | Job | Runs on | Does |
 | --- | --- | --- |
-| `prepare` | Ubuntu runner | checks that the tag names `VERSION`; resolves refineid-core `main` to one commit |
+| `prepare` | Ubuntu runner | checks that the tag names the workspace version; resolves refineid-core `main` to one commit |
 | `deb` | `ubuntu:26.04` container on an amd64 and an arm64 runner | builds with that core commit, `script/package-deb.sh` |
 | `freebsd` | FreeBSD 15.1 amd64 VM ([vmactions/freebsd-vm](https://github.com/vmactions/freebsd-vm)) | builds with that core commit, `script/package-freebsd.sh` |
 | `release` | Ubuntu runner, tag only | creates the GitHub Release for the tag with every `.deb` and `.pkg`; the notes name the core commit |

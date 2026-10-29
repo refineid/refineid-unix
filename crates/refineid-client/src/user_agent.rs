@@ -54,18 +54,18 @@
 //!   [[no-local-transport-in-portable-artifacts]] rule must
 //!   carry only intrinsic project state.
 
+use std::sync::LazyLock;
+
+use refineid_lib_core::VERSION;
+
 /// Honest `User-Agent` string sent to every well-behaved
 /// endpoint. RFC 7231 §5.5.3 `product/version (comment)` shape.
 ///
-/// The version comes from `REFINEID_VERSION` at compile time
-/// so it tracks the workspace and can't go stale. The contact
+/// The version is [`refineid_lib_core::VERSION`]. The contact
 /// URL lets server operators reach the project if our traffic
 /// causes them issues.
-const HONEST: &str = concat!(
-    "RefineID/",
-    env!("REFINEID_VERSION"),
-    " (+https://www.refineid.fi/)"
-);
+static HONEST: LazyLock<String> =
+    LazyLock::new(|| format!("RefineID/{VERSION} (+https://www.refineid.fi/)"));
 
 /// A documented endpoint exception where refineid sends a
 /// browser-shaped `User-Agent` instead of the honest one.
@@ -118,8 +118,8 @@ pub const BROWSER_UA_SET_ON: &str = "2026-05-24";
 /// Honest `User-Agent` for refineid's outbound HTTP. Default
 /// for every endpoint that accepts a project-identified client.
 #[must_use]
-pub const fn honest() -> &'static str {
-    HONEST
+pub fn honest() -> &'static str {
+    HONEST.as_str()
 }
 
 /// Browser-shaped `User-Agent` for endpoints that refuse the
@@ -140,18 +140,21 @@ pub const fn masquerade_as_browser(_reason: &MasqueradeReason) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{BROWSER_UA_SET_ON, HONEST, MasqueradeReason, masquerade_as_browser};
+    use refineid_lib_core::VERSION;
+
+    use super::{BROWSER_UA_SET_ON, MasqueradeReason, honest, masquerade_as_browser};
 
     #[test]
     fn honest_carries_version_and_contact_url() {
-        assert!(HONEST.starts_with("RefineID/"), "honest UA was {HONEST:?}");
+        let honest = honest();
+        assert!(honest.starts_with("RefineID/"), "honest UA was {honest:?}");
         assert!(
-            HONEST.contains(env!("REFINEID_VERSION")),
-            "honest UA missing version: {HONEST:?}"
+            honest.contains(VERSION),
+            "honest UA missing version: {honest:?}"
         );
         assert!(
-            HONEST.contains("refineid.fi"),
-            "honest UA missing contact URL: {HONEST:?}"
+            honest.contains("refineid.fi"),
+            "honest UA missing contact URL: {honest:?}"
         );
     }
 

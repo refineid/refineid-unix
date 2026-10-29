@@ -13,26 +13,18 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-# Stamp the project version across the tree. The canonical version is
-# CalVer YY.M.D.HHMM, where HHMM is the UTC time of day of the stamp as one
-# integer (905 at 09:05), the spelling every platform's version field takes
-# (hour * 100 + minute, 0..2359). Updates:
-#   VERSION                 canonical four-component string
-#   .cargo/config.toml      REFINEID_VERSION (compiled into binaries)
-#   Cargo.toml              workspace three-component SemVer projection
+# Stamp the workspace version YY.M.D in Cargo.toml and Cargo.lock with
+# the UTC day, so the version names the day the code last changed. The
+# build number that completes the project version YY.M.D.B is taken at
+# build time (crates/refineid-lib-core/build.rs) and never committed.
 #
 # Usage: script/version-stamp.sh
 
 set -eu
 cd "$(dirname "$0")/.."
 
-read -r year month day hour minute < <(date -u '+%y %-m %-d %H %M')
-today="$year.$month.$day"
-time_of_day=$((10#$hour * 100 + 10#$minute))
-project_version="$today.$time_of_day"
-old=$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml | head -n 1)
-[ -n "$old" ] || { echo "version-stamp: no workspace version" >&2; exit 1; }
-old_project=$(tr -d '\n' < VERSION)
+today="$(date -u '+%y.%-m.%-d')"
+old="$(script/version.sh)"
 
 old_ifs=$IFS
 IFS=.
@@ -49,17 +41,8 @@ for component in "$@"; do
     }
 done
 
-printf '%s\n' "$project_version" > VERSION
+[ "$old" != "$today" ] || exit 0
 
-awk -v version="$project_version" '
-    /^REFINEID_VERSION = / {
-        sub(/value = "[0-9.]+"/, "value = \"" version "\"")
-    }
-    { print }
-' .cargo/config.toml > .cargo/config.toml.tmp.$$ \
-    && mv .cargo/config.toml.tmp.$$ .cargo/config.toml
-
-if [ "$old" != "$today" ]; then
 awk -v version="$today" '
     /^version = "/ && !done { sub(/"[^"]*"/, "\"" version "\""); done=1 }
     { print }
@@ -87,6 +70,4 @@ awk -v old="$old" -v version="$today" '
     END { if (in_package) flush_package() }
 ' Cargo.lock > Cargo.lock.tmp.$$ && mv Cargo.lock.tmp.$$ Cargo.lock
 
-fi
-
-printf 'version-stamp: %s -> %s (workspace %s)\n' "$old_project" "$project_version" "$today"
+printf 'version-stamp: %s -> %s\n' "$old" "$today"

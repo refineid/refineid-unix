@@ -5,12 +5,10 @@ set -eu
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-# The version is the UTC day the tree was last committed on. When the day
-# has changed since the stamp, the commit carries a fresh stamp, so no
-# build published from main names an earlier day.
-# Every commit carries the minute it was made, so a build says which
-# commit it is.
+# The workspace version is the UTC day the tree was last committed on.
+# When the day has changed since the stamp, the commit carries a fresh
+# stamp, so no build published from main names an earlier day.
 ./script/version-stamp.sh
-git add VERSION .cargo/config.toml Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock
 
 exec "$REPO_ROOT/script/verify-commit.sh"

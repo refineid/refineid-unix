@@ -61,7 +61,8 @@ Show feedback only when it helps the user act:
 
 ## Versioning
 
-The window title uses the release-controlled workspace CalVer from `Cargo.toml`.
+The window title shows the project version `YY.M.D.B`
+([doc/packages.md](../../doc/packages.md#version)).
 
 ## Validation
 

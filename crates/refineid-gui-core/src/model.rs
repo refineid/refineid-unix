@@ -266,7 +266,7 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            window_title: format!("RefineID {}", env!("REFINEID_VERSION")),
+            window_title: format!("RefineID {}", refineid_lib_core::VERSION),
             status_message: String::new(),
             busy: false,
             cards: Vec::new(),

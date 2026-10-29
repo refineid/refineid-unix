@@ -109,7 +109,8 @@ so a shared desktop reader stays usable.
 
 ## Versions
 
-- Library version: tracks the workspace CalVer (see the root `VERSION` file).
+- Library version: `YY.M` of the refineid-core `refineid-pkcs11` crate
+  version, reported by that crate.
 - Cryptoki version: `2.40`.
 
 ## Register with p11-kit

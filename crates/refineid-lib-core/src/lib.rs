@@ -114,7 +114,14 @@ pub mod x509;
 pub use backend::ReaderBackend;
 pub use error::IoError;
 
-/// Crate version surfaced to upper layers (PKCS#11 callers will
-/// reflect this through `C_GetTokenInfo` once the cdylib port
-/// lands).
-pub const VERSION: &str = env!("REFINEID_VERSION");
+/// Project version `YY.M.D.B`: the workspace version `YY.M.D`, the UTC
+/// day the code last changed, and the build number `B` from build.rs,
+/// the UTC time of day of the build as hour * 100 + minute.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    ".",
+    env!("REFINEID_BUILD_NUMBER")
+);
+
+#[cfg(test)]
+mod build_number;

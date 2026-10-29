@@ -40,7 +40,9 @@
 let
   commonArgs = {
     pname = "refineid";
-    version = lib.trim (builtins.readFile ../VERSION);
+    # The workspace version YY.M.D; build.rs appends the build number
+    # from the sandbox clock.
+    version = (lib.importTOML ../Cargo.toml).workspace.package.version;
 
     src = lib.cleanSourceWith {
       src = ../.;
@@ -98,9 +100,7 @@ let
   # Cargo.lock with dummied-out workspace sources, so its hash -- and
   # therefore the cached artifact -- survives RefineID source edits.
   # The version is pinned so a version stamp does not rotate the
-  # cached derivation by name alone (the stamp still rebuilds it
-  # through .cargo/config.toml, which the dependency build must see
-  # for its rustflags).
+  # cached derivation by name alone.
   cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { version = "0"; });
 in
 craneLib.buildPackage (

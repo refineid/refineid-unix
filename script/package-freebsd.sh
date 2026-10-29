@@ -40,8 +40,7 @@ if [ "$(uname -s)" != "FreeBSD" ]; then
     exit 1
 fi
 
-VERSION="$(tr -d '\r\n ' < VERSION)"
-[ -n "$VERSION" ] || { echo "error: VERSION file is empty" >&2; exit 1; }
+VERSION="$(script/version.sh)"
 
 PREFIX="/usr/local"
 RUNTIME_DEPS="pcsc-lite libccid p11-kit nss"

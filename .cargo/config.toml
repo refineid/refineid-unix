@@ -1,5 +1,0 @@
-# Canonical YY.M.D.B project version, stamped into binaries at
-# compile time (refineid_lib_core::VERSION, the CLI user agent).
-# Kept equal to the VERSION file at the repo root.
-[env]
-REFINEID_VERSION = { value = "26.10.29.2040", force = true }
