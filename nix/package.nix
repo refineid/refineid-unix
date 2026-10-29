@@ -13,12 +13,13 @@
   cmake,
   # GTK apps abort without the GSettings machinery in their
   # environment (the file chooser reads org.gtk.Settings.FileChooser).
-  wrapGAppsHook3,
+  wrapGAppsHook4,
   gsettings-desktop-schemas,
   pcsclite,
   fontconfig,
-  # GTK 3 backs the file-chooser dialog (rfd gtk3 backend); linked at
-  # build time.
+  # GTK 4 is the GUI toolkit (refineid-gui-gtk4); linked at build time.
+  gtk4,
+  # GTK 3: the FLTK driver's native file chooser dlopens it.
   gtk3,
   pango,
   cairo,
@@ -65,7 +66,7 @@ let
     nativeBuildInputs = [
       pkg-config
       cmake
-      wrapGAppsHook3
+      wrapGAppsHook4
     ];
     dontUseCmakeConfigure = true;
     # Only the GUI needs the GTK wrap; leave the CLI and the PKCS#11
@@ -74,6 +75,7 @@ let
     buildInputs = [
       pcsclite
       fontconfig
+      gtk4
       gtk3
       pango
       cairo

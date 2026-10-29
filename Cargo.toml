@@ -16,7 +16,7 @@ members = [
 [workspace.package]
 # Cargo's three-component SemVer projection of the canonical
 # YY.M.D.B project version in VERSION. Rust code uses REFINEID_VERSION.
-version = "26.10.24"
+version = "26.10.29"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]

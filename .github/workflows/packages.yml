@@ -67,7 +67,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates git rustup build-essential cmake pkg-config dpkg-dev \
-            libpcsclite-dev libgtk-3-dev libpango1.0-dev libcairo2-dev \
+            libpcsclite-dev libgtk-4-dev libgtk-3-dev libpango1.0-dev libcairo2-dev \
             libfontconfig-dev libx11-dev libxext-dev libxinerama-dev \
             libxcursor-dev libxrender-dev libxfixes-dev libxft-dev libxi-dev \
             libxrandr-dev libxkbcommon-dev libwayland-dev libgl-dev
@@ -105,7 +105,7 @@ jobs:
           envs: CORE_REVISION
           prepare: |
             pkg install -y curl git pkgconf cmake ninja evdev-proto \
-              pcsc-lite libccid p11-kit nss gtk3 pango cairo fontconfig \
+              pcsc-lite libccid p11-kit nss gtk4 gtk3 pango cairo fontconfig \
               wayland libxkbcommon dbus mesa-libs libX11 libXext libXinerama \
               libXcursor libXrender libXfixes libXft libXi libXrandr
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
