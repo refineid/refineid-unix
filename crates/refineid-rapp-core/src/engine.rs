@@ -546,7 +546,7 @@ impl<Store: PairingStore> Requester<Store> {
     /// on.
     ///
     /// One pairing connection is open at a time, each endpoint is opened
-    /// once, and at most [`refineid_rapp::PAIRING_CANDIDATES_MAX`] are
+    /// once unless it answers busy, and at most [`refineid_rapp::PAIRING_CANDIDATES_MAX`] are
     /// opened. A custodian that answers `pairing-busy`, at bootstrap or in
     /// place of `CPace` step 2, is not tried: its endpoint is opened again
     /// after every other endpoint waiting to be opened and no sooner than
