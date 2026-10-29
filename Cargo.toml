@@ -14,8 +14,9 @@ members = [
 ]
 
 [workspace.package]
-# Cargo's three-component SemVer projection of the canonical
-# YY.M.D.B project version in VERSION. Rust code uses REFINEID_VERSION.
+# YY.M.D, the UTC day the code last changed, stamped by the pre-commit
+# hook (script/version-stamp.sh). refineid_lib_core::VERSION appends the
+# build number B for the project version YY.M.D.B.
 version = "26.10.29"
 edition = "2024"
 license = "Apache-2.0"

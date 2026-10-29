@@ -56,11 +56,7 @@ if ! command -v dpkg-deb >/dev/null 2>&1; then
     exit 1
 fi
 
-VERSION="$(tr -d '\r\n ' < VERSION)"
-if [ -z "$VERSION" ]; then
-    echo "error: VERSION file is empty" >&2
-    exit 1
-fi
+VERSION="$(script/version.sh)"
 
 ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
 MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"

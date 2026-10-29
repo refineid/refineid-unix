@@ -179,8 +179,9 @@ impl ProcessArgv {
     ///
     /// This is the entire pre-dispatch pipeline:
     ///
-    /// 1. `--help` / `-h` / `help` past `argv[0]` -- print
-    ///    `usage` to stderr, return `Err(ExitStatus::Ok)`.
+    /// 1. `--help` / `-h` / `help` past `argv[0]` -- print the
+    ///    project version and `usage` to stderr, return
+    ///    `Err(ExitStatus::Ok)`.
     /// 2. Verb dispatch or per-subcommand Args parse fails --
     ///    print the typed error line + `usage` to stderr,
     ///    return `Err(ExitStatus::BadInvocation)`.
@@ -205,6 +206,7 @@ impl ProcessArgv {
     ) -> Result<super::verb::Verb, std::process::ExitCode> {
         use crate::exit_status::ExitStatus;
         if self.wants_help() {
+            eprintln!("RefineID {}", refineid_lib_core::VERSION);
             eprint!("{usage}");
             return Err(ExitStatus::Ok.into());
         }
