@@ -132,7 +132,7 @@ impl RefineIdController {
 
     /// Keeps the Phone tab true while the GUI holds no session: at each
     /// round it tells a phone this computer forgot, when that phone is in
-    /// sight (RAPP v26.10.22 section 4.6 item 2); browses for the paired
+    /// sight (RAPP v26.10.29 section 4.6 item 2); browses for the paired
     /// phone's record; reads the authentication certificate when none is
     /// cached yet and the phone is on the network; and re-reads the
     /// pairing record, which another program on this computer may have
@@ -794,7 +794,7 @@ impl RefineIdController {
         });
     }
 
-    /// Pairs with the phone showing `code` (RAPP v26.10.22: the phone shows
+    /// Pairs with the phone showing `code` (RAPP v26.10.29: the phone shows
     /// the code and this workstation types it). One ceremony runs at a time.
     fn start_pairing(self: &Arc<Self>, code: &str) {
         if self.state().pairing.is_some() {

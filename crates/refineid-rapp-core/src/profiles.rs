@@ -1,4 +1,4 @@
-//! The credential-profile registry (RAPP v26.10.22 section 9).
+//! The credential-profile registry (RAPP v26.10.29 section 9).
 //!
 //! The names come from the engine's registry, so the strings this crate
 //! stores and compares are exactly the ones the wire carries.

@@ -1,7 +1,7 @@
 //! Client certificate authentication using remote RAPP card readers over TLS.
 //!
 //! The certificate is offered only on a session the phone opened and on
-//! which it reports the card the certificate belongs to (RAPP v26.10.22
+//! which it reports the card the certificate belongs to (RAPP v26.10.29
 //! section 8.4). Each handshake
 //! gets its own reader and session: the resolver opens them when the
 //! server asks for a certificate, the signing key owns them, the signer
@@ -69,7 +69,7 @@ impl OfferedSession {
 ///
 /// The certificate is offered only once the phone has opened a session
 /// and reported a card on it, and only the one whose fingerprint the phone
-/// reports on that session (RAPP v26.10.22 section 8.4 item 2); that
+/// reports on that session (RAPP v26.10.29 section 8.4 item 2); that
 /// session belongs to the handshake's signing key.
 #[derive(Debug)]
 pub struct RappClientCertResolver {
