@@ -8,7 +8,10 @@ cd "$REPO_ROOT"
 # The workspace version is the UTC day the tree was last committed on.
 # When the day has changed since the stamp, the commit carries a fresh
 # stamp, so no build published from main names an earlier day.
-./script/version-stamp.sh
-git add Cargo.toml Cargo.lock
+stamped=$(./script/version-stamp.sh)
+if [ -n "$stamped" ]; then
+    echo "$stamped"
+    git add Cargo.toml Cargo.lock
+fi
 
 exec "$REPO_ROOT/script/verify-commit.sh"
