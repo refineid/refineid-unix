@@ -4,8 +4,9 @@
 #
 # gives you the refineid CLI, the RefineID GUI, the PKCS#11
 # module registered system-wide for p11-kit consumers, the pcscd
-# smart-card daemon, and (when Firefox is managed by NixOS) automatic
-# Firefox card-login integration via the SecurityDevices policy.
+# smart-card daemon, Chromium card login through the user's NSS
+# database, and (when Firefox is managed by NixOS) Firefox card login
+# via the SecurityDevices policy.
 { refineidPackage }:
 {
   config,
@@ -15,6 +16,21 @@
 }:
 let
   cfg = config.programs.refineid;
+  modulePath = "/run/current-system/sw/lib/librefineid_pkcs11.so";
+  # The login-time NSS registration shared with the Debian package,
+  # with the NSS tools it calls put on its PATH.
+  browserToken = pkgs.writeShellScript "refineid-browser-token" ''
+    export PATH=${
+      lib.makeBinPath [
+        pkgs.nss.tools
+        pkgs.gnugrep
+        pkgs.coreutils
+      ]
+    }:$PATH
+    ${builtins.replaceStrings [ "@MODULE@" ] [ modulePath ] (
+      builtins.readFile ../packaging/refineid-browser-token
+    )}
+  '';
 in
 {
   options.programs.refineid = {
@@ -68,9 +84,17 @@ in
     # path so existing registrations survive updates and garbage collection.
     programs.firefox.policies = lib.mkIf cfg.firefoxIntegration {
       SecurityDevices.Add = {
-        "RefineID" = "/run/current-system/sw/lib/librefineid_pkcs11.so";
+        "RefineID" = modulePath;
       };
     };
+
+    # Chromium and every other NSS program read ~/.pki/nssdb, which no
+    # system policy reaches: a desktop autostart entry gives the
+    # signed-in user's database the module at each login.
+    environment.etc."xdg/autostart/refineid-browser-token.desktop".text =
+      builtins.replaceStrings [ "@EXEC@" ] [ "${browserToken}" ] (
+        builtins.readFile ../packaging/refineid-browser-token.desktop
+      );
 
     # Reload running desktop environments' application caches upon system activation,
     # so newly installed or upgraded RefineID appears immediately in menus without
