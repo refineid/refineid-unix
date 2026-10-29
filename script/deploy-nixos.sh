@@ -21,7 +21,7 @@
 # Usage:
 #   script/deploy-nixos.sh [TARGET]
 #
-# TARGET defaults to "root@nix" if reachable via SSH, or "local" if running
+# TARGET defaults to "root@nixos" if reachable via SSH, or "local" if running
 # directly on a NixOS host.
 
 set -eu
@@ -36,10 +36,10 @@ SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout
 if [ -z "$TARGET" ]; then
     if [ -f /etc/NIXOS ]; then
         TARGET="local"
-    elif ssh $SSH_OPTS root@nix "true" 2>/dev/null; then
-        TARGET="root@nix"
+    elif ssh $SSH_OPTS root@nixos "true" 2>/dev/null; then
+        TARGET="root@nixos"
     else
-        echo "error: no target specified and neither local NixOS nor root@nix is reachable" >&2
+        echo "error: no target specified and neither local NixOS nor root@nixos is reachable" >&2
         echo "usage: $0 [TARGET]" >&2
         exit 1
     fi
