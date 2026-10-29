@@ -62,6 +62,8 @@ let
       use_pkcs11_module = refineid;
       pkcs11_module refineid {
         module = ${cfg.package}/lib/librefineid_pkcs11.so;
+        # The card's signature over a random challenge is checked against
+        # the certificate; no chain, validity or revocation check.
         cert_policy = signature;
       }
       use_mappers = digest;
@@ -73,8 +75,9 @@ let
     }
   '';
   pamConfigArgument = "config_file=${pamConfig}";
-  # The card rule's place after the stack's pam_p11 rule; nixpkgs spaces
-  # its rules 100 apart.
+  # The card rule's place after the slot nixpkgs keeps for its own
+  # token rule (pam_p11), which stays disabled; nixpkgs spaces its rules
+  # 100 apart.
   cardRuleOffset = 10;
   # The lowest uid gdm-autologin admits, as nixpkgs sets it.
   firstNormalUid = 1000;
@@ -145,9 +148,9 @@ in
       );
     };
 
-    # The card rule sits right after the stack's own pam_p11 rule, before
-    # every password rule: a card in the reader asks for PIN 1, no card
-    # falls through to the password.
+    # The card rule sits in the token slot of each stack, before every
+    # password rule: a card in the reader asks for PIN 1, no card falls
+    # through to the password.
     #
     # WARNING (security.pam.services.<name>.rules, nixpkgs): This option and
     # its suboptions are experimental and subject to breaking changes

@@ -101,8 +101,7 @@ impl FilePairingStore {
     /// [`StoreError::WriteRefused`] when the directory exists but cannot
     /// be read.
     pub fn open_without_sweep(directory: &Path) -> Result<Self, StoreError> {
-        if fs::symlink_metadata(directory)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        if fs::metadata(directory).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
             return Ok(Self {
                 directory: directory.to_path_buf(),

@@ -61,7 +61,7 @@ computer itself.
 | --- | --- | --- |
 | CL-CC1 | A fingerprint is SHA-256 over the whole DER certificate; the evaluation refuses anything but 64 hex digits and renders the colon form itself. No subject or name mapper is configured. | CL-UCA1 |
 | CL-CC2 | The map line is the authorization, by decision. Possession of the card and PIN 1 is proved by a signature over a fresh challenge; withdrawal is removing the line and rebuilding. | CL-UCA2 |
-| CL-CC3 | The card rule is `sufficient` and sits after the stack's pam_p11 rule, before every password rule; the password rules are unchanged. `gdm-smartcard` is a service of its own. | CL-UCA3 |
+| CL-CC3 | The card rule is `sufficient` and sits in the token slot of each stack, before every password rule; the password rules are unchanged. `gdm-smartcard` is a service of its own. | CL-UCA3 |
 | CL-CC4 | The PKCS#11 module serves PIN 1 only while enough attempts are left; a card in the reader is the cardholder's choice to offer it. | CL-UCA4 |
 | CL-CC5 | Opening the pairing store for reading never creates a directory. The phone source is installed only when an absolute per-user configuration directory resolves and the store directory is owned by the process's effective uid; a missing directory counts as the process's own unless it runs as root. A login process as root, `sudo` with the invoking user's `HOME` included, leaves the user's store alone. | CL-UCA5 |
 | CL-CC6 | No network authentication rule follows the card rule in these stacks. | CL-UCA4, CL-UCA6 |
