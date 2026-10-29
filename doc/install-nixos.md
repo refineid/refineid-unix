@@ -4,7 +4,7 @@ Everything below builds RefineID from this source tree. Nix fetches
 every build dependency (Rust toolchain, pcsc-lite, fontconfig, GUI
 libraries) by itself; nothing needs to be installed by hand first.
 The Rust version and components come from `rust-toolchain.toml`,
-packaged by the locked `rust-overlay` input; a weekly workflow
+packaged by the locked `rust-overlay` input; a daily workflow
 refreshes `flake.lock`, so `stable` there is the current stable release.
 Both dependency and application builds use this compiler, even when
 the system's nixpkgs provides an older Rust. `nix develop` and
