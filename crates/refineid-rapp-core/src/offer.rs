@@ -7,7 +7,10 @@
 //! connection's transport profile.
 
 pub use refineid_rapp::cpace::CpaceError;
-pub use refineid_rapp::{PairingOffer, PairingOfferError, TransportCandidate, TransportProfile};
+pub use refineid_rapp::{
+    BootstrapAnswer, PairingBusy, PairingOffer, PairingOfferError, TransportCandidate,
+    TransportProfile,
+};
 
 /// Alias kept for the engine's error type.
 pub type OfferError = PairingOfferError;
@@ -72,19 +75,6 @@ pub fn format_pairing_code(code: &str) -> String {
         .join(" ")
 }
 
-/// Decodes the custodian's bootstrap frame into the offer this connection
-/// binds (section 4.2 step 3).
-///
-/// # Errors
-/// [`PairingOfferError`] when the bytes are not a valid offer of this
-/// protocol version, or the offer does not list `profile`.
-pub fn offer_from_bootstrap(
-    bytes: &[u8],
-    profile: TransportProfile,
-) -> Result<PairingOffer, PairingOfferError> {
-    PairingOffer::from_bootstrap(bytes, profile)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,12 +121,28 @@ mod tests {
         )
         .expect("offer");
         let bytes = offer.to_cbor().expect("encoded");
-        let decoded = offer_from_bootstrap(&bytes, TransportProfile::Stream).expect("decoded");
+        let Ok(BootstrapAnswer::Offer(decoded)) =
+            BootstrapAnswer::from_bootstrap(&bytes, TransportProfile::Stream)
+        else {
+            panic!("the bootstrap is an offer");
+        };
         assert_eq!(decoded.offer_hash().ok(), offer.offer_hash().ok());
         assert_eq!(decoded.offer_ttl_ms, PAIRING_OFFER_LIFETIME_MS);
         assert_eq!(
-            offer_from_bootstrap(&bytes, TransportProfile::Ble),
+            BootstrapAnswer::from_bootstrap(&bytes, TransportProfile::Ble),
             Err(PairingOfferError::TransportNotOffered)
         );
+    }
+
+    #[test]
+    fn a_busy_bootstrap_carries_its_wait_on_every_transport() {
+        let busy = PairingBusy::until_admissible(refineid_rapp::PAIRING_BUSY_RETRY_AFTER_MAX_MS);
+        let bytes = busy.to_cbor().expect("encoded");
+        for profile in [TransportProfile::Stream, TransportProfile::Ble] {
+            assert_eq!(
+                BootstrapAnswer::from_bootstrap(&bytes, profile),
+                Ok(BootstrapAnswer::Busy(busy))
+            );
+        }
     }
 }

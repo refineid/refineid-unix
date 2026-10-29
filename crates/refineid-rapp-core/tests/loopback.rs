@@ -19,6 +19,7 @@
     reason = "tests panic to fail; documenting each panic adds nothing"
 )]
 
+use std::collections::VecDeque;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -28,18 +29,19 @@ use refineid_rapp::{
     CertificateFingerprint, CloseReason, CpaceKc2Responder, DEFAULT_OPERATION_LIFETIME_MS,
     EndpointRole, EstablishedSessionRuntime, LIVENESS_CHALLENGE_SIZE,
     LIVENESS_PING_AFTER_SILENCE_MS, OFFER_ID_SIZE, OfferId, OperationId, OperationRequest,
-    OperationResultMessage, PAIRING_CANDIDATES_MAX, PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord,
-    PairingHandshake, PairingOffer, PairingState, PingChallenge, ProfileName, ProgressEvent,
-    ProtocolErrorMessage, ProxyDispatch, ProxyFailure, ProxyOperationEngine,
-    QUIT_WITHDRAWAL_BOUND_MS, REVOCATION_NOTICE_MS, ResultError, RuntimePoll, RuntimeReceive,
-    SESSION_READY_NONCE_SIZE, SessionHandshake, SignatureAlgorithm, SweepError, SweepOutcome,
-    TransportProfile, TypedMessage, UserApproval, decode_pair_record, encode_pair_record,
-    generate_pair_key_material, standard_pairing_context_v2,
+    OperationResultMessage, PAIRING_BUSY_RETRY_AFTER_MIN_MS, PAIRING_CANDIDATES_MAX,
+    PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, PairingBusy, PairingHandshake, PairingOffer,
+    PairingState, PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage, ProxyDispatch,
+    ProxyFailure, ProxyOperationEngine, QUIT_WITHDRAWAL_BOUND_MS, REVOCATION_NOTICE_MS,
+    ResultError, RuntimePoll, RuntimeReceive, SESSION_READY_NONCE_SIZE, SessionHandshake,
+    SignatureAlgorithm, SweepError, SweepOutcome, TransportProfile, TypedMessage, UserApproval,
+    decode_pair_record, encode_pair_record, generate_pair_key_material,
+    standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
-    AdmissionError, OpenedConnection, OperationOutcome, PairingCandidateSource, PairingError,
-    PairingSearchError, Requester, RequesterConfig, Session, SessionEnd, SessionError, Withdrawal,
-    current_time_ms, read_offer,
+    AdmissionError, OpenedConnection, OperationOutcome, PairingCandidateSource, PairingConnection,
+    PairingError, PairingSearchError, Requester, RequesterConfig, Session, SessionEnd,
+    SessionError, Withdrawal, current_time_ms,
 };
 use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::profiles::{
@@ -71,6 +73,8 @@ const SECOND_ENDPOINT: usize = 1;
 /// How long a scripted custodian waits for the requester while it tries
 /// another custodian first: longer than the attempt deadline.
 const OUTLASTS_ATTEMPT: Duration = Duration::from_secs(10);
+/// The wait a busy scripted custodian asks for when a test measures it.
+const BUSY_WAIT_MS: u64 = 300;
 /// Uniform bytes a `CPace` scalar is drawn from (section 6.1.1).
 const CPACE_SCALAR_ENTROPY_BYTES: usize = 64;
 /// Fixed custodian scalar entropy for the scripted exchange.
@@ -286,14 +290,30 @@ fn proxy_pair<T: FrameTransport>(transport: T, shown_code: &str) -> PairRecord {
 /// `Silent` custodian stores nothing and leaves the requester without its
 /// `pairing.stored`.
 fn proxy_pair_confirming<T: FrameTransport>(
-    mut transport: T,
+    transport: T,
     shown_code: &str,
     display_name: &str,
     confirmation_mode: StorageConfirmation,
 ) -> Option<PairRecord> {
+    proxy_pair_serving(
+        transport,
+        shown_code,
+        display_name,
+        confirmation_mode,
+        custodian_offer(),
+    )
+}
+
+/// As [`proxy_pair_confirming`], serving `offer`.
+fn proxy_pair_serving<T: FrameTransport>(
+    mut transport: T,
+    shown_code: &str,
+    display_name: &str,
+    confirmation_mode: StorageConfirmation,
+    (offer, bootstrap, context): (PairingOffer, Vec<u8>, Vec<u8>),
+) -> Option<PairRecord> {
     let now_ms = SESSION_START_MS;
     let candidate = TransportProfile::Stream.candidate_id();
-    let (offer, bootstrap, context) = custodian_offer();
     transport.send_frame(&bootstrap).unwrap();
 
     let step_one = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
@@ -1178,11 +1198,13 @@ fn input_that_is_not_a_code_never_touches_the_transport() {
 type CustodianScript = Box<dyn FnOnce(MemoryTransport) + Send>;
 
 /// Custodians in pairing mode at scripted endpoints, all found in the
-/// first discovery round: endpoint `n` is the `n`-th connection.
+/// first discovery round: endpoint `n` serves its scripted connections in
+/// turn, one per opening.
 struct ScriptedCustodians {
-    connections: Vec<Option<MemoryTransport>>,
+    connections: Vec<VecDeque<MemoryTransport>>,
     discovered: bool,
-    opened: usize,
+    /// The endpoints opened, in the order opened.
+    opened: Vec<usize>,
 }
 
 impl PairingCandidateSource for ScriptedCustodians {
@@ -1194,27 +1216,38 @@ impl PairingCandidateSource for ScriptedCustodians {
             .then(|| (0..self.connections.len()).collect())
     }
 
-    fn open(&mut self, endpoint: &usize) -> Option<(MemoryTransport, PairingOffer)> {
-        let mut transport = self.connections.get_mut(*endpoint)?.take()?;
-        self.opened += 1;
-        let offer = read_offer(&mut transport).ok()?;
-        Some((transport, offer))
+    fn open(&mut self, endpoint: &usize) -> Option<PairingConnection<MemoryTransport>> {
+        let transport = self.connections.get_mut(*endpoint)?.pop_front()?;
+        self.opened.push(*endpoint);
+        PairingConnection::read(transport).ok()
     }
 }
 
 /// One scripted endpoint per script, each custodian on its own thread.
 fn scripted(scripts: Vec<CustodianScript>) -> (ScriptedCustodians, Vec<JoinHandle<()>>) {
+    scripted_openings(scripts.into_iter().map(|script| vec![script]).collect())
+}
+
+/// One scripted endpoint per list, serving one connection per script in
+/// the list, each on its own thread.
+fn scripted_openings(
+    endpoints: Vec<Vec<CustodianScript>>,
+) -> (ScriptedCustodians, Vec<JoinHandle<()>>) {
     let mut connections = Vec::new();
     let mut custodians = Vec::new();
-    for script in scripts {
-        let (requester_side, custodian_side) = MemoryTransport::pair(CANDIDATE, DEADLINE);
-        connections.push(Some(requester_side));
-        custodians.push(std::thread::spawn(move || script(custodian_side)));
+    for scripts in endpoints {
+        let mut openings = VecDeque::new();
+        for script in scripts {
+            let (requester_side, custodian_side) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+            openings.push_back(requester_side);
+            custodians.push(std::thread::spawn(move || script(custodian_side)));
+        }
+        connections.push(openings);
     }
     let source = ScriptedCustodians {
         connections,
         discovered: false,
-        opened: 0,
+        opened: Vec::new(),
     };
     (source, custodians)
 }
@@ -1293,7 +1326,7 @@ fn the_code_is_not_accepted_only_after_every_phone_refused_it() {
     });
     join(threads);
     assert_eq!(outcome, Err(PairingSearchError::NotAccepted));
-    assert_eq!(custodians.opened, custodians.connections.len());
+    assert_eq!(custodians.opened.len(), custodians.connections.len());
     assert_eq!(
         PairingSearchError::NotAccepted.to_string(),
         "the code was not accepted"
@@ -1349,7 +1382,7 @@ fn a_search_opens_at_most_the_limit_of_connections() {
     });
     join(threads);
     assert_eq!(outcome, Err(PairingSearchError::NotAccepted));
-    assert_eq!(custodians.opened, PAIRING_CANDIDATES_MAX);
+    assert_eq!(custodians.opened.len(), PAIRING_CANDIDATES_MAX);
 }
 
 #[test]
@@ -1370,6 +1403,130 @@ fn a_search_that_tried_no_phone_finds_none_in_pairing_mode() {
         PairingSearchError::NoneInPairingMode.to_string(),
         "no phone in pairing mode was found"
     );
+}
+
+/// A custodian that cannot admit an attempt: it answers `pairing-busy`
+/// asking for `wait_ms` at bootstrap and closes (section 4.2, "Busy
+/// Refusal" item 1).
+fn busy_for(wait_ms: u64) -> CustodianScript {
+    Box::new(move |mut transport| {
+        let busy = PairingBusy::new(wait_ms).unwrap().to_cbor().unwrap();
+        transport.send_frame(&busy).unwrap();
+    })
+}
+
+/// A custodian that served `offer` and can no longer admit the attempt
+/// when step 1 arrives: it answers `pairing-busy` in place of step 2 and
+/// closes (section 4.2, "Busy Refusal" item 2).
+fn busy_after_step_one(offer: (PairingOffer, Vec<u8>, Vec<u8>)) -> CustodianScript {
+    Box::new(move |mut transport| {
+        let (_offer, bootstrap, _context) = offer;
+        transport.send_frame(&bootstrap).unwrap();
+        assert!(transport.receive_frame().is_ok());
+        let busy = PairingBusy::new(PAIRING_BUSY_RETRY_AFTER_MIN_MS)
+            .unwrap()
+            .to_cbor()
+            .unwrap();
+        transport.send_frame(&busy).unwrap();
+    })
+}
+
+#[test]
+fn a_busy_phone_is_opened_again_after_the_phones_waiting() {
+    let mut requester = test_requester();
+    let (mut custodians, threads) = scripted_openings(vec![
+        vec![busy_for(PAIRING_BUSY_RETRY_AFTER_MIN_MS), accepting()],
+        vec![refusing()],
+    ]);
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |_, requested| {
+        Some(requested.to_vec())
+    });
+    join(threads);
+    assert_eq!(outcome.map(|(_, endpoint)| endpoint), Ok(0));
+    assert_eq!(custodians.opened, [0, SECOND_ENDPOINT, 0]);
+}
+
+#[test]
+fn a_busy_phone_is_opened_again_no_sooner_than_its_wait() {
+    let mut requester = test_requester();
+    let (mut custodians, threads) =
+        scripted_openings(vec![vec![busy_for(BUSY_WAIT_MS), accepting()]]);
+    let started = Instant::now();
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |_, requested| {
+        Some(requested.to_vec())
+    });
+    join(threads);
+    assert_eq!(outcome.map(|(_, endpoint)| endpoint), Ok(0));
+    assert_eq!(custodians.opened, [0, 0]);
+    assert!(started.elapsed() >= Duration::from_millis(BUSY_WAIT_MS));
+}
+
+#[test]
+fn a_phone_busy_in_place_of_step_two_keeps_its_guess() {
+    let mut requester = test_requester();
+    let offer = custodian_offer_with(OfferId::from_array(SHARED_OFFER_ID));
+    let served = offer.clone();
+    let (mut custodians, threads) = scripted_openings(vec![vec![
+        busy_after_step_one(offer),
+        Box::new(move |mut transport| {
+            transport.set_receive_deadline(OUTLASTS_ATTEMPT).unwrap();
+            proxy_pair_serving(
+                transport,
+                SHOWN_CODE,
+                CUSTODIAN_NAME,
+                StorageConfirmation::Confirmed,
+                served,
+            )
+            .unwrap();
+        }),
+    ]]);
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |_, requested| {
+        Some(requested.to_vec())
+    });
+    join(threads);
+    assert_eq!(outcome.map(|(_, endpoint)| endpoint), Ok(0));
+    assert_eq!(custodians.opened, [0, 0]);
+}
+
+#[test]
+fn a_phone_busy_at_the_limit_has_not_accepted_the_code() {
+    let mut requester = test_requester();
+    let mut openings: Vec<CustodianScript> = (0..PAIRING_CANDIDATES_MAX)
+        .map(|_| busy_for(PAIRING_BUSY_RETRY_AFTER_MIN_MS))
+        .collect();
+    openings.push(accepting_never_reached());
+    let (mut custodians, threads) = scripted_openings(vec![openings]);
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |_, _| {
+        panic!("a busy phone never reaches confirmation")
+    });
+    drop(custodians.connections);
+    join(threads);
+    assert_eq!(outcome, Err(PairingSearchError::NotAccepted));
+    assert_eq!(custodians.opened.len(), PAIRING_CANDIDATES_MAX);
+}
+
+#[test]
+fn a_search_that_saw_a_busy_answer_and_tried_no_phone_is_not_accepted() {
+    let mut requester = test_requester();
+    let (mut custodians, threads) = scripted_openings(vec![vec![
+        busy_for(PAIRING_BUSY_RETRY_AFTER_MIN_MS),
+        Box::new(drop),
+    ]]);
+    let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |_, _| {
+        panic!("no phone was tried")
+    });
+    join(threads);
+    assert_eq!(outcome, Err(PairingSearchError::NotAccepted));
+    assert_eq!(custodians.opened, [0, 0]);
+}
+
+/// A custodian connection the requester never opens: it sees the
+/// connection close unanswered.
+fn accepting_never_reached() -> CustodianScript {
+    Box::new(|mut transport| {
+        transport.set_receive_deadline(OUTLASTS_ATTEMPT).unwrap();
+        assert_eq!(transport.receive_frame(), Err(TransportError::Eof));
+    })
 }
 
 #[test]
