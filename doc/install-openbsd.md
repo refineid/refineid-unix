@@ -2,8 +2,9 @@
 
 Verified on OpenBSD 8.0/amd64 under KVM, October 2026: the CLI, the
 PKCS#11 module and the FLTK GUI build from packages alone, and the GUI
-starts from the CDE Application Manager. Card operations through a reader
-are not yet verified on OpenBSD.
+starts from the CDE Application Manager. With multicast enabled (section
+5), phone discovery gets answers. Pairing and card operations are not yet
+verified on OpenBSD.
 
 ## 1. Packages
 
@@ -50,3 +51,17 @@ BIN=target/release/refineid-gui script/install-desktop.sh --prefix /usr/local
 rcctl enable pcscd
 rcctl start pcscd
 ```
+
+## 5. Multicast for phone pairing
+
+Pairing finds the phone through multicast DNS. Unless `multicast=YES` is
+set, netstart(8) routes `224.0.0.0/4` to a reject route on `lo0`, so the
+queries never leave the host and no phone is found. As root:
+
+```sh
+rcctl enable multicast
+route -qn delete 224.0.0.0/4
+```
+
+`rcctl enable multicast` takes effect at the next boot; deleting the
+reject route applies it now.
