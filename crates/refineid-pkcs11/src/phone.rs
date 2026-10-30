@@ -444,6 +444,7 @@ impl RemoteTokenSource for PhoneSource {
             *spoken = false;
         }
         self.shared.renew_withdrawal();
+        refineid_dev_errors::flush!();
     }
 }
 
@@ -598,9 +599,15 @@ fn unpaired(shared: &Shared, requests: &Receiver<SignRequest>) {
     shared.withdraw_slot();
     shared.wanted.store(false, Ordering::Release);
     while let Ok(request) = requests.try_recv() {
-        let _ = request.reply.send(Err(RemoteSignError::Withdrawn));
+        refuse(&request, RemoteSignError::Withdrawn);
     }
     pause(shared, UNPAIRED_PAUSE);
+}
+
+/// Answers `request` with `error`, the module's failure for the browser.
+fn refuse(request: &SignRequest, error: RemoteSignError) {
+    refineid_dev_errors::report!(Pkcs11, "signature request failed", error);
+    let _ = request.reply.send(Err(error));
 }
 
 /// What the token does once a held session has ended.
@@ -725,9 +732,15 @@ fn hold(
         match requests.recv_timeout(SERVICE_STEP) {
             // The browser gave up while the session was being opened;
             // the card is not asked for a signature nobody will read.
-            Ok(request) if request.expired() => {}
+            Ok(request) if request.expired() => {
+                refineid_dev_errors::report!(
+                    Pkcs11,
+                    "signature request dropped",
+                    "the browser stopped waiting"
+                );
+            }
             Ok(request) if request.pair_id != slot => {
-                let _ = request.reply.send(Err(RemoteSignError::Withdrawn));
+                refuse(&request, RemoteSignError::Withdrawn);
             }
             Ok(request) => match &confirmed {
                 // No card this session confirmed: absence, or a card whose
@@ -738,7 +751,7 @@ fn hold(
                     } else {
                         RemoteSignError::CardAbsent
                     };
-                    let _ = request.reply.send(Err(error));
+                    refuse(&request, error);
                 }
                 Some(card) => {
                     let signed = sign(reader, &mut session, &request);
@@ -751,7 +764,12 @@ fn hold(
                         // cached: the token goes, the cache goes, and the
                         // next session reads the card again.
                         Err(Failure::Mismatch) => {
-                            let _ = request.reply.send(Err(RemoteSignError::Ambiguous));
+                            refineid_dev_errors::report!(
+                                Pkcs11,
+                                "signature not handed on",
+                                "it does not verify under the cached certificate"
+                            );
+                            refuse(&request, RemoteSignError::Ambiguous);
                             let _ = reader.forget_auth_cert(phone.pair_id);
                             reader.close_session(session);
                             return After::Withdraw;
@@ -762,7 +780,7 @@ fn hold(
                             let _ = request.reply.send(Err(RemoteSignError::Unsupported));
                         }
                         Err(Failure::Sign(error)) => {
-                            let _ = request.reply.send(Err(error));
+                            refuse(&request, error);
                             match error {
                                 // The phone stopped serving or forgot this
                                 // computer: its presence goes at once.

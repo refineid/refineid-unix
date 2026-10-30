@@ -130,6 +130,7 @@ impl SignArgs {
                         | crate::card_sign::SignErrorKind::PinPolicy { .. }
                 ) =>
             {
+                refineid_dev_errors::report!(Cli, "signature not made", e);
                 eprintln!("{cmd}: {e}");
                 if matches!(
                     &e,
@@ -143,6 +144,7 @@ impl SignArgs {
                 crate::exit_status::ExitStatus::CardCredentialRejected.into()
             }
             Err(e) => {
+                refineid_dev_errors::report!(Cli, "signature not made", e);
                 eprintln!("{cmd}: {e}");
                 crate::exit_status::ExitStatus::RuntimeFailure.into()
             }

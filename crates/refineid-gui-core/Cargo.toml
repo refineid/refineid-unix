@@ -15,6 +15,7 @@ workspace = true
 refineid-client = { path = "../refineid-client", version = "26" }
 refineid-lib-core.workspace = true
 refineid-rapp-core.workspace = true
+refineid-dev-errors.workspace = true
 refineid-lib-pcsc.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 pdfluent-jpeg2000 = { version = "0.4", default-features = false, features = ["image", "std"] }

@@ -1192,9 +1192,28 @@ impl UiDriver for FltkDriver {
             widgets.window.show();
         }
 
+        #[cfg(debug_assertions)]
+        let follower = refineid_dev_errors::follow(app::awake);
+        #[cfg(debug_assertions)]
+        let mut errors = crate::errors::ErrorsWindow::default();
+
         while self.app.wait() {
             while let Some(state) = self.state_rx.recv() {
                 self.render(&state);
+            }
+            #[cfg(debug_assertions)]
+            {
+                while let Some(entry) = follower.next() {
+                    errors.add(entry);
+                }
+                // The Errors window does not keep the application open.
+                if self
+                    .widgets
+                    .as_ref()
+                    .is_some_and(|widgets| !widgets.window.shown())
+                {
+                    break;
+                }
             }
         }
 

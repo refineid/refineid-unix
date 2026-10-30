@@ -62,8 +62,10 @@ fn main() -> ExitCode {
     let _install_result: Result<(), refineid_lib_core::events::SinkAlreadySet> =
         set_global_sink(Box::new(StderrSink::new()));
 
-    match refineid_client::cli::read_command_line() {
+    let code = match refineid_client::cli::read_command_line() {
         Ok(verb) => verb.run(),
         Err(exit) => exit,
-    }
+    };
+    refineid_dev_errors::flush!();
+    code
 }

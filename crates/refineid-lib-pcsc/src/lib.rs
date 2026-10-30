@@ -128,8 +128,15 @@ pub enum PcscError {
 
 impl From<pcsc::Error> for PcscError {
     fn from(e: pcsc::Error) -> Self {
+        refineid_dev_errors::report!(Reader, "PC/SC call failed", e);
         Self::Pcsc(e)
     }
+}
+
+/// A transport failure with no PC/SC status: `reason`, reported as it is.
+fn transport_error(reason: &'static str) -> PcscError {
+    refineid_dev_errors::report!(Reader, "card exchange failed", name reason);
+    PcscError::Transport(reason.to_owned())
 }
 
 impl core::fmt::Display for PcscError {
@@ -221,8 +228,7 @@ fn connect_resilient(ctx: &Context, cstr: &CString) -> Result<Option<Card>, Pcsc
 }
 
 pub(crate) fn connect(ctx: &Context, reader: &str) -> Result<Option<PcscCard>, PcscError> {
-    let cstr = CString::new(reader)
-        .map_err(|e| PcscError::Transport(format!("reader name has interior NUL: {e}")))?;
+    let cstr = CString::new(reader).map_err(|_| transport_error("reader name has interior NUL"))?;
     let card = match connect_resilient(ctx, &cstr) {
         Ok(Some(c)) => c,
         Ok(None) => return Ok(None),
@@ -234,7 +240,7 @@ pub(crate) fn connect(ctx: &Context, reader: &str) -> Result<Option<PcscCard>, P
     let atr = status.atr().to_vec();
     let protocol = status
         .protocol2()
-        .ok_or_else(|| PcscError::Transport("connected card has no active protocol".into()))?;
+        .ok_or_else(|| transport_error("connected card has no active protocol"))?;
     Ok(Some(PcscCard {
         card,
         atr,
@@ -376,9 +382,9 @@ impl PcscCard {
         let mut atr_buf = [0_u8; pcsc::MAX_ATR_SIZE];
         let status = self.card.status2(&mut names_buf, &mut atr_buf)?;
         self.atr = status.atr().to_vec();
-        self.protocol = status.protocol2().ok_or_else(|| {
-            PcscError::Transport("reconnected card has no active protocol".into())
-        })?;
+        self.protocol = status
+            .protocol2()
+            .ok_or_else(|| transport_error("reconnected card has no active protocol"))?;
         // SCardReconnect releases a held transaction along with the
         // rest of the session state; re-acquire it so the
         // PinSequence atomicity contract survives a mid-sequence
@@ -529,14 +535,10 @@ fn run_t0_exchange<T: T0Transmitter>(
                 };
                 let progressed = !chain_body.is_empty();
                 let Some(next_len) = combined.len().checked_add(chain_body.len()) else {
-                    return Err(PcscError::Transport(
-                        "61xx GET RESPONSE chain exceeded 64 KiB".into(),
-                    ));
+                    return Err(transport_error("61xx GET RESPONSE chain exceeded 64 KiB"));
                 };
                 if next_len > EXTENDED_RESPONSE_DATA_MAX_BYTES {
-                    return Err(PcscError::Transport(
-                        "61xx GET RESPONSE chain exceeded 64 KiB".into(),
-                    ));
+                    return Err(transport_error("61xx GET RESPONSE chain exceeded 64 KiB"));
                 }
                 combined.extend_from_slice(chain_body);
                 chained_sw1 = chain_sw[0];
@@ -550,8 +552,8 @@ fn run_t0_exchange<T: T0Transmitter>(
                     // count, so a legitimate multi-KiB chain still
                     // completes.
                     if !progressed {
-                        return Err(PcscError::Transport(
-                            "card signalled 61xx but returned no bytes (stalled chain)".into(),
+                        return Err(transport_error(
+                            "card signalled 61xx but returned no bytes (stalled chain)",
                         ));
                     }
                     next_le = chained_sw2;
@@ -726,7 +728,7 @@ const VENDOR_IFD_EXCHANGE_CONTROL_CODE: pcsc::ffi::DWORD = 0x4200_0000 + 1;
 pub fn reader_escape(reader: &ReaderId, command: &[u8]) -> Result<Vec<u8>, PcscError> {
     let ctx = establish_context()?;
     let cstr = CString::new(reader.as_str())
-        .map_err(|e| PcscError::Transport(format!("reader name has interior NUL: {e}")))?;
+        .map_err(|_| transport_error("reader name has interior NUL"))?;
     let mut recv = [0_u8; 300];
     // The escape control codes in the wild: pcsc-lite's
     // IOCTL_CCID_ESCAPE, the Windows value from the vendor
@@ -763,8 +765,8 @@ pub fn reader_escape(reader: &ReaderId, command: &[u8]) -> Result<Vec<u8>, PcscE
             }
         }
     }
-    Err(PcscError::Transport(
-        "reader escape rejected on every control route (SCardControl blocked?)".into(),
+    Err(transport_error(
+        "reader escape rejected on every control route (SCardControl blocked?)",
     ))
 }
 
@@ -783,7 +785,7 @@ impl ReaderBackend for PcscBackend {
         let mut out = Vec::with_capacity(names.len());
         for name in names {
             let cstr = CString::new(name.as_str())
-                .map_err(|e| PcscError::Transport(format!("reader name has interior NUL: {e}")))?;
+                .map_err(|_| transport_error("reader name has interior NUL"))?;
             // Card-presence probe: SCardGetStatusChange with a
             // zero timeout. Doesn't open a card session so it
             // won't contend with peers running PACE.
@@ -797,9 +799,7 @@ impl ReaderBackend for PcscBackend {
                     // panic-free even if the loop body is later
                     // edited to push more states.
                     let Some(state) = states.first() else {
-                        return Err(PcscError::Transport(
-                            "reader-state vector unexpectedly empty".into(),
-                        ));
+                        return Err(transport_error("reader-state vector unexpectedly empty"));
                     };
                     let event = state.event_state();
                     event.contains(State::PRESENT) && !event.contains(State::EMPTY)
@@ -878,7 +878,7 @@ pub fn wait_for_presence_change(
     states.push(ReaderState::new(pcsc::PNP_NOTIFICATION(), State::UNAWARE));
     for name in &names {
         let cstr = CString::new(name.as_str())
-            .map_err(|e| PcscError::Transport(format!("reader name has interior NUL: {e}")))?;
+            .map_err(|_| transport_error("reader name has interior NUL"))?;
         states.push(ReaderState::new(cstr, State::UNAWARE));
     }
     // Prime the current state from a zero-timeout call: UNAWARE
