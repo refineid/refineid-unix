@@ -569,6 +569,7 @@ pub fn browse_stream_services(timeout: Duration, remembered: &[Ipv4Addr]) -> Vec
 struct BrowseSockets {
     group: Option<std::net::UdpSocket>,
     legacy: std::net::UdpSocket,
+    group_turn: core::cell::Cell<bool>,
 }
 
 impl BrowseSockets {
@@ -578,6 +579,7 @@ impl BrowseSockets {
         Some(Self {
             group: Self::group_socket(),
             legacy,
+            group_turn: core::cell::Cell::new(true),
         })
     }
 
@@ -612,14 +614,15 @@ impl BrowseSockets {
         asked
     }
 
-    /// Reads one datagram from whichever socket has one within its poll.
+    /// Reads at most one datagram, from the group and legacy sockets in
+    /// turn, waiting up to one poll; steady traffic on the shared port
+    /// therefore never keeps the legacy socket unread.
     fn receive(&self, buffer: &mut [u8]) -> Option<(usize, std::net::SocketAddr)> {
-        if let Some(group) = &self.group
-            && let Ok(received) = group.recv_from(buffer)
-        {
-            return Some(received);
+        let group_turn = self.group_turn.replace(!self.group_turn.get());
+        match &self.group {
+            Some(group) if group_turn => group.recv_from(buffer).ok(),
+            _ => self.legacy.recv_from(buffer).ok(),
         }
-        self.legacy.recv_from(buffer).ok()
     }
 }
 
@@ -884,6 +887,57 @@ mod tests {
             expected_body.extend_from_slice(&class.to_be_bytes());
             assert_eq!(body, expected_body);
         }
+    }
+
+    /// A direct answer on the legacy socket is read while the shared port
+    /// receives a datagram on every poll.
+    #[test]
+    fn browse_reads_direct_answers_under_steady_shared_port_traffic() {
+        use std::net::{Ipv4Addr, UdpSocket};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const DIRECT: &[u8] = b"direct";
+        const CHATTER: &[u8] = b"chatter";
+        const CHATTER_GAP: Duration = Duration::from_millis(1);
+        const RECEIVES: usize = 16;
+
+        let bound = || {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            socket.set_read_timeout(Some(super::MDNS_POLL)).unwrap();
+            socket
+        };
+        let sockets = super::BrowseSockets {
+            group: Some(bound()),
+            legacy: bound(),
+            group_turn: core::cell::Cell::new(true),
+        };
+        let group_address = sockets.group.as_ref().unwrap().local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let chatter = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    sender.send_to(CHATTER, group_address).unwrap();
+                    std::thread::sleep(CHATTER_GAP);
+                }
+            })
+        };
+        let responder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        responder
+            .send_to(DIRECT, sockets.legacy.local_addr().unwrap())
+            .unwrap();
+
+        let mut buffer = [0u8; super::MDNS_RESPONSE_BYTES];
+        let heard = (0..RECEIVES).any(|_| {
+            sockets
+                .receive(&mut buffer)
+                .is_some_and(|(read, _)| &buffer[..read] == DIRECT)
+        });
+        stop.store(true, Ordering::Relaxed);
+        chatter.join().unwrap();
+        assert!(heard, "the direct answer is read despite the chatter");
     }
 
     #[test]
