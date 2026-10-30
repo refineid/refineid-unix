@@ -3,8 +3,8 @@
 Verified on OpenBSD 8.0/amd64 under KVM, October 2026: the CLI, the
 PKCS#11 module and the FLTK GUI build from packages alone, and the GUI
 starts from the CDE Application Manager. With multicast enabled (section
-5), phone discovery gets answers. Pairing and card operations are not yet
-verified on OpenBSD.
+5), the GUI pairs with an iPhone and Firefox logs in to card.refineid.fi
+through it. Card readers attached to OpenBSD are not yet verified.
 
 ## 1. Packages
 
@@ -65,3 +65,11 @@ route -qn delete 224.0.0.0/4
 
 `rcctl enable multicast` takes effect at the next boot; deleting the
 reject route applies it now.
+
+## 6. Firefox
+
+Firefox on OpenBSD is confined with unveil(2), and the module it loads
+reads the phone pairings under `$XDG_CONFIG_HOME/refineid`.
+`script/install-desktop.sh` adds that directory to
+`/etc/firefox/unveil.main` along with the policy that loads the module.
+Restart Firefox afterwards; it reads both only at startup.
