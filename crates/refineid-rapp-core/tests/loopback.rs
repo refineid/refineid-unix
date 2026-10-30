@@ -30,12 +30,12 @@ use refineid_rapp::{
     EndpointRole, EstablishedSessionRuntime, LIVENESS_CHALLENGE_SIZE,
     LIVENESS_PING_AFTER_SILENCE_MS, OFFER_ID_SIZE, OfferId, OperationId, OperationRequest,
     OperationResultMessage, PAIRING_BUSY_RETRY_AFTER_MIN_MS, PAIRING_CANDIDATES_MAX,
-    PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, PairingBusy, PairingHandshake, PairingOffer,
-    PairingState, PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage, ProxyDispatch,
-    ProxyFailure, ProxyOperationEngine, QUIT_WITHDRAWAL_BOUND_MS, REVOCATION_NOTICE_MS,
-    ResultError, RuntimePoll, RuntimeReceive, SESSION_READY_NONCE_SIZE, SessionHandshake,
-    SignatureAlgorithm, SweepError, SweepOutcome, TransportProfile, TypedMessage, UserApproval,
-    decode_pair_record, encode_pair_record, generate_pair_key_material,
+    PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, PairingBusy, PairingCode, PairingHandshake,
+    PairingOffer, PairingState, PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage,
+    ProxyDispatch, ProxyFailure, ProxyOperationEngine, QUIT_WITHDRAWAL_BOUND_MS,
+    REVOCATION_NOTICE_MS, ResultError, RuntimePoll, RuntimeReceive, SESSION_READY_NONCE_SIZE,
+    SessionHandshake, SignatureAlgorithm, SweepError, SweepOutcome, TransportProfile, TypedMessage,
+    UserApproval, decode_pair_record, encode_pair_record, generate_pair_key_material,
     standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
@@ -318,7 +318,7 @@ fn proxy_pair_serving<T: FrameTransport>(
 
     let step_one = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
     let (step_two, waiting) = CpaceKc2Responder::process_step1_frame(
-        shown_code,
+        &PairingCode::parse(shown_code).unwrap(),
         &context,
         &offer.offer_id,
         &step_one,
@@ -1129,7 +1129,7 @@ fn a_mistyped_code_fails_at_the_custodian_tag_and_stores_nothing() {
         proxy_transport.send_frame(&bootstrap).unwrap();
         let step_one = BinaryFrame::reconstruct(proxy_transport.receive_frame().unwrap()).unwrap();
         let (step_two, _waiting) = CpaceKc2Responder::process_step1_frame(
-            SHOWN_CODE,
+            &PairingCode::parse(SHOWN_CODE).unwrap(),
             &context,
             &offer.offer_id,
             &step_one,
@@ -1268,7 +1268,7 @@ fn refusing_custodian(
     transport.send_frame(&bootstrap).unwrap();
     let step_one = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
     let (step_two, _waiting) = CpaceKc2Responder::process_step1_frame(
-        shown_code,
+        &PairingCode::parse(shown_code).unwrap(),
         &context,
         &offer.offer_id,
         &step_one,

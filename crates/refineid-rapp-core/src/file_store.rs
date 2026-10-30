@@ -340,7 +340,10 @@ impl PairingStore for FilePairingStore {
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
-    use refineid_rapp::{PAIRING_IDLE_EXPIRY_MS, PairingState, SweepError, SweepOutcome};
+    use refineid_rapp::{
+        PAIRING_IDLE_EXPIRY_MS, PairingState, SweepError, SweepOutcome, decode_pair_record,
+        encode_pair_record,
+    };
 
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -482,7 +485,7 @@ mod tests {
         let pair_id = PairId::from_array(FIRST);
         let mut store = FilePairingStore::open(&directory).unwrap();
         store.insert(record(pair_id)).unwrap();
-        let key = *store.get(pair_id).unwrap().pairing().local_static_private();
+        let before = encode_pair_record(store.get(pair_id).unwrap().pairing()).unwrap();
         store
             .update(pair_id, &mut |entry| Some(entry.forgotten(FORGOTTEN_AT_MS)))
             .unwrap();
@@ -490,7 +493,16 @@ mod tests {
         let loaded = reopened.get(pair_id).unwrap();
         assert_eq!(loaded.state(), PairingState::Revoking);
         assert_eq!(loaded.pairing().forgotten_at_ms(), Some(FORGOTTEN_AT_MS));
-        assert_eq!(loaded.pairing().local_static_private(), &key);
+        let expected = encode_pair_record(
+            &decode_pair_record(&before)
+                .unwrap()
+                .forgotten(FORGOTTEN_AT_MS),
+        )
+        .unwrap();
+        assert_eq!(
+            encode_pair_record(loaded.pairing()).unwrap().as_bytes(),
+            expected.as_bytes()
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

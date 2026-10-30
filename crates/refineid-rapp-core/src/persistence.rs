@@ -16,7 +16,9 @@
 //! engine's decoder and [`PairingRecord::new`], so a truncated or tampered
 //! blob fails closed rather than yielding a half-built record.
 
-use refineid_rapp::{PairRecordCodecError, decode_pair_record, encode_pair_record};
+use refineid_rapp::{
+    EncodedPairRecord, PairRecordCodecError, decode_pair_record, encode_pair_record,
+};
 use zeroize::Zeroizing;
 
 use crate::store::{PairingRecord, PeerIntroduction, RecordError};
@@ -108,9 +110,8 @@ impl core::error::Error for PairingCodecError {}
 pub fn encode_pairing_record(
     record: &PairingRecord,
 ) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
-    let pairing =
-        Zeroizing::new(encode_pair_record(record.pairing()).map_err(PairingCodecError::Pairing)?);
-    frame_pairing_record(&pairing, record.peer(), record.auth_cert())
+    let pairing = encode_pair_record(record.pairing()).map_err(PairingCodecError::Pairing)?;
+    frame_pairing_record(pairing.as_bytes(), record.peer(), record.auth_cert())
 }
 
 /// Frames `pairing`, the engine's encoded record, with what the workstation
@@ -182,8 +183,8 @@ pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecE
     if version != PAIRING_BLOB_VERSION {
         return Err(PairingCodecError::UnsupportedVersion { found: version });
     }
-    let pairing =
-        decode_pair_record(reader.take_length_prefixed()?).map_err(PairingCodecError::Pairing)?;
+    let pairing = EncodedPairRecord::from_stored(reader.take_length_prefixed()?.to_vec());
+    let pairing = decode_pair_record(&pairing).map_err(PairingCodecError::Pairing)?;
     let peer = PeerIntroduction {
         display_name: reader.take_text()?,
         platform: reader.take_text()?,
@@ -270,7 +271,7 @@ impl<'blob> Reader<'blob> {
     reason = "test fixtures are constructed to be infallible"
 )]
 mod tests {
-    use refineid_rapp::{ProfileName, SweepOutcome};
+    use refineid_rapp::{ProfileName, SweepOutcome, encode_pair_record};
 
     use super::{
         PAIRING_BLOB_MAGIC, PAIRING_BLOB_VERSION, PairingCodecError, decode_pairing_record,
@@ -314,8 +315,8 @@ mod tests {
         assert_eq!(left.pair_id(), right.pair_id());
         assert_eq!(left.state(), right.state());
         assert_eq!(
-            left.pairing().local_static_private(),
-            right.pairing().local_static_private()
+            encode_pair_record(left.pairing()).unwrap().as_bytes(),
+            encode_pair_record(right.pairing()).unwrap().as_bytes()
         );
         assert_eq!(
             left.pairing().remote_static_public(),

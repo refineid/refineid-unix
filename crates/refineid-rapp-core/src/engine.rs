@@ -28,11 +28,11 @@ use crate::store::{PairingRecord, PairingStore, PeerIntroduction, RecordError, S
 use crate::transport::{BinaryFrame, FrameTransport, TransportError};
 use refineid_rapp::{
     ActivePairing, EndpointRole, EstablishedSessionRuntime, ExplicitUserIntent, NextCandidate,
-    NextEndpoint, OperationRequest, OperationViolation, PairingCandidates, PairingHandshake,
-    PairingSecret, PairingState, PairingStorage, PingChallenge, ProfileName, ReadyOutcome,
-    RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RuntimePoll, RuntimeReceive,
-    SessionAuthentication, SessionHandshake, SweepError, SweepOutcome, TransportProfile,
-    generate_pair_key_material,
+    NextEndpoint, OperationRequest, OperationViolation, PairingCandidates, PairingCode,
+    PairingHandshake, PairingSecret, PairingState, PairingStorage, PingChallenge, ProfileName,
+    ReadyOutcome, RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RuntimePoll,
+    RuntimeReceive, SessionAuthentication, SessionHandshake, SweepError, SweepOutcome,
+    TransportProfile, generate_pair_key_material,
 };
 
 /// How long one receive waits before the liveness clock is read again: a
@@ -578,9 +578,7 @@ impl<Store: PairingStore> Requester<Store> {
         source: &mut Source,
         confirm: impl FnOnce(&PeerIntroduction, &[ProfileName]) -> Option<Vec<ProfileName>>,
     ) -> Result<(PairId, Source::Endpoint), PairingSearchError> {
-        let code = crate::offer::normalize_pairing_code(code)
-            .map(Zeroizing::new)
-            .ok_or(PairingSearchError::InvalidCode)?;
+        let code = PairingCode::parse(code).map_err(|_| PairingSearchError::InvalidCode)?;
         let mut candidates = PairingCandidates::<Source::Endpoint>::new();
         let started = Instant::now();
         let now_ms = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -637,7 +635,7 @@ impl<Store: PairingStore> Requester<Store> {
     /// `Y_B || T_B`, which must arrive within the attempt deadline, or the
     /// custodian's `pairing-busy` in its place.
     fn offer_code<Transport: FrameTransport>(
-        code: &str,
+        code: &PairingCode,
         offer: &PairingOffer,
         transport: &mut Transport,
     ) -> Result<StepTwoAnswer, PairingError> {
