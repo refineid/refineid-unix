@@ -1746,32 +1746,53 @@ fn embedded_timestamp_path(token: &VerifiedTimestampToken) -> Result<Vec<Vec<u8>
     .map_err(|e| format!("no valid path within the token's embedded chain: {e}"))
 }
 
-/// The embedded certificates a token's path may stop at: the
-/// self-issued ones, or every embedded certificate when none is.
+/// The embedded certificates a token's path may stop at.
 ///
 /// Preferring self-issued anchors makes the path run as deep as the
 /// token allows, so LT evidence covers the intermediates rather than
 /// stopping at the signer's immediate issuer.
 fn embedded_anchor_ders(token: &VerifiedTimestampToken) -> Vec<&[u8]> {
-    let self_issued: Vec<&[u8]> = token
-        .embedded_certificates
-        .iter()
-        .filter(|der| {
+    anchor_candidates(
+        &token.signer_certificate,
+        &token.embedded_certificates,
+        |der| {
             OwnedCert::from_der(der).is_ok_and(|certificate| {
                 let view = certificate.view();
                 view.issuer.as_der() == view.subject.as_der()
             })
-        })
+        },
+    )
+}
+
+/// The self-issued embedded certificates; without any, every embedded
+/// certificate above the token's signer, and the signer itself only
+/// when the token embeds nothing else.
+///
+/// A path ends at its anchor without asking for the anchor's status,
+/// so an anchored signer would leave the authority's own certificate
+/// without revocation evidence, and the signature without level LT.
+fn anchor_candidates<'a>(
+    signer: &[u8],
+    embedded: &'a [Vec<u8>],
+    is_self_issued: impl Fn(&[u8]) -> bool,
+) -> Vec<&'a [u8]> {
+    let self_issued: Vec<&[u8]> = embedded
+        .iter()
         .map(Vec::as_slice)
+        .filter(|der| is_self_issued(der))
         .collect();
-    if self_issued.is_empty() {
-        token
-            .embedded_certificates
-            .iter()
-            .map(Vec::as_slice)
-            .collect()
+    if !self_issued.is_empty() {
+        return self_issued;
+    }
+    let above_signer: Vec<&[u8]> = embedded
+        .iter()
+        .map(Vec::as_slice)
+        .filter(|der| *der != signer)
+        .collect();
+    if above_signer.is_empty() {
+        embedded.iter().map(Vec::as_slice).collect()
     } else {
-        self_issued
+        above_signer
     }
 }
 
@@ -2271,6 +2292,37 @@ mod tests {
             embedded_certificates: vec![signer_der.to_vec()],
             generated_at,
         })
+    }
+
+    #[test]
+    fn a_timestamp_signer_is_an_anchor_only_when_the_token_embeds_nothing_else() -> TestResult {
+        let signer = b"synthetic-timestamp-signer".to_vec();
+        let intermediate = b"synthetic-timestamp-intermediate".to_vec();
+        let root = b"synthetic-timestamp-root".to_vec();
+        let not_self_issued = |_: &[u8]| false;
+        check(
+            &anchor_candidates(
+                &signer,
+                &[signer.clone(), intermediate.clone()],
+                not_self_issued,
+            ),
+            &vec![intermediate.as_slice()],
+            "the signer under an embedded intermediate is no anchor",
+        )?;
+        check(
+            &anchor_candidates(&signer, std::slice::from_ref(&signer), not_self_issued),
+            &vec![signer.as_slice()],
+            "a lone embedded signer is its own anchor",
+        )?;
+        check(
+            &anchor_candidates(
+                &signer,
+                &[signer.clone(), intermediate.clone(), root.clone()],
+                |der| der == root.as_slice(),
+            ),
+            &vec![root.as_slice()],
+            "an embedded self-issued certificate is the anchor",
+        )
     }
 
     #[test]
