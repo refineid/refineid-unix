@@ -58,6 +58,7 @@ pub mod events;
 pub mod exit_status;
 pub mod http;
 pub mod reader_keyboard;
+pub mod signed_name;
 pub mod text;
 pub mod trust_roots;
 pub mod user_agent;

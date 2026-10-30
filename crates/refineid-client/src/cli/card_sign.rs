@@ -88,7 +88,7 @@ impl SignArgs {
                 reader_filter: reader_filter.clone(),
                 can,
                 // The bare verbs produce signature bytes; the format
-                // choice lives in `card sign-document`.
+                // choice lives in `document sign`.
                 document: None,
             };
             match slot {

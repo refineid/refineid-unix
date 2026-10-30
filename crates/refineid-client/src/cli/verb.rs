@@ -55,9 +55,9 @@ pub enum VerbTag {
     /// `card sign-qualified` -- PIN2-gated RSA signature on
     /// the non-repudiation key.
     CardSignQualified,
-    /// `card sign-document` -- a signature in a format a
+    /// `document sign` -- a signature in a format a
     /// counterparty can open: `PAdES`, `CAdES`, `ASiC-E` or `BDOC`.
-    CardSignDocument,
+    DocumentSign,
     /// `card decrypt-auth` -- PIN1-gated RSA decrypt on the
     /// auth key.
     CardDecryptAuth,
@@ -108,7 +108,7 @@ impl VerbTag {
             Self::CardEmrtd => "card emrtd",
             Self::CardSignAuth => "card sign-auth",
             Self::CardSignQualified => "card sign-qualified",
-            Self::CardSignDocument => "card sign-document",
+            Self::DocumentSign => "document sign",
             Self::CardDecryptAuth => "card decrypt-auth",
             Self::CardPubkey => "card pubkey",
             Self::CardExportAll => "card export-all",
@@ -153,9 +153,9 @@ pub enum Verb {
     /// `card sign-auth` / `card sign-qualified` (slot pivot
     /// inside `SignArgs::slot`).
     CardSign(super::card_sign::SignArgs),
-    /// `card sign-document` -- a signed document rather than
+    /// `document sign` -- a signed document rather than
     /// signature bytes.
-    CardSignDocument(super::card_sign_document::SignDocumentArgs),
+    DocumentSign(super::document_sign::DocumentSignArgs),
     /// `card decrypt-auth`.
     CardDecryptAuth(super::card_decrypt_auth::DecryptAuthArgs),
     /// `card pubkey`.
@@ -204,7 +204,7 @@ impl Verb {
                 SignSlot::Auth => VerbTag::CardSignAuth,
                 SignSlot::Qualified => VerbTag::CardSignQualified,
             },
-            Self::CardSignDocument(_) => VerbTag::CardSignDocument,
+            Self::DocumentSign(_) => VerbTag::DocumentSign,
             Self::CardDecryptAuth(_) => VerbTag::CardDecryptAuth,
             Self::CardPubkey(_) => VerbTag::CardPubkey,
             Self::CardExportAll(_) => VerbTag::CardExportAll,
@@ -238,7 +238,7 @@ impl Verb {
             Self::CardCheck(a) => a.run(),
             Self::CardEmrtd(a) => a.run(),
             Self::CardSign(a) => a.run(),
-            Self::CardSignDocument(a) => a.run(),
+            Self::DocumentSign(a) => a.run(),
             Self::CardDecryptAuth(a) => a.run(),
             Self::CardPubkey(a) => a.run(),
             Self::CardExportAll(a) => a.run(),
@@ -357,6 +357,13 @@ pub fn parse_argv(argv: &super::argv::ProcessArgv) -> Result<Verb, ParseError> {
         [_, c, rest @ ..] if c == "unpair" => (TopLevel::Unpair, rest),
         [_, c, rest @ ..] if c == "auth" => (TopLevel::Auth, rest),
         [_, c, v, rest @ ..] if c == "reader" => (TopLevel::Reader(v.as_str()), rest),
+        [_, c, v, rest @ ..] if c == "document" => (TopLevel::Document(v.as_str()), rest),
+        [_, c, ..] if c == "document" => {
+            return Err(VerbParseError::Unrecognized {
+                got: "document (missing sub-verb, try: document sign)".to_owned(),
+            }
+            .into());
+        }
         [_, c, ..] if c == "reader" => {
             return Err(VerbParseError::Unrecognized {
                 got: "reader (missing sub-verb, try: reader keyboard)".to_owned(),
@@ -392,9 +399,6 @@ pub fn parse_argv(argv: &super::argv::ProcessArgv) -> Result<Verb, ParseError> {
         TopLevel::Card(Some("sign-qualified")) => Verb::CardSign(
             super::card_sign::SignArgs::parse(crate::card_sign::SignSlot::Qualified, rest)?,
         ),
-        TopLevel::Card(Some("sign-document")) => {
-            Verb::CardSignDocument(super::card_sign_document::SignDocumentArgs::parse(rest)?)
-        }
         TopLevel::Card(Some("decrypt-auth")) => {
             Verb::CardDecryptAuth(super::card_decrypt_auth::DecryptAuthArgs::parse(rest)?)
         }
@@ -462,6 +466,15 @@ pub fn parse_argv(argv: &super::argv::ProcessArgv) -> Result<Verb, ParseError> {
             }
             .into());
         }
+        TopLevel::Document("sign") => {
+            Verb::DocumentSign(super::document_sign::DocumentSignArgs::parse(rest)?)
+        }
+        TopLevel::Document(other) => {
+            return Err(VerbParseError::Unrecognized {
+                got: format!("document {other}"),
+            }
+            .into());
+        }
         TopLevel::Verify => Verb::Verify(super::verify::VerifyArgs::parse(rest)?),
     })
 }
@@ -486,6 +499,9 @@ enum TopLevel<'a> {
     /// `reader` family. Always carries the sub-verb name
     /// (`reader keyboard`); there is no bare `reader` verb.
     Reader(&'a str),
+    /// `document` family. Always carries the sub-verb name
+    /// (`document sign`); there is no bare `document` verb.
+    Document(&'a str),
     /// The standalone `verify` verb (cert + signature input).
     Verify,
     /// `pair` verb.
@@ -538,11 +554,6 @@ mod tests {
                 VerbTag::CardSignQualified,
             ),
             (
-                "sign-document",
-                vec!["--format", "pades", "--in", "/i.pdf", "--out", "/o.pdf"],
-                VerbTag::CardSignDocument,
-            ),
-            (
                 "decrypt-auth",
                 vec!["--in", "/i", "--out", "/o"],
                 VerbTag::CardDecryptAuth,
@@ -559,6 +570,30 @@ mod tests {
             a.extend(extra.iter().copied());
             let sub = parse_argv(&argv(&a).clone())?;
             check(&sub.tag(), &expected, &format!("tag for verb {verb}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn document_sign_subcommand() -> TestResult {
+        let sub = parse_argv(&argv(&[
+            "refineid",
+            "document",
+            "sign",
+            "/documents/report.pdf",
+        ]))?;
+        check(&sub.tag(), &VerbTag::DocumentSign, "tag")?;
+        for unknown in [
+            vec!["refineid", "document"],
+            vec!["refineid", "document", "bogus"],
+        ] {
+            check_true(
+                matches!(
+                    parse_argv(&argv(&unknown)),
+                    Err(ParseError::Verb(VerbParseError::Unrecognized { .. }))
+                ),
+                "missing or unknown document verb",
+            )?;
         }
         Ok(())
     }
