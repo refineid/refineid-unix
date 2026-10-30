@@ -2110,6 +2110,7 @@ dependencies = [
 name = "refineid-gui"
 version = "26.10.30"
 dependencies = [
+ "refineid-dev-errors",
  "refineid-gui-core",
  "refineid-gui-fltk",
  "refineid-gui-gtk4",

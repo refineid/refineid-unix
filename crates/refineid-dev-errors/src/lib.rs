@@ -24,8 +24,10 @@
 //! An entry reads `component: event: cause`, for example
 //! `Rapp: phone session not opened: Session(ClosedByPeer(Busy))`. A
 //! failure that repeats itself is counted and written again with its
-//! count, as ` (xN)`, at most once per [`REPEAT_WINDOW`], so a loop that
-//! fails the same way on every pass does not flood the log.
+//! count, as ` (xN)`, at most once per [`REPEAT_WINDOW`] for each
+//! component and event, so a loop that fails the same way on every pass
+//! does not flood the log. A program that ends normally writes the counts
+//! still pending with [`flush!`].
 //!
 //! A cause is a name and nothing else: the case of an error value with
 //! every payload that is not itself a case dropped, or a fixed text. An
@@ -52,7 +54,7 @@ pub use cause::Cause;
 #[cfg(debug_assertions)]
 pub use follow::{Followed, Follower, follow};
 #[cfg(debug_assertions)]
-pub use record::{Component, IDENTIFIER, REPEAT_WINDOW, record};
+pub use record::{Component, IDENTIFIER, REPEAT_WINDOW, flush, record};
 
 /// Reports a failure in a debug build; expands to nothing in a release
 /// build.
@@ -109,4 +111,22 @@ macro_rules! report {
     ($component:ident, $event:expr, $cause:ident) => {{
         let _ = &$cause;
     }};
+}
+
+/// Writes the counted repeats not yet written, as a program ends, in a
+/// debug build; expands to nothing in a release build.
+#[cfg(debug_assertions)]
+#[macro_export]
+macro_rules! flush {
+    () => {
+        $crate::flush()
+    };
+}
+
+/// Writes the counted repeats not yet written, as a program ends, in a
+/// debug build; expands to nothing in a release build.
+#[cfg(not(debug_assertions))]
+#[macro_export]
+macro_rules! flush {
+    () => {{}};
 }

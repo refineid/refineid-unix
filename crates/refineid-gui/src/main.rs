@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let available_str = available.join(", ");
 
-    match chosen {
+    let ran = match chosen {
         #[cfg(feature = "gtk4")]
         "gtk4" => run_gtk4(initial_tab),
         #[cfg(feature = "fltk")]
@@ -108,5 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(2);
         }
-    }
+    };
+    refineid_dev_errors::flush!();
+    ran
 }

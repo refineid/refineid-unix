@@ -444,6 +444,7 @@ impl RemoteTokenSource for PhoneSource {
             *spoken = false;
         }
         self.shared.renew_withdrawal();
+        refineid_dev_errors::flush!();
     }
 }
 

@@ -25,3 +25,4 @@ refineid-gui-fltk = { path = "../refineid-gui-fltk", version = "26", optional = 
 refineid-gui-gtk4 = { path = "../refineid-gui-gtk4", version = "26", optional = true }
 
 refineid-lib-core.workspace = true
+refineid-dev-errors.workspace = true

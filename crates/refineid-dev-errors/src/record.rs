@@ -14,6 +14,7 @@
 
 //! One reported failure, from the call to the entries written.
 
+use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -24,9 +25,10 @@ pub const IDENTIFIER: &str = "refineid";
 
 /// How long a failure that repeats itself is only counted.
 ///
-/// The first report is written at once, and a repeat is written with its
-/// count once this long has passed since the last write, or as soon as
-/// another failure comes.
+/// Each component and event is throttled on its own. The first report is
+/// written at once, and its repeats are written with their count once
+/// this long has passed since its last write, as soon as the same
+/// component and event fail with another cause, or when the program ends.
 pub const REPEAT_WINDOW: Duration = Duration::from_secs(60);
 
 /// The longest entry message kept, in characters.
@@ -38,7 +40,7 @@ const TEST_BINARY_DIRECTORY: &str = "deps";
 
 /// The part of `RefineID` that reports a failure; an entry begins with its
 /// name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Component {
     /// The `refineid` command line.
     Cli,
@@ -96,8 +98,11 @@ impl Entry {
     }
 }
 
-/// The failure this process reported last, and its repeats not yet
-/// written.
+/// What a run is throttled by: the reporting component and its event.
+type Key = (Component, &'static str);
+
+/// The failure one component and event reported last, and its repeats not
+/// yet written.
 #[derive(Debug)]
 struct Run {
     message: String,
@@ -105,8 +110,9 @@ struct Run {
     unwritten: u32,
 }
 
-/// The last failure of this process, shared by its threads.
-static LAST: Mutex<Option<Run>> = Mutex::new(None);
+/// The last failure of each component and event in this process, shared
+/// by its threads.
+static RUNS: Mutex<BTreeMap<Key, Run>> = Mutex::new(BTreeMap::new());
 
 /// Records one failure: `component: event: cause`.
 ///
@@ -118,8 +124,20 @@ pub fn record(component: Component, event: &'static str, cause: &Cause) {
         return;
     }
     let message = message(component, event, cause);
-    let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
-    for entry in observe(&mut last, message, Instant::now()) {
+    let mut runs = RUNS.lock().unwrap_or_else(PoisonError::into_inner);
+    for entry in observe(&mut runs, (component, event), message, Instant::now()) {
+        write(&entry);
+    }
+}
+
+/// Writes every counted repeat not yet written; a program calls it as it
+/// ends ([`flush!`](crate::flush!)). A `cargo test` binary writes nothing.
+pub fn flush() {
+    if is_test_binary() {
+        return;
+    }
+    let mut runs = RUNS.lock().unwrap_or_else(PoisonError::into_inner);
+    for entry in unwritten(&mut runs) {
         write(&entry);
     }
 }
@@ -140,45 +158,76 @@ fn message(component: Component, event: &str, cause: &Cause) -> String {
         .collect()
 }
 
-/// The entries one report writes at `now`, given the run before it: the
-/// earlier failure's unwritten repeats when another failure comes, then
-/// the new failure; or a repeat with its count once [`REPEAT_WINDOW`]
-/// passed since the run was last written; or nothing.
-fn observe(last: &mut Option<Run>, message: String, now: Instant) -> Vec<Entry> {
-    if let Some(run) = last.as_mut()
-        && run.message == message
-    {
-        run.unwritten = run.unwritten.saturating_add(1);
-        if now.saturating_duration_since(run.written_at) < REPEAT_WINDOW {
-            return Vec::new();
-        }
-        let entry = Entry {
-            message,
-            occurrences: run.unwritten,
-        };
-        run.unwritten = 0;
-        run.written_at = now;
-        return vec![entry];
-    }
+/// The entries one report under `key` writes at `now`, given the runs
+/// before it: the key's earlier failure's unwritten repeats when it fails
+/// with another cause, then the new failure; or a repeat with its count
+/// once [`REPEAT_WINDOW`] passed since the run was last written; or
+/// nothing. Then the counted repeats of every other run whose window
+/// passed.
+fn observe(runs: &mut BTreeMap<Key, Run>, key: Key, message: String, now: Instant) -> Vec<Entry> {
     let mut entries = Vec::new();
-    if let Some(run) = last.take()
-        && run.unwritten > 0
-    {
-        entries.push(Entry {
-            message: run.message,
-            occurrences: run.unwritten,
-        });
+    match runs.get_mut(&key) {
+        Some(run) if run.message == message => {
+            run.unwritten = run.unwritten.saturating_add(1);
+            if now.saturating_duration_since(run.written_at) >= REPEAT_WINDOW {
+                entries.push(take_unwritten(run, now));
+            }
+        }
+        _ => {
+            if let Some(run) = runs.remove(&key)
+                && run.unwritten > 0
+            {
+                entries.push(Entry {
+                    message: run.message,
+                    occurrences: run.unwritten,
+                });
+            }
+            entries.push(Entry {
+                message: message.clone(),
+                occurrences: 1,
+            });
+            runs.insert(
+                key,
+                Run {
+                    message,
+                    written_at: now,
+                    unwritten: 0,
+                },
+            );
+        }
     }
-    entries.push(Entry {
-        message: message.clone(),
-        occurrences: 1,
-    });
-    *last = Some(Run {
-        message,
-        written_at: now,
-        unwritten: 0,
-    });
+    for (_, run) in runs.iter_mut().filter(|(other, _)| **other != key) {
+        if run.unwritten > 0 && now.saturating_duration_since(run.written_at) >= REPEAT_WINDOW {
+            entries.push(take_unwritten(run, now));
+        }
+    }
     entries
+}
+
+/// The run's unwritten repeats as one entry, written at `now`.
+fn take_unwritten(run: &mut Run, now: Instant) -> Entry {
+    let entry = Entry {
+        message: run.message.clone(),
+        occurrences: run.unwritten,
+    };
+    run.unwritten = 0;
+    run.written_at = now;
+    entry
+}
+
+/// Every run's unwritten repeats, each as one entry, leaving none.
+fn unwritten(runs: &mut BTreeMap<Key, Run>) -> Vec<Entry> {
+    runs.values_mut()
+        .filter(|run| run.unwritten > 0)
+        .map(|run| {
+            let entry = Entry {
+                message: run.message.clone(),
+                occurrences: run.unwritten,
+            };
+            run.unwritten = 0;
+            entry
+        })
+        .collect()
 }
 
 /// Whether this process is a `cargo test` binary, which runs from the
@@ -203,13 +252,20 @@ fn write(entry: &Entry) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
-    use super::{Component, Entry, REPEAT_WINDOW, observe};
+    use super::{Component, Entry, Key, REPEAT_WINDOW, observe, unwritten};
     use crate::cause::Cause;
 
     const FIRST: &str = "Rapp: phone session ended: TransportLoss";
+    const FIRST_KEY: Key = (Component::Rapp, "phone session ended");
+    const FIRST_OTHER_CAUSE: &str = "Rapp: phone session ended: Expired";
     const SECOND: &str = "Reader: PC/SC call failed: NoService";
+    const SECOND_KEY: Key = (Component::Reader, "PC/SC call failed");
+    const THIRD: &str = "Gui: card presence not watched: service down";
+    const THIRD_KEY: Key = (Component::Gui, "card presence not watched");
+    const CYCLES: u32 = 5;
     const MOMENT: Duration = Duration::from_secs(1);
     const REPEATS: u32 = 2;
 
@@ -222,40 +278,86 @@ mod tests {
 
     #[test]
     fn a_new_failure_is_written_at_once() {
-        let mut last = None;
-        let written = observe(&mut last, FIRST.to_owned(), Instant::now());
+        let mut runs = BTreeMap::new();
+        let written = observe(&mut runs, FIRST_KEY, FIRST.to_owned(), Instant::now());
         assert_eq!(written, vec![entry(FIRST, 1)]);
     }
 
     #[test]
     fn a_repeat_inside_the_window_is_only_counted() {
         let start = Instant::now();
-        let mut last = None;
-        observe(&mut last, FIRST.to_owned(), start);
-        let written = observe(&mut last, FIRST.to_owned(), start + MOMENT);
+        let mut runs = BTreeMap::new();
+        observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start);
+        let written = observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start + MOMENT);
         assert!(written.is_empty());
     }
 
     #[test]
     fn a_repeat_after_the_window_is_written_with_its_count() {
         let start = Instant::now();
-        let mut last = None;
-        observe(&mut last, FIRST.to_owned(), start);
-        observe(&mut last, FIRST.to_owned(), start + MOMENT);
-        let written = observe(&mut last, FIRST.to_owned(), start + REPEAT_WINDOW + MOMENT);
+        let mut runs = BTreeMap::new();
+        observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start);
+        observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start + MOMENT);
+        let written = observe(
+            &mut runs,
+            FIRST_KEY,
+            FIRST.to_owned(),
+            start + REPEAT_WINDOW + MOMENT,
+        );
         assert_eq!(written, vec![entry(FIRST, REPEATS)]);
         assert_eq!(written[0].line(), format!("{FIRST} (x{REPEATS})"));
     }
 
     #[test]
-    fn another_failure_first_writes_the_counted_repeats() {
+    fn another_cause_first_writes_the_counted_repeats() {
         let start = Instant::now();
-        let mut last = None;
-        observe(&mut last, FIRST.to_owned(), start);
-        observe(&mut last, FIRST.to_owned(), start + MOMENT);
-        observe(&mut last, FIRST.to_owned(), start + MOMENT);
-        let written = observe(&mut last, SECOND.to_owned(), start + MOMENT);
-        assert_eq!(written, vec![entry(FIRST, REPEATS), entry(SECOND, 1)]);
+        let mut runs = BTreeMap::new();
+        observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start);
+        observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start + MOMENT);
+        observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start + MOMENT);
+        let written = observe(
+            &mut runs,
+            FIRST_KEY,
+            FIRST_OTHER_CAUSE.to_owned(),
+            start + MOMENT,
+        );
+        assert_eq!(
+            written,
+            vec![entry(FIRST, REPEATS), entry(FIRST_OTHER_CAUSE, 1)]
+        );
+    }
+
+    /// Two failures that alternate inside the window are each written
+    /// once, then counted.
+    #[test]
+    fn alternating_failures_are_throttled_each_on_its_own() {
+        let start = Instant::now();
+        let mut runs = BTreeMap::new();
+        let mut written = Vec::new();
+        for _ in 0..CYCLES {
+            written.extend(observe(&mut runs, SECOND_KEY, SECOND.to_owned(), start));
+            written.extend(observe(&mut runs, THIRD_KEY, THIRD.to_owned(), start));
+        }
+        assert_eq!(written, vec![entry(SECOND, 1), entry(THIRD, 1)]);
+        let later = start + REPEAT_WINDOW;
+        let written = observe(&mut runs, SECOND_KEY, SECOND.to_owned(), later);
+        assert_eq!(
+            written,
+            vec![entry(SECOND, CYCLES), entry(THIRD, CYCLES - 1)]
+        );
+    }
+
+    /// Ending the program writes each run's counted repeats once.
+    #[test]
+    fn the_flush_writes_every_unwritten_repeat_once() {
+        let start = Instant::now();
+        let mut runs = BTreeMap::new();
+        observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start);
+        observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start + MOMENT);
+        observe(&mut runs, FIRST_KEY, FIRST.to_owned(), start + MOMENT);
+        observe(&mut runs, SECOND_KEY, SECOND.to_owned(), start + MOMENT);
+        assert_eq!(unwritten(&mut runs), vec![entry(FIRST, REPEATS)]);
+        assert!(unwritten(&mut runs).is_empty());
     }
 
     #[test]
