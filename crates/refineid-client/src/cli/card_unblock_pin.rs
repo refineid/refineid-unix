@@ -17,6 +17,17 @@
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::PinManageSlot;
 
+/// What `refineid card unblock-pin1 help` and `unblock-pin2 help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid card unblock-pin1 | unblock-pin2 [--reader SUBSTR]
+
+Unblock PIN1 or PIN2 with the PUK and set a new PIN.
+  --reader S  narrow to readers whose name contains S
+DANGER: a wrong PUK decrements the PUK counter; exhausting it
+permanently bricks the card.
+";
+
 /// Parsed `card unblock-pin{1,2} [--reader SUBSTR]` arguments.
 ///
 /// `slot` is set by the dispatcher at parse time -- which

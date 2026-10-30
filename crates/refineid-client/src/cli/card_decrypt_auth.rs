@@ -18,6 +18,17 @@ use std::path::PathBuf;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
+/// What `refineid card decrypt-auth help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid card decrypt-auth --in PATH --out PATH [--reader SUBSTR]
+
+PIN1 and decrypt with the authentication key.
+  --in P      ciphertext
+  --out P     output file for the plaintext
+  --reader S  narrow to readers whose name contains S
+";
+
 /// Parsed `card decrypt-auth --in PATH --out PATH
 /// [--reader SUBSTR]` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]

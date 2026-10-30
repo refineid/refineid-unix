@@ -161,6 +161,9 @@ craneLib.buildPackage (
       cp crates/refineid-gui/assets/app-icon.svg \
         $out/share/icons/hicolor/scalable/apps/refineid.svg
       cp packaging/refineid.desktop $out/share/applications/refineid.desktop
+
+      # The CLI's manual page; the fixup phase compresses it.
+      install -Dm644 crates/refineid-client/man/refineid.1 $out/share/man/man1/refineid.1
     '';
 
     meta = {

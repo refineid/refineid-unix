@@ -32,12 +32,13 @@
 //! `CardChangePin2` distinct so error wording can name the
 //! exact subcommand that fired.
 //!
-//! Adding a new subcommand: add a [`VerbTag`] variant + its
-//! `label()` arm; add a [`Verb`] variant carrying the typed
+//! Adding a new subcommand: add a [`VerbTag`] variant with its
+//! `label`, `summary`, `help` and `parse_args` arms and its place
+//! in [`VerbTag::ALL`]; add a [`Verb`] variant carrying the typed
 //! Args (or extend an existing pair-shape Args with a new slot
-//! enum value); add a `parse_argv` arm that runs the verb
-//! match then the Args parse. Match-exhaustiveness catches
-//! omissions.
+//! enum value); add its words to [`route`]; describe it in
+//! `man/refineid.1`. Match-exhaustiveness catches most omissions;
+//! the man-page test catches the rest.
 
 /// Data-less subcommand identifier. Used in
 /// [`super::ArgParseError`] so an argv shape failure can name
@@ -126,6 +127,158 @@ impl VerbTag {
             Self::CardUnpair => "unpair",
             Self::CardAuth => "auth",
         }
+    }
+
+    /// Every subcommand, in the order the short synopsis lists them.
+    /// Groups are the [`Self::label`]'s first word; a blank line in
+    /// the synopsis separates them.
+    pub const ALL: &'static [Self] = &[
+        Self::CardCheck,
+        Self::CardEmrtd,
+        Self::CardActivate,
+        Self::CardChangePin1,
+        Self::CardChangePin2,
+        Self::CardUnblockPin1,
+        Self::CardUnblockPin2,
+        Self::CardSignAuth,
+        Self::CardSignQualified,
+        Self::CardDecryptAuth,
+        Self::CardPubkey,
+        Self::CardExportAll,
+        Self::DocumentSign,
+        Self::CardPair,
+        Self::CardPairs,
+        Self::CardUnpair,
+        Self::CardAuth,
+        Self::Verify,
+        Self::CertShow,
+        Self::CertChain,
+        Self::ReaderKeyboard,
+    ];
+
+    /// A few words on what the subcommand does: its line in the short
+    /// synopsis. The detail is in [`Self::help`] and refineid(1).
+    #[must_use]
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::CardCheck => "read the card: certificates, revocation, PINs",
+            Self::CardEmrtd => "read the travel-document data with the CAN",
+            Self::CardActivate => "activate a new card",
+            Self::CardChangePin1 => "change PIN1",
+            Self::CardChangePin2 => "change PIN2",
+            Self::CardUnblockPin1 => "unblock PIN1 with the PUK",
+            Self::CardUnblockPin2 => "unblock PIN2 with the PUK",
+            Self::CardSignAuth => "sign a file with the authentication key",
+            Self::CardSignQualified => "sign a file with the qualified-signature key",
+            Self::CardDecryptAuth => "decrypt a file with the authentication key",
+            Self::CardPubkey => "print a public key as SSH or PEM",
+            Self::CardExportAll => "write every public artefact to a directory",
+            Self::DocumentSign => "sign files as PAdES, CAdES or ASiC-E",
+            Self::CardPair => "pair with a phone",
+            Self::CardPairs => "show the paired phone",
+            Self::CardUnpair => "forget the paired phone",
+            Self::CardAuth => "log in to a TLS site through the phone",
+            Self::Verify => "verify a raw signature offline",
+            Self::CertShow => "print a certificate",
+            Self::CertChain => "walk a certificate chain to its root",
+            Self::ReaderKeyboard => "show or set an ACS reader's keyboard mode",
+        }
+    }
+
+    /// The detailed help `refineid <label> help` prints. Each text
+    /// lives beside its verb's parser; refineid(1) carries the same
+    /// facts.
+    #[must_use]
+    pub const fn help(self) -> &'static str {
+        match self {
+            Self::CardCheck => super::card::HELP,
+            Self::CardEmrtd => super::card_emrtd::HELP,
+            Self::CardActivate => super::card_activate::HELP,
+            Self::CardChangePin1 | Self::CardChangePin2 => super::card_change_pin::HELP,
+            Self::CardUnblockPin1 | Self::CardUnblockPin2 => super::card_unblock_pin::HELP,
+            Self::CardSignAuth | Self::CardSignQualified => super::card_sign::HELP,
+            Self::CardDecryptAuth => super::card_decrypt_auth::HELP,
+            Self::CardPubkey => super::card_pubkey::HELP,
+            Self::CardExportAll => super::card_export_all::HELP,
+            Self::DocumentSign => super::document_sign::HELP,
+            Self::CardPair => super::card_pair::PAIR_HELP,
+            Self::CardPairs => super::card_pair::PAIRS_HELP,
+            Self::CardUnpair => super::card_pair::UNPAIR_HELP,
+            Self::CardAuth => super::card_pair::AUTH_HELP,
+            Self::Verify => super::verify::HELP,
+            Self::CertShow => super::cert_show::HELP,
+            Self::CertChain => super::cert_chain::HELP,
+            Self::ReaderKeyboard => super::reader_keyboard::HELP,
+        }
+    }
+
+    /// The group the subcommand belongs to: the first word of its
+    /// label (`card`, `document`, `cert`, ...).
+    #[must_use]
+    pub fn group(self) -> &'static str {
+        self.label()
+            .split_once(' ')
+            .map_or(self.label(), |(group, _)| group)
+    }
+
+    /// Parse the argv that follows this subcommand's words into the
+    /// typed [`Verb`].
+    ///
+    /// # Errors
+    /// The subcommand's [`super::ArgParseError`] when its parser
+    /// rejects the argv.
+    pub fn parse_args(
+        self,
+        rest: super::argv::RemainingArgv,
+    ) -> Result<Verb, super::ArgParseError> {
+        use crate::card_pin::PinManageSlot;
+        use crate::card_sign::SignSlot;
+        Ok(match self {
+            Self::CardCheck => Verb::CardCheck(super::card::CardArgs::parse(rest)?),
+            Self::CardEmrtd => Verb::CardEmrtd(super::card_emrtd::EmrtdArgs::parse(rest)?),
+            Self::CardSignAuth => {
+                Verb::CardSign(super::card_sign::SignArgs::parse(SignSlot::Auth, rest)?)
+            }
+            Self::CardSignQualified => Verb::CardSign(super::card_sign::SignArgs::parse(
+                SignSlot::Qualified,
+                rest,
+            )?),
+            Self::DocumentSign => {
+                Verb::DocumentSign(super::document_sign::DocumentSignArgs::parse(rest)?)
+            }
+            Self::CardDecryptAuth => {
+                Verb::CardDecryptAuth(super::card_decrypt_auth::DecryptAuthArgs::parse(rest)?)
+            }
+            Self::CardPubkey => Verb::CardPubkey(super::card_pubkey::PubkeyArgs::parse(rest)?),
+            Self::CardExportAll => {
+                Verb::CardExportAll(super::card_export_all::ExportAllArgs::parse(rest)?)
+            }
+            Self::CardActivate => {
+                Verb::CardActivate(super::card_activate::ActivateArgs::parse(rest)?)
+            }
+            Self::CardChangePin1 => Verb::CardChangePin(
+                super::card_change_pin::ChangePinArgs::parse(PinManageSlot::Pin1, rest)?,
+            ),
+            Self::CardChangePin2 => Verb::CardChangePin(
+                super::card_change_pin::ChangePinArgs::parse(PinManageSlot::Pin2, rest)?,
+            ),
+            Self::CardUnblockPin1 => Verb::CardUnblockPin(
+                super::card_unblock_pin::UnblockPinArgs::parse(PinManageSlot::Pin1, rest)?,
+            ),
+            Self::CardUnblockPin2 => Verb::CardUnblockPin(
+                super::card_unblock_pin::UnblockPinArgs::parse(PinManageSlot::Pin2, rest)?,
+            ),
+            Self::ReaderKeyboard => {
+                Verb::ReaderKeyboard(super::reader_keyboard::ReaderKeyboardArgs::parse(rest)?)
+            }
+            Self::Verify => Verb::Verify(super::verify::VerifyArgs::parse(rest)?),
+            Self::CertShow => Verb::CertShow(super::cert_show::CertShowArgs::parse(rest)?),
+            Self::CertChain => Verb::CertChain(super::cert_chain::CertChainArgs::parse(rest)?),
+            Self::CardPair => Verb::CardPair(super::card_pair::PairArgs::parse(rest)?),
+            Self::CardPairs => Verb::CardPairs(super::card_pair::PairsArgs::parse(rest)?),
+            Self::CardUnpair => Verb::CardUnpair(super::card_pair::UnpairArgs::parse(rest)?),
+            Self::CardAuth => Verb::CardAuth(super::card_pair::AuthArgs::parse(rest)?),
+        })
     }
 }
 
@@ -257,6 +410,15 @@ impl Verb {
     }
 }
 
+/// A parsed command line: the subcommand and the global options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    /// The subcommand with its typed arguments.
+    pub verb: Verb,
+    /// `-v` / `--verbose` given anywhere: show what each step did.
+    pub verbose: bool,
+}
+
 /// Top-level subcommand parse failure -- verb dispatch only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerbParseError {
@@ -331,9 +493,9 @@ impl From<super::ArgParseError> for ParseError {
 /// Parse a [`super::argv::ProcessArgv`] into a fully-typed
 /// [`Verb`].
 ///
-/// The single trust boundary for CLI input: verb dispatch +
-/// per-subcommand Args parsing happen here, so downstream code
-/// sees only a parsed-and-typed value.
+/// The single trust boundary for CLI input: `route` names the
+/// subcommand, then [`VerbTag::parse_args`] parses its argv, so
+/// downstream code sees only a parsed-and-typed value.
 ///
 /// # Errors
 /// [`ParseError::Verb`] on verb dispatch failure (no
@@ -341,177 +503,95 @@ impl From<super::ArgParseError> for ParseError {
 /// [`ParseError::Args`] when the verb is recognised but the
 /// subcommand's typed Args parser rejects the remaining argv.
 pub fn parse_argv(argv: &super::argv::ProcessArgv) -> Result<Verb, ParseError> {
-    use super::argv::RemainingArgv;
-    let (top, rest) = match argv.as_slice() {
-        // Explicit `card <verb>` arms must precede the catch-all
-        // bare `card` arm so action verbs win.
-        [_, c, v, rest @ ..] if c == "card" => (TopLevel::Card(Some(v.as_str())), rest),
-        [_, c, rest @ ..] if c == "card" => (TopLevel::Card(None), rest),
-        [_, c, v, rest @ ..] if c == "cert" => (TopLevel::Cert(v.as_str()), rest),
-        [_, c, ..] if c == "cert" => {
-            return Err(VerbParseError::UnknownCertVerb { got: String::new() }.into());
-        }
-        [_, c, rest @ ..] if c == "verify" => (TopLevel::Verify, rest),
-        [_, c, rest @ ..] if c == "pair" => (TopLevel::Pair, rest),
-        [_, c, rest @ ..] if c == "pairs" => (TopLevel::Pairs, rest),
-        [_, c, rest @ ..] if c == "unpair" => (TopLevel::Unpair, rest),
-        [_, c, rest @ ..] if c == "auth" => (TopLevel::Auth, rest),
-        [_, c, v, rest @ ..] if c == "reader" => (TopLevel::Reader(v.as_str()), rest),
-        [_, c, v, rest @ ..] if c == "document" => (TopLevel::Document(v.as_str()), rest),
-        [_, c, ..] if c == "document" => {
-            return Err(VerbParseError::Unrecognized {
-                got: "document (missing sub-verb, try: document sign)".to_owned(),
-            }
-            .into());
-        }
-        [_, c, ..] if c == "reader" => {
-            return Err(VerbParseError::Unrecognized {
-                got: "reader (missing sub-verb, try: reader keyboard)".to_owned(),
-            }
-            .into());
-        }
-        [_, other, ..] => {
-            return Err(VerbParseError::Unrecognized { got: other.clone() }.into());
-        }
-        _ => return Err(VerbParseError::Missing.into()),
-    };
-    let rest = RemainingArgv::from_slice(rest);
-    Ok(match top {
-        TopLevel::Card(Some("emrtd")) => {
-            Verb::CardEmrtd(super::card_emrtd::EmrtdArgs::parse(rest)?)
-        }
-        TopLevel::Card(Some("pair")) | TopLevel::Pair => {
-            Verb::CardPair(super::card_pair::PairArgs::parse(rest)?)
-        }
-        TopLevel::Card(Some("pairs")) | TopLevel::Pairs => {
-            Verb::CardPairs(super::card_pair::PairsArgs::parse(rest)?)
-        }
-        TopLevel::Card(Some("unpair")) | TopLevel::Unpair => {
-            Verb::CardUnpair(super::card_pair::UnpairArgs::parse(rest)?)
-        }
-        TopLevel::Card(Some("auth")) | TopLevel::Auth => {
-            Verb::CardAuth(super::card_pair::AuthArgs::parse(rest)?)
-        }
-        TopLevel::Card(Some("sign-auth")) => Verb::CardSign(super::card_sign::SignArgs::parse(
-            crate::card_sign::SignSlot::Auth,
-            rest,
-        )?),
-        TopLevel::Card(Some("sign-qualified")) => Verb::CardSign(
-            super::card_sign::SignArgs::parse(crate::card_sign::SignSlot::Qualified, rest)?,
-        ),
-        TopLevel::Card(Some("decrypt-auth")) => {
-            Verb::CardDecryptAuth(super::card_decrypt_auth::DecryptAuthArgs::parse(rest)?)
-        }
-        TopLevel::Card(Some("pubkey")) => {
-            Verb::CardPubkey(super::card_pubkey::PubkeyArgs::parse(rest)?)
-        }
-        TopLevel::Card(Some("export-all")) => {
-            Verb::CardExportAll(super::card_export_all::ExportAllArgs::parse(rest)?)
-        }
-        TopLevel::Card(Some("activate")) => {
-            Verb::CardActivate(super::card_activate::ActivateArgs::parse(rest)?)
-        }
-        TopLevel::Card(Some("change-pin1")) => {
-            Verb::CardChangePin(super::card_change_pin::ChangePinArgs::parse(
-                crate::card_pin::PinManageSlot::Pin1,
-                rest,
-            )?)
-        }
-        TopLevel::Card(Some("change-pin2")) => {
-            Verb::CardChangePin(super::card_change_pin::ChangePinArgs::parse(
-                crate::card_pin::PinManageSlot::Pin2,
-                rest,
-            )?)
-        }
-        TopLevel::Card(Some("unblock-pin1")) => {
-            Verb::CardUnblockPin(super::card_unblock_pin::UnblockPinArgs::parse(
-                crate::card_pin::PinManageSlot::Pin1,
-                rest,
-            )?)
-        }
-        TopLevel::Card(Some("unblock-pin2")) => {
-            Verb::CardUnblockPin(super::card_unblock_pin::UnblockPinArgs::parse(
-                crate::card_pin::PinManageSlot::Pin2,
-                rest,
-            )?)
-        }
-        // The bare-`card` catch-all must accept any non-recognised
-        // `card <flag>` as flags to CardCheck; an unknown `card
-        // <verb>` token would already have been rejected by
-        // CardArgs::parse if it didn't start with `--`.
-        TopLevel::Card(None | Some(_)) => {
-            // Re-include the verb token (it's actually a flag the
-            // operator passed to bare `card`) in the args.
-            let mut full = Vec::with_capacity(rest.len().saturating_add(1));
-            if let TopLevel::Card(Some(token)) = top {
-                full.push(token.to_owned());
-            }
-            full.extend(rest.into_vec());
-            Verb::CardCheck(super::card::CardArgs::parse(RemainingArgv::from_vec(full))?)
-        }
-        TopLevel::Cert("show") => Verb::CertShow(super::cert_show::CertShowArgs::parse(rest)?),
-        TopLevel::Cert("chain") => Verb::CertChain(super::cert_chain::CertChainArgs::parse(rest)?),
-        TopLevel::Cert(other) => {
-            return Err(VerbParseError::UnknownCertVerb {
-                got: other.to_owned(),
-            }
-            .into());
-        }
-        TopLevel::Reader("keyboard") => {
-            Verb::ReaderKeyboard(super::reader_keyboard::ReaderKeyboardArgs::parse(rest)?)
-        }
-        TopLevel::Reader(other) => {
-            return Err(VerbParseError::Unrecognized {
-                got: format!("reader {other}"),
-            }
-            .into());
-        }
-        TopLevel::Document("sign") => {
-            Verb::DocumentSign(super::document_sign::DocumentSignArgs::parse(rest)?)
-        }
-        TopLevel::Document(other) => {
-            return Err(VerbParseError::Unrecognized {
-                got: format!("document {other}"),
-            }
-            .into());
-        }
-        TopLevel::Verify => Verb::Verify(super::verify::VerifyArgs::parse(rest)?),
-    })
+    let (tag, rest) = route(argv)?;
+    Ok(tag.parse_args(rest)?)
 }
 
-/// Internal: which top-level verb (and optional sub-verb) was
-/// matched while tokenising argv. The `Card(None)` shape
-/// covers bare `card` / `card --flags`; `Card(Some(flag))`
-/// captures the awkward case where the operator wrote
-/// `card --flag arg ...` and the second token (`--flag`)
-/// needs to feed back into `CardArgs::parse` as a flag rather
-/// than be interpreted as a sub-verb. Distinct from the
-/// outer [`Verb`] enum, which carries already-parsed Args.
-enum TopLevel<'a> {
-    /// `card` family. `Some(flag)` carries a `--flag` that
-    /// appeared in sub-verb position (e.g. `card --reader X`);
-    /// `None` means a bare `card` with no sub-verb.
-    Card(Option<&'a str>),
-    /// `cert` family. Always carries the sub-verb name
-    /// (`cert show` / `cert chain` etc.) since there is no
-    /// "bare cert" verb.
-    Cert(&'a str),
-    /// `reader` family. Always carries the sub-verb name
-    /// (`reader keyboard`); there is no bare `reader` verb.
-    Reader(&'a str),
-    /// `document` family. Always carries the sub-verb name
-    /// (`document sign`); there is no bare `document` verb.
-    Document(&'a str),
-    /// The standalone `verify` verb (cert + signature input).
-    Verify,
-    /// `pair` verb.
-    Pair,
-    /// `pairs` verb.
-    Pairs,
-    /// `unpair` verb.
-    Unpair,
-    /// `auth` verb.
-    Auth,
+/// Name the subcommand the argv's leading words select and return
+/// the argv that follows them. Bare `card` and `card --flag ...`
+/// route to [`VerbTag::CardCheck`] with every token after `card`.
+///
+/// # Errors
+/// [`VerbParseError`] when no subcommand is given or the words name
+/// none.
+pub fn route(
+    argv: &super::argv::ProcessArgv,
+) -> Result<(VerbTag, super::argv::RemainingArgv), VerbParseError> {
+    use super::argv::RemainingArgv;
+    let (tag, rest) = match argv.after_program() {
+        [c, v, rest @ ..] if c == "card" => match card_verb(v) {
+            Some(tag) => (tag, rest),
+            // Not a verb: the token is the first of bare `card`'s
+            // own arguments.
+            None => {
+                let mut full = Vec::with_capacity(rest.len().saturating_add(1));
+                full.push(v.clone());
+                full.extend_from_slice(rest);
+                return Ok((VerbTag::CardCheck, RemainingArgv::from_vec(full)));
+            }
+        },
+        [c] if c == "card" => (VerbTag::CardCheck, &[][..]),
+        [c, v, rest @ ..] if c == "cert" => match v.as_str() {
+            "show" => (VerbTag::CertShow, rest),
+            "chain" => (VerbTag::CertChain, rest),
+            other => {
+                return Err(VerbParseError::UnknownCertVerb {
+                    got: other.to_owned(),
+                });
+            }
+        },
+        [c] if c == "cert" => {
+            return Err(VerbParseError::UnknownCertVerb { got: String::new() });
+        }
+        [c, rest @ ..] if c == "verify" => (VerbTag::Verify, rest),
+        [c, rest @ ..] if c == "pair" => (VerbTag::CardPair, rest),
+        [c, rest @ ..] if c == "pairs" => (VerbTag::CardPairs, rest),
+        [c, rest @ ..] if c == "unpair" => (VerbTag::CardUnpair, rest),
+        [c, rest @ ..] if c == "auth" => (VerbTag::CardAuth, rest),
+        [c, v, rest @ ..] if c == "reader" && v == "keyboard" => (VerbTag::ReaderKeyboard, rest),
+        [c, v, ..] if c == "reader" => {
+            return Err(VerbParseError::Unrecognized {
+                got: format!("reader {v}"),
+            });
+        }
+        [c] if c == "reader" => {
+            return Err(VerbParseError::Unrecognized {
+                got: "reader (missing sub-verb, try: reader keyboard)".to_owned(),
+            });
+        }
+        [c, v, rest @ ..] if c == "document" && v == "sign" => (VerbTag::DocumentSign, rest),
+        [c, v, ..] if c == "document" => {
+            return Err(VerbParseError::Unrecognized {
+                got: format!("document {v}"),
+            });
+        }
+        [c] if c == "document" => {
+            return Err(VerbParseError::Unrecognized {
+                got: "document (missing sub-verb, try: document sign)".to_owned(),
+            });
+        }
+        [other, ..] => return Err(VerbParseError::Unrecognized { got: other.clone() }),
+        [] => return Err(VerbParseError::Missing),
+    };
+    Ok((tag, RemainingArgv::from_slice(rest)))
+}
+
+/// The `card <verb>` sub-verbs. `None` for a token that is not one.
+fn card_verb(token: &str) -> Option<VerbTag> {
+    Some(match token {
+        "emrtd" => VerbTag::CardEmrtd,
+        "sign-auth" => VerbTag::CardSignAuth,
+        "sign-qualified" => VerbTag::CardSignQualified,
+        "decrypt-auth" => VerbTag::CardDecryptAuth,
+        "pubkey" => VerbTag::CardPubkey,
+        "export-all" => VerbTag::CardExportAll,
+        "activate" => VerbTag::CardActivate,
+        "change-pin1" => VerbTag::CardChangePin1,
+        "change-pin2" => VerbTag::CardChangePin2,
+        "unblock-pin1" => VerbTag::CardUnblockPin1,
+        "unblock-pin2" => VerbTag::CardUnblockPin2,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -668,7 +748,11 @@ mod tests {
         check(&sub.tag(), &VerbTag::CardUnpair, "unpair tag")?;
         let sub = parse_argv(&argv(&["refineid", "auth", "https://card.refineid.fi"]))?;
         check(&sub.tag(), &VerbTag::CardAuth, "auth tag")?;
-        let sub = parse_argv(&argv(&["refineid", "card", "auth"]))?;
-        check(&sub.tag(), &VerbTag::CardAuth, "card auth tag")
+        let sub = parse_argv(&argv(&["refineid", "auth"]))?;
+        check(&sub.tag(), &VerbTag::CardAuth, "auth tag")?;
+        check_true(
+            parse_argv(&argv(&["refineid", "card", "auth"])).is_err(),
+            "auth has no card spelling",
+        )
     }
 }

@@ -28,6 +28,19 @@ use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::{ActivateReport, ActivationCardContext, CardPinError, CardTrustAttestation};
 use crate::exit_status::ExitStatus;
 
+/// What `refineid card activate help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid card activate [--allow-reactivate] [--reader SUBSTR]
+
+First-time DVV card activation. Prompts for the activation PIN, then
+new PIN1 and PIN2.
+  --allow-reactivate  run on a card that already looks activated
+  --reader S          narrow to readers whose name contains S
+WARNING: wrong tries consume the activation PIN's retry counter;
+locking it leaves recovery to the separately orderable paid PUK.
+";
+
 /// Parsed `card activate [--allow-reactivate] [--reader SUBSTR]`
 /// arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

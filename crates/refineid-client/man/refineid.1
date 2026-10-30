@@ -1,0 +1,470 @@
+.\" Copyright 2026 Petri Koistinen
+.\"
+.\" Licensed under the Apache License, Version 2.0 (the "License");
+.\" you may not use this file except in compliance with the License.
+.\" You may obtain a copy of the License at
+.\"
+.\"     https://www.apache.org/licenses/LICENSE-2.0
+.\"
+.\" Unless required by applicable law or agreed to in writing, software
+.\" distributed under the License is distributed on an "AS IS" BASIS,
+.\" WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+.\" implied. See the License for the specific language governing
+.\" permissions and limitations under the License.
+.Dd October 30, 2026
+.Dt REFINEID 1
+.Os
+.Sh NAME
+.Nm refineid
+.Nd Finnish identity card tool
+.Sh SYNOPSIS
+.Nm
+.Op Fl v
+.Ar command
+.Op Ar argument ...
+.Nm
+.Ar command
+.Cm help
+.Nm
+.Fl V | -version
+.Sh DESCRIPTION
+.Nm
+reads, manages and signs with a FINEID card, the Finnish identity card,
+in a PC/SC reader or in a phone paired with
+.Nm pair .
+.Pp
+Without a command, or with
+.Cm help ,
+.Fl h
+or
+.Fl -help ,
+.Nm
+lists the commands, one line each.
+.Nm
+.Ar command
+.Cm help ,
+or
+.Fl h
+or
+.Fl -help
+among a command's arguments, shows that command's options.
+.Nm
+.Cm card help ,
+.Nm
+.Cm document help ,
+.Nm
+.Cm cert help
+and
+.Nm
+.Cm reader help
+list a group's commands.
+.Pp
+The commands fall into groups:
+.Bl -tag -width Ds
+.It Cm card
+The card: readout, eMRTD data, activation, PINs, raw signatures,
+decryption and public keys.
+.It Cm document
+Signed documents a counterparty can open.
+.It Cm pair , pairs , unpair , auth
+The paired phone, whose card the computer uses over the network.
+.It Cm verify , cert
+Offline signature and certificate tools.
+.It Cm reader
+The card reader itself.
+.El
+.Pp
+A command acting on a card targets one card; when several cards are
+connected,
+.Fl -reader Ar substr
+narrows the choice to readers whose name contains
+.Ar substr .
+PINs are always read from the terminal, never from the command line.
+.Sh OPTIONS
+These options are global.
+.Bl -tag -width Ds
+.It Fl h , Fl -help
+As the first argument, list the commands; after a command, show its
+options.
+.It Fl V , Fl -version
+Print the version and exit.
+No command prints the version otherwise.
+.It Fl v , Fl -verbose
+Show what each step did.
+Accepted anywhere on the command line.
+.El
+.Sh COMMANDS
+.Bl -tag -width Ds
+.It Xo
+.Cm card
+.Op Fl -offline
+.Op Fl -reader Ar substr
+.Op Fl -can Ar can | Fl -no-can
+.Op Fl -crl-file Ar path
+.Op Fl -save-cert Ar dir
+.Op Fl -remote
+.Xc
+Per-card readout: certificates, chain walk and revocation, PIN retry
+counters, and with
+.Fl -can
+the eMRTD section.
+With no card in a reader, reads the card through the paired phone.
+Without
+.Fl -can
+or
+.Fl -no-can
+on a terminal, prompts for the CAN; an empty answer skips the eMRTD
+section.
+.Bl -tag -width Ds
+.It Fl -offline
+Skip every network fetch.
+.It Fl -can Ar can
+The card access number printed on the card front; enables eMRTD.
+.It Fl -no-can
+Skip the eMRTD section without a prompt.
+.It Fl -crl-file Ar path
+Use a pre-fetched CRL instead of fetching one over HTTP.
+.It Fl -save-cert Ar dir
+Write each slot's certificate DER to
+.Ar dir .
+.It Fl -remote
+Read the card through the paired phone only.
+.El
+.It Xo
+.Cm card emrtd
+.Fl -can Ar can
+.Op Fl -save-face Ar path
+.Op Fl -save-signature Ar path
+.Op Fl -reader Ar substr
+.Xc
+eMRTD file extraction: the same read as
+.Cm card Fl -can ,
+plus options that write artefacts to disk.
+.Bl -tag -width Ds
+.It Fl -save-face Ar path
+Write the face image.
+.It Fl -save-signature Ar path
+Write the displayed-signature image.
+.El
+.It Xo
+.Cm card activate
+.Op Fl -allow-reactivate
+.Op Fl -reader Ar substr
+.Xc
+First-time DVV card activation.
+Prompts for the activation PIN, then the new PIN1 and PIN2.
+Wrong tries consume the activation PIN's retry counter; locking it
+leaves recovery to the separately orderable paid PUK.
+.Bl -tag -width Ds
+.It Fl -allow-reactivate
+Run on a card that already looks activated.
+.El
+.It Xo
+.Cm card change-pin1 | change-pin2
+.Op Fl -reader Ar substr
+.Op Fl -can Ar can
+.Xc
+Rotate PIN1, the authentication PIN, or PIN2, the qualified-signature
+PIN.
+Prompts for the current PIN, then the new PIN twice.
+.Bl -tag -width Ds
+.It Fl -can Ar can
+The card access number; needed on the contactless interface.
+.El
+.It Xo
+.Cm card unblock-pin1 | unblock-pin2
+.Op Fl -reader Ar substr
+.Xc
+Unblock PIN1 or PIN2 with the PUK and set a new PIN.
+A wrong PUK decrements the PUK counter; exhausting it permanently
+bricks the card.
+.It Xo
+.Cm card sign-auth | sign-qualified
+.Fl -in Ar path
+.Fl -out Ar path
+.Op Fl -save-cert Ar path
+.Op Fl -reader Ar substr
+.Op Fl -can Ar can
+.Xc
+Raw signature over a file:
+.Cm sign-auth
+with PIN1 and the authentication key,
+.Cm sign-qualified
+with PIN2 and the qualified-signature key.
+The signature is verified locally against the on-card certificate.
+.Bl -tag -width Ds
+.It Fl -in Ar path
+The input file.
+.It Fl -out Ar path
+The output file for the raw signature.
+.It Fl -save-cert Ar path
+Also write the signing certificate's DER.
+.It Fl -can Ar can
+The card access number; required on the contactless interface and
+prompted for on a terminal when needed.
+.El
+.It Xo
+.Cm card decrypt-auth
+.Fl -in Ar path
+.Fl -out Ar path
+.Op Fl -reader Ar substr
+.Xc
+Decrypt
+.Fl -in
+with PIN1 and the authentication key into
+.Fl -out .
+.It Xo
+.Cm card pubkey
+.Op Fl -slot Cm auth | qualified
+.Op Fl -format Cm ssh | pem
+.Op Fl -out Ar path
+.Op Fl -reader Ar substr
+.Op Fl -comment Ar string
+.Xc
+Export the public key from an on-card certificate.
+No PIN is needed.
+.Bl -tag -width Ds
+.It Fl -slot Cm auth | qualified
+The key to export.
+.It Fl -format Cm ssh | pem
+An OpenSSH public key line or a PEM SubjectPublicKeyInfo.
+.It Fl -out Ar path
+Write all blocks to
+.Ar path
+instead of the standard output.
+.It Fl -comment Ar string
+The SSH comment; the default is the certificate's common name and
+serial number.
+.El
+.It Xo
+.Cm card export-all
+.Ar dir
+.Op Fl -reader Ar substr
+.Xc
+Write every public artefact to
+.Ar dir .
+No PIN, no network.
+.It Xo
+.Cm document sign
+.Ar file ...
+.Op Fl -format Ar format
+.Op Fl -out Ar path
+.Op Fl -slot Cm qualified | auth
+.Op Fl -reason Ar text
+.Op Fl -location Ar text
+.Op Fl -reader Ar substr
+.Op Fl -can Ar can
+.Op Fl -timestamp Ar url ...
+.Op Fl -no-archive | Fl -no-long-term | Fl -no-timestamp
+.Xc
+Sign
+.Ar file
+into a format a counterparty can open.
+Several files go into one container under one signature.
+PIN2 and the qualified-signature key are used by default.
+Signs at the highest level the format supports: LTA, embedded
+evidence plus an archive timestamp, for
+.Cm pades
+and
+.Cm asice-cades ;
+LT, embedded evidence, for the rest.
+.Bl -tag -width Ds
+.It Fl -format Ar format
+.Bl -tag -width "cades-detached" -compact
+.It Cm pades
+signature inside the PDF
+.It Cm cades
+CMS, document attached
+.It Cm cades-detached
+CMS, document left outside
+.It Cm asice | bdoc
+ASiC-E container with XAdES; one format, two names
+.It Cm asice-cades
+ASiC-E container with CAdES
+.El
+The default is
+.Cm pades
+for one PDF and
+.Cm asice
+otherwise.
+The one-file formats refuse a set of files.
+.It Fl -out Ar path
+The finished document.
+The default is beside the first
+.Ar file ,
+named
+.Dq Ar stem No - signed Ar time . Ns Ar ext
+with the UTC time, and stem
+.Dq portfolio
+for several files.
+.It Fl -slot Cm qualified | auth
+The key to sign with; qualified by default.
+.It Fl -reason Ar text
+The PAdES /Reason.
+.It Fl -location Ar text
+The PAdES /Location.
+.It Fl -can Ar can
+The card access number; required on the contactless interface.
+.It Fl -timestamp Ar url
+An RFC 3161 timestamp authority URL, or a named set.
+The default is
+.Lk http://timestamp.sectigo.com/qualified .
+Repeat for alternatives; a failed answer is skipped, and signing fails
+when none remains.
+.Fl -timestamp Cm eu-qualified
+names public EU endpoints.
+.It Fl -no-archive
+Stop at level LT: no archive timestamp.
+.It Fl -no-long-term
+Stop at level T: no embedded evidence.
+.It Fl -no-timestamp
+Sign at level B: no authority is contacted.
+.El
+.It Cm pair
+Pair with a phone running RefineID.
+Start pairing on the phone and type the six-character code it shows.
+The code is read from the prompt only, never from the command line.
+.It Cm pairs
+Show the paired phone.
+.It Cm unpair
+Forget the paired phone.
+.It Cm auth Op Ar url
+Log in to a TLS site with the card in the paired phone and print the
+response's status line.
+.Ar url
+defaults to
+.Lk https://card.refineid.fi .
+.It Xo
+.Cm verify
+.Fl -cert Ar path
+.Fl -in Ar path
+.Fl -sig Ar path
+.Xc
+Offline signature verification; reports ok or FAILED.
+.Bl -tag -width Ds
+.It Fl -cert Ar path
+The certificate, PEM or DER, detected automatically.
+.It Fl -in Ar path
+The message that was signed.
+.It Fl -sig Ar path
+The raw signature.
+.El
+.It Cm cert show Ar path
+Print a certificate's fields and its SHA-256 fingerprint.
+PEM or DER, detected automatically.
+.It Xo
+.Cm cert chain
+.Ar cert
+.Op Fl -issuer-dir Ar dir
+.Op Fl -aia-fetch
+.Xc
+Walk the certificate chain upward, verifying each child against its
+issuer.
+.Bl -tag -width Ds
+.It Fl -issuer-dir Ar dir
+A directory of candidate issuer certificates.
+.It Fl -aia-fetch
+Fetch missing issuers over HTTP via AIA caIssuers.
+.El
+.It Xo
+.Cm reader keyboard
+.Op Cm status | on | off
+.Op Fl -reader Ar substr
+.Xc
+Show or set the keyboard (HID) interface of an ACS reader.
+A phone hides its on-screen keyboard while the reader acts as a
+keyboard.
+The new mode takes effect when the reader is plugged in again.
+.Bl -tag -width Ds
+.It Cm status
+Show the mode; the default.
+.It Cm on
+Keyboard and card reader.
+.It Cm off
+Card reader only.
+.El
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev XDG_CONFIG_HOME , HOME , SNAP_USER_COMMON
+Locate the pairing store; see
+.Sx FILES .
+.It Ev REFINEID_CA_BUNDLE
+A CA bundle file for TLS connections, used instead of the system
+bundle.
+.It Ev SSL_CERT_FILE , SSL_CERT_DIR
+Searched before the system bundle paths for the CA bundle of
+.Cm auth .
+.It Ev REFINEID_TLS_MAX
+Set to
+.Li 1.2
+to cap TLS at version 1.2.
+.It Ev REFINEID_PIN1 , REFINEID_PIN2
+Read instead of the PIN prompt by
+.Cm card sign-auth ,
+.Cm card sign-qualified
+and
+.Cm document sign ,
+only in a build with the
+.Li pin-env-debug
+feature.
+.It Ev REFINEID_CURRENT_PIN1 , REFINEID_CURRENT_PIN2 , \
+REFINEID_NEW_PIN1 , REFINEID_NEW_PIN2 , REFINEID_ACTIVATION_PIN
+Read instead of the prompts by
+.Cm card change-pin1 ,
+.Cm card change-pin2
+and
+.Cm card activate ,
+only in a build with the
+.Li pin-env-debug
+feature.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa $XDG_CONFIG_HOME/refineid/rapp-pairs/
+The pairing store: one owner-only file per paired phone, holding the
+pairing's private key.
+Without
+.Ev XDG_CONFIG_HOME ,
+.Pa $HOME/.config/refineid/rapp-pairs/ ;
+under a Snap,
+.Pa $SNAP_USER_COMMON/.config/refineid/rapp-pairs/ .
+.El
+.Sh EXIT STATUS
+.Bl -tag -width Ds
+.It 0
+Success, or help or version shown on request.
+.It 1
+.Cm verify
+rejected the signature,
+.Cm cert chain
+reached no self-signed root, or a paired-phone command failed.
+.It 64
+The command line was not understood
+.Pq Dv EX_USAGE .
+.It 65
+No PC/SC reader is connected.
+.It 66
+Readers are connected but no card is present.
+.It 70
+A transport, parse or signing failure
+.Pq Dv EX_SOFTWARE .
+.It 77
+The card or local policy rejected a PIN or the PUK.
+.El
+.Sh EXAMPLES
+Read the card in the only reader:
+.Dl $ refineid card
+.Pp
+Sign a PDF with the qualified-signature key:
+.Dl $ refineid document sign report.pdf
+.Pp
+Show the options of one command:
+.Dl $ refineid card activate help
+.Sh SEE ALSO
+.Xr pcscd 8
+.Rs
+.%Q Digital and Population Data Services Agency
+.%T FINEID specification
+.%U https://dvv.fi/en/fineid-specifications
+.Re

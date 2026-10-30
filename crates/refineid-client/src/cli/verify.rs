@@ -18,6 +18,17 @@ use std::path::PathBuf;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
+/// What `refineid verify help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid verify --cert PATH --in PATH --sig PATH
+
+Offline signature verification. Reports ok or FAILED, exits 0 or 1.
+  --cert P  certificate in PEM or DER (auto-detected)
+  --in P    the message that was signed
+  --sig P   the raw signature
+";
+
 /// Parsed `verify --cert PATH --in PATH --sig PATH` arguments.
 /// All three are required.
 #[derive(Debug, Clone, PartialEq, Eq)]

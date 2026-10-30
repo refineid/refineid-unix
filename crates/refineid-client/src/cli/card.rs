@@ -20,6 +20,26 @@ use refineid_lib_core::can::Can;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
+/// What `refineid card help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid card [--offline] [--reader SUBSTR] [--can NNNNNN | --no-can]
+                     [--crl-file PATH] [--save-cert DIR] [--remote]
+
+Per-card readout: certificates, chain walk and revocation, PIN retry
+counters, and with --can the eMRTD section. With no card in a reader,
+reads the card through the paired phone.
+  --offline        skip every network fetch
+  --reader S       narrow to readers whose name contains S
+  --can NNNNNN     CAN from the card front; enables eMRTD
+  --no-can         skip the eMRTD section (no prompt)
+  --crl-file P     use a pre-fetched CRL instead of HTTP fetch
+  --save-cert DIR  write each slot's DER to DIR
+  --remote         read the card through the paired phone only
+Without --can or --no-can on a terminal, prompts for the CAN
+(empty = skip).
+";
+
 /// CAN selection mode at the argv layer.
 ///
 /// `--can NNNNNN` / `--no-can` / neither is a closed three-way

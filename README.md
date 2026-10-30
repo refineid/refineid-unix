@@ -15,6 +15,9 @@ things:
 - **`refineid`** -- command-line tool: card readout, PIN management,
   qualified document signing (PAdES / CAdES / ASiC-E with RFC 3161
   timestamps and eIDAS trusted-list validation), revocation checks.
+  `refineid` lists the commands, `refineid <command> help` shows one
+  command's options, and the manual page refineid(1)
+  ([source](crates/refineid-client/man/refineid.1)) has the detail.
 - **`librefineid_pkcs11.so`** -- PKCS#11 v2.40 module (read-only,
   sign-only) for Firefox/NSS card login, and for OpenSSL / GnuTLS /
   OpenSSH through p11-kit.

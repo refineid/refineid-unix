@@ -57,7 +57,8 @@ sudo apt install ./target/deb/refineid_*.deb
 ```
 
 *What the package configures automatically:*
-- Installs `refineid` and `refineid-gui` to `/usr/bin/`
+- Installs `refineid` and `refineid-gui` to `/usr/bin/`, and the
+  manual page refineid(1)
 - Installs the PKCS#11 module to `/usr/lib/librefineid_pkcs11.so`
 - Registers the desktop application entry and icon in `/usr/share/`
 - Configures `p11-kit` (`/usr/share/p11-kit/modules/refineid.module`) so
@@ -107,6 +108,10 @@ Binaries will be placed in `target/release/`:
 # Binaries
 sudo install -m 755 target/release/refineid /usr/local/bin/refineid
 sudo install -m 755 target/release/refineid-gui /usr/local/bin/refineid-gui
+
+# Manual page
+sudo install -d /usr/local/share/man/man1
+sudo install -m 644 crates/refineid-client/man/refineid.1 /usr/local/share/man/man1/refineid.1
 
 # PKCS#11 shared module
 sudo install -m 755 target/release/librefineid_pkcs11.so /usr/local/lib/librefineid_pkcs11.so

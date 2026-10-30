@@ -18,6 +18,17 @@ use std::path::PathBuf;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
+/// What `refineid cert chain help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid cert chain CERT [--issuer-dir DIR] [--aia-fetch]
+
+Walk the certificate chain upward, verifying each child against its
+issuer. Exits 0 when a self-signed root is reached, 1 otherwise.
+  --issuer-dir D  directory of candidate issuer certificates
+  --aia-fetch     fetch missing issuers over HTTP via AIA caIssuers
+";
+
 /// Parsed `cert chain CERT [--issuer-dir DIR] [--aia-fetch]`
 /// arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]

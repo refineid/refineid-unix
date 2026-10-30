@@ -19,7 +19,7 @@
 # Packages generated:
 #   1. refineid-pkcs11: PKCS#11 module (multiarch), p11-kit config,
 #                       polkit pcscd rule, Firefox enterprise policy
-#   2. refineid-cli:    Command-line tool (/usr/bin/refineid)
+#   2. refineid-cli:    Command-line tool (/usr/bin/refineid), refineid(1)
 #   3. refineid-gui:    Desktop GUI tool (/usr/bin/refineid-gui), launcher, icons
 #   4. refineid:        Architecture-independent metapackage pulling in all components
 #
@@ -305,9 +305,12 @@ echo "Packaging $PKG_CLI..."
 rm -rf "$STAGING_CLI" "$DEB_DIR/${PKG_CLI}.deb"
 mkdir -p \
     "$STAGING_CLI/DEBIAN" \
-    "$STAGING_CLI/usr/bin"
+    "$STAGING_CLI/usr/bin" \
+    "$STAGING_CLI/usr/share/man/man1"
 
 install -m 755 target/release/refineid "$STAGING_CLI/usr/bin/refineid"
+gzip -9n < crates/refineid-client/man/refineid.1 > "$STAGING_CLI/usr/share/man/man1/refineid.1.gz"
+chmod 644 "$STAGING_CLI/usr/share/man/man1/refineid.1.gz"
 write_copyright "$STAGING_CLI/usr/share/doc/refineid-cli/copyright" "refineid-cli"
 
 CLI_SHLIBS="$(calc_shlibdeps target/release/refineid "libc6, libpcsclite1")"

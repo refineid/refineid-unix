@@ -18,6 +18,15 @@ use std::path::PathBuf;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
+/// What `refineid cert show help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid cert show PATH
+
+Print a certificate's fields and its SHA-256 fingerprint. PEM or DER,
+auto-detected.
+";
+
 /// Parsed `cert show PATH` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertShowArgs {

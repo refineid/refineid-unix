@@ -18,6 +18,15 @@ use std::path::PathBuf;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
+/// What `refineid card export-all help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid card export-all DIR [--reader SUBSTR]
+
+Write every public artefact to DIR. No PIN, no network.
+  --reader S  narrow to readers whose name contains S
+";
+
 /// Parsed `card export-all DIR [--reader SUBSTR]` arguments.
 ///
 /// Construction is exclusively via [`ExportAllArgs::parse`];

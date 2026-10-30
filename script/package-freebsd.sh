@@ -13,9 +13,10 @@
 # implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-# Build the FreeBSD package target/freebsd/refineid-<VERSION>.pkg: the CLI,
-# the GUI, the PKCS#11 module with its p11-kit registration, the Firefox
-# policy and the autostart entry that gives Chromium the module. The
+# Build the FreeBSD package target/freebsd/refineid-<VERSION>.pkg: the CLI
+# and its manual page, the GUI, the PKCS#11 module with its p11-kit
+# registration, the Firefox policy and the autostart entry that gives
+# Chromium the module. The
 # dependencies are pcsc-lite, libccid, p11-kit, nss and every package that
 # provides a shared library the binaries link, at the versions installed
 # on the build host. packaging/freebsd/+POST_INSTALL enables pcscd.
@@ -89,9 +90,12 @@ install -d \
     "$ROOT/etc/xdg/autostart" \
     "$ROOT/share/p11-kit/modules" \
     "$ROOT/share/applications" \
-    "$ROOT/share/icons/hicolor/scalable/apps"
+    "$ROOT/share/icons/hicolor/scalable/apps" \
+    "$ROOT/share/man/man1"
 
 install -m 755 target/release/refineid "$ROOT/bin/refineid"
+gzip -9n < crates/refineid-client/man/refineid.1 > "$ROOT/share/man/man1/refineid.1.gz"
+chmod 644 "$ROOT/share/man/man1/refineid.1.gz"
 install -m 755 target/release/refineid-gui "$ROOT/bin/refineid-gui"
 install -m 755 target/release/librefineid_pkcs11.so "$STAGE$MODULE"
 
