@@ -27,7 +27,7 @@ use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::sign::cades::SigningTime;
 use refineid_lib_core::sign::document::Format;
-use refineid_lib_core::sign::pades::{SignatureInk, SignatureMetadata};
+use refineid_lib_core::sign::pades::{SignatureMetadata, VisibleSignature};
 use refineid_lib_pcsc::PcscBackend;
 
 use crate::card_check::{CardCheckError, CardCheckOptions, CardCheckReport};
@@ -38,7 +38,7 @@ use crate::card_pin::{
 };
 use crate::card_sign::{
     DocumentRequest, SignErrorKind, SignOptions, SignReport, TimestampCredentials,
-    VisibleSignatureRequest,
+    process_visible_signature,
 };
 use crate::pin_source::PinSource;
 
@@ -51,14 +51,12 @@ pub struct PdfSignOptions {
     pub output: PathBuf,
     /// Qualified-signature PIN, consumed and zeroized by the sign operation.
     pub pin2: PinBytes,
-    /// Optional CAN for contactless signing and DG7 access.
+    /// Optional CAN for contactless signing.
     pub can: Option<Can>,
     /// Reader shown in the card-manager view.
     pub reader_filter: Option<String>,
     /// Full serial captured when that view inspected the card.
     pub expected_serial: TokenSerial,
-    /// Optional card-carried handwriting already decoded to RGBA ink.
-    pub handwriting: Option<SignatureInk>,
     /// Sole qualified RFC 3161 authority selected in the graphical client.
     pub timestamp_authority: String,
     /// Optional in-memory HTTP Basic credentials for that authority.
@@ -158,11 +156,10 @@ pub fn read_images(
     crate::card_emrtd::read_first(PcscBackend, &options)
 }
 
-/// Produce a qualified `PAdES-LTA` signature, visibly marked only when
-/// a card access number was supplied.
+/// Produce a qualified `PAdES-LTA` signature carrying the seal that asks
+/// the reader to check the document's electronic signature.
 ///
-/// The visible name and SATU are resolved from the live signing certificate;
-/// the request carries only the displayed card serial and optional DG7 ink.
+/// The request is bound to the displayed card serial.
 /// The original input is read before the destination is written.
 ///
 /// # Errors
@@ -176,7 +173,6 @@ pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, SignErrorKind> {
         can,
         reader_filter,
         expected_serial,
-        handwriting,
         timestamp_authority,
         timestamp_credentials,
     } = options;
@@ -189,9 +185,7 @@ pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, SignErrorKind> {
             ),
         });
     }
-    // The signed page carries the holder's mark; a card access number
-    // also reads the card's handwriting into it.
-    let visible_signature = Some(VisibleSignatureRequest { handwriting });
+    let visible_signature = Some(process_visible_signature());
     let document = pdf_document_request(
         expected_serial,
         visible_signature,
@@ -283,7 +277,7 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind>
 
 fn pdf_document_request(
     expected_serial: TokenSerial,
-    visible_signature: Option<VisibleSignatureRequest>,
+    visible_signature: Option<VisibleSignature>,
     timestamp_authority: String,
     timestamp_credentials: Option<TimestampCredentials>,
 ) -> DocumentRequest {
@@ -384,7 +378,9 @@ fn ensure_displayed_serial(
 mod tests {
     use refineid_lib_core::identity::TokenSerial;
 
-    use super::{VisibleSignatureRequest, ensure_displayed_serial, pdf_document_request};
+    use refineid_lib_core::sign::pades::{StampLanguage, VisibleSignature};
+
+    use super::{ensure_displayed_serial, pdf_document_request};
 
     #[test]
     fn displayed_serial_mismatch_is_refused() {
@@ -404,7 +400,7 @@ mod tests {
         let serial = TokenSerial::new("same-card".to_owned());
         let request = pdf_document_request(
             serial.clone(),
-            Some(VisibleSignatureRequest { handwriting: None }),
+            Some(VisibleSignature::verification(StampLanguage::English)),
             "https://timestamp.sectigo.com/qualified".to_owned(),
             None,
         );
@@ -419,10 +415,10 @@ mod tests {
             ["https://timestamp.sectigo.com/qualified"]
         );
         assert_eq!(request.expected_serial, Some(serial));
-        let visible = request
-            .visible_signature
-            .expect("visible signature request");
-        assert!(visible.handwriting.is_none());
+        assert_eq!(
+            request.visible_signature,
+            Some(VisibleSignature::verification(StampLanguage::English))
+        );
     }
 
     #[test]

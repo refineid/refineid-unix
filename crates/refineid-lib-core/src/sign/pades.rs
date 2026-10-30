@@ -43,9 +43,11 @@ use crate::sign::cades::DigestAlgorithm;
 
 mod appearance;
 mod spot;
+mod stamp;
 mod xref_stream;
 
-pub use appearance::{SignatureInk, VisibleSignature};
+pub use appearance::VisibleSignature;
+pub use stamp::StampLanguage;
 use std::collections::HashSet;
 
 /// Signature dictionary `/SubFilter` for `PAdES` (EN 319 142-1 sec.5.1).
@@ -521,18 +523,20 @@ fn signature_field_objects(
     let mut form = format!(
         "{appearance_number} 0 obj\n<< /Type /XObject /Subtype /Form \
          /BBox [0 0 {:.4} {:.4}] \
-         /Resources << /Font << /F1 {font_number} 0 R >> >> \
+         /Resources << /Font << /{} {font_number} 0 R >> >> \
          /Length {} >>\nstream\n",
         appearance.side,
         appearance.side,
+        appearance::FONT_RESOURCE_NAME,
         appearance.operators.len()
     )
     .into_bytes();
     form.extend_from_slice(&appearance.operators);
     form.extend_from_slice(b"endstream\nendobj\n");
     let font = format!(
-        "{font_number} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
-         /Encoding /WinAnsiEncoding >>\nendobj\n"
+        "{font_number} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /{} \
+         /Encoding /WinAnsiEncoding >>\nendobj\n",
+        appearance.font
     );
     vec![
         (field_number, field.into_bytes()),
@@ -2562,7 +2566,7 @@ mod tests {
 
     use super::{
         AnnotsTarget, DEFAULT_SIGNATURE_CAPACITY, FieldListTarget, MAX_FIELD_NAME_BYTES,
-        PdfDictionary, PdfError, PdfIndex, SignatureInk, SignatureMetadata, VisibleSignature,
+        PdfDictionary, PdfError, PdfIndex, SignatureMetadata, StampLanguage, VisibleSignature,
         XrefEntry, XrefLocation, append_validation_store, complete_object_reference,
         dictionary_reference, existing_field_names, last_object_header, last_reference,
         object_body, plan_annotation, plan_field_list, prepare, prepare_document_timestamp,
@@ -3020,9 +3024,7 @@ mod tests {
 
     #[test]
     fn visible_signature_is_the_widget_appearance() {
-        let ink = SignatureInk::from_rgba(2, 1, &[0, 0, 0, 255, 0, 0, 0, 255]);
-        let visible =
-            VisibleSignature::new("Test Signer", "12345678A", ink).expect("valid visible identity");
+        let visible = VisibleSignature::verification(StampLanguage::English);
         let metadata = SignatureMetadata {
             visible_signature: Some(visible),
             ..SignatureMetadata::default()
@@ -3032,7 +3034,7 @@ mod tests {
         // The fixture page is blank, so the free-spot search settles
         // the mark at clearance distance from the lower-right corner.
         assert!(
-            text.contains("/Rect [68.0000 4.0000 196.0000 132.0000]"),
+            text.contains("/Rect [64.0000 4.0000 196.0000 136.0000]"),
             "visible field has lower-right page coordinates"
         );
         assert!(
@@ -3040,14 +3042,14 @@ mod tests {
             "appearance belongs to the signature widget"
         );
         assert!(text.contains("/Subtype /Form"));
-        assert!(text.contains("/BaseFont /Helvetica"));
-        assert!(text.contains("Test Signer"));
-        assert!(text.contains("12345678A"));
+        assert!(text.contains("/Resources << /Font << /F1 7 0 R >> >>"));
+        assert!(text.contains("/BaseFont /Helvetica-Bold "));
+        assert!(text.contains("(SIGNATURE) Tj"));
         assert!(
             prepared
                 .signed_octets()
-                .windows(b"Test Signer".len())
-                .any(|window| window == b"Test Signer"),
+                .windows(b"(SIGNATURE) Tj".len())
+                .any(|window| window == b"(SIGNATURE) Tj"),
             "the PAdES byte range authenticates the appearance"
         );
     }
@@ -3057,8 +3059,7 @@ mod tests {
     /// page a reader opens.
     #[test]
     fn visible_signature_lands_on_the_last_page() {
-        let visible =
-            VisibleSignature::new("Test Signer", "12345678A", None).expect("valid identity");
+        let visible = VisibleSignature::verification(StampLanguage::English);
         let metadata = SignatureMetadata {
             visible_signature: Some(visible),
             ..SignatureMetadata::default()
@@ -3700,7 +3701,7 @@ mod pdfsig_interop {
 
     use super::tests::minimal_pdf;
     use super::{
-        DEFAULT_SIGNATURE_CAPACITY, SignatureInk, SignatureMetadata, VisibleSignature, prepare,
+        DEFAULT_SIGNATURE_CAPACITY, SignatureMetadata, StampLanguage, VisibleSignature, prepare,
     };
     use crate::sign::cades::{
         DigestAlgorithm, Encapsulation, SignatureAlgorithm, SignerParameters, signed_attributes,
@@ -3763,11 +3764,10 @@ mod pdfsig_interop {
         let certificate = Certificate::from_der(&cert_der).expect("cert parses");
 
         // 1. Reserve the hole and learn what has to be signed.
-        let ink = SignatureInk::from_rgba(2, 1, &[0, 0, 0, 255, 0, 0, 0, 255]);
         let metadata = SignatureMetadata {
             reason: Some("Declaration d'un moyen de cryptologie".to_owned()),
             location: Some("Helsinki".to_owned()),
-            visible_signature: VisibleSignature::new("Test Signer", "12345678A", ink),
+            visible_signature: Some(VisibleSignature::verification(StampLanguage::English)),
             ..SignatureMetadata::default()
         };
         let placeholder =
