@@ -40,6 +40,7 @@ use crate::card_sign::{
     DocumentRequest, SignErrorKind, SignOptions, SignReport, TimestampCredentials,
     VisibleSignatureRequest,
 };
+use crate::pin_source::PinSource;
 
 /// Inputs for one visible qualified PDF signature from the graphical client.
 #[derive(Debug)]
@@ -202,7 +203,7 @@ pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, SignErrorKind> {
         SignOptions {
             input,
             output,
-            pin: pin2,
+            pin: PinSource::Given(pin2),
             save_cert: None,
             reader_filter,
             can,
@@ -271,7 +272,7 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind>
         SignOptions {
             input,
             output,
-            pin: pin2,
+            pin: PinSource::Given(pin2),
             save_cert: None,
             reader_filter,
             can,

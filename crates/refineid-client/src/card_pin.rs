@@ -649,6 +649,30 @@ pub(crate) fn probe_pin_status_for_cli(
         .map_err(auth_to_card_pin)
 }
 
+/// Run the unblock gate (slot activated, PUK counter at or above the
+/// retry floor) in a read-only session, so the CLI refuses before it
+/// prompts for the PUK.
+///
+/// # Errors
+/// [`CardPinError::RetryFloor`], [`CardPinError::CardLooksUnactivated`],
+/// a card swap, or PC/SC / PKCS#15 failures.
+pub(crate) fn probe_unblock_gate_for_cli(
+    backend: PcscBackend,
+    ctx: &PinManagementCardContext,
+    slot: PinManageSlot,
+) -> Result<(), CardPinError> {
+    let mut transport = backend.open_session(ctx.reader_id(), ReaderAccessCap::Read)?;
+    transport
+        .select_pkcs15_application()
+        .map_err(|error| CardPinError::Pkcs15Select(format!("{error}")))?;
+    re_verify_session(&mut transport, ctx.bound_serial())?;
+    unblock_gate(
+        slot,
+        transport.pin_status(slot.as_pin_slot()).ok(),
+        transport.puk_status().ok(),
+    )
+}
+
 /// PIN change with the current PIN. Refuses on the retry floor before any
 /// modify APDU, so a PIN at two, one or no tries left is never presented.
 pub(crate) fn change_pin_first_for_cli(
@@ -1321,6 +1345,106 @@ const fn activation_continues_after_pin1(outcome: UnblockOutcome) -> bool {
     matches!(outcome, UnblockOutcome::Ok)
 }
 
+/// What [`activation_gate`] decided from the card's PIN probes.
+enum ActivationGate {
+    /// The card may be activated; carries the preflight verdict.
+    Proceed(ActivatePreflightOutcome),
+    /// The card looks activated and re-activation was not allowed.
+    Refused(ActivateReport),
+}
+
+/// Probe both PIN slots and decide whether activation may proceed:
+/// refuse an activated card without `allow_reactivate`, and apply the
+/// retry floor to the counter the activation code is presented under
+/// (PIN1 and PIN2 on the newer generation, the PUK on the older).
+/// `emit_probe` reports the PIN-changed probe event.
+///
+/// # Errors
+/// [`CardPinError::RetryFloor`] for a counter below the floor.
+fn activation_gate<T: refineid_lib_core::transport::CardTransport>(
+    transport: &mut T,
+    ctx: &ActivationCardContext,
+    allow_reactivate: bool,
+    emit_probe: bool,
+) -> Result<ActivationGate, CardPinError> {
+    let reader_label = ctx.reader_id.as_str().to_owned();
+    let pin1_probe = transport.pin_status(PinSlot::Pin1).ok();
+    let pin2_probe = transport.pin_status(PinSlot::Pin2).ok();
+    // S1 v4.2 s3.15.2 GET DATA on the PIN container, DF 2F flag.
+    // Best-effort: a card that doesn't implement the optional
+    // "Return PIN changed flag" parameter returns `Ok(None)` and
+    // refineid falls back to the PinStatus-only logic.
+    let pin1_changed = transport.pin_changed_flag(PinSlot::Pin1).ok().flatten();
+    let pin2_changed = transport.pin_changed_flag(PinSlot::Pin2).ok().flatten();
+    if emit_probe {
+        ActivateGuard::emit_pin_changed_probed(pin1_changed, pin2_changed);
+    }
+    let preflight = classify_preflight(
+        pin1_probe,
+        pin2_probe,
+        ctx.generation,
+        pin1_changed,
+        pin2_changed,
+    );
+
+    if !allow_reactivate && preflight.looks_activated() {
+        if let ActivatePreflightOutcome::LooksActivated { pin1, pin2 } = &preflight {
+            crate::events::CardActivatePreflightRefused {
+                reader: &reader_label,
+                pin1_status: &format!("{pin1:?}"),
+                pin2_status: &pin2.as_ref().map_or_else(String::new, |s| format!("{s:?}")),
+            }
+            .emit();
+        }
+        return Ok(ActivationGate::Refused(ActivateReport {
+            reader: reader_label,
+            preflight,
+            pin1_outcome: None,
+            pin2_outcome: None,
+        }));
+    }
+
+    match ctx.generation {
+        // The activation code is presented as the current PIN, so each
+        // setup is a PIN attempt under the retry floor.
+        CardGeneration::Newer => {
+            for (slot, probe) in [(PinSlot::Pin1, pin1_probe), (PinSlot::Pin2, pin2_probe)] {
+                check_retry_floor(slot, probe.unwrap_or(PinStatus::NoInfo))
+                    .map_err(CardPinError::RetryFloor)?;
+            }
+        }
+        // The activation code is presented as the PUK.
+        CardGeneration::Older => puk_gate(transport.puk_status().ok())?,
+        CardGeneration::Unknown => return Err(CardPinError::UnknownCardGeneration),
+    }
+    Ok(ActivationGate::Proceed(preflight))
+}
+
+/// Run [`activation_gate`] in a read-only session, so the CLI refuses
+/// before it prompts for the activation PIN and the new PINs.
+/// `Ok(Some(report))` is the refusal of an activated card.
+///
+/// # Errors
+/// See [`activation_gate`]; also a card swap or PC/SC / PKCS#15
+/// failures.
+pub(crate) fn probe_activation_gate_for_cli(
+    backend: PcscBackend,
+    ctx: &ActivationCardContext,
+    allow_reactivate: bool,
+) -> Result<Option<ActivateReport>, CardPinError> {
+    let mut transport = backend.open_session(&ctx.reader_id, ReaderAccessCap::Read)?;
+    transport
+        .select_pkcs15_application()
+        .map_err(|e| CardPinError::Pkcs15Select(format!("{e}")))?;
+    re_verify_session(&mut transport, &ctx.bound_serial)?;
+    Ok(
+        match activation_gate(&mut transport, ctx, allow_reactivate, false)? {
+            ActivationGate::Proceed(_) => None,
+            ActivationGate::Refused(report) => Some(report),
+        },
+    )
+}
+
 /// Drive the `card activate` flow: trust-gated card -> factory
 /// activation PIN -> fresh PIN1/PIN2.
 ///
@@ -1389,48 +1513,10 @@ pub fn activate_first(
     // trust before any modify APDU lands.
     re_verify_session(&mut transport, &ctx.bound_serial)?;
 
-    let pin1_probe = transport.pin_status(PinSlot::Pin1).ok();
-    let pin2_probe = transport.pin_status(PinSlot::Pin2).ok();
-    // S1 v4.2 §3.15.2 GET DATA on the PIN container, DF 2F flag.
-    // Best-effort: a card that doesn't implement the optional
-    // "Return PIN changed flag" parameter returns `Ok(None)` and
-    // refineid falls back to the existing PinStatus-only logic.
-    let pin1_changed = transport.pin_changed_flag(PinSlot::Pin1).ok().flatten();
-    let pin2_changed = transport.pin_changed_flag(PinSlot::Pin2).ok().flatten();
-    ActivateGuard::emit_pin_changed_probed(pin1_changed, pin2_changed);
-    let preflight = classify_preflight(
-        pin1_probe,
-        pin2_probe,
-        ctx.generation,
-        pin1_changed,
-        pin2_changed,
-    );
-
-    if !options.allow_reactivate && preflight.looks_activated() {
-        if let ActivatePreflightOutcome::LooksActivated { pin1, pin2 } = &preflight {
-            crate::events::CardActivatePreflightRefused {
-                reader: &reader_label,
-                pin1_status: &format!("{pin1:?}"),
-                pin2_status: &pin2.as_ref().map_or_else(String::new, |s| format!("{s:?}")),
-            }
-            .emit();
-        }
-        return Ok(ActivateReport {
-            reader: reader_label,
-            preflight,
-            pin1_outcome: None,
-            pin2_outcome: None,
-        });
-    }
-
-    // On the newer generation the activation code is presented as the
-    // current PIN, so each setup is a PIN attempt under the retry floor.
-    if matches!(ctx.generation, CardGeneration::Newer) {
-        for (slot, probe) in [(PinSlot::Pin1, pin1_probe), (PinSlot::Pin2, pin2_probe)] {
-            check_retry_floor(slot, probe.unwrap_or(PinStatus::NoInfo))
-                .map_err(CardPinError::RetryFloor)?;
-        }
-    }
+    let preflight = match activation_gate(&mut transport, &ctx, options.allow_reactivate, true)? {
+        ActivationGate::Proceed(preflight) => preflight,
+        ActivationGate::Refused(report) => return Ok(report),
+    };
 
     ActivateGuard::emit_scheme_selected(ctx.generation);
 

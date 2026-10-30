@@ -56,10 +56,10 @@ impl DecryptAuthArgs {
             reader_filter,
         } = self;
         let cmd = "card decrypt-auth";
-        let pin = match super::util::prompt_pin(cmd, super::util::PROMPT_PIN1) {
-            Ok(p) => p,
-            Err(exit) => return exit,
-        };
+        let pin = crate::pin_source::PinSource::Ask(Box::new(move || {
+            super::util::prompt_pin(cmd, super::util::PROMPT_PIN1)
+                .map_err(|status| crate::pin_source::PinEntryError { status })
+        }));
         let options = crate::card_decrypt::DecryptAuthOptions {
             input,
             output,
@@ -75,6 +75,7 @@ impl DecryptAuthArgs {
             Err(crate::card_decrypt::DecryptAuthError::ReaderPick(pe)) => {
                 super::util::reader_pick_exit(cmd, &pe)
             }
+            Err(crate::card_decrypt::DecryptAuthError::PinEntry(entry)) => entry.status.into(),
             Err(e)
                 if matches!(
                     &e,

@@ -78,9 +78,22 @@ impl UnblockPinArgs {
                 }
             };
         let ctx = session.into_pin_management_context();
+        // The reset presents the PUK: refuse below its retry floor, or
+        // on a slot that was never set, before prompting.
+        match crate::card_pin::probe_unblock_gate_for_cli(backend, &ctx, slot) {
+            Ok(()) => {}
+            Err(e @ crate::card_pin::CardPinError::RetryFloor(_)) => {
+                eprintln!("{cmd}: {e}");
+                return ExitStatus::CardCredentialRejected.into();
+            }
+            Err(e) => {
+                eprintln!("{cmd}: {e}");
+                return ExitStatus::RuntimeFailure.into();
+            }
+        }
         let puk_raw = match super::util::prompt_pin(cmd, super::util::PROMPT_PUK) {
             Ok(p) => p,
-            Err(exit) => return exit,
+            Err(exit) => return exit.into(),
         };
         let puk = match refineid_lib_core::pin::Puk::new(puk_raw) {
             Ok(p) => p,

@@ -93,20 +93,16 @@ impl SignArgs {
             SignSlot::Qualified => (VerbTag::CardSignQualified, "REFINEID_PIN2"),
         };
         let cmd = sub.label();
-        let pin = match super::util::pin_env_or_prompt(
-            cmd,
-            env_var,
-            super::util::sign_pin_prompt(slot),
-        ) {
-            Ok(p) => p,
-            Err(exit) => return exit,
-        };
         let backend = refineid_lib_pcsc::PcscBackend;
         let run_once = |can: Option<Can>| {
             let options = crate::card_sign::SignOptions {
                 input: input.clone(),
                 output: output.clone(),
-                pin: pin.clone(),
+                pin: super::util::pin_source_at_use(
+                    cmd,
+                    env_var,
+                    super::util::sign_pin_prompt(slot),
+                ),
                 save_cert: save_cert.clone(),
                 reader_filter: reader_filter.clone(),
                 can,
@@ -122,9 +118,9 @@ impl SignArgs {
         let mut result = run_once(can);
         // Contactless card and no CAN yet: the card told us
         // PKCS#15 is sealed behind PACE. Prompt (TTY only) and
-        // retry once. Nothing has touched the PIN counter at
-        // this point -- the seal is reported by the very first
-        // SELECT, long before VERIFY.
+        // retry once. The PIN has not been asked for and nothing
+        // has touched the PIN counter at this point -- the seal is
+        // reported by the very first SELECT, long before VERIFY.
         if matches!(result, Err(crate::card_sign::SignErrorKind::NeedCan))
             && let Some(prompted) = super::util::prompt_can_if_tty()
         {
@@ -147,6 +143,7 @@ impl SignArgs {
             Err(crate::card_sign::SignErrorKind::ReaderPick(pe)) => {
                 super::util::reader_pick_exit(cmd, &pe)
             }
+            Err(crate::card_sign::SignErrorKind::PinEntry(entry)) => entry.status.into(),
             Err(e)
                 if matches!(
                     &e,

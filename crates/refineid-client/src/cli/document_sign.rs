@@ -170,14 +170,6 @@ impl DocumentSignArgs {
             SignSlot::Auth => "REFINEID_PIN1",
             SignSlot::Qualified => "REFINEID_PIN2",
         };
-        let pin = match super::util::pin_env_or_prompt(
-            cmd,
-            env_var,
-            super::util::sign_pin_prompt(slot),
-        ) {
-            Ok(p) => p,
-            Err(exit) => return exit,
-        };
 
         // `parse` guarantees at least one; `remove(0)` splits the
         // primary from the rest the way `SignOptions` is shaped.
@@ -201,7 +193,11 @@ impl DocumentSignArgs {
             let options = crate::card_sign::SignOptions {
                 input: primary.clone(),
                 output: output.clone(),
-                pin: pin.clone(),
+                pin: super::util::pin_source_at_use(
+                    cmd,
+                    env_var,
+                    super::util::sign_pin_prompt(slot),
+                ),
                 save_cert: None,
                 reader_filter: reader_filter.clone(),
                 can,
@@ -521,6 +517,7 @@ fn report_outcome(
         Err(crate::card_sign::SignErrorKind::ReaderPick(pe)) => {
             super::util::reader_pick_exit(cmd, &pe)
         }
+        Err(crate::card_sign::SignErrorKind::PinEntry(entry)) => entry.status.into(),
         Err(e)
             if matches!(
                 &e,
