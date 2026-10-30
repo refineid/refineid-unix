@@ -149,7 +149,13 @@ NetBSD 11.0/aarch64 builds the whole workspace including the Slint GUI.
 See [doc/install-netbsd.md](doc/install-netbsd.md) for the bring-up order
 (base X sets, pkgsrc packages, pcscd, VNC desktop, Openbox menu).
 
-## 5. Verifying the Installation
+## 5. OpenBSD
+
+OpenBSD 8.0/amd64 builds the CLI, the PKCS#11 module and the FLTK GUI from
+packages. See [doc/install-openbsd.md](doc/install-openbsd.md), including
+the CDE Application Manager entry.
+
+## 6. Verifying the Installation
 
 1. **Reader and Card Status**:
    ```sh
