@@ -18,6 +18,8 @@
 # Chromium offer the card for every user without touching either browser:
 # a Firefox enterprise policy naming the PKCS#11 module, and a desktop
 # autostart entry that gives each signed-in user's NSS database the module.
+# Where CDE is installed, the GUI also gets a CDE action, icons and an
+# Application Manager entry.
 #
 # Usage:
 #   script/install-desktop.sh [--prefix /usr/local] [--openbox-menu]
@@ -73,6 +75,22 @@ if command -v rsvg-convert >/dev/null 2>&1; then
         rsvg-convert -w "$size" -h "$size" -o "$sized/refineid.png" \
             crates/refineid-gui/assets/app-icon.svg
     done
+fi
+
+# CDE reads no freedesktop launchers. Where CDE is installed, the action,
+# its icons and an Application Manager entry in the System group go to the
+# local configuration tree, which dtappgather collects at the next login.
+if [ -d /usr/dt ] || [ -d /usr/local/dt ]; then
+    CDE_CONF="$DESTDIR/etc/dt/appconfig"
+    install -d "$CDE_CONF/types/C" "$CDE_CONF/icons/C" \
+        "$CDE_CONF/appmanager/C/System"
+    sed "s|@EXEC@|$PREFIX/bin/refineid-gui|" packaging/cde/refineid.dt \
+        > "$CDE_CONF/types/C/refineid.dt"
+    chmod 644 "$CDE_CONF/types/C/refineid.dt"
+    install -m 644 packaging/cde/RefineID.l.pm packaging/cde/RefineID.m.pm \
+        packaging/cde/RefineID.t.pm "$CDE_CONF/icons/C"
+    # An executable file named after the action is its icon in the group.
+    install -m 755 /dev/null "$CDE_CONF/appmanager/C/System/RefineID"
 fi
 
 # Browsers. Firefox reads a system policy, so every profile of every user
