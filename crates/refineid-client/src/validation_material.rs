@@ -431,6 +431,7 @@ fn walk<P: EvidenceProvider>(
             if start.include_anchor {
                 push_certificate(&mut collection.material, &current_der);
             }
+            enrich_above_anchor(&current_der, start, evidence_time, provider, collection);
             return Ok(());
         }
 
@@ -448,6 +449,7 @@ fn walk<P: EvidenceProvider>(
             start.approved_anchor_ders,
             &collection.candidates,
             provider,
+            IssuerCheck::Path,
         )?;
         let issuer = OwnedCert::from_der(&issuer_der)
             .map_err(|e| MaterialError::InvalidIssuer(format!("parse: {e}")))?;
@@ -476,6 +478,59 @@ fn walk<P: EvidenceProvider>(
         if !issuer_is_anchor || start.include_anchor {
             push_certificate(&mut collection.material, &issuer_der);
         }
+        current_der = issuer_der;
+    }
+}
+
+/// Add, best effort, the parent certificates and current status above
+/// an approved anchor that is not self-issued.
+///
+/// The anchor ends the strict path, so its own status is never asked
+/// there; a timestamp token anchored on its signer would otherwise
+/// leave the authority's certificate without evidence. The strict
+/// result below the anchor stands whatever happens here: a parent or
+/// status that cannot be found or authenticated ends the climb quietly.
+fn enrich_above_anchor<P: EvidenceProvider>(
+    anchor_der: &[u8],
+    start: ChainStart<'_>,
+    evidence_time: DateTime,
+    provider: &P,
+    collection: &mut Collection,
+) {
+    let mut current_der = anchor_der.to_vec();
+    let mut guard = WalkGuard::default();
+    while guard.enter(&current_der).is_ok() {
+        let Ok(current) = OwnedCert::from_der(&current_der) else {
+            return;
+        };
+        let current_view = current.view();
+        if current_view.issuer.as_der() == current_view.subject.as_der() {
+            return;
+        }
+        let Ok(issuer_der) = find_issuer(
+            &current_view,
+            start.reference_time,
+            0,
+            &[],
+            &collection.candidates,
+            provider,
+            IssuerCheck::AboveAnchor,
+        ) else {
+            return;
+        };
+        let Ok(issuer) = OwnedCert::from_der(&issuer_der) else {
+            return;
+        };
+        if let Ok(evidence) = provider.status(
+            start.nonce_policy,
+            &current_view,
+            &issuer.view(),
+            evidence_time,
+        ) {
+            push_status(&mut collection.material, evidence);
+        }
+        push_candidate(collection, &issuer_der);
+        push_certificate(&mut collection.material, &issuer_der);
         current_der = issuer_der;
     }
 }
@@ -521,6 +576,7 @@ fn verify_chain_with<P: EvidenceProvider>(
             approved_anchor_ders,
             &collection.candidates,
             provider,
+            IssuerCheck::Path,
         )?;
         let issuer = OwnedCert::from_der(&issuer_der)
             .map_err(|e| MaterialError::InvalidIssuer(format!("parse: {e}")))?;
@@ -536,6 +592,17 @@ fn verify_chain_with<P: EvidenceProvider>(
     }
 }
 
+/// How strictly [`find_issuer`] checks the issuer it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssuerCheck {
+    /// The certification path's intermediate policy, except for an
+    /// approved anchor.
+    Path,
+    /// Name, validity and signature only, as for an anchor: a parent
+    /// above an anchor adds status evidence, never trust.
+    AboveAnchor,
+}
+
 /// Find one directly valid issuer in approved anchors, material already
 /// discovered by another path, or the subject's AIA locations.
 fn find_issuer<P: EvidenceProvider>(
@@ -545,6 +612,7 @@ fn find_issuer<P: EvidenceProvider>(
     anchors: &[&[u8]],
     candidates: &[Vec<u8>],
     provider: &P,
+    check: IssuerCheck,
 ) -> Result<Vec<u8>, MaterialError> {
     for candidate_der in anchors
         .iter()
@@ -562,7 +630,7 @@ fn find_issuer<P: EvidenceProvider>(
             &candidate.view(),
             reference_time,
             subordinate_ca_count,
-            is_approved_anchor(candidate_der, anchors),
+            check == IssuerCheck::AboveAnchor || is_approved_anchor(candidate_der, anchors),
         )
         .is_ok()
         {
@@ -603,7 +671,7 @@ fn find_issuer<P: EvidenceProvider>(
             &candidate.view(),
             reference_time,
             subordinate_ca_count,
-            is_approved_anchor(&candidate_der, anchors),
+            check == IssuerCheck::AboveAnchor || is_approved_anchor(&candidate_der, anchors),
         ) {
             Ok(()) => return Ok(candidate_der),
             Err(why) => failures.push(format!("{url}: {why}")),
@@ -1357,6 +1425,51 @@ mod tests {
             &provider.statuses.get(),
             &0,
             "level-T trust does not fetch LT status evidence",
+        )
+    }
+
+    #[test]
+    fn status_above_an_anchor_that_is_not_self_issued_is_collected() -> TestResult {
+        let provider = GoodEvidence::default();
+        let anchors = [DVV_INTERMEDIATE_DER];
+        let chain = start(DVV_INTERMEDIATE_DER, &anchors, true)?;
+        let material = collect_chains_seeded_with(
+            &[chain],
+            &[DVV_ROOT_ECC_DER],
+            reference_time()?,
+            &provider,
+        )?;
+        check(
+            &provider.statuses.get(),
+            &1,
+            "the anchor's status under its parent",
+        )?;
+        check(
+            &material.ocsp_responses,
+            &vec![TEST_STATUS.to_vec()],
+            "the anchor's status is retained",
+        )?;
+        check(
+            &material.certificates,
+            &vec![DVV_INTERMEDIATE_DER.to_vec(), DVV_ROOT_ECC_DER.to_vec()],
+            "the climb stops at the self-issued parent",
+        )
+    }
+
+    #[test]
+    fn missing_status_above_an_anchor_leaves_the_path_intact() -> TestResult {
+        let provider = MissingEvidence::default();
+        let anchors = [DVV_INTERMEDIATE_DER];
+        let chain = start(DVV_INTERMEDIATE_DER, &anchors, true)?;
+        let material = collect_chains_seeded_with(
+            &[chain],
+            &[DVV_ROOT_ECC_DER],
+            reference_time()?,
+            &provider,
+        )?;
+        check_true(
+            material.ocsp_responses.is_empty() && material.crls.is_empty(),
+            "no status above the anchor is not a failure",
         )
     }
 
