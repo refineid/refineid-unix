@@ -4,7 +4,8 @@ Verified on OpenBSD 8.0/amd64 under KVM, October 2026: the CLI, the
 PKCS#11 module and the FLTK GUI build from packages alone, and the GUI
 starts from the CDE Application Manager. With multicast enabled (section
 5), the GUI pairs with an iPhone and Firefox logs in to card.refineid.fi
-through it. Card readers attached to OpenBSD are not yet verified.
+through it. Firefox and Chromium log in with a card in a USB reader
+(HID OMNIKEY 3x21) and through the phone.
 
 ## 1. Packages
 
@@ -66,10 +67,23 @@ route -qn delete 224.0.0.0/4
 `rcctl enable multicast` takes effect at the next boot; deleting the
 reject route applies it now.
 
-## 6. Firefox
+## 6. Browsers
 
-Firefox on OpenBSD is confined with unveil(2), and the module it loads
-reads the phone pairings under `$XDG_CONFIG_HOME/refineid`.
+Both browsers on OpenBSD are confined with unveil(2), and the module they
+load reads the phone pairings under `~/.config/refineid`.
 `script/install-desktop.sh` adds that directory to
-`/etc/firefox/unveil.main` along with the policy that loads the module.
-Restart Firefox afterwards; it reads both only at startup.
+`/etc/firefox/unveil.main` and `/etc/chromium/unveil.main` when they exist.
+
+Firefox loads the module through its policy. Chromium reads the user's NSS
+database, which the browser-token script fills at each desktop login; in
+CDE, `/etc/dt/config/Xsession.d/0100.refineid` runs it. Restart the
+browsers afterwards; they read all of this only at startup.
+
+## 7. Card readers
+
+A reader connected to a running system was found after restarting
+`pcscd`; whether a running `pcscd` notices it unaided is not verified.
+
+```sh
+rcctl restart pcscd
+```
