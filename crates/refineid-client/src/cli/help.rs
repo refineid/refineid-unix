@@ -53,8 +53,10 @@ const SUMMARY_GAP: usize = 2;
 /// The blocks of the synopsis; a blank line separates them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Block {
-    /// The card: readout, PINs, keys.
+    /// The card: readout, keys.
     Card,
+    /// The card's PINs.
+    Pin,
     /// Signed documents.
     Document,
     /// The paired phone.
@@ -71,16 +73,12 @@ impl Block {
         match tag {
             VerbTag::CardCheck
             | VerbTag::CardEmrtd
-            | VerbTag::CardActivate
-            | VerbTag::CardChangePin1
-            | VerbTag::CardChangePin2
-            | VerbTag::CardUnblockPin1
-            | VerbTag::CardUnblockPin2
             | VerbTag::CardSignAuth
             | VerbTag::CardSignQualified
             | VerbTag::CardDecryptAuth
             | VerbTag::CardPubkey
             | VerbTag::CardExportAll => Self::Card,
+            VerbTag::PinActivate | VerbTag::PinChange | VerbTag::PinUnblock => Self::Pin,
             VerbTag::DocumentSign => Self::Document,
             VerbTag::CardPair | VerbTag::CardPairs | VerbTag::CardUnpair | VerbTag::CardAuth => {
                 Self::Phone
@@ -250,7 +248,12 @@ mod tests {
         check_true(!document.contains("cert show"), "no cert")?;
         let card = group("card").ok_or("card group")?;
         check_true(card.starts_with(VerbTag::CardCheck.help()), "card readout")?;
-        check_true(card.contains("card activate"), "card activate")?;
+        check_true(card.contains("card pubkey"), "card pubkey")?;
+        check_true(!card.contains("pin change"), "no pin commands")?;
+        let pin = group("pin").ok_or("pin group")?;
+        for command in ["pin activate", "pin change", "pin unblock"] {
+            check_true(pin.contains(command), command)?;
+        }
         check(
             &command(VerbTag::CardCheck),
             &card,

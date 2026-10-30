@@ -87,7 +87,7 @@ hop -- no sub-sub-CAs.
 Other intermediates listed in S2 §5 (`DVV Service
 Certificates - G5R`/`G5E`, `DVV Organisational Certificates -
 G4R`/`G4E`, social welfare / time stamp / temporary sub-CAs)
-are not in refineid's `card activate` scope; see
+are not in refineid's `pin activate` scope; see
 [`fineid-card-models.md`](fineid-card-models.md).
 
 ### Test hierarchy

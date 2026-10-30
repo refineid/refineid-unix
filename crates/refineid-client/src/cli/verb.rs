@@ -26,11 +26,12 @@
 //! (a parse failure has no Args yet, so the data-carrying
 //! [`Verb`] shape doesn't apply). [`VerbTag`] is finer-grained
 //! than [`Verb`] for pair-shaped subcommands: where
-//! `change-pin1` and `change-pin2` collapse into a single
-//! `Verb::CardChangePin(ChangePinArgs)` (the slot lives inside
-//! the Args), [`VerbTag`] keeps `CardChangePin1` and
-//! `CardChangePin2` distinct so error wording can name the
-//! exact subcommand that fired.
+//! `sign-auth` and `sign-qualified` collapse into a single
+//! `Verb::CardSign(SignArgs)` (the slot lives inside the Args),
+//! [`VerbTag`] keeps `CardSignAuth` and `CardSignQualified`
+//! distinct so error wording can name the exact subcommand that
+//! fired. The `pin` commands take the PIN as an argument, so one
+//! tag covers both PINs.
 //!
 //! Adding a new subcommand: add a [`VerbTag`] variant with its
 //! `label`, `summary`, `help` and `parse_args` arms and its place
@@ -68,16 +69,12 @@ pub enum VerbTag {
     /// `card export-all` -- bulk export of every readable
     /// slot's cert + pub key.
     CardExportAll,
-    /// `card activate` -- one-time DVV activation flow.
-    CardActivate,
-    /// `card change-pin1` -- rotate PIN1.
-    CardChangePin1,
-    /// `card change-pin2` -- rotate PIN2.
-    CardChangePin2,
-    /// `card unblock-pin1` -- PUK-driven unblock of PIN1.
-    CardUnblockPin1,
-    /// `card unblock-pin2` -- PUK-driven unblock of PIN2.
-    CardUnblockPin2,
+    /// `pin activate [1|2]` -- one-time DVV activation flow.
+    PinActivate,
+    /// `pin change 1|2` -- rotate a PIN.
+    PinChange,
+    /// `pin unblock 1|2` -- PUK-driven unblock of a PIN.
+    PinUnblock,
     /// `reader keyboard` -- ACS reader host-interface
     /// (keyboard wedge) status / control.
     ReaderKeyboard,
@@ -99,7 +96,7 @@ pub enum VerbTag {
 }
 
 impl VerbTag {
-    /// Operator-facing label, e.g. `"card change-pin1"`. Single
+    /// Operator-facing label, e.g. `"pin change"`. Single
     /// source of truth for subcommand strings -- consumed by
     /// [`super::ArgParseError`]'s `Display` impl.
     #[must_use]
@@ -113,11 +110,9 @@ impl VerbTag {
             Self::CardDecryptAuth => "card decrypt-auth",
             Self::CardPubkey => "card pubkey",
             Self::CardExportAll => "card export-all",
-            Self::CardActivate => "card activate",
-            Self::CardChangePin1 => "card change-pin1",
-            Self::CardChangePin2 => "card change-pin2",
-            Self::CardUnblockPin1 => "card unblock-pin1",
-            Self::CardUnblockPin2 => "card unblock-pin2",
+            Self::PinActivate => "pin activate",
+            Self::PinChange => "pin change",
+            Self::PinUnblock => "pin unblock",
             Self::ReaderKeyboard => "reader keyboard",
             Self::Verify => "verify",
             Self::CertShow => "cert show",
@@ -135,16 +130,14 @@ impl VerbTag {
     pub const ALL: &'static [Self] = &[
         Self::CardCheck,
         Self::CardEmrtd,
-        Self::CardActivate,
-        Self::CardChangePin1,
-        Self::CardChangePin2,
-        Self::CardUnblockPin1,
-        Self::CardUnblockPin2,
         Self::CardSignAuth,
         Self::CardSignQualified,
         Self::CardDecryptAuth,
         Self::CardPubkey,
         Self::CardExportAll,
+        Self::PinActivate,
+        Self::PinChange,
+        Self::PinUnblock,
         Self::DocumentSign,
         Self::CardPair,
         Self::CardPairs,
@@ -163,11 +156,9 @@ impl VerbTag {
         match self {
             Self::CardCheck => "read the card: certificates, revocation, PINs",
             Self::CardEmrtd => "read the travel-document data with the CAN",
-            Self::CardActivate => "activate a new card",
-            Self::CardChangePin1 => "change PIN1",
-            Self::CardChangePin2 => "change PIN2",
-            Self::CardUnblockPin1 => "unblock PIN1 with the PUK",
-            Self::CardUnblockPin2 => "unblock PIN2 with the PUK",
+            Self::PinActivate => "activate a new card's PINs",
+            Self::PinChange => "change PIN 1 or PIN 2",
+            Self::PinUnblock => "unblock PIN 1 or PIN 2 with the PUK",
             Self::CardSignAuth => "sign a file with the authentication key",
             Self::CardSignQualified => "sign a file with the qualified-signature key",
             Self::CardDecryptAuth => "decrypt a file with the authentication key",
@@ -193,9 +184,9 @@ impl VerbTag {
         match self {
             Self::CardCheck => super::card::HELP,
             Self::CardEmrtd => super::card_emrtd::HELP,
-            Self::CardActivate => super::card_activate::HELP,
-            Self::CardChangePin1 | Self::CardChangePin2 => super::card_change_pin::HELP,
-            Self::CardUnblockPin1 | Self::CardUnblockPin2 => super::card_unblock_pin::HELP,
+            Self::PinActivate => super::pin_activate::HELP,
+            Self::PinChange => super::pin_change::HELP,
+            Self::PinUnblock => super::pin_unblock::HELP,
             Self::CardSignAuth | Self::CardSignQualified => super::card_sign::HELP,
             Self::CardDecryptAuth => super::card_decrypt_auth::HELP,
             Self::CardPubkey => super::card_pubkey::HELP,
@@ -231,7 +222,6 @@ impl VerbTag {
         self,
         rest: super::argv::RemainingArgv,
     ) -> Result<Verb, super::ArgParseError> {
-        use crate::card_pin::PinManageSlot;
         use crate::card_sign::SignSlot;
         Ok(match self {
             Self::CardCheck => Verb::CardCheck(super::card::CardArgs::parse(rest)?),
@@ -253,21 +243,9 @@ impl VerbTag {
             Self::CardExportAll => {
                 Verb::CardExportAll(super::card_export_all::ExportAllArgs::parse(rest)?)
             }
-            Self::CardActivate => {
-                Verb::CardActivate(super::card_activate::ActivateArgs::parse(rest)?)
-            }
-            Self::CardChangePin1 => Verb::CardChangePin(
-                super::card_change_pin::ChangePinArgs::parse(PinManageSlot::Pin1, rest)?,
-            ),
-            Self::CardChangePin2 => Verb::CardChangePin(
-                super::card_change_pin::ChangePinArgs::parse(PinManageSlot::Pin2, rest)?,
-            ),
-            Self::CardUnblockPin1 => Verb::CardUnblockPin(
-                super::card_unblock_pin::UnblockPinArgs::parse(PinManageSlot::Pin1, rest)?,
-            ),
-            Self::CardUnblockPin2 => Verb::CardUnblockPin(
-                super::card_unblock_pin::UnblockPinArgs::parse(PinManageSlot::Pin2, rest)?,
-            ),
+            Self::PinActivate => Verb::PinActivate(super::pin_activate::ActivateArgs::parse(rest)?),
+            Self::PinChange => Verb::PinChange(super::pin_change::ChangePinArgs::parse(rest)?),
+            Self::PinUnblock => Verb::PinUnblock(super::pin_unblock::UnblockPinArgs::parse(rest)?),
             Self::ReaderKeyboard => {
                 Verb::ReaderKeyboard(super::reader_keyboard::ReaderKeyboardArgs::parse(rest)?)
             }
@@ -290,10 +268,9 @@ impl VerbTag {
 /// Args to its handler -- no argv-string handling, no untyped
 /// slice survives.
 ///
-/// Variant-pair subcommands (`sign-auth` vs `sign-qualified`,
-/// `change-pin1` vs `change-pin2`, ...) collapse to a single
-/// `Verb` variant; the slot identity is carried inside the
-/// typed Args (`SignArgs::slot`, `ChangePinArgs::slot`, ...).
+/// Variant-pair subcommands (`sign-auth` vs `sign-qualified`)
+/// collapse to a single `Verb` variant; the slot identity is
+/// carried inside the typed Args (`SignArgs::slot`).
 /// [`VerbTag`] *does* split them because it's the error-
 /// attribution label and operator messages need to name the
 /// exact subcommand that fired.
@@ -315,14 +292,12 @@ pub enum Verb {
     CardPubkey(super::card_pubkey::PubkeyArgs),
     /// `card export-all`.
     CardExportAll(super::card_export_all::ExportAllArgs),
-    /// `card activate`.
-    CardActivate(super::card_activate::ActivateArgs),
-    /// `card change-pin1` / `card change-pin2` (slot pivot
-    /// inside `ChangePinArgs::slot`).
-    CardChangePin(super::card_change_pin::ChangePinArgs),
-    /// `card unblock-pin1` / `card unblock-pin2` (slot pivot
-    /// inside `UnblockPinArgs::slot`).
-    CardUnblockPin(super::card_unblock_pin::UnblockPinArgs),
+    /// `pin activate [1|2]`.
+    PinActivate(super::pin_activate::ActivateArgs),
+    /// `pin change 1|2` (slot inside `ChangePinArgs::slot`).
+    PinChange(super::pin_change::ChangePinArgs),
+    /// `pin unblock 1|2` (slot inside `UnblockPinArgs::slot`).
+    PinUnblock(super::pin_unblock::UnblockPinArgs),
     /// `reader keyboard` -- ACS reader host-interface control.
     ReaderKeyboard(super::reader_keyboard::ReaderKeyboardArgs),
     /// `verify` -- offline signature verify.
@@ -344,11 +319,10 @@ pub enum Verb {
 impl Verb {
     /// The data-less tag identifying which subcommand this is.
     ///
-    /// For variant-pair shapes (sign / change-pin / unblock-pin)
-    /// the tag pivots off the slot field inside the Args.
+    /// For the sign pair the tag pivots off the slot field inside
+    /// the Args.
     #[must_use]
     pub const fn tag(&self) -> VerbTag {
-        use crate::card_pin::PinManageSlot;
         use crate::card_sign::SignSlot;
         match self {
             Self::CardCheck(_) => VerbTag::CardCheck,
@@ -361,15 +335,9 @@ impl Verb {
             Self::CardDecryptAuth(_) => VerbTag::CardDecryptAuth,
             Self::CardPubkey(_) => VerbTag::CardPubkey,
             Self::CardExportAll(_) => VerbTag::CardExportAll,
-            Self::CardActivate(_) => VerbTag::CardActivate,
-            Self::CardChangePin(a) => match a.slot {
-                PinManageSlot::Pin1 => VerbTag::CardChangePin1,
-                PinManageSlot::Pin2 => VerbTag::CardChangePin2,
-            },
-            Self::CardUnblockPin(a) => match a.slot {
-                PinManageSlot::Pin1 => VerbTag::CardUnblockPin1,
-                PinManageSlot::Pin2 => VerbTag::CardUnblockPin2,
-            },
+            Self::PinActivate(_) => VerbTag::PinActivate,
+            Self::PinChange(_) => VerbTag::PinChange,
+            Self::PinUnblock(_) => VerbTag::PinUnblock,
             Self::ReaderKeyboard(_) => VerbTag::ReaderKeyboard,
             Self::Verify(_) => VerbTag::Verify,
             Self::CertShow(_) => VerbTag::CertShow,
@@ -396,9 +364,9 @@ impl Verb {
             Self::CardDecryptAuth(a) => a.run(verbose),
             Self::CardPubkey(a) => a.run(),
             Self::CardExportAll(a) => a.run(verbose),
-            Self::CardActivate(a) => a.run(verbose),
-            Self::CardChangePin(a) => a.run(verbose),
-            Self::CardUnblockPin(a) => a.run(verbose),
+            Self::PinActivate(a) => a.run(verbose),
+            Self::PinChange(a) => a.run(verbose),
+            Self::PinUnblock(a) => a.run(verbose),
             Self::ReaderKeyboard(a) => a.run(verbose),
             Self::Verify(a) => a.run(),
             Self::CertShow(a) => a.run(),
@@ -568,6 +536,21 @@ pub fn route(
                 got: "reader (missing sub-verb, try: reader keyboard)".to_owned(),
             });
         }
+        [c, v, rest @ ..] if c == "pin" => match v.as_str() {
+            "activate" => (VerbTag::PinActivate, rest),
+            "change" => (VerbTag::PinChange, rest),
+            "unblock" => (VerbTag::PinUnblock, rest),
+            other => {
+                return Err(VerbParseError::Unrecognized {
+                    got: format!("pin {other}"),
+                });
+            }
+        },
+        [c] if c == "pin" => {
+            return Err(VerbParseError::Unrecognized {
+                got: "pin (missing sub-verb, try: pin change)".to_owned(),
+            });
+        }
         [c, v, rest @ ..] if c == "document" && v == "sign" => (VerbTag::DocumentSign, rest),
         [c, v, ..] if c == "document" => {
             return Err(VerbParseError::Unrecognized {
@@ -594,11 +577,6 @@ fn card_verb(token: &str) -> Option<VerbTag> {
         "decrypt-auth" => VerbTag::CardDecryptAuth,
         "pubkey" => VerbTag::CardPubkey,
         "export-all" => VerbTag::CardExportAll,
-        "activate" => VerbTag::CardActivate,
-        "change-pin1" => VerbTag::CardChangePin1,
-        "change-pin2" => VerbTag::CardChangePin2,
-        "unblock-pin1" => VerbTag::CardUnblockPin1,
-        "unblock-pin2" => VerbTag::CardUnblockPin2,
         _ => return None,
     })
 }
@@ -649,16 +627,52 @@ mod tests {
             ),
             ("pubkey", vec![], VerbTag::CardPubkey),
             ("export-all", vec!["/out"], VerbTag::CardExportAll),
-            ("activate", vec![], VerbTag::CardActivate),
-            ("change-pin1", vec![], VerbTag::CardChangePin1),
-            ("change-pin2", vec![], VerbTag::CardChangePin2),
-            ("unblock-pin1", vec![], VerbTag::CardUnblockPin1),
-            ("unblock-pin2", vec![], VerbTag::CardUnblockPin2),
         ] {
             let mut a = vec!["refineid", "card", verb];
             a.extend(extra.iter().copied());
             let sub = parse_argv(&argv(&a).clone())?;
             check(&sub.tag(), &expected, &format!("tag for verb {verb}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pin_group_dispatches_noun_then_verb() -> TestResult {
+        for (words, expected) in [
+            (vec!["pin", "activate"], VerbTag::PinActivate),
+            (vec!["pin", "activate", "2"], VerbTag::PinActivate),
+            (vec!["pin", "change", "1"], VerbTag::PinChange),
+            (vec!["pin", "unblock", "2"], VerbTag::PinUnblock),
+        ] {
+            let mut a = vec!["refineid"];
+            a.extend(words.iter().copied());
+            let sub = parse_argv(&argv(&a))?;
+            check(&sub.tag(), &expected, &format!("tag for {words:?}"))?;
+        }
+        for unknown in [vec!["refineid", "pin"], vec!["refineid", "pin", "bogus"]] {
+            check_true(
+                matches!(
+                    parse_argv(&argv(&unknown)),
+                    Err(ParseError::Verb(VerbParseError::Unrecognized { .. }))
+                ),
+                "missing or unknown pin verb",
+            )?;
+        }
+        for old in ["activate", "change-pin1", "unblock-pin2"] {
+            check_true(
+                !matches!(
+                    route(&argv(&["refineid", "card", old])),
+                    Ok((
+                        VerbTag::PinActivate | VerbTag::PinChange | VerbTag::PinUnblock,
+                        _
+                    ))
+                ),
+                &format!("card {old} is not a pin command"),
+            )?;
+            check_true(
+                parse_argv(&argv(&["refineid", "card", old])).is_err(),
+                &format!("card {old} is refused"),
+            )?;
         }
         Ok(())
     }

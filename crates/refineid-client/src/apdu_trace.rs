@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! APDU-level structured tracing for the `card activate` flow.
+//! APDU-level structured tracing for the `pin activate` flow.
 //!
 //! [`ApduTraceTransport`] is a thin [`CardTransport`] middleware
 //! that records every command APDU + its response on stderr in
@@ -28,9 +28,9 @@
 //!
 //! ## Scope
 //!
-//! The wrapper is currently used by `card activate` only
+//! The wrapper is currently used by `pin activate` only
 //! (`crates/refineid-client/src/card_pin.rs`). The
-//! `change-pin*` / `unblock-pin*` flows will move to it next; the
+//! `pin change` / `pin unblock` flows will move to it next; the
 //! observability surface they need is the same.
 
 use refineid_lib_core::atr::{Atr, AtrError};

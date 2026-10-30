@@ -12,34 +12,27 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! `card unblock-pin1` / `card unblock-pin2` typed arguments.
+//! `pin unblock 1|2` typed arguments.
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::PinManageSlot;
 
-/// What `refineid card unblock-pin1 help` and `unblock-pin2 help`
-/// prints. The man page refineid(1) carries the same facts.
+/// What `refineid pin unblock help` prints. The man page
+/// refineid(1) carries the same facts.
 pub const HELP: &str = "\
-usage: refineid card unblock-pin1 | unblock-pin2 [--reader SUBSTR]
+usage: refineid pin unblock 1|2 [--reader SUBSTR]
 
-Unblock PIN1 or PIN2 with the PUK and set a new PIN.
+Unblock PIN 1 or PIN 2 with the PUK and set a new PIN.
 Prints nothing on success; -v shows each step.
   --reader S  narrow to readers whose name contains S
 DANGER: a wrong PUK decrements the PUK counter; exhausting it
 permanently bricks the card.
 ";
 
-/// Parsed `card unblock-pin{1,2} [--reader SUBSTR]` arguments.
-///
-/// `slot` is set by the dispatcher at parse time -- which
-/// subcommand fired (`unblock-pin1` vs `unblock-pin2`) is the
-/// only signal for PIN1-vs-PIN2 identity, and we capture it
-/// into the typed struct so [`Self::run`] takes no extra
-/// argument.
+/// Parsed `pin unblock 1|2 [--reader SUBSTR]` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnblockPinArgs {
-    /// Which PIN slot to unblock; set by the dispatcher at
-    /// parse time.
+    /// Which PIN slot to unblock: the `1|2` argument.
     pub slot: PinManageSlot,
     /// Optional reader-name substring (`--reader SUBSTR`).
     /// Tier 0 `String`; presentational input to `ReaderFilter`.
@@ -47,7 +40,7 @@ pub struct UnblockPinArgs {
 }
 
 impl UnblockPinArgs {
-    /// Execute the `card unblock-pin{1,2}` verb. Silent on success;
+    /// Execute the `pin unblock` verb. Silent on success;
     /// `verbose` prints the step report.
     #[must_use]
     pub fn run(self, verbose: bool) -> std::process::ExitCode {
@@ -57,8 +50,8 @@ impl UnblockPinArgs {
             reader_filter,
         } = self;
         let cmd = match slot {
-            PinManageSlot::Pin1 => "card unblock-pin1",
-            PinManageSlot::Pin2 => "card unblock-pin2",
+            PinManageSlot::Pin1 => "pin unblock 1",
+            PinManageSlot::Pin2 => "pin unblock 2",
         };
         let label = super::util::pin_name(slot);
         let backend = refineid_lib_pcsc::PcscBackend;
@@ -147,19 +140,14 @@ impl UnblockPinArgs {
         }
     }
 
-    /// Parse the post-subcommand argv slice for the given
-    /// `slot`. The caller (the verb dispatcher) selects the
-    /// slot from which subcommand fired and we carry it into
-    /// the typed [`UnblockPinArgs`] so [`Self::run`] needs no
-    /// extra argument.
+    /// Parse the post-subcommand argv slice: the required `1|2`
+    /// and the options, in any order.
     ///
     /// # Errors
     /// [`ArgParseError`] for any shape violation.
-    pub fn parse(slot: PinManageSlot, argv: RemainingArgv) -> Result<Self, ArgParseError> {
-        let cmd = match slot {
-            PinManageSlot::Pin1 => VerbTag::CardUnblockPin1,
-            PinManageSlot::Pin2 => VerbTag::CardUnblockPin2,
-        };
+    pub fn parse(argv: RemainingArgv) -> Result<Self, ArgParseError> {
+        let cmd = VerbTag::PinUnblock;
+        let mut slot: Option<PinManageSlot> = None;
         let mut reader_filter: Option<String> = None;
         let tokens = argv.into_vec();
         let mut iter = tokens.iter();
@@ -172,14 +160,21 @@ impl UnblockPinArgs {
                     })?;
                     reader_filter = Some(value.clone());
                 }
-                other => {
-                    return Err(ArgParseError::Unexpected {
-                        cmd,
-                        got: other.to_owned(),
-                    });
-                }
+                other => match super::util::pin_number(other) {
+                    Some(number) if slot.is_none() => slot = Some(number),
+                    _ => {
+                        return Err(ArgParseError::Unexpected {
+                            cmd,
+                            got: other.to_owned(),
+                        });
+                    }
+                },
             }
         }
+        let slot = slot.ok_or(ArgParseError::Required {
+            cmd,
+            name: super::util::PIN_NUMBER,
+        })?;
         Ok(Self {
             slot,
             reader_filter,
@@ -194,26 +189,44 @@ mod tests {
     use crate::test_util::{TestResult, check, check_true};
 
     #[test]
-    fn parses_empty_argv() -> TestResult {
-        let a = UnblockPinArgs::parse(PinManageSlot::Pin1, argv(&[]))?;
+    fn parses_pin_number() -> TestResult {
+        let a = UnblockPinArgs::parse(argv(&["1"]))?;
         check_true(a.reader_filter.is_none(), "reader_filter=None")?;
         check(&a.slot, &PinManageSlot::Pin1, "slot")
     }
 
     #[test]
     fn parses_reader_filter() -> TestResult {
-        let a = UnblockPinArgs::parse(PinManageSlot::Pin2, argv(&["--reader", "OMNIKEY"]))?;
+        let a = UnblockPinArgs::parse(argv(&["2", "--reader", "Synthetic Card Reader"]))?;
         check(
             &a.reader_filter.as_deref(),
-            &Some("OMNIKEY"),
+            &Some("Synthetic Card Reader"),
             "reader_filter",
         )?;
         check(&a.slot, &PinManageSlot::Pin2, "slot")
     }
 
     #[test]
+    fn pin_number_is_required_and_one_or_two() -> TestResult {
+        check_true(
+            matches!(
+                UnblockPinArgs::parse(argv(&[])),
+                Err(ArgParseError::Required { .. })
+            ),
+            "missing number",
+        )?;
+        check_true(
+            matches!(
+                UnblockPinArgs::parse(argv(&["3"])),
+                Err(ArgParseError::Unexpected { .. })
+            ),
+            "3 rejected",
+        )
+    }
+
+    #[test]
     fn unknown_flag_rejected() -> TestResult {
-        let r = UnblockPinArgs::parse(PinManageSlot::Pin1, argv(&["--foo"]));
+        let r = UnblockPinArgs::parse(argv(&["1", "--foo"]));
         check_true(
             matches!(r, Err(ArgParseError::Unexpected { .. })),
             "Unexpected",

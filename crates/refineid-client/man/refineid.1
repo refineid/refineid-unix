@@ -11,7 +11,7 @@
 .\" WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 .\" implied. See the License for the specific language governing
 .\" permissions and limitations under the License.
-.Dd October 30, 2026
+.Dd October 31, 2026
 .Dt REFINEID 1
 .Os
 .Sh NAME
@@ -51,6 +51,8 @@ among a command's arguments, shows that command's options.
 .Nm
 .Cm card help ,
 .Nm
+.Cm pin help ,
+.Nm
 .Cm document help ,
 .Nm
 .Cm cert help
@@ -62,8 +64,10 @@ list a group's commands.
 The commands fall into groups:
 .Bl -tag -width Ds
 .It Cm card
-The card: readout, eMRTD data, activation, PINs, raw signatures,
-decryption and public keys.
+The card: readout, eMRTD data, raw signatures, decryption and public
+keys.
+.It Cm pin
+The card's PINs: activation, change and unblock.
 .It Cm document
 Signed documents a counterparty can open.
 .It Cm pair , pairs , unpair , auth
@@ -170,38 +174,6 @@ Narrow to readers whose name contains
 .Ar substr .
 .El
 .It Xo
-.Cm card activate
-.Op Fl -allow-reactivate
-.Op Fl -reader Ar substr
-.Xc
-First-time DVV card activation.
-Prompts for the activation PIN, then the new PIN1 and PIN2.
-Wrong tries consume the activation PIN's retry counter; locking it
-leaves recovery to the separately orderable paid PUK.
-.Bl -tag -width Ds
-.It Fl -allow-reactivate
-Run on a card that already looks activated.
-.El
-.It Xo
-.Cm card change-pin1 | change-pin2
-.Op Fl -reader Ar substr
-.Op Fl -can Ar can
-.Xc
-Rotate PIN1, the authentication PIN, or PIN2, the qualified-signature
-PIN.
-Prompts for the current PIN, then the new PIN twice.
-.Bl -tag -width Ds
-.It Fl -can Ar can
-The card access number; needed on the contactless interface.
-.El
-.It Xo
-.Cm card unblock-pin1 | unblock-pin2
-.Op Fl -reader Ar substr
-.Xc
-Unblock PIN1 or PIN2 with the PUK and set a new PIN.
-A wrong PUK decrements the PUK counter; exhausting it permanently
-bricks the card.
-.It Xo
 .Cm card sign-auth | sign-qualified
 .Fl -in Ar path
 .Fl -out Ar path
@@ -267,6 +239,48 @@ serial number.
 Write every public artefact to
 .Ar dir .
 No PIN, no network.
+.It Xo
+.Cm pin activate
+.Op Cm 1 | 2
+.Op Fl -allow-reactivate
+.Op Fl -reader Ar substr
+.Xc
+First-time DVV card activation.
+Prompts for the activation PIN, then the new PIN 1 and PIN 2, PIN 1
+set first; with
+.Cm 1
+or
+.Cm 2 ,
+only that PIN.
+The card is fully active once both are set; after one PIN, a line on
+the standard error says when the other still looks unactivated.
+Wrong tries consume the activation PIN's retry counter; locking it
+leaves recovery to the separately orderable paid PUK.
+.Bl -tag -width Ds
+.It Fl -allow-reactivate
+Run on a card whose PIN already looks activated.
+.El
+.It Xo
+.Cm pin change
+.Cm 1 | 2
+.Op Fl -reader Ar substr
+.Op Fl -can Ar can
+.Xc
+Rotate PIN 1, the authentication PIN, or PIN 2, the qualified-signature
+PIN.
+Prompts for the current PIN, then the new PIN twice.
+.Bl -tag -width Ds
+.It Fl -can Ar can
+The card access number; needed on the contactless interface.
+.El
+.It Xo
+.Cm pin unblock
+.Cm 1 | 2
+.Op Fl -reader Ar substr
+.Xc
+Unblock PIN 1 or PIN 2 with the PUK and set a new PIN.
+A wrong PUK decrements the PUK counter; exhausting it permanently
+bricks the card.
 .It Xo
 .Cm document sign
 .Ar file ...
@@ -439,10 +453,9 @@ feature.
 .It Ev REFINEID_CURRENT_PIN1 , REFINEID_CURRENT_PIN2 , \
 REFINEID_NEW_PIN1 , REFINEID_NEW_PIN2 , REFINEID_ACTIVATION_PIN
 Read instead of the prompts by
-.Cm card change-pin1 ,
-.Cm card change-pin2
+.Cm pin change
 and
-.Cm card activate ,
+.Cm pin activate ,
 only in a build with the
 .Li pin-env-debug
 feature.
@@ -490,7 +503,7 @@ Sign a PDF with the qualified-signature key:
 .Dl $ refineid document sign report.pdf
 .Pp
 Show the options of one command:
-.Dl $ refineid card activate help
+.Dl $ refineid pin change help
 .Sh SEE ALSO
 .Xr pcscd 8
 .Rs

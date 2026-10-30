@@ -12,41 +12,46 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! `card activate` typed arguments.
+//! `pin activate [1|2]` typed arguments.
 
 use std::process::ExitCode;
 
 /// Helpers hosted on a unit struct (typing-discipline: no
 /// free fns with borrowed parameters; see
 /// `doc/typing-discipline.md`).
-struct CardActivateHelpers;
+struct PinActivateHelpers;
 
 use refineid_lib_core::auth::UnblockOutcome;
 use refineid_lib_core::pin::ActivationCode;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::{
-    ActivateReport, ActivationCardContext, CardPinError, CardTrustAttestation, PinManageSlot,
+    ActivateReport, ActivationCardContext, ActivationTarget, CardPinError, CardTrustAttestation,
+    PinManageSlot,
 };
 use crate::exit_status::ExitStatus;
 
-/// What `refineid card activate help`
+/// What `refineid pin activate help`
 /// prints. The man page refineid(1) carries the same facts.
 pub const HELP: &str = "\
-usage: refineid card activate [--allow-reactivate] [--reader SUBSTR]
+usage: refineid pin activate [1|2] [--allow-reactivate] [--reader SUBSTR]
 
 First-time DVV card activation. Prompts for the activation PIN, then
-new PIN1 and PIN2. Prints nothing on success; -v shows each step.
+new PIN 1 and PIN 2, or only the PIN named. Prints nothing on success;
+-v shows each step.
   --allow-reactivate  run on a card that already looks activated
   --reader S          narrow to readers whose name contains S
 WARNING: wrong tries consume the activation PIN's retry counter;
 locking it leaves recovery to the separately orderable paid PUK.
 ";
 
-/// Parsed `card activate [--allow-reactivate] [--reader SUBSTR]`
+/// Parsed `pin activate [1|2] [--allow-reactivate] [--reader SUBSTR]`
 /// arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ActivateArgs {
+    /// The PIN to activate: the optional `1|2` argument. `None`
+    /// activates both, PIN 1 then PIN 2.
+    pub slot: Option<PinManageSlot>,
     /// Override the pre-flight refusal on an apparently-
     /// activated card. Rarely the right answer; the prompt
     /// in the activate flow itself explains the trade-off.
@@ -56,15 +61,43 @@ pub struct ActivateArgs {
     pub reader_filter: Option<String>,
 }
 
-/// CLI verb tag inserted into every operator-facing error
-/// message. Lets `eprintln!` lines start with the standard
-/// `"card activate: ..."` prefix without hard-coding the
-/// string at each call site.
-const CMD: &str = "card activate";
+/// The prefix of every operator-facing message, after the PIN the
+/// invocation activates.
+const fn cmd(slot: Option<PinManageSlot>) -> &'static str {
+    match slot {
+        None => "pin activate",
+        Some(PinManageSlot::Pin1) => "pin activate 1",
+        Some(PinManageSlot::Pin2) => "pin activate 2",
+    }
+}
+
+/// The length hint of a new PIN's first prompt.
+const fn digit_hint(slot: PinManageSlot) -> &'static str {
+    match slot {
+        PinManageSlot::Pin1 => "basic, 4-12 digits",
+        PinManageSlot::Pin2 => "signature, 6-12 digits",
+    }
+}
+
+/// The env var consulted for a new PIN; see [`ENV_NEW_PIN1`].
+const fn env_new_pin(slot: PinManageSlot) -> &'static str {
+    match slot {
+        PinManageSlot::Pin1 => ENV_NEW_PIN1,
+        PinManageSlot::Pin2 => ENV_NEW_PIN2,
+    }
+}
+
+/// The PIN a one-PIN activation leaves as it was.
+const fn other_pin(slot: PinManageSlot) -> PinManageSlot {
+    match slot {
+        PinManageSlot::Pin1 => PinManageSlot::Pin2,
+        PinManageSlot::Pin2 => PinManageSlot::Pin1,
+    }
+}
 
 /// Env var consulted (alpha-period debug aid) for the 7-/8-digit
 /// activation PIN before the interactive prompt. See
-/// [`CardActivateHelpers::read_pin_env_or_prompt`] for the
+/// [`PinActivateHelpers::read_pin_env_or_prompt`] for the
 /// semantics and the AGENTS.md §6 alpha exception.
 const ENV_ACTIVATION_PIN: &str = "REFINEID_ACTIVATION_PIN";
 /// Env var consulted (alpha-period debug aid) for the new PIN1
@@ -75,14 +108,18 @@ const ENV_NEW_PIN1: &str = "REFINEID_NEW_PIN1";
 const ENV_NEW_PIN2: &str = "REFINEID_NEW_PIN2";
 
 impl ActivateArgs {
-    /// Execute the `card activate` verb. Silent on success; `verbose`
-    /// prints the step report.
+    /// Execute the `pin activate` verb. Silent on success; `verbose`
+    /// prints the step report. A one-PIN activation that leaves the
+    /// other PIN unactivated says so on stderr.
     #[must_use]
     pub fn run(self, verbose: bool) -> ExitCode {
         let Self {
+            slot,
             allow_reactivate,
             reader_filter,
         } = self;
+        let cmd = cmd(slot);
+        let target = slot.map_or(ActivationTarget::Both, ActivationTarget::One);
         let backend = refineid_lib_pcsc::PcscBackend;
         let typed_reader_filter = reader_filter
             .as_deref()
@@ -93,84 +130,119 @@ impl ActivateArgs {
         ) {
             Ok(c) => c,
             Err(CardPinError::ReaderPick(pe)) => {
-                return super::util::reader_pick_exit(CMD, &pe);
+                return super::util::reader_pick_exit(cmd, &pe);
             }
             Err(e) => {
-                eprintln!("{CMD}: {e}");
+                eprintln!("{cmd}: {e}");
                 return ExitStatus::RuntimeFailure.into();
             }
         };
         let Some(expected_len) = ctx.expected_activation_pin_length() else {
             eprintln!(
-                "{CMD}: couldn't classify card generation from auth cert; \
+                "{cmd}: couldn't classify card generation from auth cert; \
                  refusing to guess at activation PIN length"
             );
             return ExitStatus::RuntimeFailure.into();
         };
         if verbose {
-            CardActivateHelpers::note_generation_disagreement(&ctx, verbose);
+            PinActivateHelpers::note_generation_disagreement(cmd, &ctx, verbose);
         }
         // Refuse an activated card, or a counter below the retry floor,
         // before prompting.
-        match crate::card_pin::probe_activation_gate_for_cli(backend, &ctx, allow_reactivate) {
+        match crate::card_pin::probe_activation_gate_for_cli(
+            backend,
+            &ctx,
+            target,
+            allow_reactivate,
+        ) {
             Ok(None) => {}
             Ok(Some(refused)) => {
-                let status = CardActivateHelpers::activate_outcome_status(&refused);
+                let status = PinActivateHelpers::activate_outcome_status(&refused);
                 super::util::show_outcome(verbose, status == ExitStatus::Ok, &refused);
                 return status.into();
             }
             Err(e @ CardPinError::RetryFloor(_)) => {
-                eprintln!("{CMD}: {e}");
+                eprintln!("{cmd}: {e}");
                 return ExitStatus::CardCredentialRejected.into();
             }
             Err(e) => {
-                eprintln!("{CMD}: {e}");
+                eprintln!("{cmd}: {e}");
                 return ExitStatus::RuntimeFailure.into();
             }
         }
-        CardActivateHelpers::emit_preflight_event(&ctx, expected_len);
-        let activation_pin = match CardActivateHelpers::prompt_activation_pin(expected_len) {
+        PinActivateHelpers::emit_preflight_event(&ctx, expected_len);
+        let activation_pin = match PinActivateHelpers::prompt_activation_pin(cmd, expected_len) {
             Ok(p) => p,
             Err(exit) => return exit,
         };
-        let pin1_new = match super::util::new_pin_env_or_prompt(
-            CMD,
-            ENV_NEW_PIN1,
-            super::util::pin_name(PinManageSlot::Pin1),
-            Some("basic, 4-12 digits"),
-        ) {
-            Ok(p) => p,
-            Err(exit) => return exit,
+        let new_pin = |slot: PinManageSlot| {
+            super::util::new_pin_env_or_prompt(
+                cmd,
+                env_new_pin(slot),
+                super::util::pin_name(slot),
+                Some(digit_hint(slot)),
+            )
         };
-        let pin2_new = match super::util::new_pin_env_or_prompt(
-            CMD,
-            ENV_NEW_PIN2,
-            super::util::pin_name(PinManageSlot::Pin2),
-            Some("signature, 6-12 digits"),
-        ) {
-            Ok(p) => p,
-            Err(exit) => return exit,
-        };
-        let options = crate::card_pin::ActivateOptions {
-            activation_pin,
-            new_pin1: pin1_new,
-            new_pin2: pin2_new,
-            allow_reactivate,
+        let result = match slot {
+            None => {
+                let pin1_new = match new_pin(PinManageSlot::Pin1) {
+                    Ok(p) => p,
+                    Err(exit) => return exit,
+                };
+                let pin2_new = match new_pin(PinManageSlot::Pin2) {
+                    Ok(p) => p,
+                    Err(exit) => return exit,
+                };
+                crate::card_pin::activate_first(
+                    backend,
+                    ctx,
+                    crate::card_pin::ActivateOptions {
+                        activation_pin,
+                        new_pin1: pin1_new,
+                        new_pin2: pin2_new,
+                        allow_reactivate,
+                    },
+                )
+            }
+            Some(slot) => {
+                let new = match new_pin(slot) {
+                    Ok(p) => p,
+                    Err(exit) => return exit,
+                };
+                crate::card_pin::activate_one_first(
+                    backend,
+                    ctx,
+                    crate::card_pin::ActivateOneOptions {
+                        activation_pin,
+                        slot,
+                        new_pin: new,
+                        allow_reactivate,
+                    },
+                )
+            }
         };
         drop(reader_filter);
-        match crate::card_pin::activate_first(backend, ctx, options) {
+        match result {
             Ok(report) => {
-                let status = CardActivateHelpers::activate_outcome_status(&report);
+                let status = PinActivateHelpers::activate_outcome_status(&report);
                 super::util::show_outcome(verbose, status == ExitStatus::Ok, &report);
+                if let (ExitStatus::Ok, ActivationTarget::One(done)) = (status, report.target)
+                    && report.other_looks_unactivated
+                {
+                    eprintln!(
+                        "{cmd}: {} is not activated; the card is not fully active",
+                        super::util::pin_name(other_pin(done))
+                    );
+                }
                 status.into()
             }
-            Err(CardPinError::ReaderPick(pe)) => super::util::reader_pick_exit(CMD, &pe),
+            Err(CardPinError::ReaderPick(pe)) => super::util::reader_pick_exit(cmd, &pe),
             Err(e @ (CardPinError::PinPolicy(_) | CardPinError::RetryFloor(_))) => {
-                eprintln!("{CMD}: {e}");
+                eprintln!("{cmd}: {e}");
                 ExitStatus::CardCredentialRejected.into()
             }
             Err(e) => {
-                eprintln!("{CMD}: {e}");
+                eprintln!("{cmd}: {e}");
                 ExitStatus::RuntimeFailure.into()
             }
         }
@@ -181,6 +253,7 @@ impl ActivateArgs {
     /// # Errors
     /// [`ArgParseError`] for any shape violation.
     pub fn parse(argv: RemainingArgv) -> Result<Self, ArgParseError> {
+        let mut slot: Option<PinManageSlot> = None;
         let mut allow_reactivate = false;
         let mut reader_filter: Option<String> = None;
         let tokens = argv.into_vec();
@@ -190,20 +263,24 @@ impl ActivateArgs {
                 "--allow-reactivate" => allow_reactivate = true,
                 "--reader" => {
                     let value = iter.next().ok_or(ArgParseError::MissingValue {
-                        cmd: VerbTag::CardActivate,
+                        cmd: VerbTag::PinActivate,
                         flag: "--reader",
                     })?;
                     reader_filter = Some(value.clone());
                 }
-                other => {
-                    return Err(ArgParseError::Unexpected {
-                        cmd: VerbTag::CardActivate,
-                        got: other.to_owned(),
-                    });
-                }
+                other => match super::util::pin_number(other) {
+                    Some(number) if slot.is_none() => slot = Some(number),
+                    _ => {
+                        return Err(ArgParseError::Unexpected {
+                            cmd: VerbTag::PinActivate,
+                            got: other.to_owned(),
+                        });
+                    }
+                },
             }
         }
         Ok(Self {
+            slot,
             allow_reactivate,
             reader_filter,
         })
@@ -214,7 +291,7 @@ impl ActivateArgs {
 /// disagrees with the issuer-CN heuristic. The issuance-date
 /// verdict wins regardless; the line just records the
 /// disagreement for the operator's log.
-impl CardActivateHelpers {
+impl PinActivateHelpers {
     /// Print a one-line operator note when the two card-
     /// generation signals disagree; the caller does so under `-v`.
     ///
@@ -225,13 +302,13 @@ impl CardActivateHelpers {
     /// the issuance-date verdict wins and the flow continues;
     /// the note exists so the discrepancy lands in the audit
     /// log.
-    fn note_generation_disagreement(ctx: &ActivationCardContext, verbose: bool) {
+    fn note_generation_disagreement(cmd: &str, ctx: &ActivationCardContext, verbose: bool) {
         if verbose
             && ctx.generation != ctx.generation_by_issuer_cn
             && ctx.generation_by_issuer_cn != refineid_lib_core::pkcs15::CardGeneration::Unknown
         {
             eprintln!(
-                "{CMD}: note: card generation by issuance-date ({:?}) disagrees with \
+                "{cmd}: note: card generation by issuance-date ({:?}) disagrees with \
              issuer-CN heuristic ({:?}); proceeding with the issuance-date verdict",
                 ctx.generation, ctx.generation_by_issuer_cn,
             );
@@ -240,10 +317,10 @@ impl CardActivateHelpers {
 }
 
 /// Emit the JSONL pre-flight event with trust-state + card-model
-/// metadata. The operator's `card activate` invocation flushes
+/// metadata. The operator's `pin activate` invocation flushes
 /// this *before* the activation-PIN prompt so log scrapers can
 /// pair the prompt with the targeted card.
-impl CardActivateHelpers {
+impl PinActivateHelpers {
     /// Emit the `card.activate.preflight.ready` JSONL event.
     ///
     /// Captures the trust state, card-model facts, and the
@@ -294,7 +371,7 @@ impl CardActivateHelpers {
 /// length-typed constructor rejects a mistyped value at the
 /// trust boundary so the activate call only sees the in-shape
 /// form.
-impl CardActivateHelpers {
+impl PinActivateHelpers {
     /// Prompt for the activation PIN and lift it into the
     /// length-typed [`ActivationCode`] variant.
     ///
@@ -305,9 +382,9 @@ impl CardActivateHelpers {
     /// contract" return is a host bug, not a card outcome --
     /// the calling site should already have classified the
     /// generation.
-    fn prompt_activation_pin(expected_len: usize) -> Result<ActivationCode, ExitCode> {
+    fn prompt_activation_pin(cmd: &str, expected_len: usize) -> Result<ActivationCode, ExitCode> {
         let raw = super::util::pin_env_or_prompt(
-            CMD,
+            cmd,
             ENV_ACTIVATION_PIN,
             super::util::PROMPT_ACTIVATION_PIN,
         )?;
@@ -315,17 +392,17 @@ impl CardActivateHelpers {
             7 => refineid_lib_core::pin::ActivationPinSeven::new(raw)
                 .map(ActivationCode::Seven)
                 .map_err(|e| {
-                    eprintln!("{CMD}: activation PIN: {e}");
+                    eprintln!("{cmd}: activation PIN: {e}");
                     ExitCode::from(ExitStatus::BadInvocation)
                 }),
             8 => refineid_lib_core::pin::ActivationPinEight::new(raw)
                 .map(ActivationCode::Eight)
                 .map_err(|e| {
-                    eprintln!("{CMD}: activation PIN: {e}");
+                    eprintln!("{cmd}: activation PIN: {e}");
                     ExitCode::from(ExitStatus::BadInvocation)
                 }),
             other => {
-                eprintln!("{CMD}: unexpected activation PIN length contract: {other}");
+                eprintln!("{cmd}: unexpected activation PIN length contract: {other}");
                 Err(ExitStatus::RuntimeFailure.into())
             }
         }
@@ -335,18 +412,18 @@ impl CardActivateHelpers {
 /// Map the card-side per-PIN outcome pair to the project's exit
 /// status convention:
 ///
-/// - Both PINs Ok -> `Ok`.
+/// - Every targeted PIN Ok -> `Ok`.
 /// - Pre-flight refused (rerun with `--allow-reactivate`) ->
 ///   `NoReaders` (no-cards-applied "config-like" exit; not a
 ///   hard failure).
 /// - Either PIN rejected by card (wrong PUK / locked /
 ///   invalidated) -> `CardCredentialRejected`.
 /// - Anything else -> `RuntimeFailure`.
-impl CardActivateHelpers {
+impl PinActivateHelpers {
     /// Translate the [`ActivateReport`] into an
     /// [`ExitStatus`].
     ///
-    /// `Ok` only when both PINs succeeded; otherwise the
+    /// `Ok` only when every targeted PIN succeeded; otherwise the
     /// mapping is per the project exit-status contract:
     /// pre-flight refusal -> `NoReaders`,
     /// `WrongPuk`/`PukLocked`/`Invalidated` ->
@@ -355,15 +432,31 @@ impl CardActivateHelpers {
     /// source of truth; the CLI shell honours it for the
     /// process exit code.
     fn activate_outcome_status(report: &ActivateReport) -> ExitStatus {
+        let all_ok = match report.target {
+            ActivationTarget::Both => matches!(
+                (&report.pin1_outcome, &report.pin2_outcome),
+                (Some(UnblockOutcome::Ok), Some(UnblockOutcome::Ok))
+            ),
+            ActivationTarget::One(PinManageSlot::Pin1) => {
+                matches!(report.pin1_outcome, Some(UnblockOutcome::Ok))
+            }
+            ActivationTarget::One(PinManageSlot::Pin2) => {
+                matches!(report.pin2_outcome, Some(UnblockOutcome::Ok))
+            }
+        };
+        if all_ok {
+            return ExitStatus::Ok;
+        }
         match (&report.pin1_outcome, &report.pin2_outcome) {
-            (Some(UnblockOutcome::Ok), Some(UnblockOutcome::Ok)) => ExitStatus::Ok,
             (None, None) => ExitStatus::NoReaders,
-            (Some(o1), o2)
+            (o1, o2)
                 if matches!(
                     o1,
-                    UnblockOutcome::WrongPuk { .. }
-                        | UnblockOutcome::PukLocked
-                        | UnblockOutcome::Invalidated
+                    Some(
+                        UnblockOutcome::WrongPuk { .. }
+                            | UnblockOutcome::PukLocked
+                            | UnblockOutcome::Invalidated
+                    )
                 ) || matches!(
                     o2,
                     Some(
@@ -389,6 +482,7 @@ mod tests {
     #[test]
     fn defaults() -> TestResult {
         let a = ActivateArgs::parse(argv(&[]))?;
+        check_true(a.slot.is_none(), "both PINs")?;
         check_true(!a.allow_reactivate, "allow_reactivate=false")?;
         check_true(a.reader_filter.is_none(), "reader_filter=None")
     }
@@ -398,6 +492,23 @@ mod tests {
         let a = ActivateArgs::parse(argv(&["--allow-reactivate", "--reader", "ACS"]))?;
         check_true(a.allow_reactivate, "allow_reactivate=true")?;
         check(&a.reader_filter.as_deref(), &Some("ACS"), "reader_filter")
+    }
+
+    #[test]
+    fn parses_optional_pin_number() -> TestResult {
+        let a = ActivateArgs::parse(argv(&["2", "--allow-reactivate"]))?;
+        check(&a.slot, &Some(PinManageSlot::Pin2), "slot")?;
+        check_true(a.allow_reactivate, "allow_reactivate=true")?;
+        for bad in [&["3"][..], &["1", "2"]] {
+            check_true(
+                matches!(
+                    ActivateArgs::parse(argv(bad)),
+                    Err(ArgParseError::Unexpected { .. })
+                ),
+                &format!("{bad:?} rejected"),
+            )?;
+        }
+        Ok(())
     }
 
     #[test]

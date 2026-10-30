@@ -12,19 +12,19 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! `card change-pin1` / `card change-pin2` typed arguments.
+//! `pin change 1|2` typed arguments.
 
 use refineid_lib_core::auth::check_retry_floor;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::PinManageSlot;
 
-/// What `refineid card change-pin1 help` and `change-pin2 help`
-/// prints. The man page refineid(1) carries the same facts.
+/// What `refineid pin change help` prints. The man page
+/// refineid(1) carries the same facts.
 pub const HELP: &str = "\
-usage: refineid card change-pin1 | change-pin2 [--reader SUBSTR] [--can NNNNNN]
+usage: refineid pin change 1|2 [--reader SUBSTR] [--can NNNNNN]
 
-Rotate PIN1 (authentication) or PIN2 (qualified signature). Prompts
+Rotate PIN 1 (authentication) or PIN 2 (qualified signature). Prompts
 for the current PIN, then the new PIN twice.
 Prints nothing on success; -v shows each step.
   --reader S    narrow to readers whose name contains S
@@ -32,17 +32,11 @@ Prints nothing on success; -v shows each step.
                 interface
 ";
 
-/// Parsed `card change-pin{1,2} [--reader SUBSTR]` arguments.
-///
-/// `slot` is set by the dispatcher at parse time -- which
-/// subcommand fired (`change-pin1` vs `change-pin2`) is the
-/// only signal for PIN1-vs-PIN2 identity, and we capture it
-/// into the typed struct so [`Self::run`] takes no extra
-/// argument.
+/// Parsed `pin change 1|2 [--reader SUBSTR] [--can NNNNNN]`
+/// arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangePinArgs {
-    /// Which PIN slot to rotate; set by the dispatcher at parse
-    /// time.
+    /// Which PIN slot to rotate: the `1|2` argument.
     pub slot: PinManageSlot,
     /// Optional reader-name substring (`--reader SUBSTR`).
     /// Tier 0 `String`; presentational input to `ReaderFilter`.
@@ -53,7 +47,7 @@ pub struct ChangePinArgs {
 }
 
 impl ChangePinArgs {
-    /// Execute the `card change-pin{1,2}` verb. Silent on success;
+    /// Execute the `pin change` verb. Silent on success;
     /// `verbose` prints the step report.
     #[must_use]
     pub fn run(self, verbose: bool) -> std::process::ExitCode {
@@ -64,8 +58,8 @@ impl ChangePinArgs {
             can: _,
         } = self;
         let cmd = match slot {
-            PinManageSlot::Pin1 => "card change-pin1",
-            PinManageSlot::Pin2 => "card change-pin2",
+            PinManageSlot::Pin1 => "pin change 1",
+            PinManageSlot::Pin2 => "pin change 2",
         };
         let label = super::util::pin_name(slot);
         let backend = refineid_lib_pcsc::PcscBackend;
@@ -153,19 +147,14 @@ impl ChangePinArgs {
         }
     }
 
-    /// Parse the post-subcommand argv slice for the given
-    /// `slot`. The caller (the verb dispatcher) selects the
-    /// slot from which subcommand fired and we carry it into
-    /// the typed [`ChangePinArgs`] so [`Self::run`] needs no
-    /// extra argument.
+    /// Parse the post-subcommand argv slice: the required `1|2`
+    /// and the options, in any order.
     ///
     /// # Errors
     /// [`ArgParseError`] for any shape violation.
-    pub fn parse(slot: PinManageSlot, argv: RemainingArgv) -> Result<Self, ArgParseError> {
-        let cmd = match slot {
-            PinManageSlot::Pin1 => VerbTag::CardChangePin1,
-            PinManageSlot::Pin2 => VerbTag::CardChangePin2,
-        };
+    pub fn parse(argv: RemainingArgv) -> Result<Self, ArgParseError> {
+        let cmd = VerbTag::PinChange;
+        let mut slot: Option<PinManageSlot> = None;
         let mut reader_filter: Option<String> = None;
         let mut can: Option<refineid_lib_core::can::Can> = None;
         let tokens = argv.into_vec();
@@ -193,14 +182,21 @@ impl ChangePinArgs {
                     })?;
                     can = Some(parsed);
                 }
-                other => {
-                    return Err(ArgParseError::Unexpected {
-                        cmd,
-                        got: other.to_owned(),
-                    });
-                }
+                other => match super::util::pin_number(other) {
+                    Some(number) if slot.is_none() => slot = Some(number),
+                    _ => {
+                        return Err(ArgParseError::Unexpected {
+                            cmd,
+                            got: other.to_owned(),
+                        });
+                    }
+                },
             }
         }
+        let slot = slot.ok_or(ArgParseError::Required {
+            cmd,
+            name: super::util::PIN_NUMBER,
+        })?;
         Ok(Self {
             slot,
             reader_filter,
@@ -216,22 +212,47 @@ mod tests {
     use crate::test_util::{TestResult, check, check_true};
 
     #[test]
-    fn parses_empty_argv_with_no_reader_filter() -> TestResult {
-        let a = ChangePinArgs::parse(PinManageSlot::Pin1, argv(&[]))?;
+    fn parses_pin_number_with_no_reader_filter() -> TestResult {
+        let a = ChangePinArgs::parse(argv(&["1"]))?;
         check_true(a.reader_filter.is_none(), "reader_filter=None")?;
         check(&a.slot, &PinManageSlot::Pin1, "slot")
     }
 
     #[test]
-    fn parses_reader_filter() -> TestResult {
-        let a = ChangePinArgs::parse(PinManageSlot::Pin2, argv(&["--reader", "ACS"]))?;
-        check(&a.reader_filter.as_deref(), &Some("ACS"), "reader_filter")?;
+    fn parses_reader_filter_before_pin_number() -> TestResult {
+        let a = ChangePinArgs::parse(argv(&["--reader", "Synthetic Card Reader", "2"]))?;
+        check(
+            &a.reader_filter.as_deref(),
+            &Some("Synthetic Card Reader"),
+            "reader_filter",
+        )?;
         check(&a.slot, &PinManageSlot::Pin2, "slot")
     }
 
     #[test]
+    fn pin_number_is_required_and_one_or_two() -> TestResult {
+        check_true(
+            matches!(
+                ChangePinArgs::parse(argv(&[])),
+                Err(ArgParseError::Required { .. })
+            ),
+            "missing number",
+        )?;
+        for bad in [&["3"][..], &["0"], &["pin1"], &["1", "2"], &["1", "1"]] {
+            check_true(
+                matches!(
+                    ChangePinArgs::parse(argv(bad)),
+                    Err(ArgParseError::Unexpected { .. })
+                ),
+                &format!("{bad:?} rejected"),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn unknown_flag_rejected() -> TestResult {
-        let r = ChangePinArgs::parse(PinManageSlot::Pin1, argv(&["--enforce-strong"]));
+        let r = ChangePinArgs::parse(argv(&["1", "--enforce-strong"]));
         check_true(
             matches!(r, Err(ArgParseError::Unexpected { .. })),
             "Unexpected",
@@ -240,7 +261,7 @@ mod tests {
 
     #[test]
     fn reader_without_value_rejected() -> TestResult {
-        let r = ChangePinArgs::parse(PinManageSlot::Pin1, argv(&["--reader"]));
+        let r = ChangePinArgs::parse(argv(&["1", "--reader"]));
         check_true(
             matches!(r, Err(ArgParseError::MissingValue { .. })),
             "MissingValue",

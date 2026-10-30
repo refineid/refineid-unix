@@ -26,9 +26,8 @@
 //! - **PIN-gated crypto**: `card sign-auth`,
 //!   `card sign-qualified`, `card decrypt-auth`.
 //! - **PIN management** (rotate / unblock / first-time
-//!   activation): `card activate`, `card change-pin1`,
-//!   `card change-pin2`, `card unblock-pin1`,
-//!   `card unblock-pin2`.
+//!   activation): `pin activate [1|2]`, `pin change 1|2`,
+//!   `pin unblock 1|2`.
 //! - **Offline tools** (no card / no network): `verify`,
 //!   `cert show`, `cert chain`.
 //!

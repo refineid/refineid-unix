@@ -28,7 +28,7 @@ classifier in `refineid-lib-core` in the same change.
 
 ## Scope: in-production citizen eID cards only
 
-refineid's `card activate` and related flows target **citizen
+refineid's `pin activate` and related flows target **citizen
 eID cards still in the field**. As of 2026-05-24 that is two
 models:
 
@@ -228,7 +228,7 @@ in-scope OSes. Live-tested 2026-05-24:
 
 Implications for the PIN-management commands:
 
-- `change-pin*` / `unblock-pin*` run a `pin_status`
+- `pin change` / `pin unblock` run a `pin_status`
   preflight that refuses on `NoInfo` / `Other` / no-probe
   states. This catches *some* unactivated cards but NOT
   Thales MultiApp v5.0.
@@ -238,7 +238,7 @@ Implications for the PIN-management commands:
   a refactor that mis-routes a context fails to compile.
 - The runtime burn-protection ultimately comes down to the
   card's own try counter. Operator error (inserting an
-  unactivated card and running `change-pin1`) costs one PIN
+  unactivated card and running `pin change 1`) costs one PIN
   try and one PUK / activation-PIN try.
 
 Open follow-up: probe the activation-PIN slot (`0x83`) for
