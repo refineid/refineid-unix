@@ -1154,6 +1154,27 @@ impl core::fmt::Display for VerifyError {
 
 impl core::error::Error for VerifyError {}
 
+/// Why [`SpkiDer::verify_digest_signature`] accepted no signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestCheckError {
+    /// The check cannot run: the key is not of the algorithm's kind or
+    /// does not decode, or the digest is not the hash's length.
+    Refused,
+    /// The signature is not one the key made over the digest.
+    DoesNotVerify,
+}
+
+impl core::fmt::Display for DigestCheckError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Refused => write!(f, "digest signature check refused"),
+            Self::DoesNotVerify => write!(f, "digest signature does not verify"),
+        }
+    }
+}
+
+impl core::error::Error for DigestCheckError {}
+
 /// `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent
 /// INTEGER }` (RFC 8017 A.1.1) as the two canonical big-endian
 /// magnitudes.
@@ -1423,87 +1444,96 @@ impl<'a> SpkiDer<'a> {
     /// digest this computer holds, as a card signs a TLS challenge.
     ///
     /// # Errors
-    /// [`VerifyError::BadIssuerKey`] when the key is not of the
-    /// algorithm's kind, [`VerifyError::Rsa`] or [`VerifyError::Ecdsa`]
-    /// when the digest has the wrong length or the signature does not
-    /// verify.
+    /// [`DigestCheckError::Refused`] when the check cannot run: the key
+    /// is not of the algorithm's kind or does not decode, or the digest
+    /// is not the hash's length. [`DigestCheckError::DoesNotVerify`]
+    /// when the signature is not one this key made over `digest`.
     pub fn verify_digest_signature(
         self,
         algorithm: MessageSignatureAlgorithm,
         digest: &[u8],
         signature: &[u8],
-    ) -> Result<(), VerifyError> {
+    ) -> Result<(), DigestCheckError> {
+        use crate::sign::{SHA256_DIGEST_LEN, SHA384_DIGEST_LEN, SHA512_DIGEST_LEN};
+
+        let digest_len = match algorithm {
+            MessageSignatureAlgorithm::RsaPkcs1Sha256
+            | MessageSignatureAlgorithm::RsaPssSha256
+            | MessageSignatureAlgorithm::EcdsaSha256Raw => SHA256_DIGEST_LEN,
+            MessageSignatureAlgorithm::RsaPkcs1Sha384
+            | MessageSignatureAlgorithm::EcdsaSha384Raw => SHA384_DIGEST_LEN,
+            MessageSignatureAlgorithm::RsaPkcs1Sha512
+            | MessageSignatureAlgorithm::EcdsaSha512Raw => SHA512_DIGEST_LEN,
+        };
+        if digest.len() != digest_len {
+            return Err(DigestCheckError::Refused);
+        }
+        let rsa_key = || extract_rsa_public_key(self.der).ok_or(DigestCheckError::Refused);
+        let rsa_outcome = |result: Result<(), RsaVerifyError>| {
+            result.map_err(|error| match error {
+                RsaVerifyError::BadModulus => DigestCheckError::Refused,
+                _ => DigestCheckError::DoesNotVerify,
+            })
+        };
         match algorithm {
             MessageSignatureAlgorithm::RsaPkcs1Sha256 => {
-                let key = extract_rsa_public_key(self.der).ok_or(VerifyError::BadIssuerKey)?;
-                let digest: &[u8; 32] = digest
-                    .try_into()
-                    .map_err(|_| VerifyError::Rsa(RsaVerifyError::BadDigest))?;
-                key.verify_pkcs1v15_sha256_digest(
+                let digest: &[u8; SHA256_DIGEST_LEN] =
+                    digest.try_into().map_err(|_| DigestCheckError::Refused)?;
+                rsa_outcome(rsa_key()?.verify_pkcs1v15_sha256_digest(
                     digest,
                     &Signature::<RsaPkcs1Sha256>::new(signature.to_vec()),
-                )
-                .map_err(VerifyError::Rsa)
+                ))
             }
             MessageSignatureAlgorithm::RsaPkcs1Sha384 => {
-                let key = extract_rsa_public_key(self.der).ok_or(VerifyError::BadIssuerKey)?;
-                let digest: &[u8; 48] = digest
-                    .try_into()
-                    .map_err(|_| VerifyError::Rsa(RsaVerifyError::BadDigest))?;
-                key.verify_pkcs1v15_sha384_digest(
+                let digest: &[u8; SHA384_DIGEST_LEN] =
+                    digest.try_into().map_err(|_| DigestCheckError::Refused)?;
+                rsa_outcome(rsa_key()?.verify_pkcs1v15_sha384_digest(
                     digest,
                     &Signature::<RsaPkcs1Sha384>::new(signature.to_vec()),
-                )
-                .map_err(VerifyError::Rsa)
+                ))
             }
             MessageSignatureAlgorithm::RsaPkcs1Sha512 => {
-                let key = extract_rsa_public_key(self.der).ok_or(VerifyError::BadIssuerKey)?;
-                let digest: &[u8; 64] = digest
-                    .try_into()
-                    .map_err(|_| VerifyError::Rsa(RsaVerifyError::BadDigest))?;
-                key.verify_pkcs1v15_sha512_digest(
+                let digest: &[u8; SHA512_DIGEST_LEN] =
+                    digest.try_into().map_err(|_| DigestCheckError::Refused)?;
+                rsa_outcome(rsa_key()?.verify_pkcs1v15_sha512_digest(
                     digest,
                     &Signature::<RsaPkcs1Sha512>::new(signature.to_vec()),
-                )
-                .map_err(VerifyError::Rsa)
+                ))
             }
             MessageSignatureAlgorithm::RsaPssSha256 => {
                 let key = extract_rsa_public_key(self.der)
                     .or_else(|| extract_rsa_pss_public_key_with_absent_parameters(self.der))
-                    .ok_or(VerifyError::BadIssuerKey)?;
-                if digest.len() != 32 {
-                    return Err(VerifyError::Rsa(RsaVerifyError::BadDigest));
-                }
-                key.verify_pss_sha256_digest(
+                    .ok_or(DigestCheckError::Refused)?;
+                rsa_outcome(key.verify_pss_sha256_digest(
                     digest,
                     &Signature::<RsaPssSha256>::new(signature.to_vec()),
-                )
-                .map_err(VerifyError::Rsa)
+                ))
             }
             MessageSignatureAlgorithm::EcdsaSha256Raw
             | MessageSignatureAlgorithm::EcdsaSha384Raw
             | MessageSignatureAlgorithm::EcdsaSha512Raw => {
                 let (curve, public_key) =
-                    extract_ec_pubkey(self.der).ok_or(VerifyError::BadIssuerKey)?;
+                    extract_ec_pubkey(self.der).ok_or(DigestCheckError::Refused)?;
                 // The profile names the hash; the key names the curve, and
                 // the two are independent: TLS pairs a P-256 key with
                 // SHA-384 as readily as with SHA-256, and the verifier
                 // takes the digest's leftmost bits as the curve's order
                 // allows. The raw signature is two coordinates of the
                 // field prime's width.
-                let digest_len = match algorithm {
-                    MessageSignatureAlgorithm::EcdsaSha256Raw => crate::sign::SHA256_DIGEST_LEN,
-                    MessageSignatureAlgorithm::EcdsaSha384Raw => crate::sign::SHA384_DIGEST_LEN,
-                    _ => crate::sign::SHA512_DIGEST_LEN,
-                };
                 let coordinate_len = curve.p.len();
-                if signature.len() != 2 * coordinate_len || digest.len() != digest_len {
-                    return Err(VerifyError::Ecdsa(EcdsaError::BadSignature));
+                if signature.len() != 2 * coordinate_len {
+                    return Err(DigestCheckError::DoesNotVerify);
                 }
                 let signature = Signature::<EcdsaDer>::from_raw_concatenation(signature)
-                    .map_err(VerifyError::Ecdsa)?;
-                verify_prehashed(&curve, &public_key, &signature, digest)
-                    .map_err(VerifyError::Ecdsa)
+                    .map_err(|_| DigestCheckError::DoesNotVerify)?;
+                verify_prehashed(&curve, &public_key, &signature, digest).map_err(|error| {
+                    match error {
+                        EcdsaError::BadModulus | EcdsaError::BadPublicKey => {
+                            DigestCheckError::Refused
+                        }
+                        _ => DigestCheckError::DoesNotVerify,
+                    }
+                })
             }
         }
     }

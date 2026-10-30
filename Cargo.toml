@@ -17,7 +17,7 @@ members = [
 # YY.M.D, the UTC day the code last changed, stamped by the pre-commit
 # hook (script/version-stamp.sh). refineid_lib_core::VERSION appends the
 # build number B for the project version YY.M.D.B.
-version = "26.10.29"
+version = "26.10.30"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]
