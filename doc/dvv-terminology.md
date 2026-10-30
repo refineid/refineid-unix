@@ -82,7 +82,7 @@ activation; the second two are issued by DVV.
 > caution stands there.
 >
 > refineid uses the activation PIN only for factory activation and
-> uses the PUK for `card unblock-pin1` / `card unblock-pin2`.
+> uses the PUK for `pin unblock 1` / `pin unblock 2`.
 > FINEID S4-1 v4.2 section 4.6 requires both PINs to be initialized,
 > but there is no combined two-PIN card command. Middleware sends one
 > per-slot command for PIN1 and then one for PIN2: `RESET RETRY COUNTER`
@@ -106,7 +106,7 @@ Canonical DVV sources:
 - Set during card activation (citizen chooses).
 - Card-side try counter; 5 wrong tries blocks the PIN.
 - A blocked PIN is recoverable only via the PUK
-  (`card unblock-pin1` / `card unblock-pin2`).
+  (`pin unblock 1` / `pin unblock 2`).
 
 ### Activation PIN (`aktivointitunnusluku` / `aktiveringskod`)
 
@@ -136,7 +136,7 @@ Canonical DVV sources:
   Production ECC-card validation confirmed two successive PIN2
   recoveries with the same PUK; after each recovery both PIN2 and
   PUK reported 5 retries remaining.
-- refineid's `card unblock-pin1 / card unblock-pin2` drive
+- refineid's `pin unblock 1 / pin unblock 2` drive
   this code via the PKCS#15 `RESET RETRY COUNTER` APDU.
 
 ### CAN (Card Access Number)

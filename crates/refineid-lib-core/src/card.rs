@@ -50,7 +50,7 @@
 //!   current `establish_trusted_session` logic.
 //! - Phase 3: AODF read + `Card<Trusted>::read_pin_state()`
 //!   yields `Card<Activated>` or `Card<Unactivated>`.
-//! - Phase 4: migrate activate / change-pin / unblock-pin to
+//! - Phase 4: migrate `pin activate` / `change` / `unblock` to
 //!   be `Card<State>` methods.
 //! - Phase 5: migrate sign / decrypt similarly.
 //! - Phase 6: retire the free-function escape hatches.

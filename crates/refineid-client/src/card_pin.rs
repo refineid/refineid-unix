@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! `refineid card change-pin{1,2}` / `card unblock-pin{1,2}` /
+//! `refineid pin change 1|2` / `pin unblock 1|2` /
 //! `card pin-status`.
 //!
 //! PIN-management surface for both FINEID PIN slots:
@@ -84,7 +84,7 @@ impl PinManageSlot {
     }
 }
 
-/// Inputs for `card change-pin{1,2}`.
+/// Inputs for `pin change 1|2`.
 #[derive(Debug)]
 pub struct ChangePinOptions {
     /// Which PIN slot to rotate. Drives both the APDU PIN
@@ -107,7 +107,7 @@ pub struct ChangePinOptions {
     pub reader_filter: Option<String>,
 }
 
-/// One reader's worth of change-pin output.
+/// One reader's worth of `pin change` output.
 #[derive(Debug, Clone)]
 pub struct ChangePinReport {
     /// PC/SC reader name the modify APDU landed against. Tier 0
@@ -136,7 +136,7 @@ pub struct ChangePinReport {
     pub outcome: ChangePinOutcome,
 }
 
-/// Inputs for `card unblock-pin{1,2}`.
+/// Inputs for `pin unblock 1|2`.
 #[derive(Debug)]
 pub struct UnblockPinOptions {
     /// Which PIN slot to unblock. Both PIN1 and PIN2 share the
@@ -174,7 +174,7 @@ pub struct UnblockPinReport {
 }
 
 /// Error returned from the PIN-management entrypoints
-/// (`card change-pin*`, `card unblock-pin*`, `card activate`).
+/// (`pin change`, `pin unblock`, `pin activate`).
 #[derive(Debug)]
 pub enum CardPinError {
     /// Reader enumeration / filter resolution failed.
@@ -192,7 +192,7 @@ pub enum CardPinError {
     /// SELECT (cert read, EF.TokenInfo read, ...). Tier 0 `String`
     /// -- presentational rendering of the upstream error.
     Transport(String),
-    /// `card activate` only: the activation PIN length the
+    /// `pin activate` only: the activation PIN length the
     /// operator entered doesn't match what the classified card
     /// generation requires. Reported *before* any modify APDU,
     /// so the card-side try counter is untouched.
@@ -207,11 +207,11 @@ pub enum CardPinError {
         /// error message.
         expected: usize,
     },
-    /// `card activate` only: refineid couldn't classify the
+    /// `pin activate` only: refineid couldn't classify the
     /// card generation and won't guess at activation-PIN length
     /// on the operator's behalf.
     UnknownCardGeneration,
-    /// `card activate` only: the card's data couldn't be
+    /// `pin activate` only: the card's data couldn't be
     /// authenticated against a pinned anchor. The activation
     /// flow refuses to use untrusted card-side data (issuance
     /// date, etc.) for type selection -- without a verified
@@ -244,13 +244,13 @@ pub enum CardPinError {
     /// organizational, health care) land here, as does any
     /// non-FINEID smartcard inserted in the reader.
     CardModelNotSupported(CardClassificationError),
-    /// `card change-pin*` / `card unblock-pin*`: the PIN slot's
+    /// `pin change` / `pin unblock`: the PIN slot's
     /// pre-flight `pin_status` probe (counter-safe empty-Lc
     /// VERIFY) reported a state inconsistent with an activated
     /// card -- typically the slot has never been set. Refineid
     /// refuses before any modify APDU goes out so a wrong-state
     /// attempt cannot burn a try-counter slot. The operator
-    /// should run `refineid card activate` first.
+    /// should run `refineid pin activate` first.
     CardLooksUnactivated {
         /// Which PIN slot the probe targeted.
         slot: PinManageSlot,
@@ -310,7 +310,7 @@ impl fmt::Display for CardPinError {
                 write!(
                     f,
                     "{} looks unactivated (pin_status probe: {probe_desc}); refusing to send \
-                     a modify APDU that could land on an unset slot. Run `refineid card activate` \
+                     a modify APDU that could land on an unset slot. Run `refineid pin activate` \
                      first to set PIN1 and PIN2.",
                     slot.label()
                 )
@@ -355,9 +355,9 @@ fn auth_to_card_pin(e: AuthError<impl fmt::Display>) -> CardPinError {
 /// The trust gate has passed and a long-serial has been
 /// bound. Activation-state is *not* yet known; downstream
 /// operations must promote this into either
-/// [`ActivationCardContext`] (for `card activate`) or
-/// [`PinManagementCardContext`] (for `card change-pin*` /
-/// `card unblock-pin*`).
+/// [`ActivationCardContext`] (for `pin activate`) or
+/// [`PinManagementCardContext`] (for `pin change` /
+/// `pin unblock`).
 ///
 /// Built by `establish_trusted_session`: card is identified
 /// by ATR against the in-scope FINEID model set, its on-card
@@ -393,10 +393,10 @@ impl TrustedCardSession {
     /// shape for `change_pin_first` and
     /// `unblock_pin_first`. By calling this constructor the
     /// caller asserts operator intent: the operator chose a
-    /// PIN-management command (not `card activate`), so they
+    /// PIN-management command (not `pin activate`), so they
     /// are claiming the card is in an already-activated
     /// state and the modify APDU is appropriate. The compiler
-    /// then enforces that no `card activate` code path can
+    /// then enforces that no `pin activate` code path can
     /// consume this value.
     ///
     /// This split is the type-level half of the safety; the
@@ -419,8 +419,8 @@ impl TrustedCardSession {
 /// borrow path back to the inner [`TrustedCardSession`].
 /// Construct via
 /// [`TrustedCardSession::into_pin_management_context`] from
-/// the CLI's `card change-pin*` / `card unblock-pin*`
-/// dispatch. Code in the `card activate` dispatch cannot
+/// the CLI's `pin change` / `pin unblock`
+/// dispatch. Code in the `pin activate` dispatch cannot
 /// produce this typestate by construction.
 #[derive(Debug, Clone)]
 pub struct PinManagementCardContext {
@@ -684,7 +684,7 @@ pub(crate) fn change_pin_first_for_cli(
     // PIN-management command path (operator intent: card is
     // activated). The compiler refuses to let
     // `ActivationCardContext` flow into this signature; the
-    // `card activate` dispatch cannot reach this function.
+    // `pin activate` dispatch cannot reach this function.
     let person = ctx.identity().person_string();
     let card_serial = ctx.identity().best_serial().unwrap_or("").to_owned();
     crate::events::CardTarget {
@@ -862,7 +862,7 @@ impl fmt::Display for UnblockPinReport {
     }
 }
 
-// ---- card activate -- first-time setup flow --------------------
+// ---- pin activate -- first-time setup flow --------------------
 
 /// Outcome of verifying that card-side data can be trusted
 /// before it drives type selection.
@@ -1114,7 +1114,16 @@ fn re_verify_session<T: refineid_lib_core::transport::CardTransport>(
     Ok(())
 }
 
-/// Inputs for `card activate` -- the one-time DVV activation flow
+/// The PINs an activation sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationTarget {
+    /// PIN1, then PIN2.
+    Both,
+    /// One PIN; the other keeps its state.
+    One(PinManageSlot),
+}
+
+/// Inputs for `pin activate` -- the one-time DVV activation flow
 /// that consumes the *activation PIN* (aktivointitunnusluku) from
 /// the activation letter and sets the initial values of PIN1 and
 /// PIN2.
@@ -1140,23 +1149,44 @@ pub struct ActivateOptions {
     pub allow_reactivate: bool,
 }
 
+/// Inputs for `pin activate 1|2`: the activation flow for one PIN.
+/// Each PIN's setup is its own card operation (FINEID S4-1 v4.2
+/// s4.6), so one PIN can be set without the other.
+#[derive(Debug)]
+pub struct ActivateOneOptions {
+    /// Typed activation code; see [`ActivateOptions::activation_pin`].
+    pub activation_pin: ActivationCode,
+    /// The PIN to set.
+    pub slot: PinManageSlot,
+    /// Its new value.
+    pub new_pin: PinBytes,
+    /// See [`ActivateOptions::allow_reactivate`].
+    pub allow_reactivate: bool,
+}
+
 /// One reader's worth of activate output.
 #[derive(Debug, Clone)]
 pub struct ActivateReport {
     /// PC/SC reader name the activation APDUs landed against.
     /// Tier 0 `String` from `ReaderId::as_str().to_owned()`.
     pub reader: String,
+    /// The PINs the run set out to activate.
+    pub target: ActivationTarget,
+    /// For [`ActivationTarget::One`]: the other PIN's probes showed
+    /// it unactivated before the run, so the card is not fully
+    /// active. `false` for [`ActivationTarget::Both`].
+    pub other_looks_unactivated: bool,
     /// PIN-status pre-flight result. Surfaced so the operator
     /// can see whether refineid found the card unactivated /
     /// activated when it ran.
     pub preflight: ActivatePreflightOutcome,
-    /// Card's outcome for the PIN1 `RESET RETRY COUNTER` call.
-    /// `None` when the pre-flight refusal aborted the flow before
-    /// any APDU went out.
+    /// Card's outcome for the PIN1 setup. `None` when the
+    /// pre-flight refusal aborted the flow before any APDU went
+    /// out, or PIN1 is not in the target.
     pub pin1_outcome: Option<UnblockOutcome>,
-    /// Same for PIN2. `None` when either the pre-flight refused
-    /// or PIN1 setup failed (we don't burn a second activation
-    /// attempt against a card that's already rejected the code).
+    /// Same for PIN2. `None` also when PIN1 setup failed (we don't
+    /// burn a second activation attempt against a card that's
+    /// already rejected the code).
     pub pin2_outcome: Option<UnblockOutcome>,
 }
 
@@ -1176,76 +1206,103 @@ pub enum ActivatePreflightOutcome {
         /// Raw PIN2 probe outcome. Same conventions as `pin1`.
         pin2: Option<PinStatus>,
     },
-    /// PIN1 probe returned a healthy counter, locked state, or
-    /// otherwise looked like an activated card. Activation was
-    /// refused (operator can override with `--allow-reactivate`).
+    /// The probe of the PIN that decides (PIN1 for both, else the
+    /// one being activated) looked like an activated card.
+    /// Activation was refused (operator can override with
+    /// `--allow-reactivate`).
     LooksActivated {
-        /// PIN1 probe outcome that triggered the refusal -- a
-        /// healthy `Remaining(_)`, `Verified`, or `Locked`. Not
-        /// `Option`-wrapped because at least one such value is
-        /// what built the variant.
-        pin1: PinStatus,
-        /// PIN2 probe outcome; auxiliary information. `None` if
-        /// PIN2 probe failed; not used in the
-        /// `LooksActivated` classification logic.
+        /// PIN1 probe outcome. `None` when the probe returned no
+        /// status word.
+        pin1: Option<PinStatus>,
+        /// PIN2 probe outcome. Same conventions as `pin1`.
         pin2: Option<PinStatus>,
     },
 }
 
 impl ActivatePreflightOutcome {
-    /// `true` when PIN1 probe returned a healthy counter or
-    /// locked state, signalling the card has likely been
-    /// activated already. The CLI uses this to abort activation
-    /// unless `--allow-reactivate` was passed.
+    /// `true` when the deciding PIN's probes read as activated.
+    /// The CLI uses this to abort activation unless
+    /// `--allow-reactivate` was passed.
     #[must_use]
     pub const fn looks_activated(&self) -> bool {
         matches!(self, Self::LooksActivated { .. })
     }
 }
 
-/// Classify the PIN1/PIN2 probes into a preflight verdict.
-///
-/// Scheme-aware (FINEID S4-1 v4.2 §4.6):
-///
-/// - **Older cards (old scheme, §4.6.1):** PIN1 ships BLOCKED.
-///   Any "healthy" PIN1 status (`Remaining(_)`, `Verified`, or
-///   `Locked`) means the slot has been written to since
-///   manufacture -- evidence of prior activation. `NoInfo` /
-///   `Other(sw)` / no-probe-result is inconclusive and the flow
-///   proceeds.
-/// - **Newer cards (new scheme, §4.6.2):** PIN1 ships SET to
-///   the 7-digit activation PIN, so `PinStatus::Remaining(5)` is
-///   the *expected* fresh state. The authoritative signal is
-///   the GET DATA "PIN changed" flag (`DF 2F`, S1 v4.2 §3.15.2
-///   Table 19): `Some(true)` means the slot has been rewritten,
-///   so the card is already activated; `Some(false)` or `None`
-///   leaves the flow free to proceed. PIN1's flag dominates;
-///   PIN2's flag is auxiliary.
-const fn classify_preflight(
-    pin1: Option<PinStatus>,
-    pin2: Option<PinStatus>,
-    generation: CardGeneration,
-    pin1_changed: Option<bool>,
-    _pin2_changed: Option<bool>,
-) -> ActivatePreflightOutcome {
-    if matches!(generation, CardGeneration::Newer) {
-        if matches!(pin1_changed, Some(true)) {
-            // The factory activation PIN has been replaced;
-            // re-running activate against this card would burn a
-            // wrong-current-PIN counter. Synthesise a Remaining
-            // status for the LooksActivated payload.
-            return match pin1 {
-                Some(s) => ActivatePreflightOutcome::LooksActivated { pin1: s, pin2 },
-                None => ActivatePreflightOutcome::LooksUnactivated { pin1, pin2 },
-            };
+/// One PIN's activation probes: its counter status and its
+/// PIN-changed flag.
+#[derive(Debug, Clone, Copy)]
+struct SlotProbe {
+    /// Counter-safe `pin_status` result; `None` when the probe
+    /// returned no status word.
+    status: Option<PinStatus>,
+    /// GET DATA "PIN changed" flag (`DF 2F`, S1 v4.2 s3.15.2
+    /// Table 19); `None` when the card does not return it.
+    changed: Option<bool>,
+}
+
+impl SlotProbe {
+    /// The probes read as an activated PIN (FINEID S4-1 v4.2 s4.6):
+    ///
+    /// - **Older cards (old scheme, s4.6.1):** the PIN ships BLOCKED.
+    ///   Any "healthy" status (`Remaining(_)`, `Verified`, or
+    ///   `Locked`) means the slot has been written to since
+    ///   manufacture. `NoInfo` / `Other(sw)` / no probe result is
+    ///   inconclusive.
+    /// - **Newer cards (new scheme, s4.6.2):** the PIN ships SET to
+    ///   the 7-digit activation PIN, so `Remaining(5)` is the
+    ///   expected fresh state. The PIN-changed flag decides:
+    ///   `Some(true)` with a readable status means the slot has
+    ///   been rewritten.
+    const fn looks_activated(self, generation: CardGeneration) -> bool {
+        match generation {
+            CardGeneration::Newer => matches!(self.changed, Some(true)),
+            CardGeneration::Older | CardGeneration::Unknown => {
+                pin_looks_activated(self.status.as_ref())
+            }
         }
-        return ActivatePreflightOutcome::LooksUnactivated { pin1, pin2 };
     }
-    match pin1 {
-        Some(s @ (PinStatus::Remaining(_) | PinStatus::Verified | PinStatus::Locked)) => {
-            ActivatePreflightOutcome::LooksActivated { pin1: s, pin2 }
+
+    /// The probes show the PIN still in its factory state: on newer
+    /// cards the PIN-changed flag reads `false`; on older cards the
+    /// status is the blocked factory reading (`NoInfo` / `Other`).
+    /// No probe result is not evidence either way.
+    const fn looks_unactivated(self, generation: CardGeneration) -> bool {
+        match generation {
+            CardGeneration::Newer => matches!(self.changed, Some(false)),
+            CardGeneration::Older => {
+                matches!(self.status, Some(PinStatus::NoInfo | PinStatus::Other(_)))
+            }
+            CardGeneration::Unknown => false,
         }
-        _ => ActivatePreflightOutcome::LooksUnactivated { pin1, pin2 },
+    }
+}
+
+/// Classify the PIN1/PIN2 probes into a preflight verdict. The
+/// deciding PIN is PIN1 for [`ActivationTarget::Both`] and the
+/// targeted PIN for [`ActivationTarget::One`]; see
+/// [`SlotProbe::looks_activated`].
+const fn classify_preflight(
+    target: ActivationTarget,
+    generation: CardGeneration,
+    pin1: SlotProbe,
+    pin2: SlotProbe,
+) -> ActivatePreflightOutcome {
+    // Activating both touches both slots, so either one already
+    // activated refuses: a set PIN would otherwise be presented the
+    // factory code, or overwritten through the PUK.
+    let activated = match target {
+        ActivationTarget::Both => {
+            pin1.looks_activated(generation) || pin2.looks_activated(generation)
+        }
+        ActivationTarget::One(PinManageSlot::Pin1) => pin1.looks_activated(generation),
+        ActivationTarget::One(PinManageSlot::Pin2) => pin2.looks_activated(generation),
+    };
+    let (pin1, pin2) = (pin1.status, pin2.status);
+    if activated {
+        ActivatePreflightOutcome::LooksActivated { pin1, pin2 }
+    } else {
+        ActivatePreflightOutcome::LooksUnactivated { pin1, pin2 }
     }
 }
 
@@ -1347,57 +1404,71 @@ const fn activation_continues_after_pin1(outcome: UnblockOutcome) -> bool {
 
 /// What [`activation_gate`] decided from the card's PIN probes.
 enum ActivationGate {
-    /// The card may be activated; carries the preflight verdict.
-    Proceed(ActivatePreflightOutcome),
+    /// The card may be activated.
+    Proceed {
+        /// The preflight verdict.
+        preflight: ActivatePreflightOutcome,
+        /// See [`ActivateReport::other_looks_unactivated`].
+        other_looks_unactivated: bool,
+    },
     /// The card looks activated and re-activation was not allowed.
     Refused(ActivateReport),
 }
 
-/// Probe both PIN slots and decide whether activation may proceed:
-/// refuse an activated card without `allow_reactivate`, and apply the
-/// retry floor to the counter the activation code is presented under
-/// (PIN1 and PIN2 on the newer generation, the PUK on the older).
-/// `emit_probe` reports the PIN-changed probe event.
+/// Probe both PIN slots and decide whether activation of `target`
+/// may proceed: refuse an activated card without `allow_reactivate`,
+/// and apply the retry floor to the counter the activation code is
+/// presented under (each targeted PIN on the newer generation, the
+/// PUK on the older). `emit_probe` reports the PIN-changed probe
+/// event.
 ///
 /// # Errors
 /// [`CardPinError::RetryFloor`] for a counter below the floor.
 fn activation_gate<T: refineid_lib_core::transport::CardTransport>(
     transport: &mut T,
     ctx: &ActivationCardContext,
+    target: ActivationTarget,
     allow_reactivate: bool,
     emit_probe: bool,
 ) -> Result<ActivationGate, CardPinError> {
     let reader_label = ctx.reader_id.as_str().to_owned();
-    let pin1_probe = transport.pin_status(PinSlot::Pin1).ok();
-    let pin2_probe = transport.pin_status(PinSlot::Pin2).ok();
-    // S1 v4.2 s3.15.2 GET DATA on the PIN container, DF 2F flag.
-    // Best-effort: a card that doesn't implement the optional
-    // "Return PIN changed flag" parameter returns `Ok(None)` and
-    // refineid falls back to the PinStatus-only logic.
-    let pin1_changed = transport.pin_changed_flag(PinSlot::Pin1).ok().flatten();
-    let pin2_changed = transport.pin_changed_flag(PinSlot::Pin2).ok().flatten();
+    let pin1 = SlotProbe {
+        status: transport.pin_status(PinSlot::Pin1).ok(),
+        // S1 v4.2 s3.15.2 GET DATA on the PIN container, DF 2F flag.
+        // Best-effort: a card that doesn't implement the optional
+        // "Return PIN changed flag" parameter returns `Ok(None)` and
+        // refineid falls back to the PinStatus-only logic.
+        changed: transport.pin_changed_flag(PinSlot::Pin1).ok().flatten(),
+    };
+    let pin2 = SlotProbe {
+        status: transport.pin_status(PinSlot::Pin2).ok(),
+        changed: transport.pin_changed_flag(PinSlot::Pin2).ok().flatten(),
+    };
     if emit_probe {
-        ActivateGuard::emit_pin_changed_probed(pin1_changed, pin2_changed);
+        ActivateGuard::emit_pin_changed_probed(pin1.changed, pin2.changed);
     }
-    let preflight = classify_preflight(
-        pin1_probe,
-        pin2_probe,
-        ctx.generation,
-        pin1_changed,
-        pin2_changed,
-    );
+    let preflight = classify_preflight(target, ctx.generation, pin1, pin2);
+    let other_looks_unactivated = match target {
+        ActivationTarget::Both => false,
+        ActivationTarget::One(PinManageSlot::Pin1) => pin2.looks_unactivated(ctx.generation),
+        ActivationTarget::One(PinManageSlot::Pin2) => pin1.looks_unactivated(ctx.generation),
+    };
 
     if !allow_reactivate && preflight.looks_activated() {
         if let ActivatePreflightOutcome::LooksActivated { pin1, pin2 } = &preflight {
+            let render =
+                |status: &Option<PinStatus>| status.map_or_else(String::new, |s| format!("{s:?}"));
             crate::events::CardActivatePreflightRefused {
                 reader: &reader_label,
-                pin1_status: &format!("{pin1:?}"),
-                pin2_status: &pin2.as_ref().map_or_else(String::new, |s| format!("{s:?}")),
+                pin1_status: &render(pin1),
+                pin2_status: &render(pin2),
             }
             .emit();
         }
         return Ok(ActivationGate::Refused(ActivateReport {
             reader: reader_label,
+            target,
+            other_looks_unactivated,
             preflight,
             pin1_outcome: None,
             pin2_outcome: None,
@@ -1408,16 +1479,28 @@ fn activation_gate<T: refineid_lib_core::transport::CardTransport>(
         // The activation code is presented as the current PIN, so each
         // setup is a PIN attempt under the retry floor.
         CardGeneration::Newer => {
-            for (slot, probe) in [(PinSlot::Pin1, pin1_probe), (PinSlot::Pin2, pin2_probe)] {
-                check_retry_floor(slot, probe.unwrap_or(PinStatus::NoInfo))
-                    .map_err(CardPinError::RetryFloor)?;
+            for (slot, probe) in [(PinSlot::Pin1, pin1), (PinSlot::Pin2, pin2)] {
+                let targeted = match target {
+                    ActivationTarget::Both => true,
+                    ActivationTarget::One(one) => matches!(
+                        (one, slot),
+                        (PinManageSlot::Pin1, PinSlot::Pin1) | (PinManageSlot::Pin2, PinSlot::Pin2)
+                    ),
+                };
+                if targeted {
+                    check_retry_floor(slot, probe.status.unwrap_or(PinStatus::NoInfo))
+                        .map_err(CardPinError::RetryFloor)?;
+                }
             }
         }
         // The activation code is presented as the PUK.
         CardGeneration::Older => puk_gate(transport.puk_status().ok())?,
         CardGeneration::Unknown => return Err(CardPinError::UnknownCardGeneration),
     }
-    Ok(ActivationGate::Proceed(preflight))
+    Ok(ActivationGate::Proceed {
+        preflight,
+        other_looks_unactivated,
+    })
 }
 
 /// Run [`activation_gate`] in a read-only session, so the CLI refuses
@@ -1430,6 +1513,7 @@ fn activation_gate<T: refineid_lib_core::transport::CardTransport>(
 pub(crate) fn probe_activation_gate_for_cli(
     backend: PcscBackend,
     ctx: &ActivationCardContext,
+    target: ActivationTarget,
     allow_reactivate: bool,
 ) -> Result<Option<ActivateReport>, CardPinError> {
     let mut transport = backend.open_session(&ctx.reader_id, ReaderAccessCap::Read)?;
@@ -1438,14 +1522,42 @@ pub(crate) fn probe_activation_gate_for_cli(
         .map_err(|e| CardPinError::Pkcs15Select(format!("{e}")))?;
     re_verify_session(&mut transport, &ctx.bound_serial)?;
     Ok(
-        match activation_gate(&mut transport, ctx, allow_reactivate, false)? {
-            ActivationGate::Proceed(_) => None,
+        match activation_gate(&mut transport, ctx, target, allow_reactivate, false)? {
+            ActivationGate::Proceed { .. } => None,
             ActivationGate::Refused(report) => Some(report),
         },
     )
 }
 
-/// Drive the `card activate` flow: trust-gated card -> factory
+/// The new PIN values an activation sets.
+enum ActivationPins {
+    /// PIN1, then PIN2.
+    Both {
+        /// New PIN1.
+        pin1: PinBytes,
+        /// New PIN2.
+        pin2: PinBytes,
+    },
+    /// One PIN.
+    One {
+        /// The PIN to set.
+        slot: PinManageSlot,
+        /// Its new value.
+        pin: PinBytes,
+    },
+}
+
+impl ActivationPins {
+    /// The PINs these values set.
+    const fn target(&self) -> ActivationTarget {
+        match self {
+            Self::Both { .. } => ActivationTarget::Both,
+            Self::One { slot, .. } => ActivationTarget::One(*slot),
+        }
+    }
+}
+
+/// Drive the `pin activate` flow: trust-gated card -> factory
 /// activation PIN -> fresh PIN1/PIN2.
 ///
 /// FINEID S4-1 v4.2 §4.6. Steps:
@@ -1467,14 +1579,63 @@ pub(crate) fn probe_activation_gate_for_cli(
 ///
 /// # Errors
 /// Returns card selection, transport, PIN-policy, or activation failures.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "ActivateOptions embeds activation PIN + new PIN1/PIN2 PinBytes; consumed by value so all drop+zeroize at function return."
-)]
 pub fn activate_first(
     backend: PcscBackend,
     ctx: ActivationCardContext,
     options: ActivateOptions,
+) -> Result<ActivateReport, CardPinError> {
+    let ActivateOptions {
+        activation_pin,
+        new_pin1,
+        new_pin2,
+        allow_reactivate,
+    } = options;
+    run_activation(
+        backend,
+        &ctx,
+        &activation_pin,
+        allow_reactivate,
+        ActivationPins::Both {
+            pin1: new_pin1,
+            pin2: new_pin2,
+        },
+    )
+}
+
+/// Drive the `pin activate 1|2` flow: [`activate_first`] for one
+/// PIN. The preflight decides on that PIN's probes, and the retry
+/// floor applies to its counter (newer cards) or the PUK's (older).
+///
+/// # Errors
+/// As [`activate_first`].
+pub fn activate_one_first(
+    backend: PcscBackend,
+    ctx: ActivationCardContext,
+    options: ActivateOneOptions,
+) -> Result<ActivateReport, CardPinError> {
+    let ActivateOneOptions {
+        activation_pin,
+        slot,
+        new_pin,
+        allow_reactivate,
+    } = options;
+    run_activation(
+        backend,
+        &ctx,
+        &activation_pin,
+        allow_reactivate,
+        ActivationPins::One { slot, pin: new_pin },
+    )
+}
+
+/// The shared body of [`activate_first`] and [`activate_one_first`].
+/// `pins` is consumed so the new PIN values drop and zeroize here.
+fn run_activation(
+    backend: PcscBackend,
+    ctx: &ActivationCardContext,
+    activation_pin: &ActivationCode,
+    allow_reactivate: bool,
+    pins: ActivationPins,
 ) -> Result<ActivateReport, CardPinError> {
     let person = ctx.identity.person_string();
     crate::events::CardTarget {
@@ -1491,7 +1652,7 @@ pub fn activate_first(
     // PC/SC resources.
     let reader_label = ctx.reader_id.as_str().to_owned();
     if let Some(err) =
-        ActivateGuard::check_length_match(&reader_label, &options.activation_pin, ctx.generation)
+        ActivateGuard::check_length_match(&reader_label, activation_pin, ctx.generation)
     {
         return Err(err);
     }
@@ -1513,9 +1674,22 @@ pub fn activate_first(
     // trust before any modify APDU lands.
     re_verify_session(&mut transport, &ctx.bound_serial)?;
 
-    let preflight = match activation_gate(&mut transport, &ctx, options.allow_reactivate, true)? {
-        ActivationGate::Proceed(preflight) => preflight,
-        ActivationGate::Refused(report) => return Ok(report),
+    let target = pins.target();
+    let (preflight, other_looks_unactivated) =
+        match activation_gate(&mut transport, ctx, target, allow_reactivate, true)? {
+            ActivationGate::Proceed {
+                preflight,
+                other_looks_unactivated,
+            } => (preflight, other_looks_unactivated),
+            ActivationGate::Refused(report) => return Ok(report),
+        };
+    let mut report = ActivateReport {
+        reader: reader_label,
+        target,
+        other_looks_unactivated,
+        preflight,
+        pin1_outcome: None,
+        pin2_outcome: None,
     };
 
     ActivateGuard::emit_scheme_selected(ctx.generation);
@@ -1528,59 +1702,58 @@ pub fn activate_first(
     // bytes. Done per-call so the typed wrapper stays the source
     // of truth at the API boundary; the transient PinBytes
     // zeroizes on drop just like every other secret material.
-    let activation_pin_bytes = options.activation_pin.to_pin_bytes();
-    let pin1_outcome = activate_slot_setup(
-        &mut transport,
-        PinSlot::Pin1,
-        ctx.generation,
-        activation_pin_bytes.clone(),
-        options.new_pin1.clone(),
-    )?;
+    let activation_pin_bytes = activation_pin.to_pin_bytes();
+    match pins {
+        ActivationPins::One { slot, pin } => {
+            let outcome = activate_slot_setup(
+                &mut transport,
+                slot.as_pin_slot(),
+                ctx.generation,
+                activation_pin_bytes,
+                pin,
+            )?;
+            ActivateGuard::emit_pin_set(&report.reader, slot, outcome);
+            match slot {
+                PinManageSlot::Pin1 => report.pin1_outcome = Some(outcome),
+                PinManageSlot::Pin2 => report.pin2_outcome = Some(outcome),
+            }
+        }
+        ActivationPins::Both { pin1, pin2 } => {
+            let pin1_outcome = activate_slot_setup(
+                &mut transport,
+                PinSlot::Pin1,
+                ctx.generation,
+                activation_pin_bytes.clone(),
+                pin1,
+            )?;
+            ActivateGuard::emit_pin_set(&report.reader, PinManageSlot::Pin1, pin1_outcome);
+            report.pin1_outcome = Some(pin1_outcome);
 
-    crate::events::CardActivatePin1Set {
-        reader: &reader_label,
-        outcome: &format!("{pin1_outcome:?}"),
+            // Single-shot: if PIN1 setup rejected the activation PIN
+            // (wrong code, locked slot, anything other than Ok), don't
+            // burn a second card-side try on the PIN2 slot. The operator
+            // re-runs after fixing the input.
+            if !activation_continues_after_pin1(pin1_outcome) {
+                return Ok(report);
+            }
+
+            // Re-verify session before the second modify APDU. A card
+            // swap between PIN1 and PIN2 setup is the canonical TOCTOU
+            // case this gate defends against.
+            re_verify_session(&mut transport, &ctx.bound_serial)?;
+
+            let pin2_outcome = activate_slot_setup(
+                &mut transport,
+                PinSlot::Pin2,
+                ctx.generation,
+                activation_pin_bytes,
+                pin2,
+            )?;
+            ActivateGuard::emit_pin_set(&report.reader, PinManageSlot::Pin2, pin2_outcome);
+            report.pin2_outcome = Some(pin2_outcome);
+        }
     }
-    .emit();
-
-    // Single-shot: if PIN1 setup rejected the activation PIN
-    // (wrong code, locked slot, anything other than Ok), don't
-    // burn a second card-side try on the PIN2 slot. The operator
-    // re-runs after fixing the input.
-    if !activation_continues_after_pin1(pin1_outcome) {
-        return Ok(ActivateReport {
-            reader: reader_label,
-            preflight,
-            pin1_outcome: Some(pin1_outcome),
-            pin2_outcome: None,
-        });
-    }
-
-    // Re-verify session before the second modify APDU. A card
-    // swap between PIN1 and PIN2 setup is the canonical TOCTOU
-    // case this gate defends against.
-    re_verify_session(&mut transport, &ctx.bound_serial)?;
-
-    let pin2_outcome = activate_slot_setup(
-        &mut transport,
-        PinSlot::Pin2,
-        ctx.generation,
-        activation_pin_bytes,
-        options.new_pin2,
-    )?;
-
-    crate::events::CardActivatePin2Set {
-        reader: &reader_label,
-        outcome: &format!("{pin2_outcome:?}"),
-    }
-    .emit();
-
-    Ok(ActivateReport {
-        reader: reader_label,
-        preflight,
-        pin1_outcome: Some(pin1_outcome),
-        pin2_outcome: Some(pin2_outcome),
-    })
+    Ok(report)
 }
 
 /// Activate-flow pre-flight helpers. Hosted on a unit struct per
@@ -1662,6 +1835,23 @@ impl ActivateGuard {
         .emit();
     }
 
+    /// Emit the per-PIN setup event with the card's outcome.
+    fn emit_pin_set(reader: &str, slot: PinManageSlot, outcome: UnblockOutcome) {
+        let outcome = format!("{outcome:?}");
+        match slot {
+            PinManageSlot::Pin1 => crate::events::CardActivatePin1Set {
+                reader,
+                outcome: &outcome,
+            }
+            .emit(),
+            PinManageSlot::Pin2 => crate::events::CardActivatePin2Set {
+                reader,
+                outcome: &outcome,
+            }
+            .emit(),
+        }
+    }
+
     /// Emit the `card.activate.scheme_selected` event naming
     /// the APDU scheme chosen for this card generation.
     ///
@@ -1693,12 +1883,16 @@ impl fmt::Display for ActivateReport {
                 writeln!(f, "preflight: card looks un-activated; proceeding")?;
             }
             ActivatePreflightOutcome::LooksActivated { pin1, pin2 } => {
+                let render = |status: &Option<PinStatus>| {
+                    status.map_or_else(|| "no reading".to_owned(), |s| format!("{s:?}"))
+                };
                 writeln!(
                     f,
-                    "preflight: card looks ALREADY ACTIVATED \
-                     (PIN1: {pin1:?}, PIN2: {pin2:?})"
+                    "preflight: card looks ALREADY ACTIVATED (PIN1: {}, PIN2: {})",
+                    render(pin1),
+                    render(pin2),
                 )?;
-                if self.pin1_outcome.is_none() {
+                if self.pin1_outcome.is_none() && self.pin2_outcome.is_none() {
                     writeln!(
                         f,
                         "  refused without --allow-reactivate; the activation PIN \
@@ -1714,6 +1908,8 @@ impl fmt::Display for ActivateReport {
         }
         if let Some(o) = self.pin2_outcome {
             writeln!(f, "PIN2 setup: {}", CardPinHelpers::fmt_unblock(o, "PIN2"))?;
+        } else if self.target != ActivationTarget::Both {
+            // A one-PIN activation reports only its PIN.
         } else if matches!(self.pin1_outcome, Some(UnblockOutcome::Ok)) {
             // Shouldn't happen -- if PIN1 succeeded we always try PIN2.
             writeln!(f, "PIN2 setup: not attempted")?;
@@ -1921,8 +2117,9 @@ mod activate_tests {
     use refineid_lib_core::apdu::status_word::PinRetries;
 
     use super::{
-        ActivatePreflightOutcome, CardGeneration, CardPinError, ChangePinOutcome, PinStatus,
-        UnblockOutcome, activation_continues_after_pin1, change_to_unblock, classify_preflight,
+        ActivatePreflightOutcome, ActivationTarget, CardGeneration, CardPinError, ChangePinOutcome,
+        PinManageSlot, PinStatus, SlotProbe, UnblockOutcome, activation_continues_after_pin1,
+        change_to_unblock, classify_preflight,
     };
     use crate::test_util::{TestResult, check_true};
     use refineid_lib_core::pin::ActivationPinSeven;
@@ -1937,11 +2134,16 @@ mod activate_tests {
     fn newer_preflight_changed_flag_indeterminate_proceeds() -> TestResult {
         let five = PinRetries::from_nibble(5).ok_or("PinRetries::from_nibble(5)")?;
         let pf = classify_preflight(
-            Some(PinStatus::Remaining(five)),
-            Some(PinStatus::Remaining(five)),
+            ActivationTarget::Both,
             CardGeneration::Newer,
-            None,
-            None,
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: None,
+            },
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: None,
+            },
         );
         check_true(
             matches!(pf, ActivatePreflightOutcome::LooksUnactivated { .. }),
@@ -1955,11 +2157,16 @@ mod activate_tests {
     fn newer_preflight_changed_flag_false_proceeds() -> TestResult {
         let five = PinRetries::from_nibble(5).ok_or("PinRetries::from_nibble(5)")?;
         let pf = classify_preflight(
-            Some(PinStatus::Remaining(five)),
-            Some(PinStatus::Remaining(five)),
+            ActivationTarget::Both,
             CardGeneration::Newer,
-            Some(false),
-            Some(false),
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: Some(false),
+            },
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: Some(false),
+            },
         );
         check_true(
             matches!(pf, ActivatePreflightOutcome::LooksUnactivated { .. }),
@@ -1974,11 +2181,63 @@ mod activate_tests {
     fn newer_preflight_changed_flag_true_refuses() -> TestResult {
         let five = PinRetries::from_nibble(5).ok_or("PinRetries::from_nibble(5)")?;
         let pf = classify_preflight(
-            Some(PinStatus::Remaining(five)),
-            Some(PinStatus::Remaining(five)),
+            ActivationTarget::Both,
             CardGeneration::Newer,
-            Some(true),
-            Some(true),
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: Some(true),
+            },
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: Some(true),
+            },
+        );
+        check_true(
+            matches!(pf, ActivatePreflightOutcome::LooksActivated { .. }),
+            "LooksActivated",
+        )
+    }
+
+    /// Activating both touches both slots: a card whose PIN 2 was
+    /// activated alone refuses, so the set PIN 2 is neither presented
+    /// the factory code nor overwritten.
+    #[test]
+    fn both_preflight_refuses_when_only_pin2_is_activated() -> TestResult {
+        let five = PinRetries::from_nibble(5).ok_or("PinRetries::from_nibble(5)")?;
+        let pf = classify_preflight(
+            ActivationTarget::Both,
+            CardGeneration::Newer,
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: Some(false),
+            },
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: Some(true),
+            },
+        );
+        check_true(
+            matches!(pf, ActivatePreflightOutcome::LooksActivated { .. }),
+            "LooksActivated",
+        )
+    }
+
+    /// New-scheme preflight: the changed flag alone proves activation;
+    /// a status probe that returned nothing must not turn an activated
+    /// PIN back into a factory one.
+    #[test]
+    fn newer_preflight_changed_flag_true_refuses_without_a_status_reading() -> TestResult {
+        let pf = classify_preflight(
+            ActivationTarget::One(PinManageSlot::Pin1),
+            CardGeneration::Newer,
+            SlotProbe {
+                status: None,
+                changed: Some(true),
+            },
+            SlotProbe {
+                status: None,
+                changed: Some(false),
+            },
         );
         check_true(
             matches!(pf, ActivatePreflightOutcome::LooksActivated { .. }),
@@ -1995,11 +2254,16 @@ mod activate_tests {
     fn older_preflight_with_healthy_pin1_refuses() -> TestResult {
         let five = PinRetries::from_nibble(5).ok_or("PinRetries::from_nibble(5)")?;
         let pf = classify_preflight(
-            Some(PinStatus::Remaining(five)),
-            None,
+            ActivationTarget::Both,
             CardGeneration::Older,
-            None,
-            None,
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: None,
+            },
+            SlotProbe {
+                status: None,
+                changed: None,
+            },
         );
         check_true(
             matches!(pf, ActivatePreflightOutcome::LooksActivated { .. }),
@@ -2014,11 +2278,16 @@ mod activate_tests {
     #[test]
     fn older_preflight_no_info_proceeds() -> TestResult {
         let pf = classify_preflight(
-            Some(PinStatus::NoInfo),
-            None,
+            ActivationTarget::Both,
             CardGeneration::Older,
-            None,
-            None,
+            SlotProbe {
+                status: Some(PinStatus::NoInfo),
+                changed: None,
+            },
+            SlotProbe {
+                status: None,
+                changed: None,
+            },
         );
         check_true(
             matches!(pf, ActivatePreflightOutcome::LooksUnactivated { .. }),
@@ -2034,16 +2303,88 @@ mod activate_tests {
     fn unknown_generation_keeps_old_scheme_classification() -> TestResult {
         let five = PinRetries::from_nibble(5).ok_or("PinRetries::from_nibble(5)")?;
         let pf = classify_preflight(
-            Some(PinStatus::Remaining(five)),
-            None,
+            ActivationTarget::Both,
             CardGeneration::Unknown,
-            None,
-            None,
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: None,
+            },
+            SlotProbe {
+                status: None,
+                changed: None,
+            },
         );
         check_true(
             matches!(pf, ActivatePreflightOutcome::LooksActivated { .. }),
             "LooksActivated",
         )
+    }
+
+    /// A one-PIN activation decides on that PIN's probes: on a
+    /// newer card with PIN1 changed and PIN2 still factory, PIN2
+    /// may be activated, PIN1 is refused, and each one's other
+    /// PIN reads as it is.
+    #[test]
+    fn one_pin_preflight_decides_on_that_pin() -> TestResult {
+        let five = PinRetries::from_nibble(5).ok_or("PinRetries::from_nibble(5)")?;
+        let generation = CardGeneration::Newer;
+        let changed = SlotProbe {
+            status: Some(PinStatus::Remaining(five)),
+            changed: Some(true),
+        };
+        let factory = SlotProbe {
+            status: Some(PinStatus::Remaining(five)),
+            changed: Some(false),
+        };
+        let one = |slot| ActivationTarget::One(slot);
+        check_true(
+            !classify_preflight(one(PinManageSlot::Pin2), generation, changed, factory)
+                .looks_activated(),
+            "PIN 2 proceeds",
+        )?;
+        check_true(
+            classify_preflight(one(PinManageSlot::Pin1), generation, changed, factory)
+                .looks_activated(),
+            "PIN 1 refused",
+        )?;
+        check_true(
+            classify_preflight(ActivationTarget::Both, generation, changed, factory)
+                .looks_activated(),
+            "both decide on PIN 1",
+        )?;
+        check_true(factory.looks_unactivated(generation), "factory PIN")?;
+        check_true(!changed.looks_unactivated(generation), "changed PIN")?;
+        let indeterminate = SlotProbe {
+            status: Some(PinStatus::Remaining(five)),
+            changed: None,
+        };
+        check_true(
+            !indeterminate.looks_unactivated(generation),
+            "no flag is no evidence",
+        )
+    }
+
+    /// Older cards: a factory PIN reads blocked (`NoInfo`), an
+    /// activated one reads a counter.
+    #[test]
+    fn older_slot_probe_reads_factory_and_activated() -> TestResult {
+        let five = PinRetries::from_nibble(5).ok_or("PinRetries::from_nibble(5)")?;
+        let generation = CardGeneration::Older;
+        let factory = SlotProbe {
+            status: Some(PinStatus::NoInfo),
+            changed: None,
+        };
+        let activated = SlotProbe {
+            status: Some(PinStatus::Remaining(five)),
+            changed: None,
+        };
+        check_true(factory.looks_unactivated(generation), "factory")?;
+        check_true(
+            !factory.looks_activated(generation),
+            "factory not activated",
+        )?;
+        check_true(activated.looks_activated(generation), "activated")?;
+        check_true(!activated.looks_unactivated(generation), "activated read")
     }
 
     /// New-scheme PIN setup uses `CHANGE REFERENCE DATA`; the

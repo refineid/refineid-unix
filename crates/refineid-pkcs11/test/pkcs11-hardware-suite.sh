@@ -287,17 +287,17 @@ guard_status "after CLI sign"
 if [[ "${REFINEID_SUITE_PIN_CHANGE:-}" == "1" ]]; then
     echo "+++ PIN1-change critical region; revert always +++" >&2
     if REFINEID_CURRENT_PIN1="$PIN1" REFINEID_NEW_PIN1="$PIN1_TMP" \
-         "$CLI" card change-pin1 </dev/null >/dev/null 2>&1; then
-        record "OK    11. change-pin1 -> temporary"; PASS=$((PASS+1))
+         "$CLI" pin change 1 </dev/null >/dev/null 2>&1; then
+        record "OK    11. pin change 1 -> temporary"; PASS=$((PASS+1))
         if REFINEID_CURRENT_PIN1="$PIN1_TMP" REFINEID_NEW_PIN1="$PIN1" \
-             "$CLI" card change-pin1 </dev/null >/dev/null 2>&1; then
-            record "OK    12. change-pin1 revert"; PASS=$((PASS+1))
+             "$CLI" pin change 1 </dev/null >/dev/null 2>&1; then
+            record "OK    12. pin change 1 revert"; PASS=$((PASS+1))
         else
-            record "FAIL  12. REVERT FAILED -- PIN1 is now the temporary value $PIN1_TMP; revert manually with: refineid card change-pin1"
+            record "FAIL  12. REVERT FAILED -- PIN1 is now the temporary value $PIN1_TMP; revert manually with: refineid pin change 1"
             FAIL=$((FAIL+1))
         fi
     else
-        record "FAIL  11. change-pin1 -> temporary (needs pin-env-debug CLI build)"; FAIL=$((FAIL+1))
+        record "FAIL  11. pin change 1 -> temporary (needs pin-env-debug CLI build)"; FAIL=$((FAIL+1))
     fi
     guard_status "after PIN1 change cycle"
 else
@@ -313,10 +313,10 @@ fi
 
 if [[ "${REFINEID_SUITE_INTERACTIVE:-}" == "1" && -t 0 ]]; then
     echo "+++ PUK unblock (interactive; enter PUK + current PIN1 at the prompts) +++"
-    if "$CLI" card unblock-pin1; then
-        record "OK    13. unblock-pin1 (PUK path)"; PASS=$((PASS+1))
+    if "$CLI" pin unblock 1; then
+        record "OK    13. pin unblock 1 (PUK path)"; PASS=$((PASS+1))
     else
-        record "FAIL  13. unblock-pin1"; FAIL=$((FAIL+1))
+        record "FAIL  13. pin unblock 1"; FAIL=$((FAIL+1))
     fi
     guard_status "after unblock"
 else

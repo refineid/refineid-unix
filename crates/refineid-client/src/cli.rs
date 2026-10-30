@@ -25,10 +25,11 @@
 //!    unknown flags) and wraps each value in its typed
 //!    counterpart where one exists (`Can` for `--can`, `Sha256`
 //!    for digests, `PinManageSlot` for slot enums, ...).
-//!    Variant-pair parsers (change-pin1 vs change-pin2,
-//!    sign-auth vs sign-qualified, ...) take the slot as a
-//!    first argument so error messages and `Args::run`
-//!    dispatch off the same value.
+//!    Variant-pair parsers (sign-auth vs sign-qualified) take
+//!    the slot as a first argument; `pin change 1|2` and its
+//!    kin parse the slot from a positional argument. Either
+//!    way error messages and `Args::run` dispatch off the same
+//!    value.
 //! 3. The typed [`Verb`] value flows into `Verb::run`, which
 //!    dispatches to `*Args::run`; an operation's handler also
 //!    takes the global `verbose` flag. Once a handler
@@ -45,9 +46,9 @@
 //! Pattern per subcommand module:
 //!
 //! 1. Define `pub struct FooArgs { ... }` with typed fields.
-//!    Variant-pair shapes (e.g. `change-pin1` vs
-//!    `change-pin2`) carry their identifying enum (e.g. `slot:
-//!    PinManageSlot`) as a field, so [`Verb::run`] doesn't need
+//!    Variant-pair shapes (e.g. `sign-auth` vs
+//!    `sign-qualified`, `pin change 1|2`) carry their
+//!    identifying enum (e.g. `slot: PinManageSlot`) as a field, so [`Verb::run`] doesn't need
 //!    to pass it as a separate argument.
 //! 2. Define `impl FooArgs { pub fn parse(...) ->
 //!    Result<Self, ArgParseError> { ... } }`. Internally the
@@ -82,19 +83,19 @@ use alloc::fmt;
 
 pub mod argv;
 pub mod card;
-pub mod card_activate;
-pub mod card_change_pin;
 pub mod card_decrypt_auth;
 pub mod card_emrtd;
 pub mod card_export_all;
 pub mod card_pair;
 pub mod card_pubkey;
 pub mod card_sign;
-pub mod card_unblock_pin;
 pub mod cert_chain;
 pub mod cert_show;
 pub mod document_sign;
 pub mod help;
+pub mod pin_activate;
+pub mod pin_change;
+pub mod pin_unblock;
 pub mod reader_keyboard;
 pub(crate) mod util;
 mod verb;

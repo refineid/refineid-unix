@@ -10,7 +10,7 @@ Client library and the `refineid` command-line tool.
   `card pubkey` and `card emrtd` are the read-only siblings.
 - **PIN-gated crypto**: `card sign-auth`, `card sign-qualified`,
   `document sign` (PAdES / CAdES / ASiC-E), `card decrypt-auth`.
-- **PIN management**: `card activate`, `card change-pin1/2`, `card unblock-pin1/2`.
+- **PIN management**: `pin activate`, `pin change 1|2`, `pin unblock 1|2`.
 - **Offline tools**: `verify`, `cert show`, `cert chain`.
 
 ## Contents

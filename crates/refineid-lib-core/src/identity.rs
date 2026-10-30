@@ -3046,7 +3046,7 @@ impl CredentialIdentity {
     ///
     /// Complements [`best_serial`]: the serial identifies the
     /// *card*, the person string identifies *who's on it*. The
-    /// pre-op identity log line in `card activate` /
+    /// pre-op identity log line in `pin activate` /
     /// `card emrtd` keeps them as separate fields so structured
     /// output can be parsed without splitting on whitespace.
     ///

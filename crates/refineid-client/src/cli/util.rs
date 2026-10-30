@@ -57,6 +57,24 @@ pub(super) const fn pin_name(slot: PinManageSlot) -> &'static str {
     }
 }
 
+/// The argument that names PIN 1 in `pin change`, `pin unblock` and
+/// `pin activate`.
+const PIN1_NUMBER: &str = "1";
+/// The argument that names PIN 2.
+const PIN2_NUMBER: &str = "2";
+/// What a missing PIN-number argument is called in the error.
+pub(super) const PIN_NUMBER: &str = "PIN number (1 or 2)";
+
+/// The PIN a `pin` command's number argument names; `None` for any
+/// other token.
+pub(super) fn pin_number(token: &str) -> Option<PinManageSlot> {
+    match token {
+        PIN1_NUMBER => Some(PinManageSlot::Pin1),
+        PIN2_NUMBER => Some(PinManageSlot::Pin2),
+        _ => None,
+    }
+}
+
 /// Write an operation's step report to `out` when `verbose`, and
 /// nothing otherwise: an operation is silent on success.
 ///
@@ -183,9 +201,7 @@ pub fn prompt_can_if_tty() -> Option<Can> {
 /// Read a PIN, consulting an environment variable first only when
 /// the `pin-env-debug` feature is enabled, otherwise prompting.
 ///
-/// This is the single consolidated home for what used to be a
-/// per-module `read_pin_env_or_prompt` (card sign / activate /
-/// change-pin) and the inline `read_pin1` in the login verbs.
+/// Shared by the signing, login and `pin` commands.
 ///
 /// The env-var branch is a compile-time alpha-period debug aid:
 /// env-var PINs show up in `ps` and are inherited by child
@@ -287,8 +303,7 @@ pub(super) fn pin_source_at_use(
 /// return the value if both entries match.
 ///
 /// Centralises the duplicate prompt-pair pattern used by
-/// `card activate`, `card change-pin{1,2}`, and `card
-/// unblock-pin{1,2}`. Emits one of two stderr lines on error
+/// `pin activate`, `pin change` and `pin unblock`. Emits one of two stderr lines on error
 /// (`cmd: <stdin-failure>` or `cmd: new <label> entries didn't
 /// match`) and folds those into the matching [`ExitStatus`]:
 ///
@@ -300,7 +315,7 @@ pub(super) fn pin_source_at_use(
 /// error. `digit_hint`, when `Some`, is appended in parens to
 /// the first prompt only -- `Some("4-12 digits")` gives `"new
 /// PIN 1 (4-12 digits): "` then `"new PIN 1 (confirm): "`. Pass
-/// `None` for change-pin / unblock-pin where no length hint is
+/// `None` for `pin change` / `pin unblock` where no length hint is
 /// shown.
 ///
 /// # Errors

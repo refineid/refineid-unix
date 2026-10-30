@@ -224,8 +224,8 @@ impl PinBytes {
     }
 }
 
-/// PUK code for the `RESET RETRY COUNTER` APDU (`card
-/// unblock-pin1` / `card unblock-pin2`).
+/// PUK code for the `RESET RETRY COUNTER` APDU (`pin unblock
+/// 1|2`).
 ///
 /// 8 to 12 ASCII digits (FINEID S4-1 v4.2 section 8.1.5, EF.AOD:
 /// minLength 8, storedLength 12), independent of card generation.
