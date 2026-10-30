@@ -85,6 +85,7 @@ find target -type d -name "incremental" -prune -exec rm -rf {} +
 | [refineid-lib-pcsc](crates/refineid-lib-pcsc/) | PC/SC adapter implementing the core's reader/transport ports. |
 | [refineid-lib-tls](crates/refineid-lib-tls/) | Server-authenticated HTTPS client (rustls) for timestamp authorities and EU trusted lists. |
 | [refineid-client](crates/refineid-client/) | Client library and the `refineid` CLI. |
+| [refineid-dev-errors](crates/refineid-dev-errors/) | Debug builds only: every reported failure to the system log (`journalctl -t refineid`, `/var/log/messages`) and the GUI's Errors window. Release builds compile none of it. |
 | [refineid-pkcs11](crates/refineid-pkcs11/) | PKCS#11 v2.40 cdylib for Firefox/NSS card login. |
 | [refineid-gui](crates/refineid-gui/) | Desktop GUI (Slint): PIN management, portrait/signature, document signing. |
 

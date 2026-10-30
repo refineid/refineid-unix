@@ -527,7 +527,11 @@ impl RemoteReader {
     /// # Errors
     /// [`RemoteError::Store`] when the store cannot be opened.
     pub fn open_local_without_sweep(directory: &std::path::Path) -> Result<Self, RemoteError> {
-        let store = FilePairingStore::open_without_sweep(directory).map_err(RemoteError::Store)?;
+        let store = FilePairingStore::open_without_sweep(directory)
+            .map_err(RemoteError::Store)
+            .inspect_err(|error| {
+                refineid_dev_errors::report!(Rapp, "pairing store not opened", error)
+            })?;
         Ok(Self::with_store(
             &local_host_name(),
             local_platform(),
@@ -540,7 +544,11 @@ impl RemoteReader {
     /// # Errors
     /// [`RemoteError::Store`] when the store cannot be opened.
     pub fn open(display_name: &str, platform: &str) -> Result<Self, RemoteError> {
-        let store = FilePairingStore::open_default().map_err(RemoteError::Store)?;
+        let store = FilePairingStore::open_default()
+            .map_err(RemoteError::Store)
+            .inspect_err(|error| {
+                refineid_dev_errors::report!(Rapp, "pairing store not opened", error)
+            })?;
         let mut reader = Self::with_store(display_name, platform, store);
         reader.sweep();
         Ok(reader)
@@ -607,6 +615,9 @@ impl RemoteReader {
         self.requester
             .expire_idle_pairings(current_time_ms())
             .map_err(RemoteError::Store)
+            .inspect_err(|error| {
+                refineid_dev_errors::report!(Rapp, "idle pairings not expired", error)
+            })
     }
 
     /// Every stored pairing, newest first.
@@ -648,6 +659,7 @@ impl RemoteReader {
         self.requester
             .forget(pair_id, current_time_ms())
             .map_err(RemoteError::Store)
+            .inspect_err(|error| refineid_dev_errors::report!(Rapp, "pairing not forgotten", error))
     }
 
     /// Tells each phone this computer forgot and that is in sight now
@@ -745,6 +757,16 @@ impl RemoteReader {
     /// [`RemoteError::Store`] when the record of a completed ceremony
     /// cannot be written.
     pub fn pair_with_code(
+        &mut self,
+        code: &str,
+        discovery_timeout: Duration,
+    ) -> Result<PairSummary, RemoteError> {
+        self.pair_with_code_unreported(code, discovery_timeout)
+            .inspect_err(|error| refineid_dev_errors::report!(Rapp, "pairing failed", error))
+    }
+
+    /// [`Self::pair_with_code`], before its failure is reported.
+    fn pair_with_code_unreported(
         &mut self,
         code: &str,
         discovery_timeout: Duration,
@@ -855,6 +877,19 @@ impl RemoteReader {
         discovery_timeout: Duration,
         wait: CardWait,
     ) -> Result<RemoteSession, RemoteError> {
+        self.establish_unreported(pair_id, discovery_timeout, wait)
+            .inspect_err(|error| {
+                refineid_dev_errors::report!(Rapp, "phone session not opened", error)
+            })
+    }
+
+    /// [`Self::establish`], before its failure is reported.
+    fn establish_unreported(
+        &mut self,
+        pair_id: Option<PairId>,
+        discovery_timeout: Duration,
+        wait: CardWait,
+    ) -> Result<RemoteSession, RemoteError> {
         self.may_dial()?;
         let pair_id = match pair_id {
             Some(pair_id) => pair_id,
@@ -898,6 +933,7 @@ impl RemoteReader {
                         ),
                     ) => return Err(session_error(error)),
                     Err(error) => {
+                        refineid_dev_errors::report!(Rapp, "phone session attempt failed", error);
                         last = RemoteError::Session(error);
                         continue;
                     }
@@ -931,6 +967,7 @@ impl RemoteReader {
                         ),
                     ) => return Err(session_error(error)),
                     Err(error) => {
+                        refineid_dev_errors::report!(Rapp, "phone card report not received", error);
                         last = RemoteError::Session(error);
                     }
                 }
@@ -969,6 +1006,7 @@ impl RemoteReader {
             operation,
             lifetime,
         )
+        .inspect_err(|error| refineid_dev_errors::report!(Rapp, "card operation failed", error))
     }
 
     /// Serves an open session for `wait`: answers the phone's pings,
@@ -988,6 +1026,7 @@ impl RemoteReader {
         self.requester
             .service(&mut session.session, wait)
             .map_err(session_error)
+            .inspect_err(|error| refineid_dev_errors::report!(Rapp, "phone session ended", error))
     }
 
     /// Closes a session deliberately; an already ended session is left
@@ -1068,6 +1107,17 @@ impl RemoteReader {
         &mut self,
         session: &mut RemoteSession,
     ) -> Result<Vec<u8>, RemoteError> {
+        self.confirmed_auth_cert_unreported(session)
+            .inspect_err(|error| {
+                refineid_dev_errors::report!(Rapp, "certificate not confirmed", error)
+            })
+    }
+
+    /// [`Self::confirmed_auth_cert`], before its failure is reported.
+    fn confirmed_auth_cert_unreported(
+        &mut self,
+        session: &mut RemoteSession,
+    ) -> Result<Vec<u8>, RemoteError> {
         let reported = session
             .card_fingerprint()
             .ok_or_else(|| RemoteError::CardAbsent(session.card_request()))?;
@@ -1119,6 +1169,9 @@ impl RemoteReader {
             .store_mut()
             .update(pair_id, &mut |record| Some(record.with_auth_cert(None)))
             .map_err(RemoteError::Store)
+            .inspect_err(|error| {
+                refineid_dev_errors::report!(Rapp, "cached certificate not dropped", error)
+            })
     }
 }
 

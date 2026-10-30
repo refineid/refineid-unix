@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 refineid-rapp.workspace = true
+refineid-dev-errors.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
 zeroize.workspace = true

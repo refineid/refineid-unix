@@ -424,10 +424,12 @@ fn report_outcome(
                     | crate::card_sign::SignErrorKind::PinPolicy { .. }
             ) =>
         {
+            refineid_dev_errors::report!(Cli, "document not signed", e);
             eprintln!("{cmd}: {e}");
             crate::exit_status::ExitStatus::CardCredentialRejected.into()
         }
         Err(e) => {
+            refineid_dev_errors::report!(Cli, "document not signed", e);
             eprintln!("{cmd}: {e}");
             crate::exit_status::ExitStatus::RuntimeFailure.into()
         }

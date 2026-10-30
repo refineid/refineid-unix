@@ -6,6 +6,7 @@ members = [
     "crates/refineid-gui-fltk",
     "crates/refineid-gui-gtk4",
     "crates/refineid-client",
+    "crates/refineid-dev-errors",
     "crates/refineid-lib-core",
     "crates/refineid-lib-pcsc",
     "crates/refineid-lib-tls",
@@ -17,7 +18,7 @@ members = [
 # YY.M.D, the UTC day the code last changed, stamped by the pre-commit
 # hook (script/version-stamp.sh). refineid_lib_core::VERSION appends the
 # build number B for the project version YY.M.D.B.
-version = "26.10.29"
+version = "26.10.30"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]
@@ -35,6 +36,7 @@ refineid-gui-core = { path = "crates/refineid-gui-core", version = "26" }
 refineid-gui-fltk = { path = "crates/refineid-gui-fltk", version = "26" }
 refineid-gui-gtk4 = { path = "crates/refineid-gui-gtk4", version = "26" }
 refineid-rapp-core = { path = "crates/refineid-rapp-core", version = "26" }
+refineid-dev-errors = { path = "crates/refineid-dev-errors", version = "26" }
 
 refineid-apdu = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-auth = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }

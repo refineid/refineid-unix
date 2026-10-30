@@ -51,6 +51,7 @@ pdf-stamp = []
 refineid-lib-core.workspace = true
 refineid-rapp-core.workspace = true
 refineid-lib-pcsc.workspace = true
+refineid-dev-errors.workspace = true
 refineid-lib-tls = { workspace = true, optional = true }
 hex.workspace = true
 # OCSP CertID hashes (issuer Name + SPKI -> SHA-1 per RFC 6960).

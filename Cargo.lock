@@ -2062,10 +2062,11 @@ source = "git+https://github.com/refineid/refineid-core.git?branch=main#367ad9cf
 
 [[package]]
 name = "refineid-client"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "hex",
  "hickory-resolver",
+ "refineid-dev-errors",
  "refineid-lib-core",
  "refineid-lib-pcsc",
  "refineid-lib-tls",
@@ -2093,6 +2094,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "refineid-dev-errors"
+version = "26.10.30"
+
+[[package]]
 name = "refineid-digest"
 version = "26.10.29"
 source = "git+https://github.com/refineid/refineid-core.git?branch=main#367ad9cf21329065f091a40ad2c9686b96574d1c"
@@ -2103,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "refineid-gui-core",
  "refineid-gui-fltk",
@@ -2113,12 +2118,13 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-core"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "hex",
  "image",
  "pdfluent-jpeg2000",
  "refineid-client",
+ "refineid-dev-errors",
  "refineid-lib-core",
  "refineid-lib-pcsc",
  "refineid-rapp-core",
@@ -2127,12 +2133,13 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-fltk"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "arboard",
  "fltk",
  "image",
  "refineid-client",
+ "refineid-dev-errors",
  "refineid-gui-core",
  "refineid-lib-core",
  "refineid-rapp-core",
@@ -2141,7 +2148,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-gtk4"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "gtk4",
  "image",
@@ -2154,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-core"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "aes 0.9.3",
  "cbc",
@@ -2179,15 +2186,16 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-pcsc"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "pcsc",
+ "refineid-dev-errors",
  "refineid-lib-core",
 ]
 
 [[package]]
 name = "refineid-lib-tls"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "refineid-lib-core",
  "refineid-rapp-core",
@@ -2265,9 +2273,10 @@ dependencies = [
 
 [[package]]
 name = "refineid-rapp-core"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "getrandom 0.4.3",
+ "refineid-dev-errors",
  "refineid-rapp",
  "sha2 0.11.0",
  "zeroize",
@@ -2292,9 +2301,10 @@ dependencies = [
 
 [[package]]
 name = "refineid-unix-pkcs11"
-version = "26.10.29"
+version = "26.10.30"
 dependencies = [
  "libc",
+ "refineid-dev-errors",
  "refineid-lib-core",
  "refineid-lib-pcsc",
  "refineid-pkcs11",

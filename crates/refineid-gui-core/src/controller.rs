@@ -345,7 +345,10 @@ impl RefineIdController {
                 Err(CardCheckError::ReaderPick(
                     ReaderPickError::NoReaders | ReaderPickError::NoCardPresent,
                 )) => Ok(Vec::new()),
-                Err(error) => Err(error.to_string()),
+                Err(error) => {
+                    refineid_dev_errors::report!(Gui, "card inspection failed", error);
+                    Err(error.to_string())
+                }
             };
 
             controller
@@ -393,7 +396,8 @@ impl RefineIdController {
                     }
                 }
                 Ok(false) => {}
-                Err(_service_down) => {
+                Err(service_down) => {
+                    refineid_dev_errors::report!(Gui, "card presence not watched", service_down);
                     thread::sleep(CARD_PRESENCE_ERROR_BACKOFF);
                 }
             }
@@ -477,6 +481,9 @@ impl RefineIdController {
                         allow_reactivate: false,
                     },
                 )
+                .inspect_err(|error| {
+                    refineid_dev_errors::report!(Gui, "card activation failed", error)
+                })
                 .map_err(|e| e.to_string())
             })();
 
@@ -539,10 +546,13 @@ impl RefineIdController {
                         s.status_message = String::new();
                     }
                     Ok(report) => {
+                        let outcome = report.outcome;
+                        refineid_dev_errors::report!(Gui, "PIN change rejected", outcome);
                         s.status_message =
                             format!("{} change rejected: {:?}", slot.label(), report.outcome);
                     }
                     Err(err) => {
+                        refineid_dev_errors::report!(Gui, "PIN change failed", err);
                         s.status_message = format!("{} change error: {err}", slot.label());
                     }
                 }
@@ -590,6 +600,7 @@ impl RefineIdController {
                         reader_filter: Some(reader),
                     },
                 )
+                .inspect_err(|error| refineid_dev_errors::report!(Gui, "PIN unblock failed", error))
                 .map_err(|e| e.to_string())
             })();
 
@@ -600,6 +611,8 @@ impl RefineIdController {
                         s.status_message = String::new();
                     }
                     Ok(report) => {
+                        let outcome = report.outcome;
+                        refineid_dev_errors::report!(Gui, "PIN unblock rejected", outcome);
                         s.status_message = format!("Reactivation rejected: {:?}", report.outcome);
                     }
                     Err(err) => {
@@ -677,6 +690,7 @@ impl RefineIdController {
                         cache.insert(card_key, (p, sig));
                     }
                     Err(err) => {
+                        refineid_dev_errors::report!(Gui, "card images not read", err);
                         s.status_message = format!("{err}");
                     }
                 }
@@ -760,6 +774,9 @@ impl RefineIdController {
                         },
                     )
                     .map(|_| out_path.display().to_string())
+                    .inspect_err(|error| {
+                        refineid_dev_errors::report!(Gui, "document not signed", error)
+                    })
                     .map_err(|e| e.to_string())
                 } else {
                     refineid_client::card_manager::sign_pdf(
@@ -776,6 +793,9 @@ impl RefineIdController {
                         },
                     )
                     .map(|_| out_path.display().to_string())
+                    .inspect_err(|error| {
+                        refineid_dev_errors::report!(Gui, "document not signed", error)
+                    })
                     .map_err(|e| e.to_string())
                 };
                 results.push(res);

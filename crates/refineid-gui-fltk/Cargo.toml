@@ -16,6 +16,7 @@ refineid-gui-core = { path = "../refineid-gui-core", version = "26" }
 refineid-client = { path = "../refineid-client", version = "26" }
 refineid-lib-core.workspace = true
 refineid-rapp-core.workspace = true
+refineid-dev-errors.workspace = true
 fltk.workspace = true
 zeroize.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

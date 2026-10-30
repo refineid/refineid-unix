@@ -15,5 +15,7 @@
 //! FLTK presentation driver for RefineID.
 
 pub mod driver;
+#[cfg(debug_assertions)]
+mod errors;
 
 pub use driver::FltkDriver;
