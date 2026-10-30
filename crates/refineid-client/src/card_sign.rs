@@ -1076,7 +1076,15 @@ fn sign_chain<T: CardTransport>(
             AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
         })?;
     check_retry_floor(slot.pin_slot(), status).map_err(SignErrorKind::RetryFloor)?;
+    // The prompt is the one moment the card is out of the flow's hands,
+    // so the card that answers VERIFY must be the card that was checked.
+    let bound = live_token_serial(transport)?;
     let pin = options.pin.obtain().map_err(SignErrorKind::PinEntry)?;
+    if live_token_serial(transport)? != bound {
+        return Err(SignErrorKind::DisplayedCard(
+            CARD_CHANGED_DURING_PROMPT.to_owned(),
+        ));
+    }
     let outcome = transport
         .verify_pin_with_scheme(slot.pin_slot(), scheme, pin)
         .map_err(|e| match e {
@@ -1188,6 +1196,20 @@ fn document_metadata(
 ///
 /// Runs before PIN verification for every document request carrying a
 /// displayed serial, whatever the format produces.
+/// The refusal when the card in the reader is not the one the PIN was
+/// entered for.
+pub(crate) const CARD_CHANGED_DURING_PROMPT: &str = "the card changed while the PIN was entered";
+
+/// The serial of the card in the reader, as EF.TokenInfo names it.
+fn live_token_serial<T: CardTransport>(
+    transport: &mut T,
+) -> Result<Option<TokenSerial>, SignErrorKind> {
+    let token = transport.read_token_info().map_err(|error| {
+        SignErrorKind::DisplayedCard(format!("cannot re-read EF.TokenInfo: {error}"))
+    })?;
+    Ok(token.serial_number_hex.map(render_token_serial))
+}
+
 fn ensure_displayed_card<T: CardTransport>(
     transport: &mut T,
     request: &DocumentRequest,
@@ -1195,10 +1217,7 @@ fn ensure_displayed_card<T: CardTransport>(
     let Some(expected) = request.expected_serial.as_ref() else {
         return Ok(());
     };
-    let token = transport.read_token_info().map_err(|error| {
-        SignErrorKind::DisplayedCard(format!("cannot re-read EF.TokenInfo: {error}"))
-    })?;
-    let live = token.serial_number_hex.map(render_token_serial);
+    let live = live_token_serial(transport)?;
     ensure_expected_serial(expected, live.as_ref())
 }
 

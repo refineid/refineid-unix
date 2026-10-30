@@ -50,7 +50,8 @@ const ANSWER_FILL: u8 = b'S';
 pub(crate) const TRIES_SERVED: u8 = 5;
 /// A PIN counter the retry floor refuses (two, one or no tries).
 pub(crate) const TRIES_BELOW_FLOOR: u8 = 2;
-/// The certificate the synthetic card holds in every slot.
+/// The certificate the card holds in every slot: the public DVV root,
+/// a real certificate standing in for the card's own.
 pub(crate) const CERTIFICATE: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-rsa.der");
 
 /// The card state a flow test sets up.

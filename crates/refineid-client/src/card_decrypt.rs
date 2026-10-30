@@ -106,6 +106,8 @@ pub enum DecryptAuthError {
     RetryFloor(RetryFloorRefusal),
     /// PIN entry ended without a PIN; nothing was presented.
     PinEntry(PinEntryError),
+    /// The card in the reader is not the card the PIN was entered for.
+    CardChanged,
     /// Local-policy rejection on PIN1 (length / non-digit)
     /// before any APDU went out. Counter is unaffected.
     PinPolicy(PinPolicyReason),
@@ -159,6 +161,7 @@ impl fmt::Display for DecryptAuthError {
             }
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
             Self::PinEntry(e) => write!(f, "{e}"),
+            Self::CardChanged => f.write_str(crate::card_sign::CARD_CHANGED_DURING_PROMPT),
             Self::PinPolicy(r) => write!(f, "PIN1 rejected locally: {r}"),
             Self::Pkcs15Select(s) => write!(f, "SELECT PKCS#15 app: {s}"),
             Self::DecryptSw { stage, sw } => {
@@ -192,6 +195,16 @@ fn auth_to_decrypt<E: fmt::Display>(e: AuthError<E>) -> DecryptAuthError {
 
 /// SELECT the PKCS#15 application and refuse when PIN1 is at the
 /// retry floor.
+/// The serial of the card in the reader, as EF.TokenInfo names it.
+fn token_serial<T: CardTransport>(
+    transport: &mut T,
+) -> Result<Option<refineid_lib_core::identity::TokenSerial>, DecryptAuthError> {
+    let token = transport
+        .read_token_info()
+        .map_err(|error| DecryptAuthError::Transport(format!("{error}")))?;
+    Ok(token.serial_number_hex)
+}
+
 fn pin1_gate<T: CardTransport>(transport: &mut T) -> Result<(), DecryptAuthError> {
     transport
         .select_pkcs15_application()
@@ -237,13 +250,19 @@ where
     let ciphertext_len = ct_bytes.len();
     let ciphertext: Ciphertext<RsaPkcs1> = Ciphertext::new(ct_bytes);
 
-    {
+    // The prompt is the one moment the card is out of the flow's hands,
+    // so the card that answers VERIFY must be the card that was checked.
+    let bound = {
         let mut probe = backend.open_session(&reader_id, ReaderAccessCap::Read)?;
         pin1_gate(&mut probe)?;
-    }
+        token_serial(&mut probe)?
+    };
     let pin = options.pin.obtain().map_err(DecryptAuthError::PinEntry)?;
 
     let mut transport = backend.open_session(&reader_id, ReaderAccessCap::PinSequence)?;
+    if token_serial(&mut transport)? != bound {
+        return Err(DecryptAuthError::CardChanged);
+    }
     pin1_gate(&mut transport)?;
     let outcome = transport.verify_pin1(pin).map_err(auth_to_decrypt)?;
     match outcome {
