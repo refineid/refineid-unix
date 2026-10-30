@@ -28,7 +28,7 @@ use std::process::ExitCode;
 ///
 /// - `Ok = 0` -- success.
 /// - `VerifyFailed = 1` -- a negative answer: offline verify rejected
-///   the signature, or the site answered a login outside 2xx.
+///   the signature, or the site answered a login with a 4xx or 5xx status.
 /// - `BadInvocation = 64` -- argv shape rejected (= `EX_USAGE`).
 /// - `NoReaders = 65` -- PC/SC: no readers connected.
 /// - `NoCardPresent = 66` -- readers present but no card.
@@ -42,7 +42,7 @@ pub enum ExitStatus {
     /// Success (`0`).
     Ok = 0,
     /// A negative answer: offline `verify` rejected the signature, or
-    /// the site answered a login outside 2xx (`1`).
+    /// the site answered a login with a 4xx or 5xx status (`1`).
     VerifyFailed = 1,
     /// argv shape rejected (`64` = `EX_USAGE`).
     BadInvocation = 64,
