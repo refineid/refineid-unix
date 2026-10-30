@@ -221,7 +221,8 @@ impl CardArgs {
             }
             Ok(_) => {}
             Err(e) => {
-                println!("  Card Status:  (Inspect error: {e})");
+                eprintln!("card: the phone did not answer the inspection: {e}");
+                return crate::exit_status::ExitStatus::RuntimeFailure.into();
             }
         }
         crate::exit_status::ExitStatus::Ok.into()

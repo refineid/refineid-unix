@@ -132,11 +132,12 @@ impl SignArgs {
         }
         match result {
             Ok(report) => {
-                super::util::print_report(verbose, &report);
                 // Failed local verify is a sign-flow failure; Skipped
                 // (e.g. ECDSA P-384 local verify not yet wired) is
                 // not -- the card-side sign chain still completed.
-                if report.local_verify.is_failed() {
+                let verified = !report.local_verify.is_failed();
+                super::util::show_outcome(verbose, verified, &report);
+                if !verified {
                     eprintln!("{cmd}: local verify: {}", report.local_verify);
                     crate::exit_status::ExitStatus::RuntimeFailure.into()
                 } else {

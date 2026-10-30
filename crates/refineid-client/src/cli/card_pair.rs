@@ -346,9 +346,12 @@ impl AuthArgs {
             match refineid_lib_tls::client_auth::get_with_rapp_client_auth(&uri, pair.pair_id) {
                 Ok(response) => {
                     let status_line = response.lines().next().unwrap_or_default();
+                    let Some(code) = http_status_code(status_line) else {
+                        eprintln!("auth: the response carries no HTTP status line");
+                        return ExitStatus::RuntimeFailure.into();
+                    };
                     println!("{status_line}");
-                    let accepted = http_status_code(status_line)
-                        .is_some_and(|code| HTTP_SUCCESS.contains(&code));
+                    let accepted = HTTP_SUCCESS.contains(&code);
                     if verbose {
                         for line in response.lines() {
                             if line.contains("<title>")

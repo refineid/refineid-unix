@@ -108,7 +108,7 @@ impl ActivateArgs {
             return ExitStatus::RuntimeFailure.into();
         };
         if verbose {
-            CardActivateHelpers::note_generation_disagreement(&ctx);
+            CardActivateHelpers::note_generation_disagreement(&ctx, verbose);
         }
         CardActivateHelpers::emit_preflight_event(&ctx, expected_len);
         let activation_pin = match CardActivateHelpers::prompt_activation_pin(expected_len) {
@@ -207,11 +207,12 @@ impl CardActivateHelpers {
     /// the issuance-date verdict wins and the flow continues;
     /// the note exists so the discrepancy lands in the audit
     /// log.
-    fn note_generation_disagreement(ctx: &ActivationCardContext) {
-        if ctx.generation != ctx.generation_by_issuer_cn
+    fn note_generation_disagreement(ctx: &ActivationCardContext, verbose: bool) {
+        if verbose
+            && ctx.generation != ctx.generation_by_issuer_cn
             && ctx.generation_by_issuer_cn != refineid_lib_core::pkcs15::CardGeneration::Unknown
         {
-            println!(
+            eprintln!(
                 "{CMD}: note: card generation by issuance-date ({:?}) disagrees with \
              issuer-CN heuristic ({:?}); proceeding with the issuance-date verdict",
                 ctx.generation, ctx.generation_by_issuer_cn,

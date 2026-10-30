@@ -487,8 +487,10 @@ fn report_outcome(
 ) -> std::process::ExitCode {
     match result {
         Ok(report) => {
-            super::util::print_report(
+            let verified = !report.local_verify.is_failed();
+            super::util::show_outcome(
                 verbose,
+                verified,
                 &DocumentReport {
                     sign: &report,
                     format,
@@ -496,7 +498,7 @@ fn report_outcome(
                     archive,
                 },
             );
-            if report.local_verify.is_failed() {
+            if !verified {
                 eprintln!("{cmd}: local verify: {}", report.local_verify);
                 crate::exit_status::ExitStatus::RuntimeFailure.into()
             } else {
