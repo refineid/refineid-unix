@@ -14,7 +14,7 @@
 
 //! Typed data models for GUI state and user intentions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use refineid_client::card_check::CardCheckReport;
@@ -24,6 +24,7 @@ use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_lib_core::sign::document::Format;
+use refineid_lib_core::x509::DateTime;
 use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::remote::PairSummary;
 
@@ -145,6 +146,46 @@ pub enum SignFormat {
     Pades,
     /// ASiC-E container alongside the document.
     AsicE,
+}
+
+/// The word between a signed document's stem and its signing time.
+const SIGNED_LABEL: &str = "signed";
+/// File extension of a PAdES-signed document.
+const PADES_EXTENSION: &str = "pdf";
+/// File extension of an ASiC-E container.
+const ASICE_EXTENSION: &str = "asice";
+/// The separator in an RFC 3339 time that file systems refuse.
+const TIME_SEPARATOR: char = ':';
+/// What [`TIME_SEPARATOR`] becomes in a file name.
+const FILE_NAME_TIME_SEPARATOR: &str = "-";
+
+impl SignFormat {
+    /// The file extension of a document signed in this format.
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Pades => PADES_EXTENSION,
+            Self::AsicE => ASICE_EXTENSION,
+        }
+    }
+}
+
+/// Where the signed copy of `document` goes: beside it, named
+/// `<stem> - signed <UTC time>.<extension>`, the name every RefineID app
+/// gives a signed document, with the time's colons as dashes.
+#[must_use]
+pub fn signed_document_path(document: &Path, format: SignFormat, signed_at: DateTime) -> PathBuf {
+    let stem = document
+        .file_stem()
+        .map(|stem| stem.to_string_lossy())
+        .unwrap_or_default();
+    let time = signed_at
+        .to_string()
+        .replace(TIME_SEPARATOR, FILE_NAME_TIME_SEPARATOR);
+    document.with_file_name(format!(
+        "{stem} - {SIGNED_LABEL} {time}.{}",
+        format.extension()
+    ))
 }
 
 impl From<SignFormat> for Format {
@@ -362,6 +403,39 @@ mod tests {
 
     /// A synthetic pair identifier.
     const PAIR_ID: PairId = PairId::from_array(*b"synthetic-pair-1");
+
+    /// A synthetic signing time, 2001-02-03T04:05:06Z.
+    const SIGNED_YEAR: u16 = 2001;
+    const SIGNED_MONTH: u8 = 2;
+    const SIGNED_DAY: u8 = 3;
+    const SIGNED_HOUR: u8 = 4;
+    const SIGNED_MINUTE: u8 = 5;
+    const SIGNED_SECOND: u8 = 6;
+
+    fn signed_at() -> DateTime {
+        DateTime::new(
+            SIGNED_YEAR,
+            SIGNED_MONTH,
+            SIGNED_DAY,
+            SIGNED_HOUR,
+            SIGNED_MINUTE,
+            SIGNED_SECOND,
+        )
+        .expect("synthetic signing time is valid")
+    }
+
+    #[test]
+    fn a_signed_document_is_named_by_stem_and_utc_signing_time() {
+        let document = Path::new("/documents/report.pdf");
+        assert_eq!(
+            signed_document_path(document, SignFormat::Pades, signed_at()),
+            Path::new("/documents/report - signed 2001-02-03T04-05-06Z.pdf")
+        );
+        assert_eq!(
+            signed_document_path(document, SignFormat::AsicE, signed_at()),
+            Path::new("/documents/report - signed 2001-02-03T04-05-06Z.asice")
+        );
+    }
 
     fn summary(state: PairingState) -> PairSummary {
         PairSummary {
