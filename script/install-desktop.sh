@@ -91,6 +91,14 @@ if [ -d /usr/dt ] || [ -d /usr/local/dt ]; then
         packaging/cde/RefineID.t.pm "$CDE_CONF/icons/C"
     # An executable file named after the action is its icon in the group.
     install -m 755 /dev/null "$CDE_CONF/appmanager/C/System/RefineID"
+    # CDE runs no freedesktop autostart entries; its Xsession sources the
+    # executable scripts in Xsession.d at every login.
+    CDE_SESSION="$DESTDIR/etc/dt/config/Xsession.d"
+    install -d "$CDE_SESSION"
+    printf '%s >/dev/null 2>&1 || true\n' \
+        "$PREFIX/libexec/refineid/refineid-browser-token" \
+        > "$CDE_SESSION/0100.refineid"
+    chmod 755 "$CDE_SESSION/0100.refineid"
 fi
 
 # Browsers. Firefox reads a system policy, so every profile of every user
@@ -111,14 +119,16 @@ fi
 install -d "$POLICY_DIR" "$DESTDIR$PREFIX/libexec/refineid" "$AUTOSTART_DIR"
 printf '{ "policies": { "SecurityDevices": { "RefineID": "%s" } } }\n' "$MODULE" \
     > "$POLICY_DIR/policies.json"
-# OpenBSD confines Firefox with unveil(2); the module in Firefox's main
+# OpenBSD confines both browsers with unveil(2); the module in the main
 # process reads and locks the phone pairings under the user's
-# configuration directory.
-UNVEIL_MAIN="$DESTDIR/etc/firefox/unveil.main"
-UNVEIL_PAIRINGS='$XDG_CONFIG_HOME/refineid rwc'
-if [ -f "$UNVEIL_MAIN" ] && ! grep -qxF "$UNVEIL_PAIRINGS" "$UNVEIL_MAIN"; then
-    printf '%s\n' "$UNVEIL_PAIRINGS" >> "$UNVEIL_MAIN"
-fi
+# configuration directory. Each browser spells that directory its own way.
+unveil_pairings() {
+    if [ -f "$1" ] && ! grep -qxF "$2" "$1"; then
+        printf '%s\n' "$2" >> "$1"
+    fi
+}
+unveil_pairings "$DESTDIR/etc/firefox/unveil.main" '$XDG_CONFIG_HOME/refineid rwc'
+unveil_pairings "$DESTDIR/etc/chromium/unveil.main" '~/.config/refineid rwc'
 sed "s|@MODULE@|$MODULE|" packaging/refineid-browser-token \
     > "$DESTDIR$PREFIX/libexec/refineid/refineid-browser-token"
 chmod 755 "$DESTDIR$PREFIX/libexec/refineid/refineid-browser-token"
