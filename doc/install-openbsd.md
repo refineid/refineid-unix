@@ -46,6 +46,7 @@ As root:
 
 ```sh
 install -m 755 target/release/refineid /usr/local/bin/refineid
+install -d /usr/local/man/man1
 install -m 444 crates/refineid-client/man/refineid.1 /usr/local/man/man1/refineid.1
 install -d /usr/local/lib/refineid
 install -m 755 target/release/librefineid_pkcs11.so /usr/local/lib/refineid/

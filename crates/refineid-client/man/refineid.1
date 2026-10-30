@@ -26,7 +26,7 @@
 .Ar command
 .Cm help
 .Nm
-.Fl V | -version
+.Fl V | Fl -version
 .Sh DESCRIPTION
 .Nm
 reads, manages and signs with a FINEID card, the Finnish identity card,
@@ -91,7 +91,8 @@ Print the version and exit.
 No command prints the version otherwise.
 .It Fl v , Fl -verbose
 Show what each step did.
-Accepted anywhere on the command line.
+Recognised anywhere on the command line, so no option value can be
+spelled like it.
 .El
 .Sh COMMANDS
 .Bl -tag -width Ds
@@ -141,10 +142,15 @@ eMRTD file extraction: the same read as
 .Cm card Fl -can ,
 plus options that write artefacts to disk.
 .Bl -tag -width Ds
+.It Fl -can Ar can
+The card access number printed on the card front.
 .It Fl -save-face Ar path
 Write the face image.
 .It Fl -save-signature Ar path
 Write the displayed-signature image.
+.It Fl -reader Ar substr
+Narrow to readers whose name contains
+.Ar substr .
 .El
 .It Xo
 .Cm card activate

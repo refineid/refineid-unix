@@ -26,7 +26,7 @@ use super::verb::VerbTag;
 /// The words that ask for help: as the first argument they ask for
 /// the synopsis, right after a command's words for that command's help.
 const HELP_WORDS: &[&str] = &["help", "-h", "--help"];
-/// The options that ask for a command's help anywhere in its argv.
+/// The options that ask for a command's help, as its first argument.
 const HELP_OPTIONS: &[&str] = &["-h", "--help"];
 /// The options that ask for the version.
 const VERSION_OPTIONS: &[&str] = &["-V", "--version"];
@@ -110,13 +110,13 @@ pub fn is_verbose_option(token: &str) -> bool {
 }
 
 /// `true` when the argv after a command's words asks for its help:
-/// a help word first, or a help option anywhere.
+/// a help word or a help option as the first argument. Later
+/// positions are the command's own, where `help` may be a file name
+/// and an option's value may spell like a help option.
 #[must_use]
 pub fn asks_command_help(rest: &[String]) -> bool {
-    rest.first().is_some_and(|first| is_help_word(first))
-        || rest
-            .iter()
-            .any(|token| HELP_OPTIONS.contains(&token.as_str()))
+    rest.first()
+        .is_some_and(|first| is_help_word(first) || HELP_OPTIONS.contains(&first.as_str()))
 }
 
 /// `refineid <version>`, the whole output of `refineid --version`.
@@ -264,13 +264,18 @@ mod tests {
     fn command_help_is_asked_first_or_by_option() -> TestResult {
         let words = |s: &[&str]| s.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
         check_true(asks_command_help(&words(&["help"])), "help first")?;
+        check_true(asks_command_help(&words(&["--help"])), "--help first")?;
         check_true(
-            asks_command_help(&words(&["--reader", "Synthetic Card Reader", "--help"])),
-            "--help anywhere",
+            !asks_command_help(&words(&["--reader", "Synthetic Card Reader", "--help"])),
+            "--help later is the command's own argument",
         )?;
         check_true(
             !asks_command_help(&words(&["--reason", "help"])),
             "help as a value",
+        )?;
+        check_true(
+            !asks_command_help(&words(&["--reason", "--help", "report.pdf"])),
+            "a help option as a value",
         )
     }
 
