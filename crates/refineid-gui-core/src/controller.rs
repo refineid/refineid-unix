@@ -42,6 +42,7 @@ use crate::error::GuiCoreError;
 use crate::image::{RgbaImageBuffer, decode_document_image};
 use crate::model::{
     CardSource, ManagedCard, PairedPhone, RappPairingState, SignFormat, UiState, UserIntent,
+    signed_document_path,
 };
 
 const DENIED_PINS: &[&[u8]] = &[
@@ -755,10 +756,8 @@ impl RefineIdController {
             let mut results = Vec::new();
 
             for doc in &documents {
-                let out_path = doc.with_extension(format!(
-                    "signed.{}",
-                    doc.extension().and_then(|s| s.to_str()).unwrap_or("pdf")
-                ));
+                let out_path =
+                    signed_document_path(doc, format, refineid_client::card_check::now_date_time());
                 let res = if format == SignFormat::AsicE {
                     refineid_client::card_manager::sign_asice(
                         refineid_client::card_manager::AsicSignOptions {
