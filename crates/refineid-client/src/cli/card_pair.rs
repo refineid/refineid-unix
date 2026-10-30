@@ -28,8 +28,10 @@ use super::argv::RemainingArgv;
 use super::verb::VerbTag;
 use crate::exit_status::ExitStatus;
 
-/// The HTTP status codes that mean the site accepted the login.
-const HTTP_SUCCESS: core::ops::RangeInclusive<u16> = 200..=299;
+/// The first HTTP status code that means the site refused the request:
+/// the client and server error classes, as `curl --fail` counts them.
+/// A redirect after a certificate login is the site moving on.
+const HTTP_FIRST_ERROR_STATUS: u16 = 400;
 /// The position of the status code in an HTTP status line.
 const HTTP_STATUS_CODE_FIELD: usize = 1;
 
@@ -74,7 +76,8 @@ pub const AUTH_HELP: &str = "\
 usage: refineid auth [URL]
 
 Log in to a TLS site with the card in the paired phone and print the
-response's status line. URL defaults to https://card.refineid.fi.
+response's status line; a 4xx or 5xx status exits 1. URL defaults to
+https://card.refineid.fi.
 -v shows each step.
 ";
 
@@ -351,7 +354,7 @@ impl AuthArgs {
                         return ExitStatus::RuntimeFailure.into();
                     };
                     println!("{status_line}");
-                    let accepted = HTTP_SUCCESS.contains(&code);
+                    let accepted = code < HTTP_FIRST_ERROR_STATUS;
                     if verbose {
                         for line in response.lines() {
                             if line.contains("<title>")
@@ -380,5 +383,34 @@ impl AuthArgs {
             eprintln!("auth: refineid built without the tls-rustls feature");
             ExitStatus::RuntimeFailure.into()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HTTP_FIRST_ERROR_STATUS, http_status_code};
+    use crate::test_util::{TestResult, check, check_true};
+
+    const REDIRECT_STATUS_LINE: &str = "HTTP/1.1 302 Found";
+    const DENIED_STATUS_LINE: &str = "HTTP/1.1 403 Forbidden";
+    const NOT_A_STATUS_LINE: &str = "<html>";
+
+    #[test]
+    fn a_redirect_is_accepted_and_a_refusal_is_not() -> TestResult {
+        let redirect = http_status_code(REDIRECT_STATUS_LINE).ok_or("redirect code")?;
+        check_true(
+            redirect < HTTP_FIRST_ERROR_STATUS,
+            "a redirect after login is success",
+        )?;
+        let denied = http_status_code(DENIED_STATUS_LINE).ok_or("denied code")?;
+        check_true(
+            denied >= HTTP_FIRST_ERROR_STATUS,
+            "a refusal is a negative answer",
+        )?;
+        check(
+            &http_status_code(NOT_A_STATUS_LINE),
+            &None,
+            "no status line",
+        )
     }
 }

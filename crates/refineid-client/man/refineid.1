@@ -468,7 +468,7 @@ rejected the signature, or
 .Cm cert chain
 reached no self-signed root, or
 .Cm auth
-received a status outside 2xx.
+received a 4xx or 5xx status; a redirect counts as success.
 .It 64
 The command line was not understood
 .Pq Dv EX_USAGE .
