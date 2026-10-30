@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! `card sign-document` typed arguments.
+//! `document sign` typed arguments.
 //!
 //! The bare `card sign-{auth,qualified}` verbs hand back the signature
 //! the card computed and nothing else, which is only useful to someone
@@ -26,6 +26,7 @@ use refineid_lib_core::can::Can;
 use refineid_lib_core::sign::cades::SigningTime;
 use refineid_lib_core::sign::document::Format;
 use refineid_lib_core::sign::pades::SignatureMetadata;
+use refineid_lib_core::x509::DateTime;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_sign::{
@@ -33,19 +34,27 @@ use crate::card_sign::{
 };
 
 /// This verb's tag, for error messages.
-const CMD: VerbTag = VerbTag::CardSignDocument;
+const CMD: VerbTag = VerbTag::DocumentSign;
 
-/// Parsed `card sign-document --format F --in PATH [--in PATH ...]
-/// --out PATH [--slot auth|qualified] [--reason TEXT]
-/// [--location TEXT] [--reader SUBSTR] [--can NNNNNN]`.
+/// What marks an argument as an option rather than an input path.
+const OPTION_PREFIX: &str = "--";
+
+/// Parsed `document sign FILE [FILE ...] [--format F] [--out PATH]
+/// [--slot auth|qualified] [--reason TEXT] [--location TEXT]
+/// [--reader SUBSTR] [--can NNNNNN]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SignDocumentArgs {
-    /// Which format to produce (`--format`).
+pub struct DocumentSignArgs {
+    /// Which format to produce (`--format`). Without it, one PDF is
+    /// signed as `PAdES` and anything else as `ASiC-E` with `XAdES`.
     pub format: Format,
-    /// Files to sign, in the order given (`--in`, repeatable).
+    /// Files to sign, in the order given (positional, at least one).
     pub inputs: Vec<PathBuf>,
     /// Where the finished document goes (`--out`).
-    pub output: PathBuf,
+    ///
+    /// `None` names it with
+    /// [`crate::signed_name::signed_document_path`] at run time, since
+    /// the name carries the signing instant.
+    pub output: Option<PathBuf>,
     /// Which key signs.
     ///
     /// Defaults to the qualified-signature slot. That is the one whose
@@ -91,7 +100,7 @@ pub struct SignDocumentArgs {
     pub timestamp_authorities: Vec<String>,
 }
 
-impl SignDocumentArgs {
+impl DocumentSignArgs {
     /// Execute the verb.
     #[must_use]
     pub fn run(self) -> std::process::ExitCode {
@@ -124,13 +133,16 @@ impl SignDocumentArgs {
             eprintln!("{cmd}: no input files");
             return crate::exit_status::ExitStatus::RuntimeFailure.into();
         }
+        let now = crate::card_check::now_date_time();
+        let output = output
+            .unwrap_or_else(|| crate::signed_name::signed_document_path(&inputs, format, now));
         let primary = inputs.remove(0);
         let metadata = SignatureMetadata {
             reason,
             location,
             ..SignatureMetadata::default()
         };
-        let signing_time = now_signing_time();
+        let signing_time = signing_time_at(now);
 
         let backend = refineid_lib_pcsc::PcscBackend;
         let run_once = |can: Option<Can>| {
@@ -177,9 +189,12 @@ impl SignDocumentArgs {
     /// `--timestamp` takes a URL or the name of a set; the private
     /// `expand_authority` helper applies that distinction.
     ///
+    /// Arguments starting with `--` are options; every other argument
+    /// is a file to sign.
+    ///
     /// # Errors
-    /// [`ArgParseError`] for any shape violation, including a missing
-    /// `--format`, `--in` or `--out`.
+    /// [`ArgParseError`] for any shape violation, including no file to
+    /// sign or an unknown option.
     pub fn parse(argv: RemainingArgv) -> Result<Self, ArgParseError> {
         let mut format_raw: Option<String> = None;
         let mut inputs: Vec<PathBuf> = Vec::new();
@@ -205,7 +220,6 @@ impl SignDocumentArgs {
             };
             match arg.as_str() {
                 "--format" => format_raw = Some(value_for("--format")?.clone()),
-                "--in" => inputs.push(PathBuf::from(value_for("--in")?)),
                 "--out" => output = Some(PathBuf::from(value_for("--out")?)),
                 "--slot" => slot_raw = Some(value_for("--slot")?.clone()),
                 "--reason" => reason = Some(value_for("--reason")?.clone()),
@@ -228,12 +242,13 @@ impl SignDocumentArgs {
                 "--no-archive" => no_archive = true,
                 "--long-term" => long_term = true,
                 "--archive" => archive = true,
-                other => {
+                other if other.starts_with(OPTION_PREFIX) => {
                     return Err(ArgParseError::Unexpected {
                         cmd: CMD,
                         got: other.to_owned(),
                     });
                 }
+                path => inputs.push(PathBuf::from(path)),
             }
         }
 
@@ -295,33 +310,31 @@ impl SignDocumentArgs {
         if timestamp_authorities.is_empty() && !no_timestamp {
             timestamp_authorities.push(DEFAULT_TIMESTAMP_AUTHORITY.to_owned());
         }
-        let format_raw = format_raw.ok_or(ArgParseError::Required {
-            cmd: CMD,
-            name: "--format NAME",
-        })?;
-        let format = parse_format(&format_raw)?;
         if inputs.is_empty() {
             return Err(ArgParseError::Required {
                 cmd: CMD,
-                name: "--in PATH",
+                name: "FILE",
             });
         }
-        // Caught here rather than at the card, so a mistyped command
-        // costs nothing: a PIN prompt the operator answers before
-        // being told the arguments were wrong is a PIN typed for
-        // nothing.
-        if format.is_single_file() && inputs.len() > 1 {
-            return Err(ArgParseError::BadValue {
-                cmd: CMD,
-                flag: "--in",
-                value: format!("{} files", inputs.len()),
-                reason: format!("{format_raw} signs one file; use asice or bdoc to cover a set"),
-            });
-        }
-        let output = output.ok_or(ArgParseError::Required {
-            cmd: CMD,
-            name: "--out PATH",
-        })?;
+        let format = match format_raw.as_deref() {
+            None => default_format(&inputs),
+            Some(raw) => {
+                let format = parse_format(raw)?;
+                // Caught here rather than at the card, so a mistyped
+                // command costs nothing: a PIN prompt the operator
+                // answers before being told the arguments were wrong
+                // is a PIN typed for nothing.
+                if format.is_single_file() && inputs.len() > 1 {
+                    return Err(ArgParseError::BadValue {
+                        cmd: CMD,
+                        flag: "--format",
+                        value: format!("{} files", inputs.len()),
+                        reason: format!("{raw} signs one file; use asice or bdoc to cover a set"),
+                    });
+                }
+                format
+            }
+        };
         let slot = match slot_raw {
             None | Some("qualified") => SignSlot::Qualified,
             Some("auth") => SignSlot::Auth,
@@ -510,6 +523,21 @@ fn check_level_is_reachable(long_term: bool, timestamps: usize) -> Result<(), Ar
     Ok(())
 }
 
+/// The format signed without `--format`: `PAdES` for exactly one PDF,
+/// `ASiC-E` with `XAdES` for anything else.
+fn default_format(inputs: &[PathBuf]) -> Format {
+    match inputs {
+        [only]
+            if only
+                .extension()
+                .is_some_and(|own| own.eq_ignore_ascii_case(Format::Pades.extension())) =>
+        {
+            Format::Pades
+        }
+        _ => Format::AsicEXades,
+    }
+}
+
 /// Map the `--format` word onto a [`Format`].
 ///
 /// `bdoc` and `asice` produce identical bytes: `BDOC 2.1` is `ASiC-E`
@@ -543,14 +571,13 @@ const fn format_label(format: Format) -> &'static str {
     }
 }
 
-/// The current UTC instant as a [`SigningTime`].
+/// A UTC instant as a [`SigningTime`].
 ///
 /// A signature's claimed time is an assertion by whoever made it, not a
 /// fact established by anything on the card. Raising it to a fact needs
 /// a timestamp token from a `TSA`, which is a network round trip and a
 /// different signature level.
-fn now_signing_time() -> SigningTime {
-    let now = crate::card_check::now_date_time();
+fn signing_time_at(now: DateTime) -> SigningTime {
     SigningTime {
         year: now.year(),
         month: now.month(),
@@ -607,26 +634,29 @@ fn expand_authority(value: &str) -> Result<Vec<String>, ArgParseError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
-        DEFAULT_TIMESTAMP_AUTHORITY, Format, SignDocumentArgs, SignSlot, describe_level,
+        DEFAULT_TIMESTAMP_AUTHORITY, DocumentSignArgs, Format, SignSlot, describe_level,
         parse_format,
     };
     use crate::cli::ArgParseError;
     use crate::cli::argv::fixtures::remaining_argv as argv;
     use crate::test_util::{TestResult, check, check_true};
 
+    /// A synthetic PDF to sign.
+    const PDF: &str = "/documents/report.pdf";
+    /// A synthetic non-PDF file to sign.
+    const TEXT: &str = "/documents/notes.txt";
+    /// A synthetic explicit output path.
+    const OUT: &str = "/documents/signed.pdf";
+
     #[test]
-    fn parses_a_minimal_pades_command() -> TestResult {
-        let a = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "pades",
-            "--in",
-            "/tmp/d.pdf",
-            "--out",
-            "/tmp/s.pdf",
-        ]))?;
-        check(&a.format, &Format::Pades, "format")?;
-        check(&a.inputs.len(), &1, "input count")?;
+    fn parses_a_minimal_command() -> TestResult {
+        let a = DocumentSignArgs::parse(argv(&[PDF]))?;
+        check(&a.format, &Format::Pades, "one PDF is signed as PAdES")?;
+        check(&a.inputs, &vec![PathBuf::from(PDF)], "inputs")?;
+        check(&a.output, &None, "output named at signing time")?;
         // The qualified slot is the default: it is the key whose
         // certificate carries non-repudiation.
         check(&a.slot, &SignSlot::Qualified, "slot")?;
@@ -642,37 +672,54 @@ mod tests {
     }
 
     #[test]
+    fn an_uppercase_pdf_extension_is_still_a_pdf() -> TestResult {
+        let a = DocumentSignArgs::parse(argv(&["/documents/Report.PDF"]))?;
+        check(&a.format, &Format::Pades, "format")
+    }
+
+    #[test]
+    fn a_non_pdf_is_signed_into_a_container() -> TestResult {
+        let a = DocumentSignArgs::parse(argv(&[TEXT]))?;
+        check(&a.format, &Format::AsicEXades, "format")
+    }
+
+    #[test]
+    fn several_inputs_are_signed_into_one_container() -> TestResult {
+        let a = DocumentSignArgs::parse(argv(&[PDF, TEXT]))?;
+        check(&a.inputs.len(), &2, "input count")?;
+        check(&a.format, &Format::AsicEXades, "format")
+    }
+
+    #[test]
+    fn an_explicit_format_and_output_are_honoured() -> TestResult {
+        let a = DocumentSignArgs::parse(argv(&[PDF, "--format", "cades", "--out", OUT]))?;
+        check(&a.format, &Format::Cades, "format")?;
+        check(&a.output, &Some(PathBuf::from(OUT)), "output")
+    }
+
+    #[test]
+    fn options_and_inputs_mix_in_any_order() -> TestResult {
+        let a = DocumentSignArgs::parse(argv(&["--format", "asice", PDF, "--out", OUT, TEXT]))?;
+        check(
+            &a.inputs,
+            &vec![PathBuf::from(PDF), PathBuf::from(TEXT)],
+            "inputs in order",
+        )
+    }
+
+    #[test]
     fn formats_without_archive_support_default_to_lt() -> TestResult {
-        let a = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "asice",
-            "--in",
-            "/tmp/d.odt",
-            "--out",
-            "/tmp/s.asice",
-        ]))?;
+        let a = DocumentSignArgs::parse(argv(&[TEXT]))?;
         check(&a.archive, &false, "no archive construction for XAdES")?;
         check(&a.long_term, &true, "still LT")
     }
 
     #[test]
     fn opt_outs_step_down_one_level_each() -> TestResult {
-        let base = [
-            "--format",
-            "pades",
-            "--in",
-            "/tmp/d.pdf",
-            "--out",
-            "/tmp/s.pdf",
-        ];
-        let mut with_no_archive = base.to_vec();
-        with_no_archive.push("--no-archive");
-        let a = SignDocumentArgs::parse(argv(&with_no_archive))?;
+        let a = DocumentSignArgs::parse(argv(&[PDF, "--no-archive"]))?;
         check(&a.archive, &false, "LT")?;
         check(&a.long_term, &true, "LT keeps evidence")?;
-        let mut with_no_long_term = base.to_vec();
-        with_no_long_term.push("--no-long-term");
-        let a = SignDocumentArgs::parse(argv(&with_no_long_term))?;
+        let a = DocumentSignArgs::parse(argv(&[PDF, "--no-long-term"]))?;
         check(&a.archive, &false, "T has no archive")?;
         check(&a.long_term, &false, "T has no evidence")?;
         check(&a.timestamp_authorities.len(), &1, "T is still attested")
@@ -680,46 +727,23 @@ mod tests {
 
     #[test]
     fn a_level_and_its_opt_out_conflict() -> TestResult {
-        let base = [
-            "--format",
-            "pades",
-            "--in",
-            "/tmp/d.pdf",
-            "--out",
-            "/tmp/s.pdf",
-        ];
-        let mut conflicting = base.to_vec();
-        conflicting.extend(["--no-long-term", "--archive"]);
         check_true(
-            SignDocumentArgs::parse(argv(&conflicting)).is_err(),
+            DocumentSignArgs::parse(argv(&[PDF, "--no-long-term", "--archive"])).is_err(),
             "a level and its opt-out cannot both be asked for",
         )
     }
 
     #[test]
     fn no_timestamp_is_the_explicit_route_to_level_b() -> TestResult {
-        let a = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "pades",
-            "--in",
-            "/tmp/d.pdf",
-            "--out",
-            "/tmp/s.pdf",
-            "--no-timestamp",
-        ]))?;
+        let a = DocumentSignArgs::parse(argv(&[PDF, "--no-timestamp"]))?;
         check(&a.timestamp_authorities.len(), &0, "no authority")
     }
 
     #[test]
     fn no_timestamp_refuses_a_named_authority() -> TestResult {
         check_true(
-            SignDocumentArgs::parse(argv(&[
-                "--format",
-                "pades",
-                "--in",
-                "/tmp/d.pdf",
-                "--out",
-                "/tmp/s.pdf",
+            DocumentSignArgs::parse(argv(&[
+                PDF,
                 "--no-timestamp",
                 "--timestamp",
                 "http://tsa.example",
@@ -732,17 +756,7 @@ mod tests {
     #[test]
     fn no_timestamp_cannot_reach_level_lt() -> TestResult {
         check_true(
-            SignDocumentArgs::parse(argv(&[
-                "--format",
-                "pades",
-                "--in",
-                "/tmp/d.pdf",
-                "--out",
-                "/tmp/s.pdf",
-                "--no-timestamp",
-                "--long-term",
-            ]))
-            .is_err(),
+            DocumentSignArgs::parse(argv(&[PDF, "--no-timestamp", "--long-term"])).is_err(),
             "LT evidence needs an attested time",
         )
     }
@@ -756,32 +770,20 @@ mod tests {
         )
     }
 
-    #[test]
-    fn repeated_in_builds_a_set_for_containers() -> TestResult {
-        let a = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "asice",
-            "--in",
-            "/tmp/a.pdf",
-            "--in",
-            "/tmp/b.txt",
-            "--out",
-            "/tmp/o.asice",
-        ]))?;
-        check(&a.inputs.len(), &2, "input count")?;
-        check(&a.format, &Format::AsicEXades, "format")
-    }
-
     /// A one-file format given a set is refused at parse time, before
     /// the operator has been asked for a PIN.
     #[test]
     fn single_file_formats_refuse_a_set_before_the_pin_prompt() -> TestResult {
         for format in ["pades", "cades", "cades-detached"] {
-            let r = SignDocumentArgs::parse(argv(&[
-                "--format", format, "--in", "/a", "--in", "/b", "--out", "/o",
-            ]));
+            let r = DocumentSignArgs::parse(argv(&["--format", format, PDF, TEXT]));
             check_true(
-                matches!(r, Err(ArgParseError::BadValue { flag: "--in", .. })),
+                matches!(
+                    r,
+                    Err(ArgParseError::BadValue {
+                        flag: "--format",
+                        ..
+                    })
+                ),
                 "two files refused",
             )?;
         }
@@ -801,14 +803,7 @@ mod tests {
 
     #[test]
     fn unknown_format_rejected() -> TestResult {
-        let r = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "xades-enveloped",
-            "--in",
-            "/a",
-            "--out",
-            "/o",
-        ]));
+        let r = DocumentSignArgs::parse(argv(&[PDF, "--format", "xades-enveloped"]));
         check_true(
             matches!(
                 r,
@@ -822,48 +817,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_format_in_and_out_are_each_required() -> TestResult {
+    fn an_input_is_required() -> TestResult {
         check_true(
             matches!(
-                SignDocumentArgs::parse(argv(&["--in", "/a", "--out", "/o"])),
-                Err(ArgParseError::Required { name, .. }) if name == "--format NAME"
-            ),
-            "format required",
-        )?;
-        check_true(
-            matches!(
-                SignDocumentArgs::parse(argv(&["--format", "pades", "--out", "/o"])),
-                Err(ArgParseError::Required { name, .. }) if name == "--in PATH"
+                DocumentSignArgs::parse(argv(&["--format", "pades", "--out", OUT])),
+                Err(ArgParseError::Required { name, .. }) if name == "FILE"
             ),
             "input required",
-        )?;
+        )
+    }
+
+    #[test]
+    fn in_is_an_unknown_option() -> TestResult {
         check_true(
             matches!(
-                SignDocumentArgs::parse(argv(&["--format", "pades", "--in", "/a"])),
-                Err(ArgParseError::Required { name, .. }) if name == "--out PATH"
+                DocumentSignArgs::parse(argv(&["--in", PDF])),
+                Err(ArgParseError::Unexpected { got, .. }) if got == "--in"
             ),
-            "output required",
+            "--in rejected",
         )
     }
 
     #[test]
     fn slot_can_be_chosen() -> TestResult {
-        let a = SignDocumentArgs::parse(argv(&[
-            "--format", "cades", "--in", "/a", "--out", "/o", "--slot", "auth",
-        ]))?;
+        let a = DocumentSignArgs::parse(argv(&[PDF, "--slot", "auth"]))?;
         check(&a.slot, &SignSlot::Auth, "slot")?;
         check_true(
             matches!(
-                SignDocumentArgs::parse(argv(&[
-                    "--format",
-                    "cades",
-                    "--in",
-                    "/a",
-                    "--out",
-                    "/o",
-                    "--slot",
-                    "signature",
-                ])),
+                DocumentSignArgs::parse(argv(&[PDF, "--slot", "signature"])),
                 Err(ArgParseError::BadValue { flag: "--slot", .. })
             ),
             "unknown slot rejected",
@@ -872,16 +853,7 @@ mod tests {
 
     #[test]
     fn eu_qualified_expands_in_order() -> TestResult {
-        let a = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "pades",
-            "--in",
-            "/a.pdf",
-            "--out",
-            "/o.pdf",
-            "--timestamp",
-            "eu-qualified",
-        ]))?;
+        let a = DocumentSignArgs::parse(argv(&[PDF, "--timestamp", "eu-qualified"]))?;
         check(&a.timestamp_authorities.len(), &1, "one authority")?;
         check(
             &a.timestamp_authorities[0].as_str(),
@@ -892,13 +864,8 @@ mod tests {
 
     #[test]
     fn a_set_and_a_url_compose_without_repeating() -> TestResult {
-        let a = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "pades",
-            "--in",
-            "/a.pdf",
-            "--out",
-            "/o.pdf",
+        let a = DocumentSignArgs::parse(argv(&[
+            PDF,
             "--timestamp",
             "eu-qualified",
             "--timestamp",
@@ -917,29 +884,16 @@ mod tests {
 
     #[test]
     fn long_term_requires_qualification_even_for_a_direct_url() -> TestResult {
-        let level_t = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "pades",
-            "--in",
-            "/a.pdf",
-            "--out",
-            "/o.pdf",
+        let level_t = DocumentSignArgs::parse(argv(&[
+            PDF,
             "--timestamp",
             "https://tsa.example/tsa",
             "--no-long-term",
         ]))?;
         check_true(!level_t.long_term, "an explicit level T stays at T")?;
 
-        let defaulted = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "pades",
-            "--in",
-            "/a.pdf",
-            "--out",
-            "/o.pdf",
-            "--timestamp",
-            "https://tsa.example/tsa",
-        ]))?;
+        let defaulted =
+            DocumentSignArgs::parse(argv(&[PDF, "--timestamp", "https://tsa.example/tsa"]))?;
         check_true(defaulted.long_term, "the default level embeds evidence")
     }
 
@@ -947,16 +901,7 @@ mod tests {
     fn a_mistyped_set_stops_before_the_card() -> TestResult {
         check_true(
             matches!(
-                SignDocumentArgs::parse(argv(&[
-                    "--format",
-                    "pades",
-                    "--in",
-                    "/a.pdf",
-                    "--out",
-                    "/o.pdf",
-                    "--timestamp",
-                    "eu-qualifed",
-                ])),
+                DocumentSignArgs::parse(argv(&[PDF, "--timestamp", "eu-qualifed"])),
                 Err(ArgParseError::BadValue {
                     flag: "--timestamp",
                     ..
@@ -968,13 +913,8 @@ mod tests {
 
     #[test]
     fn pades_metadata_is_optional() -> TestResult {
-        let a = SignDocumentArgs::parse(argv(&[
-            "--format",
-            "pades",
-            "--in",
-            "/a.pdf",
-            "--out",
-            "/o.pdf",
+        let a = DocumentSignArgs::parse(argv(&[
+            PDF,
             "--reason",
             "Declaration ANSSI",
             "--location",

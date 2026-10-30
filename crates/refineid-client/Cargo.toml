@@ -19,7 +19,7 @@ workspace = true
 # rustls by default, and nothing else. The default build stays free
 # of cmake, of a C++ toolchain and of a system OpenSSL -- ring builds
 # with cc alone. Without a TLS backend,
-# `card sign-document --timestamp eu-qualified` could not reach
+# `document sign --timestamp eu-qualified` could not reach
 # authorities that publish only an HTTPS endpoint.
 default = ["tls-rustls"]
 # Server-authenticated HTTPS support for public infrastructure

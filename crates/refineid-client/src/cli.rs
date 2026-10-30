@@ -88,10 +88,10 @@ pub mod card_export_all;
 pub mod card_pair;
 pub mod card_pubkey;
 pub mod card_sign;
-pub mod card_sign_document;
 pub mod card_unblock_pin;
 pub mod cert_chain;
 pub mod cert_show;
+pub mod document_sign;
 pub mod reader_keyboard;
 pub(crate) mod util;
 mod verb;
@@ -325,21 +325,22 @@ subcommands:
       same shape as sign-auth but with PIN2 + the qualified-signature
       key.
 
-  card sign-document --format F --in PATH [--in PATH ...] --out PATH
-      sign into a format a counterparty can open, rather than raw
-      signature bytes. PIN2 and the qualified-signature key by
-      default.
+  document sign FILE [FILE ...] [options]
+      sign FILE into a format a counterparty can open, rather than
+      raw signature bytes. Several files go into one container under
+      one signature. PIN2 and the qualified-signature key by default.
         --format F   pades          signature inside the PDF
                      cades          CMS, document attached
                      cades-detached CMS, document left outside
                      asice | bdoc   ASiC-E container with XAdES
                                     (one format, two names)
                      asice-cades    ASiC-E container with CAdES
-        --in P       file to sign; repeat for a container, which
-                     covers the whole set with one signature. The
-                     one-file formats refuse a set rather than
+                     Default: pades for one PDF, asice otherwise.
+                     The one-file formats refuse a set rather than
                      silently sign the first.
-        --out P      the finished document
+        --out P      the finished document. Default: beside the
+                     first FILE, '<stem> - signed <UTC time>.<ext>',
+                     with stem 'portfolio' for several files.
         --slot S     qualified (default) or auth
         --reason T   PAdES /Reason
         --location T PAdES /Location
