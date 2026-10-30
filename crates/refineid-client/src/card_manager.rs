@@ -188,17 +188,9 @@ pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, SignErrorKind> {
             ),
         });
     }
-    // The mark compiles in with the pdf-stamp feature. With it, the
-    // card access number is the stamp request: entering one is how the
-    // holder asks for a visible mark, and it is also what reads the
-    // card's ink. Without a number -- or without the feature -- the
-    // signature stays invisible and no page changes.
-    let visible_signature = if cfg!(feature = "pdf-stamp") {
-        can.is_some()
-            .then_some(VisibleSignatureRequest { handwriting })
-    } else {
-        None
-    };
+    // The signed page carries the holder's mark; a card access number
+    // also reads the card's handwriting into it.
+    let visible_signature = Some(VisibleSignatureRequest { handwriting });
     let document = pdf_document_request(
         expected_serial,
         visible_signature,

@@ -277,6 +277,7 @@ No PIN, no network.
 .Op Fl -location Ar text
 .Op Fl -reader Ar substr
 .Op Fl -can Ar can
+.Op Fl -no-stamp
 .Op Fl -timestamp Ar url ...
 .Op Fl -no-archive | Fl -no-long-term | Fl -no-timestamp
 .Xc
@@ -336,6 +337,9 @@ Repeat for alternatives; a failed answer is skipped, and signing fails
 when none remains.
 .Fl -timestamp Cm eu-qualified
 names public EU endpoints.
+.It Fl -no-stamp
+No visible mark on the page; the signature stays invisible.
+By default the signed page carries the holder's mark.
 .It Fl -no-archive
 Stop at level LT: no archive timestamp.
 .It Fl -no-long-term
