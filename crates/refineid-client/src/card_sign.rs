@@ -38,14 +38,13 @@ use refineid_lib_core::auth::{
     VerifyOutcome, check_retry_floor,
 };
 use refineid_lib_core::backend::{
-    ReaderAccessCap, ReaderBackend as _, ReaderBackendOps as _, ReaderPickError,
+    ReaderAccessCap, ReaderBackend, ReaderBackendOps as _, ReaderPickError,
 };
 use refineid_lib_core::can::Can;
 use refineid_lib_core::cert_state::CertDer;
 use refineid_lib_core::crypto::digest::{Sha256, Sha384};
 use refineid_lib_core::identity::{CommonName, TokenSerial, render_token_serial};
 use refineid_lib_core::pace;
-use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::Pkcs15Ops as _;
 use refineid_lib_core::pkcs15::{CertSlot, Pkcs15Error};
 use refineid_lib_core::secure_messaging::SmTransport;
@@ -62,9 +61,10 @@ use refineid_lib_core::transport::CardTransport;
 use refineid_lib_core::x509::{
     Certificate, DateTime, EcCurve, OwnedCert, PublicKeyAlgorithm, extract_rsa_public_key,
 };
-use refineid_lib_pcsc::{PcscBackend, PcscError};
+use refineid_lib_pcsc::{PcscBackend, PcscCard, PcscError};
 use zeroize::Zeroizing;
 
+use crate::pin_source::{PinEntryError, PinSource};
 use crate::validation_material::{ChainStart, NoncePolicy};
 
 /// Maximum tolerated difference between this host and a live TSA.
@@ -357,9 +357,9 @@ pub struct SignOptions {
     /// Filesystem path where the resulting raw RSA-PKCS#1 v1.5
     /// signature bytes will be written (no envelope).
     pub output: PathBuf,
-    /// PIN value the operator entered for the targeted slot.
-    /// Consumed and zeroized at function return.
-    pub pin: PinBytes,
+    /// The targeted slot's PIN, obtained after the card is found and
+    /// checked, right before VERIFY. Zeroized at function return.
+    pub pin: PinSource,
     /// Optional output path for the DER bytes of the on-card cert
     /// that produced the signature. Pairs the signature with the
     /// cert it can be verified against -- enables offline
@@ -544,6 +544,8 @@ pub enum SignErrorKind {
     /// no tries left, the PIN blocked, or no readable counter. No APDU
     /// that can spend an attempt went out.
     RetryFloor(RetryFloorRefusal),
+    /// PIN entry ended without a PIN; nothing was presented.
+    PinEntry(PinEntryError),
     /// Local-policy rejection (PIN length / non-digit) before any
     /// APDU went out. Counter is unaffected.
     PinPolicy {
@@ -664,6 +666,7 @@ impl fmt::Display for SignErrorKind {
                 ..
             } => write!(f, "internal: PinRejected(Ok) is not an error state"),
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
+            Self::PinEntry(e) => write!(f, "{e}"),
             Self::PinPolicy { slot, reason } => {
                 write!(f, "{} rejected locally: {reason}", slot.pin_label())
             }
@@ -730,20 +733,22 @@ impl From<ReaderPickError> for SignErrorKind {
     }
 }
 
-/// Drive the sign chain for `slot` on the first reader with a
-/// card. `options` is taken by value so the embedded
-/// [`PinBytes`] drops (and zeroes) when this function returns,
-/// regardless of branch.
-///
-/// # Errors
-/// PC/SC enumeration / connect failure, PIN policy / verify
-/// failure, sign-chain SW failure, signature-length mismatch,
-/// cert read or parse failure, local-verify failure, or
-/// input / output I/O failure.
-// sign_with_slot is a flat sequence of open -> read input -> hash
-// -> read cert -> VERIFY PIN -> sign chain -> local verify ->
-// write. Splitting into helpers would just shuttle locals across
-// boundaries; the body reads top-to-bottom as one operation.
+/// A card transport that can power-cycle its card, which PACE needs
+/// to start from a clean card.
+pub(crate) trait CardReset {
+    /// Reset the card in place.
+    ///
+    /// # Errors
+    /// The backend's reset failure.
+    fn reset_card(&mut self) -> Result<(), PcscError>;
+}
+
+impl CardReset for PcscCard {
+    fn reset_card(&mut self) -> Result<(), PcscError> {
+        self.reset()
+    }
+}
+
 /// Dispatch the per-cert sign chain: RSA (PKCS#1 v1.5 SHA-256) or
 /// ECDSA P-384 SHA-384, returning the raw signature bytes plus the
 /// local-verify outcome. Unsupported curves / non-RSA SPKIs raise
@@ -815,8 +820,9 @@ fn sign_dispatch_by_alg<T: CardTransport>(
 ///   1. Open a transport against the picked reader.
 ///   2. Select the FINEID PKCS#15 application, then the slot's
 ///      cert; read the SPKI for the local verify step.
-///   3. VERIFY the slot's PIN; consume `options` so the
-///      [`PinBytes`] zeroize on return (Rule E1).
+///   3. Check the retry floor, obtain the PIN from
+///      `options.pin`, VERIFY it; the PIN zeroizes on return
+///      (Rule E1).
 ///   4. MSE:SET DST -> PSO:HASH -> PSO:CDS chain.
 ///   5. Local verify against the SPKI (Rule E7); refuse to
 ///      hand back a signature that doesn't verify.
@@ -825,11 +831,15 @@ fn sign_dispatch_by_alg<T: CardTransport>(
 /// local-verify outcome, and audit metadata. Errors surface
 /// as [`SignErrorKind`] -- the function never panics across
 /// the FFI / CLI boundary.
-pub(crate) fn sign_with_slot(
-    backend: PcscBackend,
+pub(crate) fn sign_with_slot<B>(
+    backend: B,
     slot: SignSlot,
-    options: SignOptions,
-) -> Result<SignReport, SignErrorKind> {
+    mut options: SignOptions,
+) -> Result<SignReport, SignErrorKind>
+where
+    B: ReaderBackend<Error = PcscError>,
+    B::Transport: CardReset,
+{
     if let Some(request) = options.document.as_ref() {
         request.validate_signing_policy()?;
     }
@@ -877,7 +887,13 @@ pub(crate) fn sign_with_slot(
     // restriction (FINEID S4-1 v4.2 s8.1.7-9), which is what
     // licenses contactless signing at all.
     let chain = match transport.select_pkcs15_application() {
-        Ok(()) => sign_chain(&mut transport, slot, &options, &input_bytes, input_sha256)?,
+        Ok(()) => sign_chain(
+            &mut transport,
+            slot,
+            &mut options,
+            &input_bytes,
+            input_sha256,
+        )?,
         Err(Pkcs15Error::Sw(sw))
             if StatusWord::from_u16(sw) == StatusWord::SecurityNotSatisfied =>
         {
@@ -895,7 +911,7 @@ pub(crate) fn sign_with_slot(
             // production card over an ACR1581 PICC slot,
             // 2026-07-24.
             transport
-                .reset()
+                .reset_card()
                 .map_err(|e| SignErrorKind::Pace(format!("reset before PACE: {e}")))?;
             // PACE's MSE:Set AT is only accepted in MF context.
             // The reset lands the card there already; this makes
@@ -913,7 +929,7 @@ pub(crate) fn sign_with_slot(
                     slot,
                     detail: format!("select pkcs15 app under SM: {e}"),
                 })?;
-            sign_chain(&mut sm, slot, &options, &input_bytes, input_sha256)?
+            sign_chain(&mut sm, slot, &mut options, &input_bytes, input_sha256)?
         }
         Err(e) => {
             return Err(SignErrorKind::CertUnavailable {
@@ -990,7 +1006,7 @@ struct SignChainOutput {
 fn sign_chain<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
-    options: &SignOptions,
+    options: &mut SignOptions,
     input_bytes: &[u8],
     input_sha256: Sha256,
 ) -> Result<SignChainOutput, SignErrorKind> {
@@ -1060,8 +1076,9 @@ fn sign_chain<T: CardTransport>(
             AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
         })?;
     check_retry_floor(slot.pin_slot(), status).map_err(SignErrorKind::RetryFloor)?;
+    let pin = options.pin.obtain().map_err(SignErrorKind::PinEntry)?;
     let outcome = transport
-        .verify_pin_with_scheme(slot.pin_slot(), scheme, options.pin.clone())
+        .verify_pin_with_scheme(slot.pin_slot(), scheme, pin)
         .map_err(|e| match e {
             AuthError::Transport(t) => SignErrorKind::Transport(format!("{t}")),
             AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
@@ -2733,5 +2750,94 @@ mod tests {
         let s2 = report.to_string();
         check_true(!s2.contains("cert DER:"), "no cert der line")?;
         check_true(!s2.contains("retries after verify"), "no retry line")
+    }
+
+    // ---- The PIN is asked for only once the card is found and its
+    // counter served. ----
+
+    use crate::pin_source::test_support::{counting_source, prompts};
+    use crate::test_card::{SyntheticBackend, SyntheticCard, TRIES_BELOW_FLOOR, TRIES_SERVED};
+    use crate::test_util::TempDir;
+
+    /// Synthetic message to sign.
+    const MESSAGE: &[u8] = b"synthetic message";
+
+    fn sign_on(
+        backend: SyntheticBackend,
+    ) -> Result<(Result<SignReport, SignErrorKind>, usize), Box<dyn core::error::Error>> {
+        let dir = TempDir::new("sign-pin-late")?;
+        let input = dir.write("message.txt", MESSAGE)?;
+        let (pin, asked) = counting_source();
+        let options = SignOptions {
+            input,
+            output: dir.path().join("signature.bin"),
+            pin,
+            save_cert: None,
+            reader_filter: None,
+            can: None,
+            document: None,
+        };
+        let result = sign_with_slot(backend, SignSlot::Auth, options);
+        Ok((result, prompts(&asked)))
+    }
+
+    #[test]
+    fn no_reader_fails_before_the_pin_is_asked() -> TestResult {
+        let backend = SyntheticBackend {
+            readers: Vec::new(),
+            card: SyntheticCard::with_tries(TRIES_SERVED)?,
+        };
+        let (result, asked) = sign_on(backend)?;
+        check_true(
+            matches!(
+                result,
+                Err(SignErrorKind::ReaderPick(ReaderPickError::NoReaders))
+            ),
+            "no readers",
+        )?;
+        check(&asked, &0, "prompts")
+    }
+
+    #[test]
+    fn no_card_fails_before_the_pin_is_asked() -> TestResult {
+        let backend = SyntheticBackend::one_reader(false, SyntheticCard::with_tries(TRIES_SERVED)?);
+        let (result, asked) = sign_on(backend)?;
+        check_true(
+            matches!(
+                result,
+                Err(SignErrorKind::ReaderPick(ReaderPickError::NoCardPresent))
+            ),
+            "no card",
+        )?;
+        check(&asked, &0, "prompts")
+    }
+
+    #[test]
+    fn retry_floor_refuses_before_the_pin_is_asked() -> TestResult {
+        let backend =
+            SyntheticBackend::one_reader(true, SyntheticCard::with_tries(TRIES_BELOW_FLOOR)?);
+        let (result, asked) = sign_on(backend)?;
+        check_true(
+            matches!(result, Err(SignErrorKind::RetryFloor(_))),
+            "retry floor",
+        )?;
+        check(&asked, &0, "prompts")
+    }
+
+    /// The synthetic card cannot make a signature that verifies, so the
+    /// flow ends at local verify -- after the one VERIFY it asked for.
+    #[test]
+    fn a_served_card_asks_for_the_pin_once() -> TestResult {
+        let backend = SyntheticBackend::one_reader(true, SyntheticCard::with_tries(TRIES_SERVED)?);
+        let (result, asked) = sign_on(backend)?;
+        check_true(
+            matches!(
+                result,
+                Err(SignErrorKind::LocalVerifyFailed(_)
+                    | SignErrorKind::UnexpectedSignatureLength(_))
+            ),
+            "flow passed VERIFY",
+        )?;
+        check(&asked, &1, "prompts")
     }
 }

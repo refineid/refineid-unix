@@ -110,6 +110,24 @@ impl ActivateArgs {
         if verbose {
             CardActivateHelpers::note_generation_disagreement(&ctx, verbose);
         }
+        // Refuse an activated card, or a counter below the retry floor,
+        // before prompting.
+        match crate::card_pin::probe_activation_gate_for_cli(backend, &ctx, allow_reactivate) {
+            Ok(None) => {}
+            Ok(Some(refused)) => {
+                let status = CardActivateHelpers::activate_outcome_status(&refused);
+                super::util::show_outcome(verbose, status == ExitStatus::Ok, &refused);
+                return status.into();
+            }
+            Err(e @ CardPinError::RetryFloor(_)) => {
+                eprintln!("{CMD}: {e}");
+                return ExitStatus::CardCredentialRejected.into();
+            }
+            Err(e) => {
+                eprintln!("{CMD}: {e}");
+                return ExitStatus::RuntimeFailure.into();
+            }
+        }
         CardActivateHelpers::emit_preflight_event(&ctx, expected_len);
         let activation_pin = match CardActivateHelpers::prompt_activation_pin(expected_len) {
             Ok(p) => p,

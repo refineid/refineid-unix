@@ -30,6 +30,7 @@ use refineid_lib_core::pin::PinBytes;
 use crate::card_pin::PinManageSlot;
 use crate::card_sign::SignSlot;
 use crate::exit_status::ExitStatus;
+use crate::pin_source::{PinEntryError, PinSource};
 
 /// Prompt for PIN 1.
 pub(super) const PROMPT_PIN1: &str = "PIN 1: ";
@@ -200,7 +201,7 @@ pub(super) fn pin_env_or_prompt(
     cmd: &str,
     env_var: &str,
     prompt: &str,
-) -> Result<PinBytes, ExitCode> {
+) -> Result<PinBytes, ExitStatus> {
     #[cfg(feature = "pin-env-debug")]
     {
         if let Ok(val) = std::env::var(env_var) {
@@ -209,7 +210,7 @@ pub(super) fn pin_env_or_prompt(
                 eprintln!("{cmd}: reading {env_var} from environment (alpha-period debug aid)");
                 return PinBytes::new(bytes).map_err(|error| {
                     eprintln!("{cmd}: invalid PIN: {error}");
-                    ExitCode::from(ExitStatus::BadInvocation)
+                    ExitStatus::BadInvocation
                 });
             }
         }
@@ -256,21 +257,30 @@ pub(super) fn new_pin_env_or_prompt(
 /// prompt failure into the standard `cmd: <error>` stderr line
 /// + `RuntimeFailure` exit.
 ///
-/// Thin shim over [`read_pin_masked`]: takes the `cmd` label
-/// each handler already passes around and returns the typed
-/// [`ExitCode`] the handler is going to return anyway. Drops
-/// the repeated `match Ok(p) => p, Err(msg) => { eprintln!;
-/// return ExitStatus::RuntimeFailure.into() }` block at every
-/// call site.
+/// Thin shim over [`read_pin_masked`] that writes the stderr
+/// line and returns the [`ExitStatus`] the handler exits with.
 ///
 /// # Errors
 /// Returns `ExitStatus::RuntimeFailure` when the prompt or
-/// stdin read fails. The stderr line is already written.
-pub(super) fn prompt_pin(cmd: &str, prompt: &str) -> Result<PinBytes, ExitCode> {
+/// stdin read fails or ends without a PIN. The stderr line is
+/// already written.
+pub(super) fn prompt_pin(cmd: &str, prompt: &str) -> Result<PinBytes, ExitStatus> {
     read_pin_masked(prompt).map_err(|msg| {
         eprintln!("{cmd}: {msg}");
-        ExitCode::from(ExitStatus::RuntimeFailure)
+        ExitStatus::RuntimeFailure
     })
+}
+
+/// A [`PinSource`] that runs [`pin_env_or_prompt`] when the flow
+/// reaches the command that presents the PIN.
+pub(super) fn pin_source_at_use(
+    cmd: &'static str,
+    env_var: &'static str,
+    prompt: &'static str,
+) -> PinSource {
+    PinSource::Ask(Box::new(move || {
+        pin_env_or_prompt(cmd, env_var, prompt).map_err(|status| PinEntryError { status })
+    }))
 }
 
 /// Prompt for a new PIN twice (new + confirm), masked, and

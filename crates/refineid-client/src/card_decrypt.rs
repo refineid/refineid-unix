@@ -29,13 +29,15 @@ use refineid_lib_core::auth::{
     check_retry_floor,
 };
 use refineid_lib_core::backend::{
-    ReaderAccessCap, ReaderBackend as _, ReaderBackendOps as _, ReaderPickError,
+    ReaderAccessCap, ReaderBackend, ReaderBackendOps as _, ReaderPickError,
 };
 use refineid_lib_core::crypto::container::{Ciphertext, RsaPkcs1};
-use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::Pkcs15Ops as _;
 use refineid_lib_core::sign::{RSA_3072_SIG_BYTES, SignError, SignOps as _};
-use refineid_lib_pcsc::{PcscBackend, PcscError};
+use refineid_lib_core::transport::CardTransport;
+use refineid_lib_pcsc::PcscError;
+
+use crate::pin_source::{PinEntryError, PinSource};
 
 /// Inputs.
 #[derive(Debug)]
@@ -47,9 +49,9 @@ pub struct DecryptAuthOptions {
     /// be written. The card strips PKCS#1 v1.5 padding before
     /// returning, so this file holds only the plaintext payload.
     pub output: PathBuf,
-    /// PIN1 value gating the auth key. Consumed and zeroized at
-    /// function return.
-    pub pin: PinBytes,
+    /// PIN1, gating the auth key. Obtained after the card is found
+    /// and its counter checked; zeroized at function return.
+    pub pin: PinSource,
     /// Optional reader-name substring; required when more than
     /// one card is present. Tier 0 `String`; presentational input
     /// to `ReaderFilter::new`.
@@ -102,6 +104,8 @@ pub enum DecryptAuthError {
     /// The retry floor refused the PIN1 VERIFY: the card reports two, one
     /// or no tries left, the PIN blocked, or no readable counter.
     RetryFloor(RetryFloorRefusal),
+    /// PIN entry ended without a PIN; nothing was presented.
+    PinEntry(PinEntryError),
     /// Local-policy rejection on PIN1 (length / non-digit)
     /// before any APDU went out. Counter is unaffected.
     PinPolicy(PinPolicyReason),
@@ -154,6 +158,7 @@ impl fmt::Display for DecryptAuthError {
                 write!(f, "internal: PinRejected(Ok) is not an error state")
             }
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
+            Self::PinEntry(e) => write!(f, "{e}"),
             Self::PinPolicy(r) => write!(f, "PIN1 rejected locally: {r}"),
             Self::Pkcs15Select(s) => write!(f, "SELECT PKCS#15 app: {s}"),
             Self::DecryptSw { stage, sw } => {
@@ -178,19 +183,43 @@ impl From<ReaderPickError> for DecryptAuthError {
     }
 }
 
+fn auth_to_decrypt<E: fmt::Display>(e: AuthError<E>) -> DecryptAuthError {
+    match e {
+        AuthError::Transport(t) => DecryptAuthError::Transport(format!("{t}")),
+        AuthError::PinPolicy(r) => DecryptAuthError::PinPolicy(r),
+    }
+}
+
+/// SELECT the PKCS#15 application and refuse when PIN1 is at the
+/// retry floor.
+fn pin1_gate<T: CardTransport>(transport: &mut T) -> Result<(), DecryptAuthError> {
+    transport
+        .select_pkcs15_application()
+        .map_err(|e| DecryptAuthError::Pkcs15Select(format!("{e}")))?;
+    let status = transport
+        .pin_status(PinSlot::Pin1)
+        .map_err(auth_to_decrypt)?;
+    check_retry_floor(PinSlot::Pin1, status).map_err(DecryptAuthError::RetryFloor)
+}
+
 /// Decrypt `options.input` against the first reader with a card.
 ///
-/// `options` is taken by value so the embedded [`PinBytes`] drops
-/// (and zeroes) when this function returns.
+/// The PIN1 counter is checked in a read-only session first; only
+/// then is the PIN obtained, outside any held transaction, and the
+/// VERIFY -> decipher span runs in one `PinSequence` session that
+/// checks the counter again.
 ///
 /// # Errors
-/// PC/SC enumeration / connect failure, PIN policy / verify
+/// PC/SC enumeration / connect failure, PIN entry / policy / verify
 /// failure, MSE / DECIPHER SW failure, ciphertext-length
 /// mismatch, or I/O failure on input or output.
-pub(crate) fn decrypt_auth_first(
-    backend: PcscBackend,
-    options: DecryptAuthOptions,
-) -> Result<DecryptReport, DecryptAuthError> {
+pub(crate) fn decrypt_auth_first<B>(
+    backend: B,
+    mut options: DecryptAuthOptions,
+) -> Result<DecryptReport, DecryptAuthError>
+where
+    B: ReaderBackend<Error = PcscError>,
+{
     let reader_id = backend.pick_single_reader(
         options
             .reader_filter
@@ -208,25 +237,15 @@ pub(crate) fn decrypt_auth_first(
     let ciphertext_len = ct_bytes.len();
     let ciphertext: Ciphertext<RsaPkcs1> = Ciphertext::new(ct_bytes);
 
-    // PinSequence: the PIN arrived in `options` and the
-    // ciphertext was read before the open, so the VERIFY ->
-    // decipher span is card-bound inside one held transaction.
-    let mut transport = backend.open_session(&reader_id, ReaderAccessCap::PinSequence)?;
-    transport
-        .select_pkcs15_application()
-        .map_err(|e| DecryptAuthError::Pkcs15Select(format!("{e}")))?;
+    {
+        let mut probe = backend.open_session(&reader_id, ReaderAccessCap::Read)?;
+        pin1_gate(&mut probe)?;
+    }
+    let pin = options.pin.obtain().map_err(DecryptAuthError::PinEntry)?;
 
-    let status = transport.pin_status(PinSlot::Pin1).map_err(|e| match e {
-        AuthError::Transport(t) => DecryptAuthError::Transport(format!("{t}")),
-        AuthError::PinPolicy(r) => DecryptAuthError::PinPolicy(r),
-    })?;
-    check_retry_floor(PinSlot::Pin1, status).map_err(DecryptAuthError::RetryFloor)?;
-    let outcome = transport
-        .verify_pin1(options.pin.clone())
-        .map_err(|e| match e {
-            AuthError::Transport(t) => DecryptAuthError::Transport(format!("{t}")),
-            AuthError::PinPolicy(r) => DecryptAuthError::PinPolicy(r),
-        })?;
+    let mut transport = backend.open_session(&reader_id, ReaderAccessCap::PinSequence)?;
+    pin1_gate(&mut transport)?;
+    let outcome = transport.verify_pin1(pin).map_err(auth_to_decrypt)?;
     match outcome {
         VerifyOutcome::Ok => {}
         rejected @ (VerifyOutcome::WrongPin { .. }
@@ -413,6 +432,108 @@ mod tests {
         check_true(
             s.contains("plaintext: /tmp/pt.bin (32 bytes, PKCS#1 v1.5 unpadded)"),
             "pt line",
+        )
+    }
+
+    // ---- The PIN is asked for only once the card is found and its
+    // counter served. ----
+
+    use crate::pin_source::test_support::{counting_source, prompts};
+    use crate::test_card::{SyntheticBackend, SyntheticCard, TRIES_BELOW_FLOOR, TRIES_SERVED};
+    use crate::test_util::{TempDir, check};
+
+    /// Fill byte of the synthetic ciphertext.
+    const CIPHERTEXT_FILL: u8 = b'C';
+
+    fn decrypt_on(
+        backend: SyntheticBackend,
+    ) -> Result<(Result<DecryptReport, DecryptAuthError>, usize), Box<dyn core::error::Error>> {
+        let dir = TempDir::new("decrypt-pin-late")?;
+        let input = dir.write("ciphertext.bin", &[CIPHERTEXT_FILL; RSA_3072_SIG_BYTES])?;
+        let (pin, asked) = counting_source();
+        let options = DecryptAuthOptions {
+            input,
+            output: dir.path().join("plaintext.bin"),
+            pin,
+            reader_filter: None,
+        };
+        let result = decrypt_auth_first(backend, options);
+        Ok((result, prompts(&asked)))
+    }
+
+    #[test]
+    fn no_reader_fails_before_the_pin_is_asked() -> TestResult {
+        let backend = SyntheticBackend {
+            readers: Vec::new(),
+            card: SyntheticCard::with_tries(TRIES_SERVED)?,
+        };
+        let (result, asked) = decrypt_on(backend)?;
+        check_true(
+            matches!(
+                result,
+                Err(DecryptAuthError::ReaderPick(ReaderPickError::NoReaders))
+            ),
+            "no readers",
+        )?;
+        check(&asked, &0, "prompts")
+    }
+
+    #[test]
+    fn no_card_fails_before_the_pin_is_asked() -> TestResult {
+        let backend = SyntheticBackend::one_reader(false, SyntheticCard::with_tries(TRIES_SERVED)?);
+        let (result, asked) = decrypt_on(backend)?;
+        check_true(
+            matches!(
+                result,
+                Err(DecryptAuthError::ReaderPick(ReaderPickError::NoCardPresent))
+            ),
+            "no card",
+        )?;
+        check(&asked, &0, "prompts")
+    }
+
+    #[test]
+    fn retry_floor_refuses_before_the_pin_is_asked() -> TestResult {
+        let backend =
+            SyntheticBackend::one_reader(true, SyntheticCard::with_tries(TRIES_BELOW_FLOOR)?);
+        let (result, asked) = decrypt_on(backend)?;
+        check_true(
+            matches!(result, Err(DecryptAuthError::RetryFloor(_))),
+            "retry floor",
+        )?;
+        check(&asked, &0, "prompts")
+    }
+
+    #[test]
+    fn a_served_card_asks_for_the_pin_once() -> TestResult {
+        let backend = SyntheticBackend::one_reader(true, SyntheticCard::with_tries(TRIES_SERVED)?);
+        let (result, asked) = decrypt_on(backend)?;
+        check_true(result.is_ok(), "decrypted")?;
+        check(&asked, &1, "prompts")
+    }
+
+    /// A prompt that ends without a PIN (EOF on the terminal) ends the
+    /// flow with the prompt's exit status.
+    #[test]
+    fn an_ended_prompt_carries_its_exit_status() -> TestResult {
+        let dir = TempDir::new("decrypt-pin-ended")?;
+        let input = dir.write("ciphertext.bin", &[CIPHERTEXT_FILL; RSA_3072_SIG_BYTES])?;
+        let ended = PinEntryError {
+            status: crate::exit_status::ExitStatus::RuntimeFailure,
+        };
+        let options = DecryptAuthOptions {
+            input,
+            output: dir.path().join("plaintext.bin"),
+            pin: PinSource::Ask(Box::new(move || Err(ended))),
+            reader_filter: None,
+        };
+        let backend = SyntheticBackend::one_reader(true, SyntheticCard::with_tries(TRIES_SERVED)?);
+        check_true(
+            matches!(
+                decrypt_auth_first(backend, options),
+                Err(DecryptAuthError::PinEntry(e)) if e == ended
+            ),
+            "ended prompt",
         )
     }
 }

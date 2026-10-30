@@ -105,7 +105,7 @@ impl ChangePinArgs {
         let current =
             match super::util::pin_env_or_prompt(cmd, current_env, &format!("current {label}: ")) {
                 Ok(p) => p,
-                Err(exit) => return exit,
+                Err(exit) => return exit.into(),
             };
         let new1 = match super::util::new_pin_env_or_prompt(cmd, new_env, label, None) {
             Ok(p) => p,
