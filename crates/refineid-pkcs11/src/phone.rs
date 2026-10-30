@@ -46,7 +46,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use refineid_lib_core::x509::{MessageSignatureAlgorithm, OwnedCert};
+use refineid_lib_core::x509::{DigestCheckError, MessageSignatureAlgorithm, OwnedCert};
 use refineid_pkcs11::remote::{
     RemoteOffer, RemoteSignError, RemoteTokenSource, SessionCertificate,
 };
@@ -756,6 +756,11 @@ fn hold(
                             reader.close_session(session);
                             return After::Withdraw;
                         }
+                        // A check that cannot run says nothing of the
+                        // card: the request is refused and the cache kept.
+                        Err(Failure::Refused) => {
+                            let _ = request.reply.send(Err(RemoteSignError::Unsupported));
+                        }
                         Err(Failure::Sign(error)) => {
                             let _ = request.reply.send(Err(error));
                             match error {
@@ -845,6 +850,11 @@ enum Failure {
     /// The phone answered with a signature the cached certificate does
     /// not verify: the card on the phone is not the one cached.
     Mismatch,
+    /// The phone answered with a signature the module cannot check
+    /// under the cached certificate: the certificate does not decode,
+    /// its key is not of the request's kind, or the digest is not the
+    /// hash's length.
+    Refused,
     /// The phone gave no signature, for the reason the module reports.
     Sign(RemoteSignError),
 }
@@ -865,8 +875,9 @@ fn sign(
 
 /// The signature as it may be handed on: checked under the public key
 /// of the certificate the token carries, which this computer does
-/// alone. A profile the module cannot check is reported unsupported and
-/// the cache kept; a signature that does not verify is a mismatch.
+/// alone. A profile the module cannot check is reported unsupported, a
+/// check that cannot run is refused, and both keep the cache; a
+/// signature that does not verify is a mismatch.
 fn checked(
     signed: Result<Vec<u8>, RemoteSignError>,
     certificate: &[u8],
@@ -875,17 +886,15 @@ fn checked(
     let signature = signed.map_err(Failure::Sign)?;
     let algorithm = message_algorithm(request.algorithm())
         .ok_or(Failure::Sign(RemoteSignError::Unsupported))?;
-    let verifies = OwnedCert::from_der(certificate).is_ok_and(|certificate| {
-        certificate
-            .view()
-            .spki
-            .verify_digest_signature(algorithm, request.digest(), &signature)
-            .is_ok()
-    });
-    if verifies {
-        Ok(signature)
-    } else {
-        Err(Failure::Mismatch)
+    let certificate = OwnedCert::from_der(certificate).map_err(|_| Failure::Refused)?;
+    match certificate
+        .view()
+        .spki
+        .verify_digest_signature(algorithm, request.digest(), &signature)
+    {
+        Ok(()) => Ok(signature),
+        Err(DigestCheckError::Refused) => Err(Failure::Refused),
+        Err(DigestCheckError::DoesNotVerify) => Err(Failure::Mismatch),
     }
 }
 
@@ -1301,12 +1310,12 @@ mod tests {
             vec![7; DIGEST_SHA384_LEN],
         )
         .expect("a registered combination");
-        // A signature the certificate cannot vouch for is a mismatch,
-        // never a signature for the browser; here the certificate parses
-        // as nothing, so no signature can verify under it.
+        // A certificate that parses as nothing cannot check the
+        // signature: the request is refused, never handed on, and the
+        // refusal is no mismatch.
         assert_eq!(
             checked(Ok(vec![0; 96]), &[], &request),
-            Err(Failure::Mismatch)
+            Err(Failure::Refused)
         );
         // The phone's own refusal passes through and keeps the cache.
         assert_eq!(
