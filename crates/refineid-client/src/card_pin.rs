@@ -1256,7 +1256,7 @@ impl SlotProbe {
     ///   been rewritten.
     const fn looks_activated(self, generation: CardGeneration) -> bool {
         match generation {
-            CardGeneration::Newer => matches!(self.changed, Some(true)) && self.status.is_some(),
+            CardGeneration::Newer => matches!(self.changed, Some(true)),
             CardGeneration::Older | CardGeneration::Unknown => {
                 pin_looks_activated(self.status.as_ref())
             }
@@ -1288,12 +1288,18 @@ const fn classify_preflight(
     pin1: SlotProbe,
     pin2: SlotProbe,
 ) -> ActivatePreflightOutcome {
-    let deciding = match target {
-        ActivationTarget::Both | ActivationTarget::One(PinManageSlot::Pin1) => pin1,
-        ActivationTarget::One(PinManageSlot::Pin2) => pin2,
+    // Activating both touches both slots, so either one already
+    // activated refuses: a set PIN would otherwise be presented the
+    // factory code, or overwritten through the PUK.
+    let activated = match target {
+        ActivationTarget::Both => {
+            pin1.looks_activated(generation) || pin2.looks_activated(generation)
+        }
+        ActivationTarget::One(PinManageSlot::Pin1) => pin1.looks_activated(generation),
+        ActivationTarget::One(PinManageSlot::Pin2) => pin2.looks_activated(generation),
     };
     let (pin1, pin2) = (pin1.status, pin2.status);
-    if deciding.looks_activated(generation) {
+    if activated {
         ActivatePreflightOutcome::LooksActivated { pin1, pin2 }
     } else {
         ActivatePreflightOutcome::LooksUnactivated { pin1, pin2 }
@@ -2184,6 +2190,53 @@ mod activate_tests {
             SlotProbe {
                 status: Some(PinStatus::Remaining(five)),
                 changed: Some(true),
+            },
+        );
+        check_true(
+            matches!(pf, ActivatePreflightOutcome::LooksActivated { .. }),
+            "LooksActivated",
+        )
+    }
+
+    /// Activating both touches both slots: a card whose PIN 2 was
+    /// activated alone refuses, so the set PIN 2 is neither presented
+    /// the factory code nor overwritten.
+    #[test]
+    fn both_preflight_refuses_when_only_pin2_is_activated() -> TestResult {
+        let five = PinRetries::from_nibble(5).ok_or("PinRetries::from_nibble(5)")?;
+        let pf = classify_preflight(
+            ActivationTarget::Both,
+            CardGeneration::Newer,
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: Some(false),
+            },
+            SlotProbe {
+                status: Some(PinStatus::Remaining(five)),
+                changed: Some(true),
+            },
+        );
+        check_true(
+            matches!(pf, ActivatePreflightOutcome::LooksActivated { .. }),
+            "LooksActivated",
+        )
+    }
+
+    /// New-scheme preflight: the changed flag alone proves activation;
+    /// a status probe that returned nothing must not turn an activated
+    /// PIN back into a factory one.
+    #[test]
+    fn newer_preflight_changed_flag_true_refuses_without_a_status_reading() -> TestResult {
+        let pf = classify_preflight(
+            ActivationTarget::One(PinManageSlot::Pin1),
+            CardGeneration::Newer,
+            SlotProbe {
+                status: None,
+                changed: Some(true),
+            },
+            SlotProbe {
+                status: None,
+                changed: Some(false),
             },
         );
         check_true(
