@@ -138,9 +138,6 @@ section.
 Skip every network fetch.
 .It Fl -can Ar can
 The card access number printed on the card front; enables eMRTD.
-.It Fl -no-stamp
-No visible mark on the page; the signature stays invisible.
-By default the signed page carries the holder's mark.
 .It Fl -no-can
 Skip the eMRTD section without a prompt.
 .It Fl -crl-file Ar path
@@ -340,6 +337,9 @@ Repeat for alternatives; a failed answer is skipped, and signing fails
 when none remains.
 .Fl -timestamp Cm eu-qualified
 names public EU endpoints.
+.It Fl -no-stamp
+No visible mark on the page; the signature stays invisible.
+By default the signed page carries the holder's mark.
 .It Fl -no-archive
 Stop at level LT: no archive timestamp.
 .It Fl -no-long-term
