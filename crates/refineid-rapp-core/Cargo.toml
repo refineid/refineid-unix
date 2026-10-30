@@ -15,4 +15,5 @@ workspace = true
 refineid-rapp.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
+socket2.workspace = true
 zeroize.workspace = true

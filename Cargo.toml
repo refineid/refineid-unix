@@ -17,7 +17,7 @@ members = [
 # YY.M.D, the UTC day the code last changed, stamped by the pre-commit
 # hook (script/version-stamp.sh). refineid_lib_core::VERSION appends the
 # build number B for the project version YY.M.D.B.
-version = "26.10.29"
+version = "26.10.30"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]
@@ -71,6 +71,10 @@ sha1 = "0.11"
 # used only by a short-lived current-thread runtime around each attempt.
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["dnssec-ring", "system-config", "tokio"] }
 tokio = { version = "1", default-features = false, features = ["net", "rt", "time"] }
+
+# Socket options std cannot set before bind: the mDNS browse shares the
+# mDNS port with the system responder. Already in-tree through tokio.
+socket2 = { version = "0.6", features = ["all"] }
 
 # Random generation for session-local secrets.
 getrandom = "0.4"

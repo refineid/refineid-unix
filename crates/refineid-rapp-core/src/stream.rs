@@ -334,16 +334,28 @@ const RR_TYPE_TXT: u16 = 16;
 const RR_TYPE_SRV: u16 = 33;
 /// DNS message header length in bytes.
 const DNS_HEADER_BYTES: usize = 12;
+/// Offset of the question count in the DNS header (RFC 1035 section 4.1.1).
+const DNS_QUESTION_COUNT_OFFSET: usize = 4;
+/// Questions in one browse query.
+const BROWSE_QUESTIONS: u16 = 1;
 /// Fixed bytes after a resource record's name: type, class, TTL, length.
 const RR_FIXED_BYTES: usize = 10;
 /// SRV rdata bytes before the target name: priority, weight, port.
 const SRV_FIXED_BYTES: usize = 6;
 /// Largest mDNS response the browser reads.
 const MDNS_RESPONSE_BYTES: usize = 4096;
-/// The mDNS IPv4 group and port (RFC 6762 section 3).
-const MDNS_GROUP: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 251), 5353);
-/// Poll interval while waiting for answers.
-const MDNS_POLL: Duration = Duration::from_millis(250);
+/// DNS class IN (RFC 1035 section 3.2.4).
+const DNS_CLASS_IN: u16 = 1;
+/// The unicast-response bit of an mDNS question's class (RFC 6762 section 5.4).
+const DNS_UNICAST_RESPONSE: u16 = 1 << 15;
+/// The mDNS port (RFC 6762 section 3).
+const MDNS_PORT: u16 = 5353;
+/// The mDNS IPv4 group address (RFC 6762 section 3).
+const MDNS_GROUP_ADDRESS: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+/// The mDNS IPv4 group and port.
+const MDNS_GROUP: SocketAddrV4 = SocketAddrV4::new(MDNS_GROUP_ADDRESS, MDNS_PORT);
+/// Read timeout of each browse socket while waiting for answers.
+const MDNS_POLL: Duration = Duration::from_millis(125);
 
 /// Records gathered from mDNS answers before they are joined per instance.
 #[derive(Debug, Default)]
@@ -393,7 +405,7 @@ fn parse_mdns_response(data: &[u8], responder: Option<Ipv4Addr>, records: &mut M
         return;
     }
     let count = |index: usize| usize::from(u16::from_be_bytes([data[index], data[index + 1]]));
-    let questions = count(4);
+    let questions = count(DNS_QUESTION_COUNT_OFFSET);
     let resources = count(6) + count(8) + count(10);
     let mut offset = DNS_HEADER_BYTES;
     for _ in 0..questions {
@@ -525,14 +537,11 @@ pub fn local_neighbors() -> Vec<Ipv4Addr> {
 /// Browses `_refineid-stream._tcp.local.` for `timeout` and returns every
 /// advertised custodian, with the TXT entries it published.
 ///
-/// The query goes to the mDNS group and, directly, to each of `remembered`
+/// The question goes to the mDNS group and, directly, to each of `remembered`
 /// as well as active local neighbors discovered from the host's ARP table.
 /// A wireless network delivers multicast to a phone unreliably (and bridged
 /// VMs on Wi-Fi drop multicast altogether); queries to known or active neighbor
 /// addresses are answered whenever the phone is reachable at all.
-///
-/// The query asks for unicast answers from an ephemeral port (RFC 6762
-/// section 5.4), so it works beside a system mDNS responder.
 #[must_use]
 pub fn browse_stream_services(timeout: Duration, remembered: &[Ipv4Addr]) -> Vec<StreamService> {
     let mut targets: Vec<Ipv4Addr> = remembered.to_vec();
@@ -543,22 +552,110 @@ pub fn browse_stream_services(timeout: Duration, remembered: &[Ipv4Addr]) -> Vec
     }
     let responders: Vec<SocketAddrV4> = targets
         .iter()
-        .map(|address| SocketAddrV4::new(*address, MDNS_GROUP.port()))
+        .map(|address| SocketAddrV4::new(*address, MDNS_PORT))
         .collect();
     browse_responders(timeout, &responders)
 }
 
+/// The sockets one browse asks on.
+///
+/// A responder answers a question by multicast unless the question asks
+/// for a unicast answer and the record was multicast within a quarter of
+/// its TTL (RFC 6762 section 5.4); only a socket bound to the mDNS port and
+/// joined to the group hears a multicast answer, and that port is shared
+/// with the system responder. A legacy question from an ephemeral port
+/// (section 6.7) is answered by unicast, reaches responders asked directly,
+/// and still works where the mDNS port cannot be shared.
+struct BrowseSockets {
+    group: Option<std::net::UdpSocket>,
+    legacy: std::net::UdpSocket,
+}
+
+impl BrowseSockets {
+    fn open() -> Option<Self> {
+        let legacy = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        legacy.set_read_timeout(Some(MDNS_POLL)).ok()?;
+        Some(Self {
+            group: Self::group_socket(),
+            legacy,
+        })
+    }
+
+    /// Binds the shared mDNS port and joins the group on the default
+    /// interface; `None` where the platform refuses either.
+    fn group_socket() -> Option<std::net::UdpSocket> {
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+        socket.set_reuse_address(true).ok()?;
+        socket.set_reuse_port(true).ok()?;
+        let port = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT);
+        socket.bind(&SockAddr::from(port)).ok()?;
+        socket
+            .join_multicast_v4(&MDNS_GROUP_ADDRESS, &Ipv4Addr::UNSPECIFIED)
+            .ok()?;
+        socket.set_read_timeout(Some(MDNS_POLL)).ok()?;
+        Some(socket.into())
+    }
+
+    /// Asks the group an ordinary question from the group socket, and the
+    /// group and `responders` a legacy one; false when nothing went out.
+    fn ask(&self, responders: &[SocketAddrV4]) -> bool {
+        let mut asked = self
+            .group
+            .as_ref()
+            .is_some_and(|socket| socket.send_to(&browse_query(false), MDNS_GROUP).is_ok());
+        let legacy = browse_query(true);
+        for responder in core::iter::once(&MDNS_GROUP).chain(responders) {
+            asked |= self.legacy.send_to(&legacy, responder).is_ok();
+        }
+        asked
+    }
+
+    /// Reads one datagram from whichever socket has one within its poll.
+    fn receive(&self, buffer: &mut [u8]) -> Option<(usize, std::net::SocketAddr)> {
+        if let Some(group) = &self.group
+            && let Ok(received) = group.recv_from(buffer)
+        {
+            return Some(received);
+        }
+        self.legacy.recv_from(buffer).ok()
+    }
+}
+
 /// [`browse_stream_services`], asking the mDNS group and `responders`.
 fn browse_responders(timeout: Duration, responders: &[SocketAddrV4]) -> Vec<StreamService> {
-    use std::net::UdpSocket;
     use std::time::Instant;
 
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+    let Some(sockets) = BrowseSockets::open() else {
         return Vec::new();
     };
-    let _ = socket.set_read_timeout(Some(MDNS_POLL));
+    if !sockets.ask(responders) {
+        return Vec::new();
+    }
+
+    let start = Instant::now();
+    let mut records = MdnsRecords::default();
+    let mut buffer = [0u8; MDNS_RESPONSE_BYTES];
+    while start.elapsed() < timeout {
+        let Some((read, peer)) = sockets.receive(&mut buffer) else {
+            continue;
+        };
+        let responder = match peer {
+            std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+            std::net::SocketAddr::V6(_) => None,
+        };
+        parse_mdns_response(&buffer[..read], responder, &mut records);
+    }
+    records.into_services()
+}
+
+/// One PTR question for the stream service type, class IN, with the
+/// unicast-response bit when `unicast_response` is set.
+fn browse_query(unicast_response: bool) -> Vec<u8> {
     let mut query = vec![0u8; DNS_HEADER_BYTES];
-    query[5] = 1;
+    query[DNS_QUESTION_COUNT_OFFSET..DNS_QUESTION_COUNT_OFFSET + 2]
+        .copy_from_slice(&BROWSE_QUESTIONS.to_be_bytes());
     for label in STREAM_SERVICE_TYPE.split('.') {
         #[allow(
             clippy::cast_possible_truncation,
@@ -569,30 +666,13 @@ fn browse_responders(timeout: Duration, responders: &[SocketAddrV4]) -> Vec<Stre
     }
     query.push(0);
     query.extend_from_slice(&RR_TYPE_PTR.to_be_bytes());
-    // Class IN with the unicast-response bit.
-    query.extend_from_slice(&0x8001u16.to_be_bytes());
-    let mut asked = false;
-    for responder in core::iter::once(&MDNS_GROUP).chain(responders) {
-        asked |= socket.send_to(&query, responder).is_ok();
-    }
-    if !asked {
-        return Vec::new();
-    }
-
-    let start = Instant::now();
-    let mut records = MdnsRecords::default();
-    let mut buffer = [0u8; MDNS_RESPONSE_BYTES];
-    while start.elapsed() < timeout {
-        let Ok((read, peer)) = socket.recv_from(&mut buffer) else {
-            continue;
-        };
-        let responder = match peer {
-            std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
-            std::net::SocketAddr::V6(_) => None,
-        };
-        parse_mdns_response(&buffer[..read], responder, &mut records);
-    }
-    records.into_services()
+    let class = if unicast_response {
+        DNS_CLASS_IN | DNS_UNICAST_RESPONSE
+    } else {
+        DNS_CLASS_IN
+    };
+    query.extend_from_slice(&class.to_be_bytes());
+    query
 }
 
 /// Browses for custodians advertising `mode`, each with at least one
@@ -782,6 +862,28 @@ mod tests {
             .expect("the direct answer names the custodian");
         assert!(found.endpoints.contains(&"192.0.2.10:47110".to_owned()));
         assert!(found.advertises(DiscoveryMode::Session));
+    }
+
+    /// The question names the stream service type, asks for PTR, and sets
+    /// the unicast-response bit only on the legacy form.
+    #[test]
+    fn browse_questions_differ_only_in_the_unicast_response_bit() {
+        let mut question = name(&["_refineid-stream", "_tcp", "local"]);
+        question.extend_from_slice(&super::RR_TYPE_PTR.to_be_bytes());
+        for (unicast_response, class) in [
+            (false, super::DNS_CLASS_IN),
+            (true, super::DNS_CLASS_IN | super::DNS_UNICAST_RESPONSE),
+        ] {
+            let query = super::browse_query(unicast_response);
+            let (header, body) = query.split_at(super::DNS_HEADER_BYTES);
+            let mut expected_header = [0u8; super::DNS_HEADER_BYTES];
+            expected_header[super::DNS_QUESTION_COUNT_OFFSET..super::DNS_QUESTION_COUNT_OFFSET + 2]
+                .copy_from_slice(&super::BROWSE_QUESTIONS.to_be_bytes());
+            assert_eq!(header, expected_header);
+            let mut expected_body = question.clone();
+            expected_body.extend_from_slice(&class.to_be_bytes());
+            assert_eq!(body, expected_body);
+        }
     }
 
     #[test]
