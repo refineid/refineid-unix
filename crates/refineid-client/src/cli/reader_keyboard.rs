@@ -26,6 +26,7 @@ usage: refineid reader keyboard [status | on | off] [--reader SUBSTR]
 Show or set the keyboard (HID) interface of an ACS reader. A phone
 hides its on-screen keyboard while the reader acts as a keyboard.
 The new mode takes effect when the reader is plugged in again.
+Setting prints nothing on success; -v shows each step.
   status      show the mode (default)
   on          keyboard and card reader
   off         card reader only
@@ -78,13 +79,17 @@ impl ReaderKeyboardArgs {
         })
     }
 
-    /// Execute the `reader keyboard` verb.
+    /// Execute the `reader keyboard` verb. Showing the mode prints it;
+    /// setting it is silent on success unless `verbose`.
     #[must_use]
-    pub fn run(self) -> std::process::ExitCode {
+    pub fn run(self, verbose: bool) -> std::process::ExitCode {
+        let show = verbose || self.action == KeyboardAction::Status;
         match crate::reader_keyboard::run(self.action, self.reader_filter.as_deref()) {
             Ok(lines) => {
-                for line in &lines {
-                    println!("{line}");
+                if show {
+                    for line in &lines {
+                        println!("{line}");
+                    }
                 }
                 crate::exit_status::ExitStatus::Ok.into()
             }

@@ -30,7 +30,8 @@
 //!    first argument so error messages and `Args::run`
 //!    dispatch off the same value.
 //! 3. The typed [`Verb`] value flows into `Verb::run`, which
-//!    dispatches uniformly to `*Args::run(self)`. Once a handler
+//!    dispatches to `*Args::run`; an operation's handler also
+//!    takes the global `verbose` flag. Once a handler
 //!    has a typed `Args` value, the compiler refuses to invoke
 //!    it with a malformed argv -- the only way to construct an
 //!    `Args` is through `parse`.
@@ -54,10 +55,11 @@
 //!    is no per-module `const CMD: &str` literal; the
 //!    [`VerbTag`] enum is the single source of truth.
 //! 3. Define `impl FooArgs { pub fn run(self) ->
-//!    std::process::ExitCode { ... } }`. The verb dispatch in
-//!    [`Verb::run`] forwards uniformly: `Self::CardFoo(a) =>
-//!    a.run()`. No verb-name -> handler-name mapping in
-//!    `bin/refineid.rs`.
+//!    std::process::ExitCode { ... } }`, or `run(self, verbose:
+//!    bool)` for an operation: it prints nothing on success and its
+//!    step report under `-v`. The verb dispatch in [`Verb::run`]
+//!    forwards: `Self::CardFoo(a) => a.run(verbose)`. No verb-name
+//!    -> handler-name mapping in `bin/refineid.rs`.
 //!
 //! [`ArgParseError`] is intentionally a single shared enum so
 //! the binary has one error formatter that knows how to render

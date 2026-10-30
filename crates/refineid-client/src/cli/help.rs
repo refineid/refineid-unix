@@ -38,7 +38,7 @@ const PROGRAM: &str = "refineid";
 /// The synopsis's first line.
 const SYNOPSIS_USAGE: &str = "usage: refineid [-vV] <command> [args]";
 /// The synopsis line on the global verbose option.
-const SYNOPSIS_VERBOSE: &str = "-v, --verbose  show what each step did";
+const SYNOPSIS_VERBOSE: &str = "-v, --verbose  show each step; operations are silent otherwise";
 /// The synopsis line on the version option.
 const SYNOPSIS_VERSION: &str = "-V, --version  print the version";
 /// The synopsis's last line.

@@ -108,6 +108,8 @@ pub enum KeyboardError {
     Pcsc(PcscError),
     /// The reader answered, but not in the documented shape.
     BadResponse(Vec<u8>),
+    /// The reader answered a set with a mode other than the one asked.
+    NotAccepted,
 }
 
 impl core::fmt::Display for KeyboardError {
@@ -128,6 +130,7 @@ impl core::fmt::Display for KeyboardError {
                 }
                 Ok(())
             }
+            Self::NotAccepted => write!(f, "reader did not accept the requested mode"),
         }
     }
 }
@@ -192,11 +195,10 @@ pub fn run(
         set.push(wanted.byte());
         let after = parse_mode(&reader_escape(reader, &set)?)?;
         lines.push(format!("  set host interface: {}", after.describe()));
-        if after == wanted {
-            lines.push("  done -- replug the reader for the change to take effect".to_owned());
-        } else {
-            lines.push("  WARNING: reader did not accept the requested mode".to_owned());
+        if after != wanted {
+            return Err(KeyboardError::NotAccepted);
         }
+        lines.push("  done -- replug the reader for the change to take effect".to_owned());
     }
     Ok(lines)
 }

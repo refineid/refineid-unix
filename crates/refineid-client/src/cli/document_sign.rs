@@ -43,7 +43,7 @@ usage: refineid document sign FILE [FILE ...] [--format F] [--out PATH]
 
 Sign FILE into a format a counterparty can open. Several files go into
 one container under one signature. PIN2 and the qualified-signature
-key by default.
+key by default. Prints nothing on success; -v shows each step.
   --format F    pades          signature inside the PDF
                 cades          CMS, document attached
                 cades-detached CMS, document left outside
@@ -141,9 +141,10 @@ pub struct DocumentSignArgs {
 }
 
 impl DocumentSignArgs {
-    /// Execute the verb.
+    /// Execute the verb. Silent on success; `verbose` prints the step
+    /// report.
     #[must_use]
-    pub fn run(self) -> std::process::ExitCode {
+    pub fn run(self, verbose: bool) -> std::process::ExitCode {
         let Self {
             format,
             mut inputs,
@@ -158,11 +159,15 @@ impl DocumentSignArgs {
             archive,
         } = self;
         let cmd = CMD.label();
-        let (pin_prompt, env_var) = match slot {
-            SignSlot::Auth => ("PIN1: ", "REFINEID_PIN1"),
-            SignSlot::Qualified => ("PIN2: ", "REFINEID_PIN2"),
+        let env_var = match slot {
+            SignSlot::Auth => "REFINEID_PIN1",
+            SignSlot::Qualified => "REFINEID_PIN2",
         };
-        let pin = match super::util::pin_env_or_prompt(cmd, env_var, pin_prompt) {
+        let pin = match super::util::pin_env_or_prompt(
+            cmd,
+            env_var,
+            super::util::sign_pin_prompt(slot),
+        ) {
             Ok(p) => p,
             Err(exit) => return exit,
         };
@@ -221,7 +226,7 @@ impl DocumentSignArgs {
             result = run_once(Some(prompted));
         }
 
-        report_outcome(cmd, result, format, long_term, archive)
+        report_outcome(cmd, verbose, result, format, long_term, archive)
     }
 
     /// Parse the post-subcommand argv slice.
@@ -446,9 +451,35 @@ fn describe_level(timestamp_tokens: usize, long_term: bool, archive: bool) -> St
     }
 }
 
+/// The step report of a signed document: the signing steps, the
+/// format and the level reached.
+struct DocumentReport<'a> {
+    /// What the card and the timestamp authorities did.
+    sign: &'a crate::card_sign::SignReport,
+    /// The format produced.
+    format: Format,
+    /// Whether the evidence was embedded.
+    long_term: bool,
+    /// Whether an archive timestamp was added.
+    archive: bool,
+}
+
+impl core::fmt::Display for DocumentReport<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.sign)?;
+        writeln!(f, "format:           {}", format_label(self.format))?;
+        writeln!(
+            f,
+            "signature level:  {}",
+            describe_level(self.sign.timestamps, self.long_term, self.archive)
+        )
+    }
+}
+
 /// Turn the signing outcome into a report and an exit code.
 fn report_outcome(
     cmd: &str,
+    verbose: bool,
     result: Result<crate::card_sign::SignReport, crate::card_sign::SignErrorKind>,
     format: Format,
     long_term: bool,
@@ -456,11 +487,19 @@ fn report_outcome(
 ) -> std::process::ExitCode {
     match result {
         Ok(report) => {
-            let level = describe_level(report.timestamps, long_term, archive);
-            print!("{report}");
-            println!("format:           {}", format_label(format));
-            println!("signature level:  {level}");
-            if report.local_verify.is_failed() {
+            let verified = !report.local_verify.is_failed();
+            super::util::show_outcome(
+                verbose,
+                verified,
+                &DocumentReport {
+                    sign: &report,
+                    format,
+                    long_term,
+                    archive,
+                },
+            );
+            if !verified {
+                eprintln!("{cmd}: local verify: {}", report.local_verify);
                 crate::exit_status::ExitStatus::RuntimeFailure.into()
             } else {
                 crate::exit_status::ExitStatus::Ok.into()
@@ -676,13 +715,76 @@ fn expand_authority(value: &str) -> Result<Vec<String>, ArgParseError> {
 mod tests {
     use std::path::PathBuf;
 
+    use refineid_lib_core::crypto::digest::Sha256;
+
     use super::{
-        DEFAULT_TIMESTAMP_AUTHORITY, DocumentSignArgs, Format, SignSlot, describe_level,
-        parse_format,
+        DEFAULT_TIMESTAMP_AUTHORITY, DocumentReport, DocumentSignArgs, Format, SignSlot,
+        describe_level, parse_format,
     };
+    use crate::card_sign::{LocalVerifyOutcome, SignReport};
     use crate::cli::ArgParseError;
     use crate::cli::argv::fixtures::remaining_argv as argv;
+    use crate::cli::util::write_report;
     use crate::test_util::{TestResult, check, check_true};
+
+    /// A synthetic reader name.
+    const READER: &str = "Synthetic Card Reader";
+    /// A synthetic document's content.
+    const DOCUMENT: &[u8] = b"synthetic document";
+    /// A synthetic card signature length.
+    const SIGNATURE_LEN: usize = DOCUMENT.len();
+    /// A synthetic signed document length: the document and its
+    /// signature.
+    const SIGNED_LEN: usize = DOCUMENT.len().saturating_add(SIGNATURE_LEN);
+    /// Timestamp tokens a level-T signature carries.
+    const ONE_TOKEN: usize = 1;
+
+    /// The report of a synthetic level-T `PAdES` signature.
+    fn signed_report() -> SignReport {
+        SignReport {
+            reader: READER.to_owned(),
+            slot: SignSlot::Qualified,
+            input_len: u64::try_from(DOCUMENT.len()).unwrap_or(u64::MAX),
+            input_sha256: Sha256::of(DOCUMENT),
+            signature_path: PathBuf::from(OUT),
+            cert_path: None,
+            signature_len: SIGNATURE_LEN,
+            timestamps: ONE_TOKEN,
+            output_len: SIGNED_LEN,
+            cert_subject_cn: None,
+            pin_retries_after: None,
+            local_verify: LocalVerifyOutcome::Ok,
+        }
+    }
+
+    /// The bytes [`write_report`] writes for the synthetic signature.
+    fn written(verbose: bool) -> Result<Vec<u8>, std::io::Error> {
+        let sign = signed_report();
+        let report = DocumentReport {
+            sign: &sign,
+            format: Format::Pades,
+            long_term: false,
+            archive: false,
+        };
+        let mut out = Vec::new();
+        write_report(&mut out, verbose, &report)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn a_signed_document_reports_nothing_without_verbose() -> TestResult {
+        check_true(written(false)?.is_empty(), "silent on success")
+    }
+
+    #[test]
+    fn a_signed_document_reports_its_steps_with_verbose() -> TestResult {
+        let text = String::from_utf8(written(true)?)?;
+        check_true(text.contains(READER), "reader line")?;
+        check_true(text.contains(OUT), "output line")?;
+        check_true(text.contains("local verify"), "local verify line")?;
+        check_true(text.contains("format:"), "format line")?;
+        check_true(text.contains("signature level:  B-T"), "level line")
+    }
 
     /// A synthetic PDF to sign.
     const PDF: &str = "/documents/report.pdf";

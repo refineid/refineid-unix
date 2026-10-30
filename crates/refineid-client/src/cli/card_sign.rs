@@ -30,6 +30,7 @@ usage: refineid card sign-auth | sign-qualified --in PATH --out PATH
 Raw signature over a file: sign-auth with PIN1 and the authentication
 key, sign-qualified with PIN2 and the qualified-signature key. The
 signature is verified locally against the on-card certificate.
+Prints nothing on success; -v shows each step.
   --in P         input file
   --out P        output file for the raw signature
   --save-cert P  also write the signing certificate's DER
@@ -75,9 +76,10 @@ pub struct SignArgs {
 }
 
 impl SignArgs {
-    /// Execute the `card sign-{auth,qualified}` verb.
+    /// Execute the `card sign-{auth,qualified}` verb. Silent on
+    /// success; `verbose` prints the step report.
     #[must_use]
-    pub fn run(self) -> std::process::ExitCode {
+    pub fn run(self, verbose: bool) -> std::process::ExitCode {
         let Self {
             slot,
             input,
@@ -86,12 +88,16 @@ impl SignArgs {
             reader_filter,
             can,
         } = self;
-        let (sub, pin_prompt, env_var) = match slot {
-            SignSlot::Auth => (VerbTag::CardSignAuth, "PIN1: ", "REFINEID_PIN1"),
-            SignSlot::Qualified => (VerbTag::CardSignQualified, "PIN2: ", "REFINEID_PIN2"),
+        let (sub, env_var) = match slot {
+            SignSlot::Auth => (VerbTag::CardSignAuth, "REFINEID_PIN1"),
+            SignSlot::Qualified => (VerbTag::CardSignQualified, "REFINEID_PIN2"),
         };
         let cmd = sub.label();
-        let pin = match super::util::pin_env_or_prompt(cmd, env_var, pin_prompt) {
+        let pin = match super::util::pin_env_or_prompt(
+            cmd,
+            env_var,
+            super::util::sign_pin_prompt(slot),
+        ) {
             Ok(p) => p,
             Err(exit) => return exit,
         };
@@ -126,11 +132,13 @@ impl SignArgs {
         }
         match result {
             Ok(report) => {
-                print!("{report}");
                 // Failed local verify is a sign-flow failure; Skipped
                 // (e.g. ECDSA P-384 local verify not yet wired) is
                 // not -- the card-side sign chain still completed.
-                if report.local_verify.is_failed() {
+                let verified = !report.local_verify.is_failed();
+                super::util::show_outcome(verbose, verified, &report);
+                if !verified {
+                    eprintln!("{cmd}: local verify: {}", report.local_verify);
                     crate::exit_status::ExitStatus::RuntimeFailure.into()
                 } else {
                     crate::exit_status::ExitStatus::Ok.into()

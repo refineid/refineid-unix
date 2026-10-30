@@ -14,19 +14,82 @@
 
 //! Shared CLI helpers used across multiple verb handlers.
 //!
-//! The three helpers here all touch operator I/O (stdin / stderr)
+//! The helpers here touch operator I/O (stdin / stdout / stderr)
 //! or map the shared [`ReaderPickError`] family to typed
 //! [`ExitStatus`] -- both are concerns the verb-specific
 //! handlers share via call, not via duplicated logic.
 
-use std::io::{BufRead as _, IsTerminal};
+use core::fmt::Display;
+use std::io::{self, BufRead as _, IsTerminal, Write};
 use std::process::ExitCode;
 
 use refineid_lib_core::backend::ReaderPickError;
 use refineid_lib_core::can::Can;
 use refineid_lib_core::pin::PinBytes;
 
+use crate::card_pin::PinManageSlot;
+use crate::card_sign::SignSlot;
 use crate::exit_status::ExitStatus;
+
+/// Prompt for PIN 1.
+pub(super) const PROMPT_PIN1: &str = "PIN 1: ";
+/// Prompt for PIN 2.
+pub(super) const PROMPT_PIN2: &str = "PIN 2: ";
+/// Prompt for the PUK.
+pub(super) const PROMPT_PUK: &str = "PUK: ";
+/// Prompt for the activation PIN of a new card.
+pub(super) const PROMPT_ACTIVATION_PIN: &str = "Activation PIN: ";
+
+/// The PIN prompt for the PIN that gates `slot`.
+pub(super) const fn sign_pin_prompt(slot: SignSlot) -> &'static str {
+    match slot {
+        SignSlot::Auth => PROMPT_PIN1,
+        SignSlot::Qualified => PROMPT_PIN2,
+    }
+}
+
+/// The name prompts give the PIN in `slot`: `PIN 1` or `PIN 2`.
+pub(super) const fn pin_name(slot: PinManageSlot) -> &'static str {
+    match slot {
+        PinManageSlot::Pin1 => "PIN 1",
+        PinManageSlot::Pin2 => "PIN 2",
+    }
+}
+
+/// Write an operation's step report to `out` when `verbose`, and
+/// nothing otherwise: an operation is silent on success.
+///
+/// # Errors
+/// The write error of `out`.
+pub(super) fn write_report(
+    out: &mut impl Write,
+    verbose: bool,
+    report: &impl Display,
+) -> io::Result<()> {
+    if verbose {
+        write!(out, "{report}")?;
+    }
+    Ok(())
+}
+
+/// [`write_report`] to stdout. A failed write is reported on stderr;
+/// the operation itself has already succeeded.
+pub(super) fn print_report(verbose: bool, report: &impl Display) {
+    if let Err(error) = write_report(&mut io::stdout().lock(), verbose, report) {
+        eprintln!("{error}");
+    }
+}
+
+/// Show the report of an operation the card answered: on stdout under
+/// `-v` when it succeeded, always on stderr when it failed, since the
+/// report then carries the error.
+pub(super) fn show_outcome(verbose: bool, succeeded: bool, report: &impl Display) {
+    if succeeded {
+        print_report(verbose, report);
+    } else {
+        eprint!("{report}");
+    }
+}
 
 /// Map a [`ReaderPickError`] to the project's exit-status
 /// convention.
@@ -83,7 +146,7 @@ pub fn prompt_can_if_tty() -> Option<Can> {
     /// matches the "1 + 2 retries" feel an operator expects.
     const CAN_PROMPT_MAX_TRIES: u32 = 3;
 
-    if !std::io::stdin().is_terminal() {
+    if !io::stdin().is_terminal() {
         return None;
     }
     let mut tries_left: u32 = CAN_PROMPT_MAX_TRIES;
@@ -222,11 +285,11 @@ pub(super) fn prompt_pin(cmd: &str, prompt: &str) -> Result<PinBytes, ExitCode> 
 /// - stdin / prompt error -> `RuntimeFailure`
 /// - new/confirm mismatch -> `BadInvocation`
 ///
-/// `label` is the short PIN name (`"PIN1"`, `"PIN2"`), shown in
+/// `label` is the PIN name (`"PIN 1"`, `"PIN 2"`), shown in
 /// both the first and the confirm prompt and in the mismatch
 /// error. `digit_hint`, when `Some`, is appended in parens to
 /// the first prompt only -- `Some("4-12 digits")` gives `"new
-/// PIN1 (4-12 digits): "` then `"new PIN1 (confirm): "`. Pass
+/// PIN 1 (4-12 digits): "` then `"new PIN 1 (confirm): "`. Pass
 /// `None` for change-pin / unblock-pin where no length hint is
 /// shown.
 ///
@@ -261,7 +324,7 @@ pub(super) fn prompt_new_pin_pair(
 /// Returns the prompt failure or stdin read failure as a
 /// human-readable string. The caller maps it to an exit code.
 pub(super) fn read_pin_masked(prompt: &str) -> Result<PinBytes, String> {
-    let pin_str = if IsTerminal::is_terminal(&std::io::stdin()) {
+    let pin_str = if IsTerminal::is_terminal(&io::stdin()) {
         let config = rpassword::ConfigBuilder::new()
             .password_feedback_mask('*')
             .build();
@@ -269,7 +332,7 @@ pub(super) fn read_pin_masked(prompt: &str) -> Result<PinBytes, String> {
             .map_err(|e| format!("PIN prompt failed: {e}"))?
     } else {
         let mut line = String::new();
-        let stdin = std::io::stdin();
+        let stdin = io::stdin();
         {
             let mut guard = stdin.lock();
             let _read_bytes: usize = guard
@@ -288,7 +351,42 @@ pub(super) fn read_pin_masked(prompt: &str) -> Result<PinBytes, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{TestResult, check};
+    use crate::test_util::{TestResult, check, check_true};
+
+    /// A synthetic step report.
+    const REPORT: &str = "step: done\n";
+
+    #[test]
+    fn a_report_is_written_only_when_verbose() -> TestResult {
+        let mut quiet = Vec::new();
+        write_report(&mut quiet, false, &REPORT)?;
+        check_true(quiet.is_empty(), "nothing without verbose")?;
+        let mut verbose = Vec::new();
+        write_report(&mut verbose, true, &REPORT)?;
+        check(
+            verbose.as_slice(),
+            REPORT.as_bytes(),
+            "the report with verbose",
+        )
+    }
+
+    #[test]
+    fn prompts_name_the_pin_with_a_space() -> TestResult {
+        check(sign_pin_prompt(SignSlot::Auth), "PIN 1: ", "auth prompt")?;
+        check(
+            sign_pin_prompt(SignSlot::Qualified),
+            "PIN 2: ",
+            "qualified prompt",
+        )?;
+        check(pin_name(PinManageSlot::Pin1), "PIN 1", "PIN 1 name")?;
+        check(pin_name(PinManageSlot::Pin2), "PIN 2", "PIN 2 name")?;
+        check(PROMPT_PUK, "PUK: ", "PUK prompt")?;
+        check(
+            PROMPT_ACTIVATION_PIN,
+            "Activation PIN: ",
+            "activation prompt",
+        )
+    }
 
     // The reader-filter-error -> exit-status table. The
     // distinction that matters operationally: "no hardware"

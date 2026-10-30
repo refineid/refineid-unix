@@ -23,6 +23,7 @@ pub const HELP: &str = "\
 usage: refineid card unblock-pin1 | unblock-pin2 [--reader SUBSTR]
 
 Unblock PIN1 or PIN2 with the PUK and set a new PIN.
+Prints nothing on success; -v shows each step.
   --reader S  narrow to readers whose name contains S
 DANGER: a wrong PUK decrements the PUK counter; exhausting it
 permanently bricks the card.
@@ -46,9 +47,10 @@ pub struct UnblockPinArgs {
 }
 
 impl UnblockPinArgs {
-    /// Execute the `card unblock-pin{1,2}` verb.
+    /// Execute the `card unblock-pin{1,2}` verb. Silent on success;
+    /// `verbose` prints the step report.
     #[must_use]
-    pub fn run(self) -> std::process::ExitCode {
+    pub fn run(self, verbose: bool) -> std::process::ExitCode {
         use crate::exit_status::ExitStatus;
         let Self {
             slot,
@@ -58,7 +60,7 @@ impl UnblockPinArgs {
             PinManageSlot::Pin1 => "card unblock-pin1",
             PinManageSlot::Pin2 => "card unblock-pin2",
         };
-        let label = slot.label();
+        let label = super::util::pin_name(slot);
         let backend = refineid_lib_pcsc::PcscBackend;
         let typed_reader_filter = reader_filter
             .as_deref()
@@ -76,7 +78,7 @@ impl UnblockPinArgs {
                 }
             };
         let ctx = session.into_pin_management_context();
-        let puk_raw = match super::util::prompt_pin(cmd, "PUK: ") {
+        let puk_raw = match super::util::prompt_pin(cmd, super::util::PROMPT_PUK) {
             Ok(p) => p,
             Err(exit) => return exit,
         };
@@ -99,7 +101,9 @@ impl UnblockPinArgs {
         };
         match crate::card_pin::unblock_pin_first(backend, ctx, options) {
             Ok(report) => {
-                print!("{report}");
+                let succeeded =
+                    matches!(report.outcome, refineid_lib_core::auth::UnblockOutcome::Ok);
+                super::util::show_outcome(verbose, succeeded, &report);
                 match report.outcome {
                     refineid_lib_core::auth::UnblockOutcome::Ok => ExitStatus::Ok.into(),
                     refineid_lib_core::auth::UnblockOutcome::WrongPuk { .. }

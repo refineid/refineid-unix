@@ -25,7 +25,9 @@ use refineid_lib_core::auth::UnblockOutcome;
 use refineid_lib_core::pin::ActivationCode;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
-use crate::card_pin::{ActivateReport, ActivationCardContext, CardPinError, CardTrustAttestation};
+use crate::card_pin::{
+    ActivateReport, ActivationCardContext, CardPinError, CardTrustAttestation, PinManageSlot,
+};
 use crate::exit_status::ExitStatus;
 
 /// What `refineid card activate help`
@@ -34,7 +36,7 @@ pub const HELP: &str = "\
 usage: refineid card activate [--allow-reactivate] [--reader SUBSTR]
 
 First-time DVV card activation. Prompts for the activation PIN, then
-new PIN1 and PIN2.
+new PIN1 and PIN2. Prints nothing on success; -v shows each step.
   --allow-reactivate  run on a card that already looks activated
   --reader S          narrow to readers whose name contains S
 WARNING: wrong tries consume the activation PIN's retry counter;
@@ -73,9 +75,10 @@ const ENV_NEW_PIN1: &str = "REFINEID_NEW_PIN1";
 const ENV_NEW_PIN2: &str = "REFINEID_NEW_PIN2";
 
 impl ActivateArgs {
-    /// Execute the `card activate` verb.
+    /// Execute the `card activate` verb. Silent on success; `verbose`
+    /// prints the step report.
     #[must_use]
-    pub fn run(self) -> ExitCode {
+    pub fn run(self, verbose: bool) -> ExitCode {
         let Self {
             allow_reactivate,
             reader_filter,
@@ -104,7 +107,9 @@ impl ActivateArgs {
             );
             return ExitStatus::RuntimeFailure.into();
         };
-        CardActivateHelpers::warn_on_generation_disagreement(&ctx);
+        if verbose {
+            CardActivateHelpers::note_generation_disagreement(&ctx, verbose);
+        }
         CardActivateHelpers::emit_preflight_event(&ctx, expected_len);
         let activation_pin = match CardActivateHelpers::prompt_activation_pin(expected_len) {
             Ok(p) => p,
@@ -113,7 +118,7 @@ impl ActivateArgs {
         let pin1_new = match super::util::new_pin_env_or_prompt(
             CMD,
             ENV_NEW_PIN1,
-            "PIN1",
+            super::util::pin_name(PinManageSlot::Pin1),
             Some("basic, 4-12 digits"),
         ) {
             Ok(p) => p,
@@ -122,7 +127,7 @@ impl ActivateArgs {
         let pin2_new = match super::util::new_pin_env_or_prompt(
             CMD,
             ENV_NEW_PIN2,
-            "PIN2",
+            super::util::pin_name(PinManageSlot::Pin2),
             Some("signature, 6-12 digits"),
         ) {
             Ok(p) => p,
@@ -137,8 +142,9 @@ impl ActivateArgs {
         drop(reader_filter);
         match crate::card_pin::activate_first(backend, ctx, options) {
             Ok(report) => {
-                print!("{report}");
-                CardActivateHelpers::activate_outcome_exit(&report)
+                let status = CardActivateHelpers::activate_outcome_status(&report);
+                super::util::show_outcome(verbose, status == ExitStatus::Ok, &report);
+                status.into()
             }
             Err(CardPinError::ReaderPick(pe)) => super::util::reader_pick_exit(CMD, &pe),
             Err(e @ (CardPinError::PinPolicy(_) | CardPinError::RetryFloor(_))) => {
@@ -192,7 +198,7 @@ impl ActivateArgs {
 /// disagreement for the operator's log.
 impl CardActivateHelpers {
     /// Print a one-line operator note when the two card-
-    /// generation signals disagree.
+    /// generation signals disagree; the caller does so under `-v`.
     ///
     /// The card-issuance-date signal (FINEID S4-1 v4.2 §1.3
     /// table) and the auth-cert issuer-CN heuristic should
@@ -201,8 +207,9 @@ impl CardActivateHelpers {
     /// the issuance-date verdict wins and the flow continues;
     /// the note exists so the discrepancy lands in the audit
     /// log.
-    fn warn_on_generation_disagreement(ctx: &ActivationCardContext) {
-        if ctx.generation != ctx.generation_by_issuer_cn
+    fn note_generation_disagreement(ctx: &ActivationCardContext, verbose: bool) {
+        if verbose
+            && ctx.generation != ctx.generation_by_issuer_cn
             && ctx.generation_by_issuer_cn != refineid_lib_core::pkcs15::CardGeneration::Unknown
         {
             eprintln!(
@@ -281,8 +288,11 @@ impl CardActivateHelpers {
     /// the calling site should already have classified the
     /// generation.
     fn prompt_activation_pin(expected_len: usize) -> Result<ActivationCode, ExitCode> {
-        let prompt = format!("activation PIN ({expected_len} digits): ");
-        let raw = super::util::pin_env_or_prompt(CMD, ENV_ACTIVATION_PIN, &prompt)?;
+        let raw = super::util::pin_env_or_prompt(
+            CMD,
+            ENV_ACTIVATION_PIN,
+            super::util::PROMPT_ACTIVATION_PIN,
+        )?;
         match expected_len {
             7 => refineid_lib_core::pin::ActivationPinSeven::new(raw)
                 .map(ActivationCode::Seven)
@@ -326,10 +336,10 @@ impl CardActivateHelpers {
     /// `RuntimeFailure`. The mapping table is the single
     /// source of truth; the CLI shell honours it for the
     /// process exit code.
-    fn activate_outcome_exit(report: &ActivateReport) -> ExitCode {
+    fn activate_outcome_status(report: &ActivateReport) -> ExitStatus {
         match (&report.pin1_outcome, &report.pin2_outcome) {
-            (Some(UnblockOutcome::Ok), Some(UnblockOutcome::Ok)) => ExitStatus::Ok.into(),
-            (None, None) => ExitStatus::NoReaders.into(),
+            (Some(UnblockOutcome::Ok), Some(UnblockOutcome::Ok)) => ExitStatus::Ok,
+            (None, None) => ExitStatus::NoReaders,
             (Some(o1), o2)
                 if matches!(
                     o1,
@@ -345,9 +355,9 @@ impl CardActivateHelpers {
                     )
                 ) =>
             {
-                ExitStatus::CardCredentialRejected.into()
+                ExitStatus::CardCredentialRejected
             }
-            _ => ExitStatus::RuntimeFailure.into(),
+            _ => ExitStatus::RuntimeFailure,
         }
     }
 }

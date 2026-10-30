@@ -24,6 +24,7 @@ pub const HELP: &str = "\
 usage: refineid card export-all DIR [--reader SUBSTR]
 
 Write every public artefact to DIR. No PIN, no network.
+Prints nothing on success; -v shows each step.
   --reader S  narrow to readers whose name contains S
 ";
 
@@ -44,9 +45,10 @@ pub struct ExportAllArgs {
 }
 
 impl ExportAllArgs {
-    /// Execute the `card export-all` verb.
+    /// Execute the `card export-all` verb. Silent on success;
+    /// `verbose` lists what was written.
     #[must_use]
-    pub fn run(self) -> std::process::ExitCode {
+    pub fn run(self, verbose: bool) -> std::process::ExitCode {
         let Self {
             directory,
             reader_filter,
@@ -58,7 +60,7 @@ impl ExportAllArgs {
         let backend = refineid_lib_pcsc::PcscBackend;
         match crate::card_export::export_all_first(backend, &options) {
             Ok(report) => {
-                print!("{report}");
+                super::util::print_report(verbose, &report);
                 crate::exit_status::ExitStatus::Ok.into()
             }
             Err(crate::card_export::ExportError::ReaderPick(pe)) => {

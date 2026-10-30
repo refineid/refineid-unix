@@ -1388,7 +1388,7 @@ impl CardCheckReport {
     /// trust-relevant data so the reader knows which physical
     /// card the rest of the report describes.
     fn fmt_reader_card(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "=== Reader & card ===")?;
+        writeln!(f, "Reader & card:")?;
         writeln!(f, "reader:           {}", self.reader)?;
         writeln!(f, "ATR:              {}", self.atr_hex)?;
         if let Some(serial) = self.identity.best_serial() {
@@ -1405,7 +1405,7 @@ impl CardCheckReport {
     /// identity probe couldn't parse anything -- a malformed
     /// auth cert or no auth slot.
     fn fmt_identity(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "=== Identity ===")?;
+        writeln!(f, "Identity:")?;
         if self.identity.is_empty() {
             writeln!(f, "(no auth-cert subject readable)")?;
         } else {
@@ -1422,7 +1422,7 @@ impl CardCheckReport {
     /// authentication; this section therefore lights up even
     /// when the cardholder hasn't entered a PIN/CAN yet.
     fn fmt_card_metadata(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "=== Card metadata (PKCS#15) ===")?;
+        writeln!(f, "Card metadata (PKCS#15):")?;
         if let Some(label) = &self.token_info.label {
             writeln!(f, "label:            {label}")?;
         }
@@ -1449,7 +1449,7 @@ impl CardCheckReport {
     /// multiple cards. `(no certificates)` reads when the slot
     /// scan returned an empty list.
     fn fmt_cert_slots(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "=== Cert slots ===")?;
+        writeln!(f, "Cert slots:")?;
         if self.certs.is_empty() {
             writeln!(f, "(no certificates)")?;
         }
@@ -1471,7 +1471,7 @@ impl CardCheckReport {
     /// section is safe to run on every `card check` -- it
     /// never decrements the counter.
     fn fmt_pin_counters(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "=== PIN retry counters ===")?;
+        writeln!(f, "PIN retry counters:")?;
         writeln!(
             f,
             "PIN references:           {}",
@@ -1519,7 +1519,7 @@ impl CardCheckReport {
             }
             (None, Some(err)) => {
                 writeln!(f)?;
-                writeln!(f, "=== eMRTD (read via PACE / --can) ===")?;
+                writeln!(f, "eMRTD (read via PACE / --can):")?;
                 writeln!(f, "FAILED: {err}")
             }
             (None, None) => Ok(()),
@@ -1666,7 +1666,7 @@ impl CardCheckHelpers {
     /// that order; called once from [`CardCheckReport::fmt_emrtd_block`]
     /// when an `EmrtdPersonalData` is present.
     fn write_emrtd_section(f: &mut fmt::Formatter<'_>, emrtd: &EmrtdPersonalData) -> fmt::Result {
-        writeln!(f, "=== eMRTD (read via PACE / --can) ===")?;
+        writeln!(f, "eMRTD (read via PACE / --can):")?;
         Self::write_emrtd_mrz(f, emrtd)?;
         Self::write_emrtd_images(f, emrtd)?;
         Self::write_emrtd_security(f, emrtd)

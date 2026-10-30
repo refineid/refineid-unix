@@ -37,8 +37,8 @@
 //!
 //! All of the work lives in the library:
 //! [`refineid_client::cli::read_command_line`] parses argv into
-//! a typed [`refineid_client::cli::Invocation`], and `Verb::run`
-//! dispatches to the appropriate handler. This file is just the
+//! a typed [`refineid_client::cli::Invocation`], and
+//! `Invocation::run` dispatches to the appropriate handler. This file is just the
 //! entry point.
 
 #![forbid(unsafe_code)]
@@ -63,7 +63,7 @@ fn main() -> ExitCode {
         set_global_sink(Box::new(StderrSink::new()));
 
     let code = match refineid_client::cli::read_command_line() {
-        Ok(invocation) => invocation.verb.run(),
+        Ok(invocation) => invocation.run(),
         Err(exit) => exit,
     };
     refineid_dev_errors::flush!();
