@@ -31,6 +31,7 @@ use refineid_lib_core::x509::DateTime;
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_sign::{
     DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES, SignSlot,
+    VisibleSignatureRequest,
 };
 
 /// What `refineid document sign help`
@@ -38,7 +39,7 @@ use crate::card_sign::{
 pub const HELP: &str = "\
 usage: refineid document sign FILE [FILE ...] [--format F] [--out PATH]
                 [--slot S] [--reason T] [--location T] [--reader SUBSTR]
-                [--can NNNNNN] [--timestamp U ...]
+                [--can NNNNNN] [--no-stamp] [--timestamp U ...]
                 [--no-archive | --no-long-term | --no-timestamp]
 
 Sign FILE into a format a counterparty can open. Several files go into
@@ -60,6 +61,8 @@ key by default. Prints nothing on success; -v shows each step.
   --reader S    narrow to readers whose name contains S
   --can NNNNNN  CAN from the card front; required on the contactless
                 interface
+  --no-stamp    no visible mark on the page; the signature stays
+                invisible
 Signs at the highest level the format supports: LTA (embedded
 evidence plus archive timestamp) for pades and asice-cades, LT
 (embedded evidence) for the rest.
@@ -119,6 +122,9 @@ pub struct DocumentSignArgs {
     /// it. The other formats archive through signature attributes this
     /// crate does not build.
     pub archive: bool,
+    /// Draw the holder's mark on the signed page (default; `--no-stamp`
+    /// leaves the signature invisible). Only `PAdES` has a page.
+    pub stamp: bool,
     /// Embed the chain and revocation answers (`--long-term`).
     ///
     /// Raises the signature from level T to LT. Requires at least one
@@ -157,6 +163,7 @@ impl DocumentSignArgs {
             timestamp_authorities,
             long_term,
             archive,
+            stamp,
         } = self;
         let cmd = CMD.label();
         let env_var = match slot {
@@ -206,7 +213,8 @@ impl DocumentSignArgs {
                     // The CLI signs whichever card is present; there is
                     // no prior inspection view to bind to.
                     expected_serial: None,
-                    visible_signature: None,
+                    visible_signature: stamp
+                        .then_some(VisibleSignatureRequest { handwriting: None }),
                     timestamp_authorities: timestamp_authorities.clone(),
                     timestamp_credentials: None,
                     long_term,
@@ -253,6 +261,7 @@ impl DocumentSignArgs {
         let mut no_timestamp = false;
         let mut no_long_term = false;
         let mut no_archive = false;
+        let mut no_stamp = false;
         let mut long_term = false;
         let mut archive = false;
 
@@ -285,6 +294,7 @@ impl DocumentSignArgs {
                 "--no-timestamp" => no_timestamp = true,
                 "--no-long-term" => no_long_term = true,
                 "--no-archive" => no_archive = true,
+                "--no-stamp" => no_stamp = true,
                 "--long-term" => long_term = true,
                 "--archive" => archive = true,
                 other if other.starts_with(OPTION_PREFIX) => {
@@ -312,6 +322,7 @@ impl DocumentSignArgs {
             no_timestamp,
             no_long_term,
             no_archive,
+            no_stamp,
         )
     }
 
@@ -340,6 +351,7 @@ impl DocumentSignArgs {
         no_timestamp: bool,
         no_long_term: bool,
         no_archive: bool,
+        no_stamp: bool,
     ) -> Result<Self, ArgParseError> {
         if no_timestamp && !timestamp_authorities.is_empty() {
             return Err(ArgParseError::BadValue {
@@ -424,6 +436,7 @@ impl DocumentSignArgs {
             archive,
             long_term,
             timestamp_authorities,
+            stamp: !no_stamp,
         })
     }
 }
@@ -854,6 +867,14 @@ mod tests {
         let a = DocumentSignArgs::parse(argv(&[TEXT]))?;
         check(&a.archive, &false, "no archive construction for XAdES")?;
         check(&a.long_term, &true, "still LT")
+    }
+
+    #[test]
+    fn the_stamp_is_drawn_unless_declined() -> TestResult {
+        let stamped = DocumentSignArgs::parse(argv(&[PDF]))?;
+        check(&stamped.stamp, &true, "stamp by default")?;
+        let bare = DocumentSignArgs::parse(argv(&[PDF, "--no-stamp"]))?;
+        check(&bare.stamp, &false, "--no-stamp declines it")
     }
 
     #[test]
