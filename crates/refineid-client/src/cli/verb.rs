@@ -286,9 +286,9 @@ impl VerbTag {
 /// payload is the typed Args struct that operation consumes.
 ///
 /// Produced by [`parse_argv`] (the single trust boundary for
-/// CLI input). The dispatch in `main` matches arms that are
-/// all the uniform `Self::X(args) => args.run()` shape -- no
-/// argv-string handling, no untyped slice survives.
+/// CLI input). The dispatch in [`Verb::run`] hands each typed
+/// Args to its handler -- no argv-string handling, no untyped
+/// slice survives.
 ///
 /// Variant-pair subcommands (`sign-auth` vs `sign-qualified`,
 /// `change-pin1` vs `change-pin2`, ...) collapse to a single
@@ -381,31 +381,32 @@ impl Verb {
         }
     }
 
-    /// Execute the parsed verb. Every arm is uniform `Self::X(a)
-    /// => a.run()`. The slot identity (where it matters) was
-    /// written into the typed Args by the parser, so the
+    /// Execute the parsed verb. An operation prints nothing on
+    /// success unless `verbose`, so it takes the flag; a query prints
+    /// its result either way and does not. The slot identity (where it
+    /// matters) was written into the typed Args by the parser, so the
     /// dispatch carries no per-subcommand plumbing.
     #[must_use]
-    pub fn run(self) -> std::process::ExitCode {
+    pub fn run(self, verbose: bool) -> std::process::ExitCode {
         match self {
-            Self::CardCheck(a) => a.run(),
+            Self::CardCheck(a) => a.run(verbose),
             Self::CardEmrtd(a) => a.run(),
-            Self::CardSign(a) => a.run(),
-            Self::DocumentSign(a) => a.run(),
-            Self::CardDecryptAuth(a) => a.run(),
+            Self::CardSign(a) => a.run(verbose),
+            Self::DocumentSign(a) => a.run(verbose),
+            Self::CardDecryptAuth(a) => a.run(verbose),
             Self::CardPubkey(a) => a.run(),
-            Self::CardExportAll(a) => a.run(),
-            Self::CardActivate(a) => a.run(),
-            Self::CardChangePin(a) => a.run(),
-            Self::CardUnblockPin(a) => a.run(),
-            Self::ReaderKeyboard(a) => a.run(),
+            Self::CardExportAll(a) => a.run(verbose),
+            Self::CardActivate(a) => a.run(verbose),
+            Self::CardChangePin(a) => a.run(verbose),
+            Self::CardUnblockPin(a) => a.run(verbose),
+            Self::ReaderKeyboard(a) => a.run(verbose),
             Self::Verify(a) => a.run(),
             Self::CertShow(a) => a.run(),
             Self::CertChain(a) => a.run(),
-            Self::CardPair(a) => a.run(),
+            Self::CardPair(a) => a.run(verbose),
             Self::CardPairs(a) => a.run(),
-            Self::CardUnpair(a) => a.run(),
-            Self::CardAuth(a) => a.run(),
+            Self::CardUnpair(a) => a.run(verbose),
+            Self::CardAuth(a) => a.run(verbose),
         }
     }
 }
@@ -417,6 +418,14 @@ pub struct Invocation {
     pub verb: Verb,
     /// `-v` / `--verbose` given anywhere: show what each step did.
     pub verbose: bool,
+}
+
+impl Invocation {
+    /// Execute the subcommand with the global options.
+    #[must_use]
+    pub fn run(self) -> std::process::ExitCode {
+        self.verb.run(self.verbose)
+    }
 }
 
 /// Top-level subcommand parse failure -- verb dispatch only.

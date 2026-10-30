@@ -83,8 +83,9 @@ pub struct CardArgs {
 
 impl CardArgs {
     /// Execute the bare `card` (unified per-card readout) verb.
+    /// `verbose` adds the connection step of a paired-phone readout.
     #[must_use]
-    pub fn run(self) -> std::process::ExitCode {
+    pub fn run(self, verbose: bool) -> std::process::ExitCode {
         let Self {
             reader_filter,
             offline,
@@ -95,7 +96,7 @@ impl CardArgs {
         } = self;
 
         if remote {
-            return Self::run_remote_card_check();
+            return Self::run_remote_card_check(verbose);
         }
 
         // Resolve the typed CardCanArg into Option<Can>:
@@ -117,7 +118,7 @@ impl CardArgs {
         };
         match crate::card_check::check_all(backend, &options) {
             Ok(reports) if reports.is_empty() => {
-                if let Some(exit) = Self::try_remote_card_check() {
+                if let Some(exit) = Self::try_remote_card_check(verbose) {
                     return exit;
                 }
                 eprintln!("no FINEID card present in any connected reader");
@@ -133,7 +134,7 @@ impl CardArgs {
                 crate::exit_status::ExitStatus::Ok.into()
             }
             Err(crate::card_check::CardCheckError::ReaderPick(pe)) => {
-                if let Some(exit) = Self::try_remote_card_check() {
+                if let Some(exit) = Self::try_remote_card_check(verbose) {
                     return exit;
                 }
                 super::util::reader_pick_exit("card", &pe)
@@ -145,32 +146,40 @@ impl CardArgs {
         }
     }
 
-    fn try_remote_card_check() -> Option<std::process::ExitCode> {
+    fn try_remote_card_check(verbose: bool) -> Option<std::process::ExitCode> {
         let mut reader = refineid_rapp_core::remote::RemoteReader::open_local().ok()?;
         let pair = reader.phone()?;
-        Some(Self::run_remote_card_check_with_pair(&mut reader, &pair))
+        Some(Self::run_remote_card_check_with_pair(
+            &mut reader,
+            &pair,
+            verbose,
+        ))
     }
 
-    fn run_remote_card_check() -> std::process::ExitCode {
+    fn run_remote_card_check(verbose: bool) -> std::process::ExitCode {
+        use crate::exit_status::ExitStatus;
         let Ok(mut reader) = refineid_rapp_core::remote::RemoteReader::open_local() else {
             eprintln!("cannot open the paired-phone store.");
-            return std::process::ExitCode::FAILURE;
+            return ExitStatus::RuntimeFailure.into();
         };
         let Some(pair) = reader.phone() else {
             eprintln!("no phone paired. Run `refineid pair` first.");
-            return std::process::ExitCode::FAILURE;
+            return ExitStatus::RuntimeFailure.into();
         };
-        Self::run_remote_card_check_with_pair(&mut reader, &pair)
+        Self::run_remote_card_check_with_pair(&mut reader, &pair, verbose)
     }
 
     fn run_remote_card_check_with_pair(
         reader: &mut refineid_rapp_core::remote::RemoteReader,
         pair: &refineid_rapp_core::remote::PairSummary,
+        verbose: bool,
     ) -> std::process::ExitCode {
         use refineid_rapp_core::operations::{CardOperation, CardOperationResult};
         let dev_name = &pair.peer_display_name;
         let platform = &pair.peer_platform;
-        println!("Connecting to paired remote reader: {dev_name} ({platform})...");
+        if verbose {
+            println!("Connecting to paired remote reader: {dev_name} ({platform})");
+        }
 
         let identity_res = reader.execute(
             Some(pair.pair_id),
@@ -183,13 +192,7 @@ impl CardArgs {
             super::card_pair::DISCOVERY_TIMEOUT,
         );
 
-        println!(
-            "================================================================================"
-        );
         println!("Remote FINEID Card (via {dev_name} - {platform})");
-        println!(
-            "================================================================================"
-        );
         println!("  Pair ID:      {}", pair.pair_id_hex());
 
         match identity_res {
@@ -221,10 +224,7 @@ impl CardArgs {
                 println!("  Card Status:  (Inspect error: {e})");
             }
         }
-        println!(
-            "================================================================================"
-        );
-        std::process::ExitCode::SUCCESS
+        crate::exit_status::ExitStatus::Ok.into()
     }
 
     /// Parse the post-subcommand argv slice.

@@ -80,6 +80,22 @@ connected,
 narrows the choice to readers whose name contains
 .Ar substr .
 PINs are always read from the terminal, never from the command line.
+.Pp
+An operation, a command that changes the card, a file or the pairing,
+prints nothing when it succeeds: the PIN prompt is all it shows.
+With
+.Fl v
+it prints its step report on the standard output.
+A query, such as
+.Cm card ,
+.Cm pairs ,
+.Cm verify
+or
+.Cm cert show ,
+prints its result.
+Errors go to the standard error, and the exit status tells success from
+failure; see
+.Sx EXIT STATUS .
 .Sh OPTIONS
 These options are global.
 .Bl -tag -width Ds
@@ -91,6 +107,7 @@ Print the version and exit.
 No command prints the version otherwise.
 .It Fl v , Fl -verbose
 Show what each step did.
+Without it an operation prints nothing on success.
 Recognised anywhere on the command line, so no option value can be
 spelled like it.
 .El
@@ -381,6 +398,7 @@ Show or set the keyboard (HID) interface of an ACS reader.
 A phone hides its on-screen keyboard while the reader acts as a
 keyboard.
 The new mode takes effect when the reader is plugged in again.
+Setting the mode prints nothing on success.
 .Bl -tag -width Ds
 .It Cm status
 Show the mode; the default.
@@ -442,9 +460,11 @@ under a Snap,
 Success, or help or version shown on request.
 .It 1
 .Cm verify
-rejected the signature,
+rejected the signature, or
 .Cm cert chain
-reached no self-signed root, or a paired-phone command failed.
+reached no self-signed root, or
+.Cm auth
+received a status outside 2xx.
 .It 64
 The command line was not understood
 .Pq Dv EX_USAGE .
@@ -453,7 +473,7 @@ No PC/SC reader is connected.
 .It 66
 Readers are connected but no card is present.
 .It 70
-A transport, parse or signing failure
+A transport, parse, signing or paired-phone failure
 .Pq Dv EX_SOFTWARE .
 .It 77
 The card or local policy rejected a PIN or the PUK.

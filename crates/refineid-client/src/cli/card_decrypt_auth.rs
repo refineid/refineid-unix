@@ -24,6 +24,7 @@ pub const HELP: &str = "\
 usage: refineid card decrypt-auth --in PATH --out PATH [--reader SUBSTR]
 
 PIN1 and decrypt with the authentication key.
+Prints nothing on success; -v shows each step.
   --in P      ciphertext
   --out P     output file for the plaintext
   --reader S  narrow to readers whose name contains S
@@ -45,16 +46,17 @@ pub struct DecryptAuthArgs {
 }
 
 impl DecryptAuthArgs {
-    /// Execute the `card decrypt-auth` verb.
+    /// Execute the `card decrypt-auth` verb. Silent on success;
+    /// `verbose` prints the step report.
     #[must_use]
-    pub fn run(self) -> std::process::ExitCode {
+    pub fn run(self, verbose: bool) -> std::process::ExitCode {
         let Self {
             input,
             output,
             reader_filter,
         } = self;
         let cmd = "card decrypt-auth";
-        let pin = match super::util::prompt_pin(cmd, "PIN1: ") {
+        let pin = match super::util::prompt_pin(cmd, super::util::PROMPT_PIN1) {
             Ok(p) => p,
             Err(exit) => return exit,
         };
@@ -67,7 +69,7 @@ impl DecryptAuthArgs {
         let backend = refineid_lib_pcsc::PcscBackend;
         match crate::card_decrypt::decrypt_auth_first(backend, options) {
             Ok(report) => {
-                print!("{report}");
+                super::util::print_report(verbose, &report);
                 crate::exit_status::ExitStatus::Ok.into()
             }
             Err(crate::card_decrypt::DecryptAuthError::ReaderPick(pe)) => {

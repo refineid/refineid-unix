@@ -26,6 +26,7 @@ usage: refineid card change-pin1 | change-pin2 [--reader SUBSTR] [--can NNNNNN]
 
 Rotate PIN1 (authentication) or PIN2 (qualified signature). Prompts
 for the current PIN, then the new PIN twice.
+Prints nothing on success; -v shows each step.
   --reader S    narrow to readers whose name contains S
   --can NNNNNN  CAN from the card front; needed on the contactless
                 interface
@@ -52,9 +53,10 @@ pub struct ChangePinArgs {
 }
 
 impl ChangePinArgs {
-    /// Execute the `card change-pin{1,2}` verb.
+    /// Execute the `card change-pin{1,2}` verb. Silent on success;
+    /// `verbose` prints the step report.
     #[must_use]
-    pub fn run(self) -> std::process::ExitCode {
+    pub fn run(self, verbose: bool) -> std::process::ExitCode {
         use crate::exit_status::ExitStatus;
         let Self {
             slot,
@@ -65,7 +67,7 @@ impl ChangePinArgs {
             PinManageSlot::Pin1 => "card change-pin1",
             PinManageSlot::Pin2 => "card change-pin2",
         };
-        let label = slot.label();
+        let label = super::util::pin_name(slot);
         let backend = refineid_lib_pcsc::PcscBackend;
         let typed_reader_filter = reader_filter
             .as_deref()
@@ -117,7 +119,11 @@ impl ChangePinArgs {
         };
         match crate::card_pin::change_pin_first_for_cli(backend, ctx, options) {
             Ok(report) => {
-                print!("{report}");
+                let succeeded = matches!(
+                    report.outcome,
+                    refineid_lib_core::auth::ChangePinOutcome::Ok
+                );
+                super::util::show_outcome(verbose, succeeded, &report);
                 match report.outcome {
                     refineid_lib_core::auth::ChangePinOutcome::Ok => ExitStatus::Ok.into(),
                     refineid_lib_core::auth::ChangePinOutcome::WrongCurrentPin { .. }

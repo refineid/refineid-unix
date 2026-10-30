@@ -26,6 +26,20 @@ use refineid_rapp_core::remote::{RemoteError, RemoteReader};
 use super::ArgParseError;
 use super::argv::RemainingArgv;
 use super::verb::VerbTag;
+use crate::exit_status::ExitStatus;
+
+/// The HTTP status codes that mean the site accepted the login.
+const HTTP_SUCCESS: core::ops::RangeInclusive<u16> = 200..=299;
+/// The position of the status code in an HTTP status line.
+const HTTP_STATUS_CODE_FIELD: usize = 1;
+
+/// The status code of an HTTP status line, `None` when the line has none.
+fn http_status_code(status_line: &str) -> Option<u16> {
+    status_line
+        .split_whitespace()
+        .nth(HTTP_STATUS_CODE_FIELD)
+        .and_then(|code| code.parse().ok())
+}
 
 /// What `refineid pair help`
 /// prints. The man page refineid(1) carries the same facts.
@@ -35,6 +49,7 @@ usage: refineid pair
 Pair with a phone running RefineID. Start pairing on the phone and
 type the six-character code it shows. The code is read from the
 prompt only, never from the command line.
+Prints nothing on success; -v shows each step.
 ";
 
 /// What `refineid pairs help`
@@ -50,7 +65,7 @@ List the paired phone.
 pub const UNPAIR_HELP: &str = "\
 usage: refineid unpair
 
-Forget the paired phone.
+Forget the paired phone. Prints nothing on success; -v shows each step.
 ";
 
 /// What `refineid auth help`
@@ -60,6 +75,7 @@ usage: refineid auth [URL]
 
 Log in to a TLS site with the card in the paired phone and print the
 response's status line. URL defaults to https://card.refineid.fi.
+-v shows each step.
 ";
 
 /// How long pairing and operations browse for the phone.
@@ -85,68 +101,66 @@ impl PairArgs {
         }
     }
 
-    /// Pair with the phone that shows the code.
+    /// Pair with the phone that shows the code. Silent on success;
+    /// `verbose` prints the steps.
     #[must_use]
-    pub fn run(self) -> ExitCode {
-        println!("======================================================");
-        println!("              RefineID Device Pairing                 ");
-        println!("======================================================");
-        println!();
-        println!("  1. Open RefineID on your phone (iPhone / Android)");
-        println!("  2. Start pairing; the phone shows a six-character code");
-        println!("  3. Type that code here");
-        println!();
+    pub fn run(self, verbose: bool) -> ExitCode {
         let Some(code) = prompt_code() else {
-            eprintln!("Error: that is not a pairing code.");
-            return ExitCode::FAILURE;
+            eprintln!("pair: that is not a pairing code");
+            return ExitStatus::BadInvocation.into();
         };
         let Some(normalized) = normalize_pairing_code(&code) else {
-            eprintln!("Error: that is not a pairing code.");
-            return ExitCode::FAILURE;
+            eprintln!("pair: that is not a pairing code");
+            return ExitStatus::BadInvocation.into();
         };
 
         let mut reader = match RemoteReader::open_local() {
             Ok(reader) => reader,
             Err(e) => {
-                eprintln!("Error opening the paired-phone store: {e}");
-                return ExitCode::FAILURE;
+                eprintln!("pair: cannot open the paired-phone store: {e}");
+                return ExitStatus::RuntimeFailure.into();
             }
         };
-        println!(
-            "Looking for the phone showing {} on the local network...",
-            format_pairing_code(&normalized)
-        );
+        if verbose {
+            println!(
+                "Looking for the phone showing {} on the local network",
+                format_pairing_code(&normalized)
+            );
+        }
         let pair = match reader.pair_with_code(&normalized, DISCOVERY_TIMEOUT) {
             Ok(pair) => pair,
             Err(RemoteError::Pairing(error)) => {
-                eprintln!("Pairing failed: {error}.");
-                return ExitCode::FAILURE;
+                eprintln!("pair: {error}");
+                return ExitStatus::RuntimeFailure.into();
             }
             Err(e) => {
-                eprintln!("Pairing failed: {e}");
-                return ExitCode::FAILURE;
+                eprintln!("pair: {e}");
+                return ExitStatus::RuntimeFailure.into();
             }
         };
-        println!(
-            "Pairing established with {} ({})!",
-            pair.peer_display_name, pair.peer_platform
-        );
-
-        println!("Retrieving authentication certificate for offline caching...");
-        match reader.refresh_auth_cert(pair.pair_id, DISCOVERY_TIMEOUT) {
-            Ok(_) => println!("Cached authentication certificate."),
-            Err(e) => eprintln!("Warning: Failed to retrieve initial certificate: {e}"),
+        if verbose {
+            println!(
+                "Paired with {} ({})",
+                pair.peer_display_name, pair.peer_platform
+            );
+            println!("Retrieving the authentication certificate for offline caching");
         }
-
-        println!();
-        println!("Successfully paired!");
-        println!("Pair ID: {}", pair.pair_id_hex());
-        println!(
-            "Granted profiles: {}",
-            profile_names(&pair.granted_profiles)
-        );
-        println!("Remote reader is now active for PKCS#11 (Firefox / suomi.fi) and CLI!");
-        ExitCode::SUCCESS
+        match reader.refresh_auth_cert(pair.pair_id, DISCOVERY_TIMEOUT) {
+            Ok(_) => {
+                if verbose {
+                    println!("Cached the authentication certificate");
+                }
+            }
+            Err(e) => eprintln!("pair: authentication certificate not cached: {e}"),
+        }
+        if verbose {
+            println!("Pair ID: {}", pair.pair_id_hex());
+            println!(
+                "Granted profiles: {}",
+                profile_names(&pair.granted_profiles)
+            );
+        }
+        ExitStatus::Ok.into()
     }
 }
 
@@ -159,10 +173,11 @@ fn profile_names(profiles: &[ProfileName]) -> String {
         .join(", ")
 }
 
-/// Reads one line from standard input as the pairing code.
+/// Prompt on stderr and read one line from standard input as the
+/// pairing code.
 fn prompt_code() -> Option<String> {
-    print!("Pairing code: ");
-    std::io::stdout().flush().ok()?;
+    eprint!("Pairing code: ");
+    std::io::stderr().flush().ok()?;
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line).ok()?;
     normalize_pairing_code(line.trim()).map(|_| line.trim().to_owned())
@@ -194,13 +209,13 @@ impl PairsArgs {
         let reader = match RemoteReader::open_local() {
             Ok(reader) => reader,
             Err(e) => {
-                eprintln!("Error reading the paired-phone store: {e}");
-                return ExitCode::FAILURE;
+                eprintln!("pairs: cannot read the paired-phone store: {e}");
+                return ExitStatus::RuntimeFailure.into();
             }
         };
         let Some(pair) = reader.phone() else {
             println!("No phone paired.");
-            return ExitCode::SUCCESS;
+            return ExitStatus::Ok.into();
         };
         println!("Phone: {} - {}", pair.peer_display_name, pair.peer_platform);
         println!("  Pair ID:    {}", pair.pair_id_hex());
@@ -213,7 +228,7 @@ impl PairsArgs {
                 "None"
             }
         );
-        ExitCode::SUCCESS
+        ExitStatus::Ok.into()
     }
 }
 
@@ -237,33 +252,37 @@ impl UnpairArgs {
         }
     }
 
-    /// Forget the paired phone.
+    /// Forget the paired phone. Silent on success; `verbose` says
+    /// whether the phone was told.
     #[must_use]
-    pub fn run(self) -> ExitCode {
+    pub fn run(self, verbose: bool) -> ExitCode {
         let mut reader = match RemoteReader::open_local() {
             Ok(reader) => reader,
             Err(e) => {
-                eprintln!("Error reading the paired-phone store: {e}");
-                return ExitCode::FAILURE;
+                eprintln!("unpair: cannot read the paired-phone store: {e}");
+                return ExitStatus::RuntimeFailure.into();
             }
         };
         let Some(phone) = reader.phone() else {
-            eprintln!("No phone paired.");
-            return ExitCode::FAILURE;
+            eprintln!("unpair: no phone paired");
+            return ExitStatus::RuntimeFailure.into();
         };
         if let Err(e) = reader.forget() {
-            eprintln!("Error forgetting {}: {e}", phone.peer_display_name);
-            return ExitCode::FAILURE;
+            eprintln!("unpair: cannot forget {}: {e}", phone.peer_display_name);
+            return ExitStatus::RuntimeFailure.into();
         }
-        if reader.deliver_revocation_notices() > 0 {
-            println!("Forgot {}; the phone was told.", phone.peer_display_name);
-        } else {
-            println!(
-                "Forgot {}; the phone is told when this computer next reaches it.",
-                phone.peer_display_name
-            );
+        let told = reader.deliver_revocation_notices() > 0;
+        if verbose {
+            if told {
+                println!("Forgot {}; the phone was told.", phone.peer_display_name);
+            } else {
+                println!(
+                    "Forgot {}; the phone is told when this computer next reaches it.",
+                    phone.peer_display_name
+                );
+            }
         }
-        ExitCode::SUCCESS
+        ExitStatus::Ok.into()
     }
 }
 
@@ -290,70 +309,73 @@ impl AuthArgs {
         Ok(Self { url })
     }
 
-    /// Run the `refineid auth` command.
+    /// Run the `refineid auth` command: print the response's status
+    /// line. `verbose` adds the steps and the page's title lines.
     #[must_use]
-    pub fn run(self) -> ExitCode {
+    pub fn run(self, verbose: bool) -> ExitCode {
         let target = self.url.as_deref().unwrap_or("https://card.refineid.fi");
-        println!("======================================================");
-        println!("         RefineID Remote Card Authentication          ");
-        println!("======================================================");
-        println!("Target URL: {target}");
-
         let reader = match RemoteReader::open_local() {
             Ok(reader) => reader,
             Err(e) => {
-                eprintln!("Error opening the paired-phone store: {e}");
-                return ExitCode::FAILURE;
+                eprintln!("auth: cannot open the paired-phone store: {e}");
+                return ExitStatus::RuntimeFailure.into();
             }
         };
         let Some(pair) = reader.phone() else {
-            eprintln!("No phone paired. Run `refineid pair` first.");
-            return ExitCode::FAILURE;
+            eprintln!("auth: no phone paired; run `refineid pair` first");
+            return ExitStatus::RuntimeFailure.into();
         };
-        println!(
-            "Using paired reader: {} ({})",
-            pair.peer_display_name,
-            pair.pair_id_hex()
-        );
-
         let uri = match refineid_lib_core::text::Uri::parse(target.to_string()) {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("Invalid URL {target}: {e:?}");
-                return ExitCode::FAILURE;
+                eprintln!("auth: invalid URL {target}: {e:?}");
+                return ExitStatus::BadInvocation.into();
             }
         };
-
-        println!("Initiating TLS client certificate authentication...");
+        if verbose {
+            println!("Target URL: {target}");
+            println!(
+                "Using paired reader: {} ({})",
+                pair.peer_display_name,
+                pair.pair_id_hex()
+            );
+            println!("Initiating TLS client certificate authentication");
+        }
         #[cfg(feature = "tls-rustls")]
         {
             match refineid_lib_tls::client_auth::get_with_rapp_client_auth(&uri, pair.pair_id) {
                 Ok(response) => {
-                    println!("\nAuthentication successful!");
-                    if let Some(status_line) = response.lines().next() {
-                        println!("Status: {status_line}");
-                    }
-                    for line in response.lines() {
-                        if line.contains("<title>")
-                            || line.contains("<h1>")
-                            || line.contains("Publish as")
-                        {
-                            let clean = line.trim();
-                            println!("{clean}");
+                    let status_line = response.lines().next().unwrap_or_default();
+                    println!("{status_line}");
+                    let accepted = http_status_code(status_line)
+                        .is_some_and(|code| HTTP_SUCCESS.contains(&code));
+                    if verbose {
+                        for line in response.lines() {
+                            if line.contains("<title>")
+                                || line.contains("<h1>")
+                                || line.contains("Publish as")
+                            {
+                                println!("{}", line.trim());
+                            }
                         }
                     }
-                    ExitCode::SUCCESS
+                    if accepted {
+                        ExitStatus::Ok.into()
+                    } else {
+                        ExitStatus::VerifyFailed.into()
+                    }
                 }
                 Err(e) => {
-                    eprintln!("Authentication failed: {e:?}");
-                    ExitCode::FAILURE
+                    eprintln!("auth: {e:?}");
+                    ExitStatus::RuntimeFailure.into()
                 }
             }
         }
         #[cfg(not(feature = "tls-rustls"))]
         {
-            eprintln!("refineid built without tls-rustls feature");
-            ExitCode::FAILURE
+            let _ = (uri, pair);
+            eprintln!("auth: refineid built without the tls-rustls feature");
+            ExitStatus::RuntimeFailure.into()
         }
     }
 }
