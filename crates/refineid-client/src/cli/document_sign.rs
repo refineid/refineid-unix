@@ -31,7 +31,7 @@ use refineid_lib_core::x509::DateTime;
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_sign::{
     DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES, SignSlot,
-    VisibleSignatureRequest,
+    process_visible_signature,
 };
 
 /// What `refineid document sign help`
@@ -61,8 +61,9 @@ key by default. Prints nothing on success; -v shows each step.
   --reader S    narrow to readers whose name contains S
   --can NNNNNN  CAN from the card front; required on the contactless
                 interface
-  --no-stamp    no visible mark on the page; the signature stays
-                invisible
+  --no-stamp    no red seal asking the reader to check the
+                document's electronic signature; the signature
+                stays invisible
 Signs at the highest level the format supports: LTA (embedded
 evidence plus archive timestamp) for pades and asice-cades, LT
 (embedded evidence) for the rest.
@@ -122,8 +123,10 @@ pub struct DocumentSignArgs {
     /// it. The other formats archive through signature attributes this
     /// crate does not build.
     pub archive: bool,
-    /// Draw the holder's mark on the signed page (default; `--no-stamp`
-    /// leaves the signature invisible). Only `PAdES` has a page.
+    /// Draw the seal asking the reader to check the document's
+    /// electronic signature, its middle lines in the language of the
+    /// process locale (default; `--no-stamp` leaves the signature
+    /// invisible). Only `PAdES` has a page.
     pub stamp: bool,
     /// Embed the chain and revocation answers (`--long-term`).
     ///
@@ -209,8 +212,8 @@ impl DocumentSignArgs {
                     // The CLI signs whichever card is present; there is
                     // no prior inspection view to bind to.
                     expected_serial: None,
-                    visible_signature: stamp
-                        .then_some(VisibleSignatureRequest { handwriting: None }),
+                    visible_signature: (stamp && format == Format::Pades)
+                        .then(process_visible_signature),
                     timestamp_authorities: timestamp_authorities.clone(),
                     timestamp_credentials: None,
                     long_term,

@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use image::{ImageDecoder, ImageFormat};
 use refineid_lib_core::emrtd::DocumentImage;
-use refineid_lib_core::sign::pades::SignatureInk;
 
 use crate::error::GuiCoreError;
 
@@ -81,11 +80,6 @@ impl RgbaImageBuffer {
             rgb.extend_from_slice(&chunk[0..3]);
         }
         rgb
-    }
-
-    /// Extract signature ink from the RGBA pixels for PAdES visual stamps.
-    pub fn signature_ink(&self) -> Option<SignatureInk> {
-        SignatureInk::from_rgba(self.width, self.height, &self.rgba)
     }
 
     /// Encode buffer as PNG bytes.

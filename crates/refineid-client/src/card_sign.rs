@@ -53,7 +53,7 @@ use refineid_lib_core::sign::cades::{
     DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime,
 };
 use refineid_lib_core::sign::document::{self, DocumentError, DocumentPlan, Format};
-use refineid_lib_core::sign::pades::{SignatureInk, SignatureMetadata, VisibleSignature};
+use refineid_lib_core::sign::pades::{SignatureMetadata, StampLanguage, VisibleSignature};
 use refineid_lib_core::sign::timestamp::{self, TimestampError, VerifiedTimestampToken};
 use refineid_lib_core::sign::validation::ValidationMaterial;
 use refineid_lib_core::sign::{KeyRef, SignError, SignOps as _};
@@ -258,11 +258,9 @@ pub struct DocumentRequest {
     /// swap cannot spend the PIN on an undisplayed identity. `None`
     /// only for flows that sign whichever card is present (the CLI).
     pub expected_serial: Option<TokenSerial>,
-    /// Optional visible mark for `PAdES`.
-    ///
-    /// The caller supplies only optional card-carried handwriting. The
-    /// name and SATU are always read from the live signing certificate.
-    pub visible_signature: Option<VisibleSignatureRequest>,
+    /// Optional visible mark for `PAdES`: the seal advising the reader
+    /// to check the document's electronic signature.
+    pub visible_signature: Option<VisibleSignature>,
     /// Add an archive timestamp over the finished document, raising it
     /// to level LTA.
     ///
@@ -297,11 +295,26 @@ pub struct DocumentRequest {
     pub timestamp_credentials: Option<TimestampCredentials>,
 }
 
-/// User-interface material for a certificate-derived visible PDF signature.
-#[derive(Debug, Clone)]
-pub struct VisibleSignatureRequest {
-    /// Optional DG7 handwriting read from the displayed card.
-    pub handwriting: Option<SignatureInk>,
+/// The locale variables that name the language of messages, in the
+/// order POSIX.1-2017 XBD 8.2 gives them precedence.
+const MESSAGE_LOCALE_VARIABLES: [&str; 3] = ["LC_ALL", "LC_MESSAGES", "LANG"];
+
+/// The verification seal in the language of the process locale.
+#[must_use]
+pub fn process_visible_signature() -> VisibleSignature {
+    VisibleSignature::verification(stamp_language(|name| std::env::var(name).ok()))
+}
+
+/// The stamp language of the first locale variable `lookup` finds set
+/// and non-empty; English when none is.
+fn stamp_language(lookup: impl Fn(&str) -> Option<String>) -> StampLanguage {
+    MESSAGE_LOCALE_VARIABLES
+        .iter()
+        .filter_map(|name| lookup(name))
+        .find(|value| !value.is_empty())
+        .map_or(StampLanguage::English, |value| {
+            StampLanguage::for_locale(&value)
+        })
 }
 
 impl DocumentRequest {
@@ -494,8 +507,7 @@ pub enum SignErrorKind {
     /// before the card signs anything, except for the PDF
     /// "signature did not fit" case, which is only knowable after.
     Document(DocumentError),
-    /// A visible signature could not be bound to the live card and signing
-    /// certificate before PIN verification.
+    /// A visible signature was asked of a format without a page.
     VisibleSignature(String),
     /// The live card is not the card the operator was shown; refused
     /// before PIN verification.
@@ -1045,7 +1057,7 @@ fn sign_chain<T: CardTransport>(
             ensure_displayed_card(transport, request)?;
             let parameters = document_signer(&cert, cert_algorithm, slot, request.signing_time)?;
             let objects = load_data_objects(options, request, input_bytes)?;
-            let metadata = document_metadata(&cert, request)?;
+            let metadata = document_metadata(request)?;
             let plan = document::plan(request.format, objects, &parameters, &metadata)
                 .map_err(SignErrorKind::Document)?;
             Some((plan, parameters))
@@ -1147,15 +1159,10 @@ fn sign_chain<T: CardTransport>(
     })
 }
 
-/// Resolve a visible PDF mark from the live signing certificate.
-///
-/// This runs before PIN verification, after the displayed-card check
-/// has bound the session to the card the UI showed.
-fn document_metadata(
-    certificate: &Certificate<'_>,
-    request: &DocumentRequest,
-) -> Result<SignatureMetadata, SignErrorKind> {
-    let Some(visible) = request.visible_signature.as_ref() else {
+/// The signature metadata with the requested visible mark, refused for
+/// a format without a page.
+fn document_metadata(request: &DocumentRequest) -> Result<SignatureMetadata, SignErrorKind> {
+    let Some(visible) = request.visible_signature else {
         return Ok(request.metadata.clone());
     };
     if request.format != Format::Pades {
@@ -1163,32 +1170,8 @@ fn document_metadata(
             "visible marks are supported only for PAdES".to_owned(),
         ));
     }
-
-    let names = certificate.subject.given_names();
-    let first = names.first.ok_or_else(|| {
-        SignErrorKind::VisibleSignature(
-            "signing certificate has no structured given name".to_owned(),
-        )
-    })?;
-    let surname = certificate.subject.surname().ok_or_else(|| {
-        SignErrorKind::VisibleSignature("signing certificate has no structured surname".to_owned())
-    })?;
-    let identifier = certificate.subject.peuin().ok_or_else(|| {
-        SignErrorKind::VisibleSignature("signing certificate has no SATU identifier".to_owned())
-    })?;
-    let display_name = format!("{} {}", first.to_native(), surname.to_native());
-    let appearance = VisibleSignature::new(
-        &display_name,
-        identifier.as_str(),
-        visible.handwriting.clone(),
-    )
-    .ok_or_else(|| {
-        SignErrorKind::VisibleSignature(
-            "certificate identity cannot be rendered safely in the PDF".to_owned(),
-        )
-    })?;
     let mut metadata = request.metadata.clone();
-    metadata.visible_signature = Some(appearance);
+    metadata.visible_signature = Some(visible);
     Ok(metadata)
 }
 
@@ -2080,6 +2063,42 @@ mod tests {
     use super::*;
     use crate::test_util::{TestResult, check, check_true};
     use refineid_lib_core::apdu::status_word::PinRetries;
+
+    /// A locale environment of `(variable, value)` pairs.
+    fn locale_lookup(set: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let set: Vec<(String, String)> = set
+            .iter()
+            .map(|&(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        move |name| {
+            set.iter()
+                .find(|(variable, _)| variable == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn the_stamp_language_follows_the_message_locale_precedence() {
+        for (set, language) in [
+            (&[][..], StampLanguage::English),
+            (&[("LANG", "fi_FI.UTF-8")][..], StampLanguage::Finnish),
+            (
+                &[("LANG", "fi_FI.UTF-8"), ("LC_MESSAGES", "sv_SE.UTF-8")][..],
+                StampLanguage::Swedish,
+            ),
+            (
+                &[("LC_MESSAGES", "sv_SE.UTF-8"), ("LC_ALL", "en_GB.UTF-8")][..],
+                StampLanguage::English,
+            ),
+            (
+                &[("LC_ALL", ""), ("LANG", "fi_FI.UTF-8")][..],
+                StampLanguage::Finnish,
+            ),
+            (&[("LANG", "C")][..], StampLanguage::English),
+        ] {
+            assert_eq!(stamp_language(locale_lookup(set)), language, "{set:?}");
+        }
+    }
 
     // ---- SignSlot: the FINEID slot -> {key ref, PIN, cert}
     // mapping (S1 v4.2 §3.5). Getting any of these wrong signs

@@ -722,7 +722,7 @@ impl RefineIdController {
     }
 
     fn sign_documents(self: &Arc<Self>, pin2: PinBytes) {
-        let (reader, serial, signature_buf, documents, format) = {
+        let (reader, serial, documents, format) = {
             let state = self.state();
             let Some(card) = state.selected_card.and_then(|idx| state.cards.get(idx)) else {
                 self.update_state(|s| s.status_message = "No card selected for signing.".into());
@@ -731,7 +731,6 @@ impl RefineIdController {
             (
                 card.report.reader.clone(),
                 card.report.token_info.serial_number_hex.clone(),
-                state.signature.clone(),
                 state.pdf_documents.clone(),
                 state.sign_format,
             )
@@ -751,7 +750,6 @@ impl RefineIdController {
         let controller = Arc::clone(self);
 
         thread::spawn(move || {
-            let handwriting = signature_buf.as_ref().and_then(|buf| buf.signature_ink());
             let mut results = Vec::new();
 
             for doc in &documents {
@@ -788,7 +786,6 @@ impl RefineIdController {
                             can: None,
                             reader_filter: Some(reader.clone()),
                             expected_serial: render_token_serial(serial.clone()),
-                            handwriting: handwriting.clone(),
                             timestamp_authority: DEFAULT_TIMESTAMP_AUTHORITY.to_owned(),
                             timestamp_credentials: None,
                         },

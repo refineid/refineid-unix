@@ -353,7 +353,12 @@ when none remains.
 names public EU endpoints.
 .It Fl -no-stamp
 No visible mark on the page; the signature stays invisible.
-By default the signed page carries the holder's mark.
+By default a PAdES signature puts a red seal on the last page asking the
+reader to check the document's electronic signature.
+Its middle lines are in the language of the locale, see
+.Sx ENVIRONMENT ,
+and its band carries the other two.
+The seal names no one; the signature in the file is the evidence.
 .It Fl -no-archive
 Stop at level LT: no archive timestamp.
 .It Fl -no-long-term
@@ -428,6 +433,14 @@ Card reader only.
 .El
 .Sh ENVIRONMENT
 .Bl -tag -width Ds
+.It Ev LC_ALL , LC_MESSAGES , LANG
+The first one set and non-empty chooses the language of the seal
+.Cm document sign
+draws: Finnish for
+.Li fi ,
+Swedish for
+.Li sv ,
+English otherwise.
 .It Ev XDG_CONFIG_HOME , HOME , SNAP_USER_COMMON
 Locate the pairing store; see
 .Sx FILES .
