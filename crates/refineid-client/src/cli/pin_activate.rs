@@ -37,8 +37,9 @@ pub const HELP: &str = "\
 usage: refineid pin activate [1|2] [--allow-reactivate] [--reader SUBSTR]
 
 First-time DVV card activation. Prompts for the activation PIN, then
-new PIN 1 and PIN 2, or only the PIN named. Prints nothing on success;
--v shows each step.
+new PIN 1 and PIN 2, or only the PIN named. Prints nothing on success,
+except a line on stderr when the other PIN is still unactivated; -v
+shows each step.
   --allow-reactivate  run on a card that already looks activated
   --reader S          narrow to readers whose name contains S
 WARNING: wrong tries consume the activation PIN's retry counter;
