@@ -100,11 +100,11 @@ if [ -z "$BIN_TARGET" ]; then
 fi
 echo "   Binary resolves to: $BIN_TARGET"
 
-# 5. Check the version: the CLI help starts with "RefineID YY.M.D.B"
+# 5. Check the version: `refineid --version` prints "refineid YY.M.D.B"
 echo "-> Checking the installed version starts with $EXPECTED_VERSION..."
-FOUND_VER="$(run_cmd '/run/current-system/sw/bin/refineid --help 2>&1 | head -n1' || true)"
+FOUND_VER="$(run_cmd '/run/current-system/sw/bin/refineid --version 2>&1' || true)"
 case "$FOUND_VER" in
-    "RefineID $EXPECTED_VERSION".*)
+    "refineid $EXPECTED_VERSION".*)
         echo "   Version verified: $FOUND_VER"
         ;;
     *)

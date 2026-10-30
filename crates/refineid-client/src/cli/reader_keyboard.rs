@@ -18,6 +18,20 @@ use crate::reader_keyboard::KeyboardAction;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
+/// What `refineid reader keyboard help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid reader keyboard [status | on | off] [--reader SUBSTR]
+
+Show or set the keyboard (HID) interface of an ACS reader. A phone
+hides its on-screen keyboard while the reader acts as a keyboard.
+The new mode takes effect when the reader is plugged in again.
+  status      show the mode (default)
+  on          keyboard and card reader
+  off         card reader only
+  --reader S  narrow to readers whose name contains S
+";
+
 /// Parsed `reader keyboard [off|on] [--reader SUBSTR]` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReaderKeyboardArgs {

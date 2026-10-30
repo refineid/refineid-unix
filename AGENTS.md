@@ -68,6 +68,15 @@
 - Merge the pull request after mandatory local verification and review pass,
   then remove the worktree and branch and fast-forward `main`.
 
+## Command line
+
+- `refineid` alone lists the commands, one line each; `refineid <command>
+  help` shows that command's options; the man page refineid(1) carries the
+  detail and stays in step with every command's help text.
+- Operations are silent on success; details only with `-v`/`--verbose`.
+  `-V`/`--version` prints the version; nothing else prints it, and no
+  command prints a banner.
+
 ## Source comments
 
 - Comments explain what the code does now and the constraints it honors.

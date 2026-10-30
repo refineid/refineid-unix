@@ -21,6 +21,23 @@ use refineid_lib_core::can::Can;
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_sign::SignSlot;
 
+/// What `refineid card sign-auth help` and `sign-qualified help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid card sign-auth | sign-qualified --in PATH --out PATH
+                [--save-cert PATH] [--reader SUBSTR] [--can NNNNNN]
+
+Raw signature over a file: sign-auth with PIN1 and the authentication
+key, sign-qualified with PIN2 and the qualified-signature key. The
+signature is verified locally against the on-card certificate.
+  --in P         input file
+  --out P        output file for the raw signature
+  --save-cert P  also write the signing certificate's DER
+  --reader S     narrow to readers whose name contains S
+  --can NNNNNN   CAN from the card front; required on the contactless
+                 interface, prompted on a terminal when needed
+";
+
 /// Parsed `card sign-{auth,qualified} --in PATH --out PATH
 /// [--save-cert PATH] [--reader SUBSTR] [--can NNNNNN]`
 /// arguments.

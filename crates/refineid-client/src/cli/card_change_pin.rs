@@ -19,6 +19,18 @@ use refineid_lib_core::auth::check_retry_floor;
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::PinManageSlot;
 
+/// What `refineid card change-pin1 help` and `change-pin2 help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid card change-pin1 | change-pin2 [--reader SUBSTR] [--can NNNNNN]
+
+Rotate PIN1 (authentication) or PIN2 (qualified signature). Prompts
+for the current PIN, then the new PIN twice.
+  --reader S    narrow to readers whose name contains S
+  --can NNNNNN  CAN from the card front; needed on the contactless
+                interface
+";
+
 /// Parsed `card change-pin{1,2} [--reader SUBSTR]` arguments.
 ///
 /// `slot` is set by the dispatcher at parse time -- which

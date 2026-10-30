@@ -32,12 +32,12 @@
 //! - **Offline tools** (no card / no network): `verify`,
 //!   `cert show`, `cert chain`.
 //!
-//! Run `refineid --help` for the full usage block with per-
-//! subcommand flags.
+//! `refineid` lists the commands, `refineid <command> help` shows
+//! one command's options, and refineid(1) carries the detail.
 //!
 //! All of the work lives in the library:
 //! [`refineid_client::cli::read_command_line`] parses argv into
-//! a typed [`refineid_client::cli::Verb`], and `Verb::run`
+//! a typed [`refineid_client::cli::Invocation`], and `Verb::run`
 //! dispatches to the appropriate handler. This file is just the
 //! entry point.
 
@@ -63,7 +63,7 @@ fn main() -> ExitCode {
         set_global_sink(Box::new(StderrSink::new()));
 
     let code = match refineid_client::cli::read_command_line() {
-        Ok(verb) => verb.run(),
+        Ok(invocation) => invocation.verb.run(),
         Err(exit) => exit,
     };
     refineid_dev_errors::flush!();

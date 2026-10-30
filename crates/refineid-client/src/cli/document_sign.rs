@@ -33,6 +33,46 @@ use crate::card_sign::{
     DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES, SignSlot,
 };
 
+/// What `refineid document sign help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid document sign FILE [FILE ...] [--format F] [--out PATH]
+                [--slot S] [--reason T] [--location T] [--reader SUBSTR]
+                [--can NNNNNN] [--timestamp U ...]
+                [--no-archive | --no-long-term | --no-timestamp]
+
+Sign FILE into a format a counterparty can open. Several files go into
+one container under one signature. PIN2 and the qualified-signature
+key by default.
+  --format F    pades          signature inside the PDF
+                cades          CMS, document attached
+                cades-detached CMS, document left outside
+                asice | bdoc   ASiC-E container with XAdES
+                asice-cades    ASiC-E container with CAdES
+                Default: pades for one PDF, asice otherwise. The
+                one-file formats refuse a set of files.
+  --out P       the finished document. Default: beside the first
+                FILE, '<stem> - signed <UTC time>.<ext>', with stem
+                'portfolio' for several files.
+  --slot S      qualified (default) or auth
+  --reason T    PAdES /Reason
+  --location T  PAdES /Location
+  --reader S    narrow to readers whose name contains S
+  --can NNNNNN  CAN from the card front; required on the contactless
+                interface
+Signs at the highest level the format supports: LTA (embedded
+evidence plus archive timestamp) for pades and asice-cades, LT
+(embedded evidence) for the rest.
+  --timestamp U   RFC 3161 timestamp authority URL, or a named set.
+                  Default: http://timestamp.sectigo.com/qualified.
+                  Repeat for alternatives; a failed answer is
+                  skipped, and signing fails when none remains.
+                  --timestamp eu-qualified names public EU endpoints.
+  --no-archive    stop at level LT: no archive timestamp
+  --no-long-term  stop at level T: no embedded evidence
+  --no-timestamp  sign at level B: no authority contacted
+";
+
 /// This verb's tag, for error messages.
 const CMD: VerbTag = VerbTag::DocumentSign;
 

@@ -20,6 +20,20 @@ use crate::card_pubkey::{PubkeyFormat, PubkeySlot};
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
+/// What `refineid card pubkey help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid card pubkey [--slot auth|qualified] [--format ssh|pem]
+                            [--out PATH] [--reader SUBSTR] [--comment STR]
+
+Export the public key from an on-card certificate. No PIN required.
+  --slot S     auth or qualified
+  --format F   ssh or pem
+  --out P      write all blocks to P instead of stdout
+  --reader S   narrow to readers whose name contains S
+  --comment S  SSH comment; default is '<cert CN> <serial>'
+";
+
 /// Parsed `card pubkey [--slot auth|qualified]
 /// [--format ssh|pem] [--out PATH] [--reader SUBSTR]
 /// [--comment STR]` arguments.

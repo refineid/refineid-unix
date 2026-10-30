@@ -27,6 +27,41 @@ use super::ArgParseError;
 use super::argv::RemainingArgv;
 use super::verb::VerbTag;
 
+/// What `refineid pair help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const PAIR_HELP: &str = "\
+usage: refineid pair
+
+Pair with a phone running RefineID. Start pairing on the phone and
+type the six-character code it shows. The code is read from the
+prompt only, never from the command line.
+";
+
+/// What `refineid pairs help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const PAIRS_HELP: &str = "\
+usage: refineid pairs
+
+List the paired phone.
+";
+
+/// What `refineid unpair help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const UNPAIR_HELP: &str = "\
+usage: refineid unpair
+
+Forget the paired phone.
+";
+
+/// What `refineid auth help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const AUTH_HELP: &str = "\
+usage: refineid auth [URL]
+
+Log in to a TLS site with the card in the paired phone and print the
+response's status line. URL defaults to https://card.refineid.fi.
+";
+
 /// How long pairing and operations browse for the phone.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -232,7 +267,7 @@ impl UnpairArgs {
     }
 }
 
-/// Arguments for `refineid auth` / `refineid card auth`.
+/// Arguments for `refineid auth`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthArgs {
     /// URL to authenticate to (default: <https://card.refineid.fi>).

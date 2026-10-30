@@ -20,6 +20,20 @@ use refineid_lib_core::can::Can;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
+/// What `refineid card emrtd help`
+/// prints. The man page refineid(1) carries the same facts.
+pub const HELP: &str = "\
+usage: refineid card emrtd --can NNNNNN [--save-face PATH]
+                           [--save-signature PATH] [--reader SUBSTR]
+
+eMRTD file extraction: the same read as `card --can`, plus flags that
+write artefacts to disk.
+  --can NNNNNN        CAN from the card front
+  --save-face P       face image
+  --save-signature P  displayed-signature image
+  --reader S          narrow to readers whose name contains S
+";
+
 /// Parsed `card emrtd --can NNNNNN [--save-face PATH]
 /// [--save-signature PATH] [--reader SUBSTR]` arguments.
 ///

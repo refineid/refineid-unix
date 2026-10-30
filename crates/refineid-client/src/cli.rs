@@ -62,7 +62,7 @@
 //! [`ArgParseError`] is intentionally a single shared enum so
 //! the binary has one error formatter that knows how to render
 //! every parse failure with consistent wording + the
-//! `usage:` block hint.
+//! `refineid <command> help` hint.
 //!
 //! [`Verb`]: verb::Verb
 //! [`VerbTag`]: verb::VerbTag
@@ -92,6 +92,7 @@ pub mod card_unblock_pin;
 pub mod cert_chain;
 pub mod cert_show;
 pub mod document_sign;
+pub mod help;
 pub mod reader_keyboard;
 pub(crate) mod util;
 mod verb;
@@ -101,7 +102,7 @@ mod verb;
 // Per-item `#[expect(clippy::pub_use)]` is rejected by rustc; the
 // suppression lives as a module-level inner attribute at the top
 // of this file.
-pub use verb::{ParseError, Verb, VerbParseError, VerbTag, parse_argv};
+pub use verb::{Invocation, ParseError, Verb, VerbParseError, VerbTag, parse_argv};
 pub mod verify;
 
 /// CLI argument parse error.
@@ -209,190 +210,18 @@ impl fmt::Display for ArgParseError {
 
 impl core::error::Error for ArgParseError {}
 
-/// The operator-facing USAGE help text.
-///
-/// Newtype so call sites pass a value whose role is visible in
-/// the signature (`fn resolve(usage: Usage)` reads as "give me
-/// the help block"), rather than an unlabelled `&str`. The
-/// binary holds the content in a single `const USAGE: Usage =
-/// Usage::new(...)` near the entry point; everything else
-/// receives the typed value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Usage<'a>(&'a str);
-
-impl<'a> Usage<'a> {
-    /// Construct a `Usage` view over a borrowed string slice.
-    /// Intended for `const USAGE: Usage = Usage::new("...")` at
-    /// the binary entry point.
-    #[must_use]
-    pub const fn new(text: &'a str) -> Self {
-        Self(text)
-    }
-
-    /// Borrow the wrapped string slice for emission.
-    #[must_use]
-    pub const fn as_str(self) -> &'a str {
-        self.0
-    }
-}
-
-impl fmt::Display for Usage<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
-    }
-}
-
 /// Read and parse the CLI command line.
 ///
 /// Captures the process argv, runs the trust-boundary parse,
-/// renders help / error to stderr, and surfaces either the
-/// typed [`Verb`] or the already-rendered exit code for the
-/// binary to pass through.
+/// renders help and version to stdout and errors to stderr, and
+/// surfaces either the typed [`Invocation`] or the
+/// already-rendered exit code for the binary to pass through.
 ///
 /// # Errors
 /// Help short-circuit returns `Err(ExitStatus::Ok.into())`;
 /// parse failure returns `Err(ExitStatus::BadInvocation.into())`.
 /// The `Err` value is the rendering of the outcome, not a
 /// failure to do work.
-pub fn read_command_line() -> Result<Verb, std::process::ExitCode> {
-    argv::ProcessArgv::from_env().resolve_command_line(USAGE)
+pub fn read_command_line() -> Result<Invocation, std::process::ExitCode> {
+    argv::ProcessArgv::from_env().resolve_command_line()
 }
-
-/// The operator-facing USAGE help block.
-///
-/// Single source of truth for `refineid --help` and the
-/// "here's the manual" hint that follows every parse-failure
-/// error line. Authored as a single multi-line string literal;
-/// the formatting is preserved on screen verbatim.
-const USAGE: Usage<'static> = Usage::new(
-    "\
-usage: refineid <subcommand> [args]
-
-`refineid card` is the default per-card readout. Action verbs target
-one card; pass --reader SUBSTR when multiple cards are connected.
-
-subcommands:
-  card [--offline] [--reader SUBSTR] [--can NNNNNN | --no-can]
-       [--crl-file PATH] [--save-cert DIR]
-      per-card readout: certificates, chain walk + revocation, PIN
-      retry counters, and (with --can) the eMRTD section.
-        --offline       skip every network fetch
-        --reader S      narrow to readers whose name contains S
-        --can NNNNNN    CAN from the card front; enables eMRTD
-        --no-can        skip the eMRTD section (no prompt)
-        --crl-file P    use a pre-fetched CRL instead of HTTP fetch
-        --save-cert DIR write each slot's DER to DIR
-      Without --can / --no-can on a TTY, prompts for CAN (empty = skip).
-
-  card emrtd --can NNNNNN [options]
-      eMRTD file extraction (same read as `card --can`, plus --save-*
-      flags that write artefacts to disk).
-        --save-face P       face image
-        --save-signature P  displayed-signature image
-        --reader S          target one reader
-
-  card activate [--allow-reactivate] [--reader SUBSTR]
-      first-time DVV card activation. Prompts for the activation PIN,
-      then new PIN1 + PIN2.
-      WARNING: wrong tries consume the activation PIN's retry counter;
-      locking it leaves recovery to the separately-orderable paid PUK.
-      Pre-flight refuses an already-activated card; --allow-reactivate
-      overrides.
-
-  card change-pin1 | change-pin2
-      rotate PIN1 (auth) or PIN2 (qualified-sig). Prompts for current
-      PIN, then new PIN twice.
-
-  card unblock-pin1 | unblock-pin2
-      PUK-driven unblock + replace PIN1 or PIN2.
-      DANGER: wrong PUK decrements the PUK counter; exhausting it
-      permanently bricks the card. See doc/dvv-terminology.md for the
-      PUK vs activation-PIN distinction.
-
-  card sign-auth --in PATH --out PATH [--save-cert PATH]
-                 [--reader SUBSTR] [--can NNNNNN]
-      PIN1 + sign with the auth key. Locally verifies against the
-      on-card auth cert.
-        --in P         input file
-        --out P        output file for the raw signature
-        --save-cert P  also write the auth cert DER
-        --reader S     narrow to readers whose name contains S
-        --can NNNNNN   CAN from the card front; required on the
-                       contactless interface, prompted on a TTY
-                       when needed. Omit on contact.
-
-  card sign-qualified --in PATH --out PATH [--save-cert PATH]
-      same shape as sign-auth but with PIN2 + the qualified-signature
-      key.
-
-  document sign FILE [FILE ...] [options]
-      sign FILE into a format a counterparty can open, rather than
-      raw signature bytes. Several files go into one container under
-      one signature. PIN2 and the qualified-signature key by default.
-        --format F   pades          signature inside the PDF
-                     cades          CMS, document attached
-                     cades-detached CMS, document left outside
-                     asice | bdoc   ASiC-E container with XAdES
-                                    (one format, two names)
-                     asice-cades    ASiC-E container with CAdES
-                     Default: pades for one PDF, asice otherwise.
-                     The one-file formats refuse a set rather than
-                     silently sign the first.
-        --out P      the finished document. Default: beside the
-                     first FILE, '<stem> - signed <UTC time>.<ext>',
-                     with stem 'portfolio' for several files.
-        --slot S     qualified (default) or auth
-        --reason T   PAdES /Reason
-        --location T PAdES /Location
-        --reader S   narrow to readers whose name contains S
-        --can NNNNNN as for sign-auth
-      Signs at the highest level the format supports: LTA (embedded
-      evidence plus archive timestamp) for pades and asice-cades,
-      LT (embedded evidence) for the rest.
-        --timestamp U
-                     RFC 3161 timestamp authority URL, or a named set.
-                     Default: http://timestamp.sectigo.com/qualified.
-                     Repeat for alternatives; a failed answer is
-                     skipped, and signing fails when none remains.
-                     --timestamp eu-qualified names public EU
-                     endpoints; whoever configures an authority
-                     answers for its standing.
-        --no-archive    stop at level LT: no archive timestamp
-        --no-long-term  stop at level T: no embedded evidence
-        --no-timestamp  sign at level B: no authority contacted, the
-                        signature time is the signer's own claim
-
-  card decrypt-auth --in PATH --out PATH
-      PIN1 + decrypt with the auth key.
-        --in P   ciphertext
-        --out P  output file for the plaintext
-
-  card pubkey [--slot auth|qualified] [--format ssh|pem] [--out PATH]
-              [--reader SUBSTR] [--comment STR]
-      export the public key from an on-card cert. No PIN required.
-        --slot S     auth or qualified
-        --format F   ssh or pem
-        --out P      write all blocks to PATH instead of stdout
-        --reader S   process only matching readers
-        --comment S  SSH comment; default is '<cert CN> <serial>'
-
-  card export-all DIR
-      dump every public artefact to DIR. No PIN, no network.
-
-  verify --cert PATH --in PATH --sig PATH
-      offline signature verify. Reports ok/FAILED, exits 0/1.
-        --cert P  cert in PEM or DER (auto-detected)
-        --in P    the message that was signed
-        --sig P   the raw signature
-
-  cert show PATH
-      offline cert inspector: prints the certificate's fields and its
-      SHA-256 fingerprint. PEM or DER, auto-detected.
-
-  cert chain CERT [--issuer-dir DIR] [--aia-fetch]
-      walk the cert chain upward; verify each child against its issuer.
-      Exits 0 if a self-signed root is reached, 1 otherwise.
-        --issuer-dir D  directory of candidate issuer certs
-        --aia-fetch     HTTP-fetch missing issuers via AIA caIssuers
-",
-);

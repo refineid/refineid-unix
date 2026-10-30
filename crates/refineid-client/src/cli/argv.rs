@@ -164,57 +164,94 @@ impl ProcessArgv {
         self.args.first().map(String::as_str)
     }
 
-    /// `true` when any token past `argv[0]` is `--help`,
-    /// `-h`, or `help`. The CLI surfaces a help short-circuit
-    /// before subcommand dispatch via this predicate.
-    #[must_use]
-    pub fn wants_help(&self) -> bool {
-        self.after_program()
-            .iter()
-            .any(|a| a == "--help" || a == "-h" || a == "help")
+    /// Remove the global `-v` / `--verbose` options wherever they
+    /// stand; `true` when there was one.
+    fn take_verbose(&mut self) -> bool {
+        use super::help::is_verbose_option;
+        let before = self.args.len();
+        let program = self.args.first().cloned();
+        let rest = self.after_program().to_vec();
+        self.args = program
+            .into_iter()
+            .chain(rest.into_iter().filter(|token| !is_verbose_option(token)))
+            .collect();
+        self.args.len() != before
     }
 
-    /// Resolve this argv into a parsed [`Verb`], or
-    /// already-rendered exit code on help / parse failure.
+    /// Resolve this argv into a parsed [`Invocation`], or the
+    /// already-rendered exit code of a help, version or parse
+    /// failure outcome.
     ///
-    /// This is the entire pre-dispatch pipeline:
+    /// `-v` / `--verbose` is global: it stands anywhere and sets
+    /// [`Invocation::verbose`]. The rest resolves in this order:
     ///
-    /// 1. `--help` / `-h` / `help` past `argv[0]` -- print the
-    ///    project version and `usage` to stderr, return
-    ///    `Err(ExitStatus::Ok)`.
-    /// 2. Verb dispatch or per-subcommand Args parse fails --
-    ///    print the typed error line + `usage` to stderr,
-    ///    return `Err(ExitStatus::BadInvocation)`.
-    /// 3. Otherwise -- return `Ok(Verb)` for the caller
-    ///    to dispatch on.
-    ///
-    /// `usage` is the operator-facing USAGE block; it's
-    /// CLI-specific and lives in the binary, so the caller
-    /// passes it in.
+    /// 1. No argument: the short synopsis to stderr,
+    ///    `Err(ExitStatus::BadInvocation)`.
+    /// 2. `help` / `-h` / `--help` first: the short synopsis to
+    ///    stdout, `Err(ExitStatus::Ok)`.
+    /// 3. `-V` / `--version` first: `refineid <version>` to stdout,
+    ///    `Err(ExitStatus::Ok)`. Nothing else prints the version.
+    /// 4. `<group> help` (`card help`, `document help`, ...): that
+    ///    group's one-line list to stdout, `Err(ExitStatus::Ok)`.
+    /// 5. A missing or unknown command: the error line and the
+    ///    short synopsis to stderr, `Err(ExitStatus::BadInvocation)`.
+    /// 6. `<command> help`, or `-h` / `--help` among its arguments:
+    ///    that command's help to stdout, `Err(ExitStatus::Ok)`.
+    /// 7. The command's arguments rejected: the error line and the
+    ///    hint `try: refineid <command> help` to stderr,
+    ///    `Err(ExitStatus::BadInvocation)`.
+    /// 8. Otherwise `Ok(Invocation)` for the caller to dispatch on.
     ///
     /// # Errors
-    /// Help short-circuit returns
-    /// `Err(ExitStatus::Ok.into())`; parse failure returns
-    /// `Err(ExitStatus::BadInvocation.into())`. The exit code
-    /// is the rendering of the outcome, not a failure to do
+    /// Help and version return `Err(ExitStatus::Ok.into())`; a parse
+    /// failure returns `Err(ExitStatus::BadInvocation.into())`. The
+    /// exit code is the rendering of the outcome, not a failure to do
     /// work.
     ///
-    /// [`Verb`]: super::verb::Verb
+    /// [`Invocation`]: super::verb::Invocation
+    /// [`Invocation::verbose`]: super::verb::Invocation::verbose
     pub fn resolve_command_line(
-        self,
-        usage: super::Usage<'_>,
-    ) -> Result<super::verb::Verb, std::process::ExitCode> {
+        mut self,
+    ) -> Result<super::verb::Invocation, std::process::ExitCode> {
+        use super::help;
         use crate::exit_status::ExitStatus;
-        if self.wants_help() {
-            eprintln!("RefineID {}", refineid_lib_core::VERSION);
-            eprint!("{usage}");
+        let verbose = self.take_verbose();
+        match self.after_program() {
+            [] => {
+                eprint!("{}", help::synopsis());
+                return Err(ExitStatus::BadInvocation.into());
+            }
+            [first, ..] if help::is_help_word(first) => {
+                print!("{}", help::synopsis());
+                return Err(ExitStatus::Ok.into());
+            }
+            [first, ..] if help::is_version_option(first) => {
+                println!("{}", help::version());
+                return Err(ExitStatus::Ok.into());
+            }
+            [word, next, ..] if help::is_help_word(next) => {
+                if let Some(text) = help::group(word) {
+                    print!("{text}");
+                    return Err(ExitStatus::Ok.into());
+                }
+            }
+            _ => {}
+        }
+        let (tag, rest) = super::verb::route(&self).map_err(|e| {
+            eprintln!("{e}");
+            eprint!("{}", help::synopsis());
+            ExitStatus::BadInvocation
+        })?;
+        if help::asks_command_help(rest.as_slice()) {
+            print!("{}", help::command(tag));
             return Err(ExitStatus::Ok.into());
         }
-        super::verb::parse_argv(&self).map_err(|e| {
+        let verb = tag.parse_args(rest).map_err(|e| {
             eprintln!("{e}");
-            eprint!("{usage}");
-            ExitStatus::BadInvocation.into()
-        })
+            eprintln!("{}", help::hint(tag));
+            ExitStatus::BadInvocation
+        })?;
+        Ok(super::verb::Invocation { verb, verbose })
     }
 }
 
@@ -275,21 +312,51 @@ mod tests {
         assert!(a.program_name().is_none());
     }
 
-    #[test]
-    fn wants_help_matches_long_short_and_bare_forms() {
-        assert!(argv(&["refineid", "--help"]).wants_help());
-        assert!(argv(&["refineid", "-h"]).wants_help());
-        assert!(argv(&["refineid", "help"]).wants_help());
-        assert!(argv(&["refineid", "card", "--help"]).wants_help());
-        assert!(!argv(&["refineid", "card", "--no-can"]).wants_help());
+    /// The argv of a synthetic `verify` that parses.
+    const VERIFY: &[&str] = &["verify", "--cert", "/c", "--in", "/i", "--sig", "/s"];
+
+    fn invocation(words: &[&str]) -> Result<crate::cli::Invocation, String> {
+        let mut all = vec!["refineid"];
+        all.extend_from_slice(words);
+        argv(&all)
+            .resolve_command_line()
+            .map_err(|code| format!("{words:?} did not parse: {code:?}"))
     }
 
     #[test]
-    fn wants_help_ignores_argv0() {
-        // Even if argv0 itself happens to be `--help`, it
-        // doesn't trigger the help short-circuit.
-        let a = argv(&["--help"]);
-        assert!(!a.wants_help());
+    fn verbose_is_global() -> Result<(), String> {
+        let [verb, options @ ..] = VERIFY else {
+            return Err("VERIFY is empty".to_owned());
+        };
+        let quiet = invocation(VERIFY)?;
+        if quiet.verbose {
+            return Err("verbose without -v".to_owned());
+        }
+        let mut before = vec!["-v"];
+        before.extend_from_slice(VERIFY);
+        let mut after = vec![*verb, "-v"];
+        after.extend_from_slice(options);
+        let mut among = VERIFY.to_vec();
+        let in_option = among.iter().position(|w| *w == "--in").unwrap_or_default();
+        among.insert(in_option, "--verbose");
+        for words in [before, after, among] {
+            let parsed = invocation(&words)?;
+            if !parsed.verbose || parsed.verb != quiet.verb {
+                return Err(format!("{words:?}: verbose and the same verb"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn version_and_verbose_are_distinct() {
+        let mut words = vec!["-V"];
+        words.extend_from_slice(VERIFY);
+        // -V asks for the version, which is not an invocation.
+        assert!(invocation(&words).is_err());
+        let mut words = vec!["-v"];
+        words.extend_from_slice(VERIFY);
+        assert!(invocation(&words).is_ok_and(|parsed| parsed.verbose));
     }
 
     #[test]
