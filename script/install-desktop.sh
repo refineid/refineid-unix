@@ -111,6 +111,14 @@ fi
 install -d "$POLICY_DIR" "$DESTDIR$PREFIX/libexec/refineid" "$AUTOSTART_DIR"
 printf '{ "policies": { "SecurityDevices": { "RefineID": "%s" } } }\n' "$MODULE" \
     > "$POLICY_DIR/policies.json"
+# OpenBSD confines Firefox with unveil(2); the module in Firefox's main
+# process reads and locks the phone pairings under the user's
+# configuration directory.
+UNVEIL_MAIN="$DESTDIR/etc/firefox/unveil.main"
+UNVEIL_PAIRINGS='$XDG_CONFIG_HOME/refineid rwc'
+if [ -f "$UNVEIL_MAIN" ] && ! grep -qxF "$UNVEIL_PAIRINGS" "$UNVEIL_MAIN"; then
+    printf '%s\n' "$UNVEIL_PAIRINGS" >> "$UNVEIL_MAIN"
+fi
 sed "s|@MODULE@|$MODULE|" packaging/refineid-browser-token \
     > "$DESTDIR$PREFIX/libexec/refineid/refineid-browser-token"
 chmod 755 "$DESTDIR$PREFIX/libexec/refineid/refineid-browser-token"
