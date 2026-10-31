@@ -53,8 +53,9 @@ Moran found no memory advantage for names users chose themselves over
 names a designer chose; what helped was names that are specific and
 discriminable from one another
 ([black1982commandnames](references.md#black1982commandnames)). Landauer,
-Galotti and Hartwell found that even poorly chosen names were learned
-when operations with different syntax had different names
+Galotti and Hartwell found that names chosen to be natural gave no
+advantage in initial learning, while giving differently behaving
+operations different names did
 ([landauer1983naturalnames](references.md#landauer1983naturalnames)).
 Hence no two commands differ only in a word that means the same thing,
 and arguments about `sign` versus `sign-document` are settled by the
@@ -71,16 +72,16 @@ listings are that: a screenful for the card holder, and the engineering
 tools one word away.
 
 **Truncation is the abbreviation people reach for.** Streeter, Ackroff
-and Taylor compared abbreviation schemes and found that people produce
-and decode truncations most reliably
-([streeter1983abbreviating](references.md#streeter1983abbreviating));
-Ehrenreich's review of the abbreviation literature reaches the same
-conclusion and adds that ambiguity must be resolved by a rule the user
-can predict
-([ehrenreich1985abbreviations](references.md#ehrenreich1985abbreviations)).
-That is unique-prefix matching with an error on ambiguity, and it is
-why scripts spell commands out: a prefix unique today may not be after
-the next command is added.
+and Taylor compared abbreviation schemes and found truncation the best
+single scheme for producing an abbreviation from a command name, and
+the one people use unprompted for longer words
+([streeter1983abbreviating](references.md#streeter1983abbreviating)).
+They also name the two problems of a unique prefix, that it is harder
+to learn than a fixed cut and that a new command can make an old prefix
+ambiguous, and their answers are ours: an ambiguous prefix is an error
+that names the candidates, never a guess, scripts spell commands out,
+and a prefix need only be unique within its noun group, so `doc s` is
+`document sign` even if some other group gains an `s` word.
 
 **People will not guess our words; we do not add theirs.** Furnas and
 colleagues measured how often two people choose the same word for the

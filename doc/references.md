@@ -219,53 +219,70 @@ command set, not any particular word in it.
 
 ### carroll1982paradigms
 
-- **Supports:** congruent names for opposed commands and hierarchical
-  names for a family (a shared head word, a differing modifier) were
-  learned and recalled better than unstructured sets. The reason the
-  commands are noun-first families: `pin activate`, `pin change`,
-  `pin unblock`; `pair` and `unpair`.
-- **Does NOT prove:** that noun-first beats verb-first. The experiments
-  varied structure within a fixed order, not the order itself.
+- **Supports:** two properties of a command vocabulary that make it
+  easier to learn: congruence, where opposed actions get names that
+  are opposites (`raise`/`lower`, not `reach`/`down`), and
+  hierarchicalness, where a family shares a head word and differs in a
+  modifier (`move forward`/`move backward`, not `advance`/`retreat`).
+  The reason the commands are noun-first families: `pin activate`,
+  `pin change`, `pin unblock`; `pair` and `unpair`.
+- **Does NOT prove:** that noun-first beats verb-first. The
+  experiments varied the structure of names, not which word leads.
 - **Source quality:** peer-reviewed (Behaviour and Information
-  Technology 1982).
+  Technology 1982). The original is paywalled; the findings as stated
+  here are taken from rosenberg1984lexical, which reports them with the
+  examples above. Bibliographic data from Crossref.
+
+### rosenberg1984lexical
+
+- **Supports:** a survey of the command-naming studies of its time;
+  the source for the carroll1982paradigms and black1982commandnames
+  findings as stated here, with the examples. Open access.
+- **Does NOT prove:** anything on its own; it reports others' results.
+- **Source quality:** peer-reviewed (COLING/ACL 1984); read in full.
 
 ### black1982commandnames
 
-- **Supports:** command names users generate themselves are remembered
-  no better than names a designer chose; specific, discriminable names
-  are what help. The reason naming debates are settled by the family's
-  regularity.
-- **Does NOT prove:** anything about two-word commands; the study used
-  single words.
-- **Source quality:** peer-reviewed (CHI 1982).
+- **Supports:** names that are specific and discriminable are
+  remembered better than general, high-frequency words, and users'
+  own choices of names varied widely and tended to the general. The
+  reason naming debates are settled by the family's regularity and by
+  distinctness, not by polling.
+- **Does NOT prove:** anything about two-word commands; the study
+  used single words.
+- **Source quality:** peer-reviewed (CHI 1982); findings as reported
+  in rosenberg1984lexical and the ACM abstract.
 
 ### landauer1983naturalnames
 
-- **Supports:** operations with different syntax must have different
-  names; given that, even poorly chosen names were learned. Together
-  with black1982commandnames, structure over wording.
-- **Does NOT prove:** that names are irrelevant; the task was text
-  editing with a small set.
-- **Source quality:** peer-reviewed (CACM 1983).
+- **Supports:** giving operations that take different syntax
+  different names greatly reduced learning difficulty, while names
+  chosen to be natural gave no advantage over arbitrary ones in
+  initial learning. Together with black1982commandnames, structure
+  over wording.
+- **Does NOT prove:** that names are irrelevant to anything but
+  initial learning; the task was text editing with a small set.
+- **Source quality:** peer-reviewed (CACM 1983); abstract checked.
 
 ### streeter1983abbreviating
 
-- **Supports:** truncation is the abbreviation scheme people produce
-  and decode most reliably. The reason command words may be given as
-  unique prefixes.
-- **Does NOT prove:** how ambiguity should be handled; see
-  ehrenreich1985abbreviations.
+- **Supports:** across their production studies, truncation was the
+  best single abbreviation scheme for producing an abbreviation from a
+  command name, and the one that best captured what people do
+  unprompted for words of two or more syllables. On "minimum to
+  distinguish" (a unique prefix) they note two problems and answer
+  both: it is harder to learn than fixed-length truncation, and a new
+  command can make an old prefix ambiguous; their remedy is a system
+  that presents the collisions and asks, and command tables structured
+  hierarchically so a prefix need only be unique within its group. The
+  reason an ambiguous prefix is an error naming the candidates, scripts
+  spell commands out, and prefixes resolve within a noun group.
+- **Does NOT prove:** that prefixes suit everyone; the paper also
+  finds vowel deletion better for the reverse task (recovering the
+  word from the abbreviation), and that one-syllable words and
+  multi-word terms are abbreviated differently.
 - **Source quality:** peer-reviewed (Bell System Technical Journal
-  1983).
-
-### ehrenreich1985abbreviations
-
-- **Supports:** a synthesis of the abbreviation studies: truncate, and
-  resolve collisions by a rule the user can predict. The reason an
-  ambiguous prefix is an error naming the candidates, never a guess.
-- **Does NOT prove:** that users of a modern shell with completion
-  still abbreviate; the studies predate tab completion.
-- **Source quality:** peer-reviewed (Human Factors 1985, review).
+  1983); full text read in the scanned issue.
 
 ### furnas1987vocabulary
 
