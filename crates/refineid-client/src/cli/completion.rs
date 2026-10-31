@@ -539,7 +539,9 @@ fn group_function(out: &mut String, group: &str) {
     if let Some(bare) = bare {
         let arguments = arguments(bare);
         if !arguments.positionals.is_empty() || !arguments.options.is_empty() {
-            out.push_str("    *)\n");
+            // Only an option after the bare word reaches here; an
+            // unknown or ambiguous verb completes nothing.
+            out.push_str("    -*)\n");
             arguments_call(out, "      ", arguments);
             out.push_str("      ;;\n");
         }
@@ -620,7 +622,7 @@ pub fn zsh() -> String {
          \x20   print -r -- \"$word\"\n\
          \x20   return\n\
          \x20 fi\n\
-         \x20 local -a hits=(${(M)candidates:#${word}*})\n\
+         \x20 local -a hits=(${(M)candidates:#\"$word\"*})\n\
          \x20 if (( $#hits == 1 )); then\n\
          \x20   print -r -- \"$hits[1]\"\n\
          \x20 else\n\
@@ -696,6 +698,28 @@ mod tests {
         Ok(())
     }
 
+    /// A value's words and nouns are emitted raw, so they carry no
+    /// quote, colon or space.
+    fn plain_value(value: Value, owner: &str) -> TestResult {
+        match value {
+            Value::Words(words) => {
+                check_true(!words.is_empty(), &format!("{owner} words"))?;
+                for word in words {
+                    check_true(
+                        !word.contains([':', '\'', ' ', '(', ')']),
+                        &format!("{word} of {owner} is plain"),
+                    )?;
+                }
+                Ok(())
+            }
+            Value::Text(noun) => check_true(
+                !noun.contains([':', '\'']),
+                &format!("{noun} of {owner} is plain"),
+            ),
+            Value::None | Value::File | Value::Directory | Value::Url => Ok(()),
+        }
+    }
+
     #[test]
     fn every_group_has_a_listing_line_and_no_text_breaks_the_quoting() -> TestResult {
         for group in VerbTag::groups() {
@@ -708,15 +732,14 @@ mod tests {
                     !opt.summary.contains(['[', ']']),
                     &format!("{} of {} has no brackets", opt.flag, tag.label()),
                 )?;
-                if let Value::Words(words) = opt.value {
-                    check_true(!words.is_empty(), &format!("{} words", opt.flag))?;
-                }
+                plain_value(opt.value, opt.flag)?;
             }
             for positional in arguments.positionals {
                 check_true(
-                    !positional.name.contains([':', '\'']),
+                    !positional.name.contains([':', '\'', ' ']),
                     &format!("{} name is plain", positional.name),
                 )?;
+                plain_value(positional.value, positional.name)?;
             }
         }
         Ok(())

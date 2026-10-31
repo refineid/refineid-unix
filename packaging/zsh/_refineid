@@ -61,7 +61,7 @@ _refineid_expand() {
     print -r -- "$word"
     return
   fi
-  local -a hits=(${(M)candidates:#${word}*})
+  local -a hits=(${(M)candidates:#"$word"*})
   if (( $#hits == 1 )); then
     print -r -- "$hits[1]"
   else
@@ -141,7 +141,7 @@ _refineid_card() {
         '1:directory:_files -/' \
         '--reader[narrow to readers whose name contains S]:substring'
       ;;
-    *)
+    -*)
       _arguments \
         '--offline[skip every network fetch]' \
         '--reader[narrow to readers whose name contains S]:substring' \
