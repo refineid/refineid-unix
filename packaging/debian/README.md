@@ -20,6 +20,7 @@ Binary `.deb` packages are produced automatically by `script/package-deb.sh`
 2. **`refineid-cli`** (`Multi-Arch: foreign`):
    - Command-line tool `/usr/bin/refineid`
    - Manual page `/usr/share/man/man1/refineid.1.gz`
+   - zsh completion `/usr/share/zsh/vendor-completions/_refineid`
 3. **`refineid-gui`**:
    - Desktop application `/usr/bin/refineid-gui`
    - Freedesktop launcher `/usr/share/applications/refineid.desktop`

@@ -110,8 +110,9 @@ CLI goes beside it:
 ```sh
 sh script/install-desktop.sh --prefix /usr/local
 install -m 755 target/release/refineid /usr/local/bin/
-install -d /usr/local/share/man/man1
+install -d /usr/local/share/man/man1 /usr/local/share/zsh/site-functions
 install -m 444 crates/refineid-client/man/refineid.1 /usr/local/share/man/man1/
+install -m 444 packaging/zsh/_refineid /usr/local/share/zsh/site-functions/
 ```
 
 RefineID then appears in the xfce application menu. Reinstall after

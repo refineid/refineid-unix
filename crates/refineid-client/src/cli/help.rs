@@ -282,6 +282,15 @@ fn push_command_line(out: &mut String, tag: VerbTag) {
     out.push('\n');
 }
 
+/// The options a subcommand's help text shows: every `--word` in it.
+#[cfg(test)]
+pub(super) fn help_options(tag: VerbTag) -> Vec<&'static str> {
+    tag.help()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|word| word.starts_with("--") && word.len() > "--".len())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,14 +468,6 @@ mod tests {
             ([group, name], [first, rest @ ..]) => group == first && rest.contains(name),
             _ => false,
         }
-    }
-
-    /// The options a subcommand's help text shows.
-    fn help_options(tag: VerbTag) -> Vec<&'static str> {
-        tag.help()
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-            .filter(|word| word.starts_with("--") && word.len() > "--".len())
-            .collect()
     }
 
     #[test]
