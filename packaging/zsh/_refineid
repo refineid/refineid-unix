@@ -217,9 +217,6 @@ _refineid_document() {
         '--reader[narrow to readers whose name contains S]:substring' \
         '--can[CAN from the card front]:six digits' \
         '--timestamp[timestamp authority URL or named set]:url:_urls' \
-        '--no-timestamp[sign at level B]' \
-        '--no-long-term[stop at level T]' \
-        '--no-archive[stop at level LT]' \
         '--no-stamp[no visible seal on the PDF]'
       ;;
   esac

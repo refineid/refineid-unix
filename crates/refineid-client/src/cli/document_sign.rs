@@ -40,7 +40,6 @@ pub const HELP: &str = "\
 usage: refineid document sign FILE [FILE ...] [--format F] [--out PATH]
                 [--slot S] [--reason T] [--location T] [--reader SUBSTR]
                 [--can NNNNNN] [--no-stamp] [--timestamp U ...]
-                [--no-archive | --no-long-term | --no-timestamp]
 
 Sign FILE into a format a counterparty can open. Several files go into
 one container under one signature. PIN2 and the qualified-signature
@@ -66,15 +65,12 @@ key by default. Prints nothing on success; -v shows each step.
                 stays invisible
 Signs at the highest level the format supports: LTA (embedded
 evidence plus archive timestamp) for pades and asice-cades, LT
-(embedded evidence) for the rest.
+(embedded evidence) for the rest. There is no lower level.
   --timestamp U   RFC 3161 timestamp authority URL, or a named set.
                   Default: http://timestamp.sectigo.com/qualified.
                   Repeat for alternatives; a failed answer is
                   skipped, and signing fails when none remains.
                   --timestamp eu-qualified names public EU endpoints.
-  --no-archive    stop at level LT: no archive timestamp
-  --no-long-term  stop at level T: no embedded evidence
-  --no-timestamp  sign at level B: no authority contacted
 ";
 
 /// This verb's tag, for error messages.
@@ -115,8 +111,8 @@ pub struct DocumentSignArgs {
     pub reader_filter: Option<String>,
     /// Card Access Number for contactless (`--can`).
     pub can: Option<Can>,
-    /// Add an archive timestamp over the finished document
-    /// (`--archive`). Implies `--long-term`.
+    /// Add an archive timestamp over the finished document: level
+    /// LTA. Set for the formats whose archive construction exists.
     ///
     /// `PAdES` archives with a document timestamp revision; `ASiC-E`
     /// with `CAdES` archives with a second manifest and a token over
@@ -128,18 +124,14 @@ pub struct DocumentSignArgs {
     /// process locale (default; `--no-stamp` leaves the signature
     /// invisible). Only `PAdES` has a page.
     pub stamp: bool,
-    /// Embed the chain and revocation answers (`--long-term`).
-    ///
-    /// Raises the signature from level T to LT. Requires at least one
-    /// timestamp: evidence about a certificate is only useful next to
-    /// an attested time to evaluate it at.
+    /// Embed the chain and revocation answers: level LT. Always set;
+    /// every signature carries the evidence to check it after the
+    /// certificate expires.
     pub long_term: bool,
-    /// RFC 3161 Time Stamp Authority URLs (`--timestamp`, repeatable).
-    ///
-    /// Empty leaves the signature at baseline `B`, where the time is
-    /// the signer's own claim. Supplying one raises it to `T`, where a
-    /// third party attests the signature existed by then -- which is
-    /// what keeps it checkable after the certificate expires.
+    /// RFC 3161 Time Stamp Authority URLs (`--timestamp`, repeatable),
+    /// never empty: the default authority stands in when none is
+    /// named. A third party attests the signature existed by then,
+    /// which is what keeps it checkable after the certificate expires.
     ///
     /// Repeating it adds independent attestations of the same
     /// signature. They are alternatives: the signature keeps a proven
@@ -257,12 +249,7 @@ impl DocumentSignArgs {
         let mut reader_filter: Option<String> = None;
         let mut can_raw: Option<String> = None;
         let mut timestamp_authorities: Vec<String> = Vec::new();
-        let mut no_timestamp = false;
-        let mut no_long_term = false;
-        let mut no_archive = false;
         let mut no_stamp = false;
-        let mut long_term = false;
-        let mut archive = false;
 
         let tokens = argv.into_vec();
         let mut iter = tokens.iter();
@@ -290,12 +277,7 @@ impl DocumentSignArgs {
                         }
                     }
                 }
-                "--no-timestamp" => no_timestamp = true,
-                "--no-long-term" => no_long_term = true,
-                "--no-archive" => no_archive = true,
                 "--no-stamp" => no_stamp = true,
-                "--long-term" => long_term = true,
-                "--archive" => archive = true,
                 other if other.starts_with(OPTION_PREFIX) => {
                     return Err(ArgParseError::Unexpected {
                         cmd: CMD,
@@ -315,12 +297,7 @@ impl DocumentSignArgs {
             location,
             reader_filter,
             can_raw,
-            long_term,
-            archive,
             timestamp_authorities,
-            no_timestamp,
-            no_long_term,
-            no_archive,
             no_stamp,
         )
     }
@@ -332,7 +309,6 @@ impl DocumentSignArgs {
     /// command that can run.
     #[expect(
         clippy::too_many_arguments,
-        clippy::fn_params_excessive_bools,
         reason = "one parameter per flag; bundling them into a struct would name the same fields twice"
     )]
     fn resolve(
@@ -344,26 +320,12 @@ impl DocumentSignArgs {
         location: Option<String>,
         reader_filter: Option<String>,
         can_raw: Option<String>,
-        long_term: bool,
-        archive: bool,
         mut timestamp_authorities: Vec<String>,
-        no_timestamp: bool,
-        no_long_term: bool,
-        no_archive: bool,
         no_stamp: bool,
     ) -> Result<Self, ArgParseError> {
-        if no_timestamp && !timestamp_authorities.is_empty() {
-            return Err(ArgParseError::BadValue {
-                cmd: CMD,
-                flag: "--no-timestamp",
-                value: "--timestamp".to_owned(),
-                reason: "choose an authority or none, not both".to_owned(),
-            });
-        }
         // The Sectigo qualified endpoint is the default across the
-        // first-party RefineID clients; --no-timestamp is the explicit
-        // route to an unattested level-B signature.
-        if timestamp_authorities.is_empty() && !no_timestamp {
+        // first-party RefineID clients.
+        if timestamp_authorities.is_empty() {
             timestamp_authorities.push(DEFAULT_TIMESTAMP_AUTHORITY.to_owned());
         }
         if inputs.is_empty() {
@@ -403,15 +365,7 @@ impl DocumentSignArgs {
                 });
             }
         };
-        let (long_term, archive) = resolve_levels(
-            format,
-            long_term,
-            archive,
-            no_timestamp,
-            no_long_term,
-            no_archive,
-        )?;
-        check_level_is_reachable(long_term, timestamp_authorities.len())?;
+        let (long_term, archive) = levels_for(format);
         let can = can_raw
             .map(|raw| {
                 Can::new(&raw).map_err(|e| ArgParseError::BadValue {
@@ -541,78 +495,13 @@ fn report_outcome(
     }
 }
 
-/// Refuse level LT when nothing attests the time.
-///
-/// Embedding evidence about a certificate says nothing without an
-/// attested time to judge it at, so the combination is a category error
-/// rather than a weaker signature. Caught before the PIN prompt: a PIN
-/// typed for a command that was never going to run is a PIN typed for
-/// nothing.
-/// Apply the level defaults and their opt-outs.
-///
-/// Signing defaults to the highest level the format supports: LTA for
-/// pades and asice-cades, LT for the rest. Each opt-out steps one
-/// level down; an archive timestamp is only meaningful over embedded
-/// evidence, so archive implies LT. Returns `(long_term, archive)`.
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "one parameter per flag; bundling them into a struct would name the same fields twice"
-)]
-fn resolve_levels(
-    format: Format,
-    long_term: bool,
-    archive: bool,
-    no_timestamp: bool,
-    no_long_term: bool,
-    no_archive: bool,
-) -> Result<(bool, bool), ArgParseError> {
-    if no_long_term && (long_term || archive) {
-        return Err(ArgParseError::BadValue {
-            cmd: CMD,
-            flag: "--no-long-term",
-            value: if archive { "--archive" } else { "--long-term" }.to_owned(),
-            reason: "choose a level or its opt-out, not both".to_owned(),
-        });
-    }
-    if no_archive && archive {
-        return Err(ArgParseError::BadValue {
-            cmd: CMD,
-            flag: "--no-archive",
-            value: "--archive".to_owned(),
-            reason: "choose a level or its opt-out, not both".to_owned(),
-        });
-    }
-    if archive && !matches!(format, Format::Pades | Format::AsicECades) {
-        return Err(ArgParseError::BadValue {
-            cmd: CMD,
-            flag: "--archive",
-            value: format!("{format:?}"),
-            reason: "archive timestamps are built for pades and asice-cades; the CAdES and \
-                     XAdES archive attributes cover a different construction that is not \
-                     implemented"
-                .to_owned(),
-        });
-    }
-    let archive = if no_timestamp || no_long_term || no_archive {
-        false
-    } else {
-        archive || matches!(format, Format::Pades | Format::AsicECades)
-    };
-    let long_term = long_term || archive || !(no_timestamp || no_long_term);
-    Ok((long_term, archive))
-}
-
-fn check_level_is_reachable(long_term: bool, timestamps: usize) -> Result<(), ArgParseError> {
-    if long_term && timestamps == 0 {
-        return Err(ArgParseError::BadValue {
-            cmd: CMD,
-            flag: "--long-term",
-            value: "no timestamp".to_owned(),
-            reason: "level LT needs at least one --timestamp to evaluate the evidence against"
-                .to_owned(),
-        });
-    }
-    Ok(())
+/// The level a format is signed at, as `(long_term, archive)`: LTA
+/// where the archive construction exists, `PAdES` and `ASiC-E` with
+/// `CAdES`; LT for the rest, whose archive attributes this crate does
+/// not build. Nothing lower is offered: a signature without embedded
+/// evidence decays with its certificates.
+const fn levels_for(format: Format) -> (bool, bool) {
+    (true, matches!(format, Format::Pades | Format::AsicECades))
 }
 
 /// The format signed without `--format`: `PAdES` for exactly one PDF,
@@ -870,58 +759,32 @@ mod tests {
     }
 
     #[test]
+    fn every_signature_is_attested_and_archived_where_the_format_allows() -> TestResult {
+        let a = DocumentSignArgs::parse(argv(&[PDF]))?;
+        check(&a.archive, &true, "LTA for a PDF")?;
+        check(&a.long_term, &true, "evidence embedded")?;
+        check(&a.timestamp_authorities.len(), &1, "the default authority")?;
+        for gone in [
+            "--no-archive",
+            "--no-long-term",
+            "--no-timestamp",
+            "--archive",
+            "--long-term",
+        ] {
+            check_true(
+                DocumentSignArgs::parse(argv(&[PDF, gone])).is_err(),
+                &format!("{gone} is not an option"),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn the_stamp_is_drawn_unless_declined() -> TestResult {
         let stamped = DocumentSignArgs::parse(argv(&[PDF]))?;
         check(&stamped.stamp, &true, "stamp by default")?;
         let bare = DocumentSignArgs::parse(argv(&[PDF, "--no-stamp"]))?;
         check(&bare.stamp, &false, "--no-stamp declines it")
-    }
-
-    #[test]
-    fn opt_outs_step_down_one_level_each() -> TestResult {
-        let a = DocumentSignArgs::parse(argv(&[PDF, "--no-archive"]))?;
-        check(&a.archive, &false, "LT")?;
-        check(&a.long_term, &true, "LT keeps evidence")?;
-        let a = DocumentSignArgs::parse(argv(&[PDF, "--no-long-term"]))?;
-        check(&a.archive, &false, "T has no archive")?;
-        check(&a.long_term, &false, "T has no evidence")?;
-        check(&a.timestamp_authorities.len(), &1, "T is still attested")
-    }
-
-    #[test]
-    fn a_level_and_its_opt_out_conflict() -> TestResult {
-        check_true(
-            DocumentSignArgs::parse(argv(&[PDF, "--no-long-term", "--archive"])).is_err(),
-            "a level and its opt-out cannot both be asked for",
-        )
-    }
-
-    #[test]
-    fn no_timestamp_is_the_explicit_route_to_level_b() -> TestResult {
-        let a = DocumentSignArgs::parse(argv(&[PDF, "--no-timestamp"]))?;
-        check(&a.timestamp_authorities.len(), &0, "no authority")
-    }
-
-    #[test]
-    fn no_timestamp_refuses_a_named_authority() -> TestResult {
-        check_true(
-            DocumentSignArgs::parse(argv(&[
-                PDF,
-                "--no-timestamp",
-                "--timestamp",
-                "http://tsa.example",
-            ]))
-            .is_err(),
-            "an authority and none cannot both be asked for",
-        )
-    }
-
-    #[test]
-    fn no_timestamp_cannot_reach_level_lt() -> TestResult {
-        check_true(
-            DocumentSignArgs::parse(argv(&[PDF, "--no-timestamp", "--long-term"])).is_err(),
-            "LT evidence needs an attested time",
-        )
     }
 
     #[test]
@@ -1046,18 +909,12 @@ mod tests {
     }
 
     #[test]
-    fn long_term_requires_qualification_even_for_a_direct_url() -> TestResult {
-        let level_t = DocumentSignArgs::parse(argv(&[
-            PDF,
-            "--timestamp",
-            "https://tsa.example/tsa",
-            "--no-long-term",
-        ]))?;
-        check_true(!level_t.long_term, "an explicit level T stays at T")?;
-
-        let defaulted =
-            DocumentSignArgs::parse(argv(&[PDF, "--timestamp", "https://tsa.example/tsa"]))?;
-        check_true(defaulted.long_term, "the default level embeds evidence")
+    fn a_direct_url_still_embeds_the_evidence() -> TestResult {
+        let own = DocumentSignArgs::parse(argv(&[PDF, "--timestamp", "https://tsa.example/tsa"]))?;
+        check_true(
+            own.long_term,
+            "an own authority changes the attester, not the level",
+        )
     }
 
     #[test]

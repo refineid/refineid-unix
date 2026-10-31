@@ -293,21 +293,6 @@ pub const fn arguments(tag: VerbTag) -> Arguments {
                     value: Value::Url,
                 },
                 Opt {
-                    flag: "--no-timestamp",
-                    summary: "sign at level B",
-                    value: Value::None,
-                },
-                Opt {
-                    flag: "--no-long-term",
-                    summary: "stop at level T",
-                    value: Value::None,
-                },
-                Opt {
-                    flag: "--no-archive",
-                    summary: "stop at level LT",
-                    value: Value::None,
-                },
-                Opt {
                     flag: "--no-stamp",
                     summary: "no visible seal on the PDF",
                     value: Value::None,
