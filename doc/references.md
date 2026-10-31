@@ -213,8 +213,8 @@ Published by DVV at <https://dvv.fi/en/fineid-specifications>.
 
 #### The command line
 
-These inform [`command-line.md`](command-line.md). They are forty-year-old
-laboratory studies of command languages; they justify the shape of the
+These inform [`command-line.md`](command-line.md). They are
+laboratory studies of command languages from the 1980s; they justify the shape of the
 command set, not any particular word in it.
 
 ### carroll1982paradigms
