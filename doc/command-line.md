@@ -32,6 +32,12 @@ Citations are BibTeX keys in [`references.md`](references.md).
   signer's name is the certificate's common name verbatim, never
   reordered or joined with other attributes. Times are ISO 8601 in
   UTC.
+- **A timestamp proves the signing time.** `refineid document verify`
+  judges a signature at the earliest time a proven timestamp sets and
+  prints it as `signed:`; without one the signature is judged as of
+  now and `signed:` is `-`. An unproven timestamp is listed and
+  decides nothing. This is the validation time of ETSI EN 319 102-1
+  clauses 5.4 and 5.6.
 - **Secrets at the terminal only.** A PIN is asked once the card is in
   hand, read from the terminal, never from the command line, and
   nothing is echoed while it is typed.

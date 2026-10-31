@@ -68,9 +68,10 @@ impl core::error::Error for DocumentVerifyError {}
 /// Judge the document at `path` as of `now`.
 ///
 /// Every signature is verified from the file alone, anchored on the
-/// pinned DVV roots. A signer whose revocation the file does not
-/// answer is then asked about over the network; the answer is dated
-/// `now`, and no answer leaves the row unavailable.
+/// pinned DVV roots, at the earliest time a timestamp proves, else at
+/// `now`. A signer on a verified chain whose revocation the file does
+/// not answer is then asked about over the network; the answer is
+/// judged at `now`, and no answer leaves the row unavailable.
 ///
 /// # Errors
 /// [`DocumentVerifyError`] when the file cannot be read or carries
@@ -87,21 +88,34 @@ pub fn verify_file(path: &Path, now: DateTime) -> Result<DocumentReport, Documen
         path: path.to_path_buf(),
         failure,
     })?;
+    fill_unavailable_revocation(&mut report, |signature| live_revocation(signature, now));
+    Ok(report)
+}
+
+/// Replace the revocation of every signature on a verified chain that
+/// the document left unavailable with what `lookup` answers; every
+/// other row stays as the document judged it.
+fn fill_unavailable_revocation(
+    report: &mut DocumentReport,
+    mut lookup: impl FnMut(&SignatureReport) -> Revocation,
+) {
     for entry in &mut report.signatures {
         if let SignatureEntry::Judged(signature) = entry
+            && signature.chain_verified
             && signature.revocation == Revocation::Unavailable
         {
-            signature.revocation = live_revocation(signature, now);
+            signature.revocation = lookup(signature);
         }
     }
-    Ok(report)
 }
 
 /// Ask the signer's responders whether the certificate is good now.
 ///
-/// The walk must reach a pinned root and every step must answer; a
-/// signer outside that trust, or a responder that does not answer,
-/// leaves the revocation unavailable rather than guessed.
+/// The path and every answer are judged at `now`, not at the proven
+/// time. The walk must reach a pinned root and every step must answer;
+/// a signer outside that trust, or a responder that does not answer,
+/// leaves the revocation unavailable rather than guessed. A revoked
+/// answer is the gravest one along the path.
 fn live_revocation(signature: &SignatureReport, now: DateTime) -> Revocation {
     let anchors: Vec<&[u8]> = PINNED_ROOT_DER.iter().map(|(_, der)| *der).collect();
     let candidates: Vec<&[u8]> = signature
@@ -120,7 +134,90 @@ fn live_revocation(signature: &SignatureReport, now: DateTime) -> Revocation {
     };
     match collect_chains_with_candidates(&[start], &candidates) {
         Ok(_) => Revocation::Good { checked_at: now },
-        Err(MaterialError::Revoked { revoked_at, .. }) => Revocation::Revoked { revoked_at },
+        Err(MaterialError::Revoked {
+            revoked_at, reason, ..
+        }) => Revocation::Revoked { revoked_at, reason },
         Err(_) => Revocation::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{TestResult, check};
+    use refineid_lib_core::crl::CrlReason;
+    use refineid_lib_core::document::{CertificatePath, SignerIdentity, SubjectName};
+    use refineid_lib_core::x509::OwnedCert;
+
+    /// A public DVV intermediate, standing in for the signer.
+    const INTERMEDIATE_DER: &[u8] =
+        include_bytes!("../test-vectors/fineid-intermediate-01-citizen-g4e.der");
+    /// The signer's common name.
+    const SIGNER: &str = "Synthetic Signer";
+
+    /// A signature the document left without a revocation answer.
+    fn unanswered(chain_verified: bool) -> Result<SignatureReport, Box<dyn core::error::Error>> {
+        Ok(SignatureReport {
+            signer: SignerIdentity {
+                name: SubjectName::CommonName(SIGNER.to_owned()),
+                identifier: None,
+            },
+            signer_certificate: OwnedCert::from_der(INTERMEDIATE_DER)?,
+            chain: CertificatePath {
+                certificates: Vec::new(),
+                anchored: chain_verified,
+            },
+            document_intact: true,
+            signature_valid: true,
+            chain_verified,
+            claimed_signing_time: None,
+            proof_of_existence: None,
+            signature_timestamps: Vec::new(),
+            document_timestamps: Vec::new(),
+            covers_whole_document: true,
+            revocation: Revocation::Unavailable,
+        })
+    }
+
+    /// The revocation of each judged row.
+    fn revocations(report: &DocumentReport) -> Vec<Revocation> {
+        report
+            .signatures
+            .iter()
+            .filter_map(|entry| match entry {
+                SignatureEntry::Judged(signature) => Some(signature.revocation),
+                SignatureEntry::Unsupported(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_an_unavailable_row_on_a_verified_chain_is_looked_up() -> TestResult {
+        let now = DateTime::new(2026, 6, 20, 12, 0, 0)?;
+        let live = Revocation::Revoked {
+            revoked_at: now,
+            reason: Some(CrlReason::KeyCompromise),
+        };
+        let answered = Revocation::Good { checked_at: now };
+        let mut already = unanswered(true)?;
+        already.revocation = answered;
+        let mut report = DocumentReport {
+            signatures: vec![
+                SignatureEntry::Judged(unanswered(true)?),
+                SignatureEntry::Judged(unanswered(false)?),
+                SignatureEntry::Judged(already),
+            ],
+        };
+        let mut asked = 0_usize;
+        fill_unavailable_revocation(&mut report, |_signature| {
+            asked = asked.saturating_add(1);
+            live
+        });
+        check(&asked, &1, "one lookup")?;
+        check(
+            &revocations(&report),
+            &vec![live, Revocation::Unavailable, answered],
+            "the live answer with its reason fills only the verified unanswered row",
+        )
     }
 }

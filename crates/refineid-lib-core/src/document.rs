@@ -35,6 +35,9 @@
 //!   path to a trust anchor, at the validation time, with its
 //!   revocation status; a signer that only verifies against its own
 //!   embedded certificate is reported as unanchored, never as valid.
+//! - `ETSI EN 319 102-1` clauses 5.4 and 5.6: the validation time is
+//!   the earliest time a timestamp proves, else the current time. A
+//!   timestamp that proves nothing is reported and decides nothing.
 
 pub mod asic;
 pub mod cades;
@@ -43,6 +46,7 @@ pub mod trust;
 pub mod xades;
 pub mod xml;
 
+use crate::crl::CrlReason;
 use crate::crypto::digest::Sha256;
 use crate::identity::Peuin;
 use crate::sign::timestamp::VerifiedTimestampToken;
@@ -171,9 +175,57 @@ pub enum Revocation {
         /// The revocation time the answer states: OCSP
         /// `revocationTime` or the CRL entry's `revocationDate`.
         revoked_at: DateTime,
+        /// The `CRLReason` the answer states, when it states one
+        /// (RFC 5280 sec.5.3.1).
+        reason: Option<CrlReason>,
     },
     /// No verified answer was available.
     Unavailable,
+}
+
+impl Revocation {
+    /// Whether this status invalidates a signature whose existence is
+    /// proven at `proof_of_existence`.
+    ///
+    /// A revocation at or before the proven time invalidates; one after
+    /// it does not. Without a proven time any revocation invalidates. A
+    /// revocation for `keyCompromise`, `cACompromise` or `aACompromise`
+    /// invalidates whatever the proven time: the compromise may predate
+    /// the stated revocation time (RFC 5280 sec.5.3.1 and sec.5.3.2).
+    #[must_use]
+    pub fn invalidates(self, proof_of_existence: Option<DateTime>) -> bool {
+        match self {
+            Self::Revoked { revoked_at, reason } => {
+                reason.is_some_and(CrlReason::is_compromise)
+                    || proof_of_existence.is_none_or(|proven| revoked_at <= proven)
+            }
+            Self::Good { .. } | Self::Unavailable => false,
+        }
+    }
+
+    /// The graver of two statuses: a revocation outranks any other
+    /// status, a compromise outranks any other reason, then the earlier
+    /// revocation time does; on a tie `self` is kept. Whatever the proof
+    /// of existence, the graver one invalidates whenever either does
+    /// ([`Self::invalidates`]).
+    #[must_use]
+    pub fn graver(self, other: Self) -> Self {
+        /// What ranks a revocation: not a compromise, then the time;
+        /// the smaller key is graver.
+        fn rank(revocation: Revocation) -> Option<(bool, DateTime)> {
+            match revocation {
+                Revocation::Revoked { revoked_at, reason } => {
+                    Some((!reason.is_some_and(CrlReason::is_compromise), revoked_at))
+                }
+                Revocation::Good { .. } | Revocation::Unavailable => None,
+            }
+        }
+        match (rank(self), rank(other)) {
+            (Some(kept), Some(offered)) if offered < kept => other,
+            (None, Some(_)) => other,
+            _ => self,
+        }
+    }
 }
 
 /// One signature timestamp token, as a format reader checked it.
@@ -246,7 +298,9 @@ pub struct SignatureReport {
     /// the signer certificate, with the ESS binding where the profile
     /// requires it.
     pub signature_valid: bool,
-    /// Whether the signer chains to one of the caller's trust anchors.
+    /// Whether the signer chains to one of the caller's trust anchors
+    /// at the validation time: [`Self::proof_of_existence`] when there
+    /// is one, else the time the caller verifies at.
     pub chain_verified: bool,
     /// The signing time the signature claims: the `CMS` `signing-time`
     /// attribute, the `XAdES` `SigningTime` property, or the PDF
@@ -262,10 +316,6 @@ pub struct SignatureReport {
     /// Every document timestamp whose byte range covers this
     /// signature, in document order.
     pub document_timestamps: Vec<DocumentTimestamp>,
-    /// Whether every signature timestamp present verified against its
-    /// own embedded chain and imprints this signature, and at least one
-    /// proof of existence was found.
-    pub timestamps_valid: bool,
     /// Whether the signature's byte range runs to the end of the file.
     /// A signature followed by a document timestamp or a `DSS`
     /// revision does not, and is none the worse for it.
@@ -276,12 +326,21 @@ pub struct SignatureReport {
 }
 
 impl SignatureReport {
-    /// The one-line verdict of the facts above. Revocation is not part
-    /// of it: an unavailable answer is reported beside the verdict,
-    /// a revoked answer is a verdict of its own.
+    /// The one-line verdict of the facts above. Timestamps decide only
+    /// the validation time. Revocation is not part of it: an
+    /// unavailable answer is reported beside the verdict, an
+    /// invalidating revocation ([`Self::is_revoked`]) is a verdict of
+    /// its own.
     #[must_use]
     pub const fn is_valid(&self) -> bool {
-        self.document_intact && self.signature_valid && self.chain_verified && self.timestamps_valid
+        self.document_intact && self.signature_valid && self.chain_verified
+    }
+
+    /// Whether the revocation status invalidates the signature, judged
+    /// against its proof of existence ([`Revocation::invalidates`]).
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.revocation.invalidates(self.proof_of_existence)
     }
 }
 
@@ -317,8 +376,7 @@ impl DocumentReport {
         !self.signatures.is_empty()
             && self.signatures.iter().all(|entry| match entry {
                 SignatureEntry::Judged(signature) => {
-                    signature.is_valid()
-                        && !matches!(signature.revocation, Revocation::Revoked { .. })
+                    signature.is_valid() && !signature.is_revoked()
                 }
                 SignatureEntry::Unsupported(_) => false,
             })
@@ -398,9 +456,9 @@ impl FileKind {
 
 /// Verify every signature of the document, as of `now`.
 ///
-/// `now` stands in for the validation time of a signature that proves
-/// no earlier existence; a signature with a verified timestamp is
-/// judged at that time (`ETSI EN 319 102-1` clause 5.6.2).
+/// A signature with a proven timestamp is judged at the earliest time
+/// one proves (`ETSI EN 319 102-1` clause 5.6.2); a signature without
+/// one is judged at `now`.
 ///
 /// # Errors
 /// [`DocumentFailure`] when there is nothing to judge: the file is not
@@ -716,7 +774,7 @@ struct SignatureFacts<'a> {
 
 /// Turn one signature's facts into a report row: chain and revocation
 /// judged from the signature's own material, `pool` and the anchors,
-/// at the earliest proof of existence.
+/// at the earliest proof of existence, else at `now`.
 fn report(
     facts: SignatureFacts<'_>,
     mut pool: trust::MaterialPool,
@@ -758,16 +816,12 @@ fn report(
             },
         })
         .collect();
-    let proven: Vec<DateTime> = signature_timestamps
+    let proof_of_existence = signature_timestamps
         .iter()
         .filter_map(|timestamp| match timestamp {
             SignatureTimestamp::Proven { generated_at, .. } => Some(*generated_at),
             SignatureTimestamp::Unproven { .. } => None,
         })
-        .collect();
-    let proof_of_existence = proven
-        .iter()
-        .copied()
         .chain(
             facts
                 .covering_document_timestamps
@@ -778,8 +832,6 @@ fn report(
                 }),
         )
         .min();
-    let timestamps_valid =
-        proof_of_existence.is_some() && proven.len() == signature_timestamps.len();
     let chain = trust::judge(
         facts.signer,
         &pool,
@@ -797,7 +849,6 @@ fn report(
         proof_of_existence,
         signature_timestamps,
         document_timestamps: facts.covering_document_timestamps,
-        timestamps_valid,
         covers_whole_document: facts.covers_whole_document,
         revocation: chain.revocation,
     }
@@ -823,10 +874,12 @@ mod tests {
         SubjectName, TrustAnchors, UnsupportedSignature, verify,
     };
     use crate::ber::tlv;
+    use crate::crl::CrlReason;
+    use crate::crypto::digest::Sha256;
     use crate::document::trust::testkit::{
-        CertificateSpec, Curve, OcspSpec, PRINTABLE_STRING, TestKey, UTF8_STRING, ca_extensions,
-        certificate, certificate_named, day, minimal_pdf, name_of, ocsp_response, timestamp_token,
-        timestamping_extensions,
+        CertificateSpec, Curve, OcspSpec, PRINTABLE_STRING, RevokedSpec, TestKey, UTF8_STRING,
+        ca_extensions, certificate, certificate_named, day, minimal_pdf, name_of, ocsp_response,
+        timestamp_token, timestamping_extensions,
     };
     use crate::hex::Hex;
     use crate::oid::known;
@@ -837,6 +890,7 @@ mod tests {
         DEFAULT_SIGNATURE_CAPACITY, SignatureMetadata, prepare_document_timestamp,
     };
     use crate::sign::validation::ValidationMaterial;
+    use crate::x509::DateTime;
     use crate::x509::{Certificate, OwnedCert};
 
     /// Root common name.
@@ -875,6 +929,14 @@ mod tests {
     const NOW: u8 = 20;
     /// Day every certificate ends.
     const ENDS: u8 = 28;
+    /// Day of an unproven timestamp's claim, before [`STAMPED`].
+    const CLAIMED_EARLIER: u8 = 5;
+    /// Day of a second proven timestamp, after [`STAMPED`].
+    const STAMPED_LATER: u8 = 12;
+    /// A validation day after every certificate ended.
+    const AFTER_EXPIRY: u8 = 30;
+    /// Data a misdirected timestamp imprints in place of the signature.
+    const OTHER_DATA: &[u8] = b"Synthetic data other than the signature";
     /// The signing time the writers assert.
     const SIGNING_TIME: SigningTime = SigningTime {
         year: 2026,
@@ -916,6 +978,38 @@ mod tests {
     const ESCAPED_WITH_NUL: &str = r"Synthetic\00Org";
     /// [`ORGANIZATION`] as RFC 4514 writes it.
     const ESCAPED_ORGANIZATION: &str = "Synthetic\\, Org";
+
+    /// What a fixture's signature timestamp token imprints.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Imprint {
+        /// The signature value.
+        Signature,
+        /// [`OTHER_DATA`].
+        OtherData,
+    }
+
+    /// One signature timestamp token a fixture carries, from the TSA
+    /// the root issued.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Token {
+        /// What it imprints.
+        imprint: Imprint,
+        /// The day of its `genTime`.
+        day: u8,
+    }
+
+    /// No signature timestamp.
+    const NO_STAMP: &[Token] = &[];
+    /// One token over the signature, on [`STAMPED`].
+    const STAMP_OVER_SIGNATURE: &[Token] = &[Token {
+        imprint: Imprint::Signature,
+        day: STAMPED,
+    }];
+    /// One token over other data, on [`STAMPED`].
+    const STAMP_OVER_OTHER_DATA: &[Token] = &[Token {
+        imprint: Imprint::OtherData,
+        day: STAMPED,
+    }];
 
     /// Which signer signs.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1019,13 +1113,13 @@ mod tests {
         }
 
         /// Sign `objects` as `format` through the repository's router,
-        /// optionally with a signature timestamp, embedding `material`.
+        /// with the signature timestamp `stamp`, embedding `material`.
         fn sign(
             &self,
             format: Format,
             objects: Vec<DataObject>,
             signer: Signer,
-            timestamp: bool,
+            stamp: &[Token],
             material: &ValidationMaterial,
         ) -> Vec<u8> {
             let der = match signer {
@@ -1042,25 +1136,25 @@ mod tests {
             let planned =
                 plan(format, objects, &parameters, &SignatureMetadata::default()).expect("plans");
             let signature = self.signer_key.sign_raw(planned.to_be_signed());
-            let mut timestamps = Vec::new();
-            if timestamp {
-                let imprint = planned
-                    .timestamp_digest(&parameters, &signature, DigestAlgorithm::Sha256)
-                    .expect("timestamp digest");
-                timestamps.push(timestamp_token(
-                    &self.tsa,
-                    &self.tsa_key,
-                    &imprint,
-                    day(STAMPED),
-                ));
-            }
+            let timestamps: Vec<Vec<u8>> = stamp
+                .iter()
+                .map(|token| {
+                    let imprint = match token.imprint {
+                        Imprint::Signature => planned
+                            .timestamp_digest(&parameters, &signature, DigestAlgorithm::Sha256)
+                            .expect("timestamp digest"),
+                        Imprint::OtherData => Sha256::of(OTHER_DATA).as_bytes().to_vec(),
+                    };
+                    timestamp_token(&self.tsa, &self.tsa_key, &imprint, day(token.day))
+                })
+                .collect();
             planned
                 .finish(&parameters, &signature, &timestamps, material)
                 .expect("finishes")
         }
 
         /// A signed PDF.
-        fn pdf(&self, signer: Signer, timestamp: bool, material: &ValidationMaterial) -> Vec<u8> {
+        fn pdf(&self, signer: Signer, stamp: &[Token], material: &ValidationMaterial) -> Vec<u8> {
             self.sign(
                 Format::Pades,
                 vec![DataObject {
@@ -1069,7 +1163,7 @@ mod tests {
                     content: minimal_pdf(),
                 }],
                 signer,
-                timestamp,
+                stamp,
                 material,
             )
         }
@@ -1084,21 +1178,22 @@ mod tests {
                     content: NOTE.to_vec(),
                 }],
                 Signer::Direct,
-                false,
+                NO_STAMP,
                 &ValidationMaterial::default(),
             )
         }
 
-        /// The issued signer's chain and OCSP answers about the signer
-        /// and the intermediate, produced after the timestamps.
-        fn lt_material(&self, revoked: bool, with_root: bool) -> ValidationMaterial {
+        /// The issued signer's chain and OCSP answers about the signer,
+        /// revoked as `revoked` states, and the intermediate, produced
+        /// after the timestamps.
+        fn lt_material(&self, revoked: Option<RevokedSpec>, with_root: bool) -> ValidationMaterial {
             let issuer = OwnedCert::from_der(&self.intermediate).expect("intermediate parses");
             let answer = ocsp_response(&OcspSpec {
                 responder_key: &self.intermediate_key,
                 responder: INTERMEDIATE,
                 issuer: &issuer,
                 serial: ISSUED_SIGNER_SERIAL,
-                revoked: revoked.then(|| day(ISSUED)),
+                revoked,
                 produced_at: day(ANSWERED),
                 this_update: day(ANSWERED),
                 next_update: Some(day(ENDS)),
@@ -1135,10 +1230,19 @@ mod tests {
 
     /// Verify `bytes` at `NOW` trusting `anchors`.
     fn verify_with(bytes: Vec<u8>, anchors: &[&[u8]]) -> Result<DocumentReport, DocumentFailure> {
+        verify_at(bytes, anchors, day(NOW))
+    }
+
+    /// Verify `bytes` at `now` trusting `anchors`.
+    fn verify_at(
+        bytes: Vec<u8>,
+        anchors: &[&[u8]],
+        now: DateTime,
+    ) -> Result<DocumentReport, DocumentFailure> {
         verify(
             &DocumentFile::from_file(bytes),
             TrustAnchors::new(anchors),
-            day(NOW),
+            now,
         )
     }
 
@@ -1174,14 +1278,18 @@ mod tests {
     fn a_level_b_pdf_is_intact_valid_and_anchored_without_proof_of_existence() {
         let world = World::new();
         let report = world
-            .verify_trusting_root(world.pdf(Signer::Direct, false, &ValidationMaterial::default()))
+            .verify_trusting_root(world.pdf(
+                Signer::Direct,
+                NO_STAMP,
+                &ValidationMaterial::default(),
+            ))
             .expect("report");
         let signature = only(&report);
         assert!(signature.document_intact);
         assert!(signature.signature_valid);
         assert!(signature.chain_verified);
         assert_eq!(signature.proof_of_existence, None);
-        assert!(!signature.timestamps_valid);
+        assert!(signature.is_valid());
         assert!(signature.covers_whole_document);
         assert_eq!(signature.revocation, Revocation::Unavailable);
         assert_eq!(
@@ -1199,14 +1307,17 @@ mod tests {
     fn a_signature_timestamp_proves_existence() {
         let world = World::new();
         let report = world
-            .verify_trusting_root(world.pdf(Signer::Direct, true, &ValidationMaterial::default()))
+            .verify_trusting_root(world.pdf(
+                Signer::Direct,
+                STAMP_OVER_SIGNATURE,
+                &ValidationMaterial::default(),
+            ))
             .expect("report");
         let signature = only(&report);
         assert!(signature.document_intact);
         assert!(signature.signature_valid);
         assert!(signature.chain_verified);
         assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
-        assert!(signature.timestamps_valid);
         assert!(signature.is_valid());
         let [
             SignatureTimestamp::Proven {
@@ -1226,7 +1337,11 @@ mod tests {
     fn a_timestamp_whose_root_is_not_pinned_proves_no_time() {
         let world = World::new();
         let report = verify_with(
-            world.pdf(Signer::Direct, true, &ValidationMaterial::default()),
+            world.pdf(
+                Signer::Direct,
+                STAMP_OVER_SIGNATURE,
+                &ValidationMaterial::default(),
+            ),
             &[&world.stranger],
         )
         .expect("report");
@@ -1244,19 +1359,21 @@ mod tests {
         assert_eq!(names(chain), vec![TSA.to_owned()]);
         assert!(!chain.anchored);
         assert_eq!(signature.proof_of_existence, None);
-        assert!(!signature.timestamps_valid);
     }
 
     #[test]
     fn level_lt_chains_through_the_store_and_reads_a_later_ocsp_answer() {
         let world = World::new();
-        let pdf = world.pdf(Signer::Issued, true, &world.lt_material(false, false));
+        let pdf = world.pdf(
+            Signer::Issued,
+            STAMP_OVER_SIGNATURE,
+            &world.lt_material(None, false),
+        );
         let report = world.verify_trusting_root(pdf).expect("report");
         let signature = only(&report);
         assert!(signature.document_intact);
         assert!(signature.signature_valid);
         assert!(signature.chain_verified);
-        assert!(signature.timestamps_valid);
         assert!(!signature.covers_whole_document);
         assert_eq!(
             signature.revocation,
@@ -1270,7 +1387,7 @@ mod tests {
     #[test]
     fn a_document_timestamp_covering_the_signature_proves_existence() {
         let world = World::new();
-        let signed = world.pdf(Signer::Direct, false, &ValidationMaterial::default());
+        let signed = world.pdf(Signer::Direct, NO_STAMP, &ValidationMaterial::default());
         let placeholder =
             prepare_document_timestamp(&signed, DEFAULT_SIGNATURE_CAPACITY).expect("prepares");
         let token = timestamp_token(
@@ -1285,7 +1402,6 @@ mod tests {
         assert!(signature.document_intact);
         assert!(signature.signature_valid);
         assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
-        assert!(signature.timestamps_valid);
         assert!(!signature.covers_whole_document);
         assert_eq!(
             signature.document_timestamps,
@@ -1298,7 +1414,7 @@ mod tests {
     #[test]
     fn a_document_timestamp_under_an_unknown_root_is_listed_and_proves_nothing() {
         let world = World::new();
-        let signed = world.pdf(Signer::Direct, false, &ValidationMaterial::default());
+        let signed = world.pdf(Signer::Direct, NO_STAMP, &ValidationMaterial::default());
         let placeholder =
             prepare_document_timestamp(&signed, DEFAULT_SIGNATURE_CAPACITY).expect("prepares");
         let token = timestamp_token(
@@ -1317,13 +1433,12 @@ mod tests {
             }]
         );
         assert_eq!(signature.proof_of_existence, None);
-        assert!(!signature.timestamps_valid);
     }
 
     #[test]
     fn a_changed_byte_in_the_signed_span_breaks_only_integrity() {
         let world = World::new();
-        let pdf = tamper(world.pdf(Signer::Direct, false, &ValidationMaterial::default()));
+        let pdf = tamper(world.pdf(Signer::Direct, NO_STAMP, &ValidationMaterial::default()));
         let report = world.verify_trusting_root(pdf).expect("report");
         let signature = only(&report);
         assert!(!signature.document_intact);
@@ -1336,7 +1451,11 @@ mod tests {
     #[test]
     fn an_untrusted_root_leaves_the_chain_unverified_but_names_the_issuer() {
         let world = World::new();
-        let pdf = world.pdf(Signer::Issued, true, &world.lt_material(false, true));
+        let pdf = world.pdf(
+            Signer::Issued,
+            STAMP_OVER_SIGNATURE,
+            &world.lt_material(None, true),
+        );
         let report = verify_with(pdf, &[&world.stranger]).expect("report");
         let signature = only(&report);
         assert!(signature.document_intact);
@@ -1405,17 +1524,275 @@ mod tests {
     #[test]
     fn a_revoked_signer_makes_the_document_invalid() {
         let world = World::new();
-        let pdf = world.pdf(Signer::Issued, true, &world.lt_material(true, false));
+        let pdf = world.pdf(
+            Signer::Issued,
+            STAMP_OVER_SIGNATURE,
+            &world.lt_material(Some(RevokedSpec::at(day(ISSUED))), false),
+        );
         let report = world.verify_trusting_root(pdf).expect("report");
         let signature = only(&report);
         assert_eq!(
             signature.revocation,
             Revocation::Revoked {
-                revoked_at: day(ISSUED)
+                revoked_at: day(ISSUED),
+                reason: None,
             }
         );
         assert!(signature.is_valid());
+        assert!(signature.is_revoked());
         assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn an_untimestamped_signature_after_the_certificate_expired_is_not_valid() {
+        let world = World::new();
+        let pdf = world.pdf(Signer::Direct, NO_STAMP, &ValidationMaterial::default());
+        let report = verify_at(pdf, &[&world.root], day(AFTER_EXPIRY)).expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact);
+        assert!(signature.signature_valid);
+        assert!(!signature.chain_verified);
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn a_proven_timestamp_judges_the_chain_at_its_time() {
+        let world = World::new();
+        let pdf = world.pdf(
+            Signer::Direct,
+            STAMP_OVER_SIGNATURE,
+            &ValidationMaterial::default(),
+        );
+        let report = verify_at(pdf, &[&world.root], day(AFTER_EXPIRY)).expect("report");
+        let signature = only(&report);
+        assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
+        assert!(signature.chain_verified);
+        assert!(report.is_valid());
+    }
+
+    #[test]
+    fn an_unproven_timestamp_leaves_the_signature_judged_now() {
+        let world = World::new();
+        let pdf = world.pdf(
+            Signer::Direct,
+            STAMP_OVER_OTHER_DATA,
+            &ValidationMaterial::default(),
+        );
+        let report = verify_with(pdf.clone(), &[&world.root]).expect("report");
+        let signature = only(&report);
+        let [
+            SignatureTimestamp::Unproven {
+                claimed_at,
+                chain: None,
+            },
+        ] = signature.signature_timestamps.as_slice()
+        else {
+            panic!("one unproven timestamp");
+        };
+        assert_eq!(*claimed_at, Some(day(STAMPED)));
+        assert_eq!(signature.proof_of_existence, None);
+        assert!(report.is_valid());
+
+        let report = verify_at(pdf, &[&world.root], day(AFTER_EXPIRY)).expect("report");
+        assert!(!only(&report).chain_verified);
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn a_revocation_after_the_proven_time_leaves_the_signature_valid() {
+        let world = World::new();
+        let pdf = world.pdf(
+            Signer::Issued,
+            STAMP_OVER_SIGNATURE,
+            &world.lt_material(Some(RevokedSpec::at(day(ANSWERED))), false),
+        );
+        let report = world.verify_trusting_root(pdf).expect("report");
+        let signature = only(&report);
+        assert_eq!(
+            signature.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ANSWERED),
+                reason: None,
+            }
+        );
+        assert!(!signature.is_revoked());
+        assert!(report.is_valid());
+    }
+
+    #[test]
+    fn a_key_compromise_after_the_proven_time_still_invalidates() {
+        let world = World::new();
+        let pdf = world.pdf(
+            Signer::Issued,
+            STAMP_OVER_SIGNATURE,
+            &world.lt_material(
+                Some(RevokedSpec::for_reason(
+                    day(ANSWERED),
+                    CrlReason::KeyCompromise,
+                )),
+                false,
+            ),
+        );
+        let report = world.verify_trusting_root(pdf).expect("report");
+        let signature = only(&report);
+        assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
+        assert!(signature.is_revoked());
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn a_ca_or_aa_compromise_after_the_proven_time_still_invalidates() {
+        for reason in [CrlReason::CaCompromise, CrlReason::AaCompromise] {
+            let world = World::new();
+            let pdf = world.pdf(
+                Signer::Issued,
+                STAMP_OVER_SIGNATURE,
+                &world.lt_material(Some(RevokedSpec::for_reason(day(ANSWERED), reason)), false),
+            );
+            let report = world.verify_trusting_root(pdf).expect("report");
+            let signature = only(&report);
+            assert_eq!(
+                signature.revocation,
+                Revocation::Revoked {
+                    revoked_at: day(ANSWERED),
+                    reason: Some(reason),
+                }
+            );
+            assert!(signature.is_revoked(), "{reason}");
+            assert!(!report.is_valid(), "{reason}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_reason_after_the_proven_time_leaves_the_signature_valid() {
+        let world = World::new();
+        let pdf = world.pdf(
+            Signer::Issued,
+            STAMP_OVER_SIGNATURE,
+            &world.lt_material(
+                Some(RevokedSpec::for_reason(
+                    day(ANSWERED),
+                    CrlReason::Unrecognised,
+                )),
+                false,
+            ),
+        );
+        let report = world.verify_trusting_root(pdf).expect("report");
+        let signature = only(&report);
+        assert_eq!(
+            signature.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ANSWERED),
+                reason: Some(CrlReason::Unrecognised),
+            }
+        );
+        assert!(!signature.is_revoked());
+        assert!(report.is_valid());
+    }
+
+    #[test]
+    fn the_earliest_proven_timestamp_sets_the_proof_and_an_unproven_one_none() {
+        let world = World::new();
+        let pdf = world.pdf(
+            Signer::Direct,
+            &[
+                Token {
+                    imprint: Imprint::OtherData,
+                    day: CLAIMED_EARLIER,
+                },
+                Token {
+                    imprint: Imprint::Signature,
+                    day: STAMPED_LATER,
+                },
+                Token {
+                    imprint: Imprint::Signature,
+                    day: STAMPED,
+                },
+            ],
+            &ValidationMaterial::default(),
+        );
+        let report = world.verify_trusting_root(pdf).expect("report");
+        let signature = only(&report);
+        assert_eq!(signature.signature_timestamps.len(), 3);
+        assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
+        assert!(report.is_valid());
+    }
+
+    #[test]
+    fn the_earlier_of_a_signature_and_a_document_timestamp_sets_the_proof() {
+        let world = World::new();
+        for (signature_day, document_day) in [(STAMPED, STAMPED_LATER), (STAMPED_LATER, STAMPED)] {
+            let signed = world.pdf(
+                Signer::Direct,
+                &[Token {
+                    imprint: Imprint::Signature,
+                    day: signature_day,
+                }],
+                &ValidationMaterial::default(),
+            );
+            let placeholder =
+                prepare_document_timestamp(&signed, DEFAULT_SIGNATURE_CAPACITY).expect("prepares");
+            let token = timestamp_token(
+                &world.tsa,
+                &world.tsa_key,
+                &placeholder.digest(DigestAlgorithm::Sha256),
+                day(document_day),
+            );
+            let stamped = placeholder.finish(&token).expect("finishes");
+            let report = world.verify_trusting_root(stamped).expect("report");
+            let signature = only(&report);
+            assert_eq!(
+                signature.proof_of_existence,
+                Some(day(STAMPED)),
+                "signature {signature_day}, document {document_day}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_proven_time_any_revocation_invalidates() {
+        let world = World::new();
+        let pdf = world.pdf(
+            Signer::Issued,
+            NO_STAMP,
+            &world.lt_material(Some(RevokedSpec::at(day(ANSWERED))), false),
+        );
+        let report = world.verify_trusting_root(pdf).expect("report");
+        let signature = only(&report);
+        assert_eq!(signature.proof_of_existence, None);
+        assert!(signature.is_valid());
+        assert!(signature.is_revoked());
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn a_revocation_invalidates_by_its_time_against_the_proof_of_existence() {
+        let revoked = |reason| Revocation::Revoked {
+            revoked_at: day(STAMPED),
+            reason,
+        };
+        let proven_earlier = Some(day(ISSUED));
+        let proven_then = Some(day(STAMPED));
+        let proven_later = Some(day(ANSWERED));
+        assert!(revoked(None).invalidates(None));
+        assert!(revoked(None).invalidates(proven_then));
+        assert!(revoked(None).invalidates(proven_later));
+        assert!(!revoked(None).invalidates(proven_earlier));
+        assert!(!revoked(Some(CrlReason::Superseded)).invalidates(proven_earlier));
+        for compromise in [
+            CrlReason::KeyCompromise,
+            CrlReason::CaCompromise,
+            CrlReason::AaCompromise,
+        ] {
+            assert!(revoked(Some(compromise)).invalidates(proven_earlier));
+        }
+        assert!(!Revocation::Unavailable.invalidates(None));
+        assert!(
+            !Revocation::Good {
+                checked_at: day(ANSWERED)
+            }
+            .invalidates(None)
+        );
     }
 
     #[test]

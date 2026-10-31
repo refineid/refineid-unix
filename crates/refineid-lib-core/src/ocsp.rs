@@ -614,13 +614,15 @@ impl OcspHelpers {
                         .map_err(|_ignored| {
                         X509Error::UnexpectedStructure("OCSP revocationReason")
                     })?;
-                    if enumerated.tag() != Tag::Enumerated || enumerated.value().len() != 1 {
+                    if enumerated.tag() != Tag::Enumerated {
                         return Err(X509Error::UnexpectedStructure("OCSP revocationReason"));
                     }
-                    reason = enumerated
-                        .value()
-                        .first()
-                        .and_then(|code| crate::crl::CrlReason::from_code(*code));
+                    // Every assigned code is one octet; any other length
+                    // states a reason this reader does not know.
+                    reason = Some(match enumerated.value() {
+                        [code] => crate::crl::CrlReason::from_code(*code),
+                        _ => crate::crl::CrlReason::Unrecognised,
+                    });
                     saw_reason = true;
                 }
                 Ok(CertStatus::Revoked { revoked_at, reason })
@@ -1777,6 +1779,39 @@ mod tests {
                 assert_eq!(reason, Some(crate::crl::CrlReason::KeyCompromise));
             }
             _ => panic!("expected Revoked, got {:?}", sr.status),
+        }
+    }
+
+    #[test]
+    fn a_revocation_reason_not_one_octet_or_unassigned_is_unrecognised() {
+        use crate::crl::CrlReason;
+        use crate::crl::testkit::ReasonOctets;
+        for written in [
+            ReasonOctets::Padded(CrlReason::KeyCompromise),
+            ReasonOctets::Code(CrlReason::Unrecognised),
+        ] {
+            let mut revoked_info = gtime(2026, 5, 1, 8, 0, 0);
+            revoked_info
+                .extend_from_slice(&tlv(TAG_CONTEXT_0, tlv(TAG_ENUMERATED, written.content())));
+            let serial = fixture_serial(2);
+            let der = build_response(&single_response_der(
+                &serial,
+                &tlv(TAG_CONTEXT_1, revoked_info),
+            ));
+            let resp = super::OcspResponse::parse(&der).expect("parses");
+            let basic = resp.basic.expect("basic present");
+            let sr = basic.find_serial(&serial).expect("serial found");
+            assert!(
+                matches!(
+                    sr.status,
+                    CertStatus::Revoked {
+                        reason: Some(CrlReason::Unrecognised),
+                        ..
+                    }
+                ),
+                "{written:?}: {:?}",
+                sr.status
+            );
         }
     }
 
