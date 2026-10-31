@@ -12,7 +12,8 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! `refineid pair`, `refineid pairs`, and `refineid unpair` CLI commands.
+//! The `phone` group: `refineid phone`, `phone pair`, `phone unpair` and
+//! `phone auth`.
 
 use alloc::string::{String, ToString};
 use std::io::{BufRead as _, Write as _};
@@ -43,10 +44,10 @@ fn http_status_code(status_line: &str) -> Option<u16> {
         .and_then(|code| code.parse().ok())
 }
 
-/// What `refineid pair help`
+/// What `refineid phone pair help`
 /// prints. The man page refineid(1) carries the same facts.
 pub const PAIR_HELP: &str = "\
-usage: refineid pair
+usage: refineid phone pair
 
 Pair with a phone running RefineID. Start pairing on the phone and
 type the six-character code it shows. The code is read from the
@@ -54,26 +55,27 @@ prompt only, never from the command line.
 Prints nothing on success; -v shows each step.
 ";
 
-/// What `refineid pairs help`
-/// prints. The man page refineid(1) carries the same facts.
+/// Bare `phone`'s own help: the first part of what `refineid phone
+/// help` prints, before the group's commands. The man page refineid(1)
+/// carries the same facts.
 pub const PAIRS_HELP: &str = "\
-usage: refineid pairs
+usage: refineid phone
 
-List the paired phone.
+Show the paired phone.
 ";
 
-/// What `refineid unpair help`
+/// What `refineid phone unpair help`
 /// prints. The man page refineid(1) carries the same facts.
 pub const UNPAIR_HELP: &str = "\
-usage: refineid unpair
+usage: refineid phone unpair
 
 Forget the paired phone. Prints nothing on success; -v shows each step.
 ";
 
-/// What `refineid auth help`
+/// What `refineid phone auth help`
 /// prints. The man page refineid(1) carries the same facts.
 pub const AUTH_HELP: &str = "\
-usage: refineid auth [URL]
+usage: refineid phone auth [URL]
 
 Log in to a TLS site with the card in the paired phone and print the
 response's status line; a 4xx or 5xx status exits 1. URL defaults to
@@ -84,13 +86,13 @@ https://card.refineid.fi.
 /// How long pairing and operations browse for the phone.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Arguments for `refineid pair`. The code is read from the prompt only,
+/// Arguments for `refineid phone pair`. The code is read from the prompt only,
 /// never from the command line, where other local accounts could read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairArgs;
 
 impl PairArgs {
-    /// Parse arguments for `refineid pair`, which takes none.
+    /// Parse arguments for `refineid phone pair`, which takes none.
     ///
     /// # Errors
     /// Returns [`ArgParseError`] on any argument.
@@ -98,7 +100,7 @@ impl PairArgs {
         match argv.into_vec().first() {
             None => Ok(Self),
             Some(got) => Err(ArgParseError::Unexpected {
-                cmd: VerbTag::CardPair,
+                cmd: VerbTag::PhonePair,
                 got: got.clone(),
             }),
         }
@@ -186,12 +188,12 @@ fn prompt_code() -> Option<String> {
     normalize_pairing_code(line.trim()).map(|_| line.trim().to_owned())
 }
 
-/// Arguments for `refineid pairs`.
+/// Arguments for `refineid phone`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairsArgs;
 
 impl PairsArgs {
-    /// Parse arguments for `refineid pairs`.
+    /// Parse arguments for `refineid phone`.
     ///
     /// # Errors
     /// Returns [`ArgParseError`] on unexpected arguments.
@@ -199,7 +201,7 @@ impl PairsArgs {
         let tokens = argv.into_vec();
         if let Some(arg) = tokens.into_iter().next() {
             return Err(ArgParseError::Unexpected {
-                cmd: VerbTag::CardPairs,
+                cmd: VerbTag::PhoneCheck,
                 got: arg,
             });
         }
@@ -235,13 +237,13 @@ impl PairsArgs {
     }
 }
 
-/// Arguments for `refineid unpair`, which takes none: it forgets the
+/// Arguments for `refineid phone unpair`, which takes none: it forgets the
 /// paired phone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnpairArgs;
 
 impl UnpairArgs {
-    /// Parse arguments for `refineid unpair`, which takes none.
+    /// Parse arguments for `refineid phone unpair`, which takes none.
     ///
     /// # Errors
     /// Returns [`ArgParseError`] on any argument.
@@ -249,7 +251,7 @@ impl UnpairArgs {
         match argv.into_vec().first() {
             None => Ok(Self),
             Some(got) => Err(ArgParseError::Unexpected {
-                cmd: VerbTag::CardUnpair,
+                cmd: VerbTag::PhoneUnpair,
                 got: got.clone(),
             }),
         }
@@ -289,7 +291,7 @@ impl UnpairArgs {
     }
 }
 
-/// Arguments for `refineid auth`.
+/// Arguments for `refineid phone auth`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthArgs {
     /// URL to authenticate to (default: <https://card.refineid.fi>).
@@ -297,7 +299,7 @@ pub struct AuthArgs {
 }
 
 impl AuthArgs {
-    /// Parse arguments for `refineid auth`.
+    /// Parse arguments for `refineid phone auth`.
     ///
     /// # Errors
     /// Returns [`ArgParseError`] on syntax error.
@@ -312,7 +314,7 @@ impl AuthArgs {
         Ok(Self { url })
     }
 
-    /// Run the `refineid auth` command: print the response's status
+    /// Run the `refineid phone auth` command: print the response's status
     /// line. `verbose` adds the steps and the page's title lines.
     #[must_use]
     pub fn run(self, verbose: bool) -> ExitCode {
@@ -325,7 +327,7 @@ impl AuthArgs {
             }
         };
         let Some(pair) = reader.phone() else {
-            eprintln!("auth: no phone paired; run `refineid pair` first");
+            eprintln!("phone auth: no phone paired; run `refineid phone pair` first");
             return ExitStatus::RuntimeFailure.into();
         };
         let uri = match refineid_lib_core::text::Uri::parse(target.to_string()) {

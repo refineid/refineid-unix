@@ -163,7 +163,7 @@ impl CardArgs {
             return ExitStatus::RuntimeFailure.into();
         };
         let Some(pair) = reader.phone() else {
-            eprintln!("no phone paired. Run `refineid pair` first.");
+            eprintln!("no phone paired. Run `refineid phone pair` first.");
             return ExitStatus::RuntimeFailure.into();
         };
         Self::run_remote_card_check_with_pair(&mut reader, &pair, verbose)

@@ -86,9 +86,10 @@ impl Block {
             | VerbTag::CardExportAll => Self::Card,
             VerbTag::PinActivate | VerbTag::PinChange | VerbTag::PinUnblock => Self::Pin,
             VerbTag::DocumentSign => Self::Document,
-            VerbTag::CardPair | VerbTag::CardPairs | VerbTag::CardUnpair | VerbTag::CardAuth => {
-                Self::Phone
-            }
+            VerbTag::PhonePair
+            | VerbTag::PhoneCheck
+            | VerbTag::PhoneUnpair
+            | VerbTag::PhoneAuth => Self::Phone,
             VerbTag::Verify | VerbTag::CertShow | VerbTag::CertChain => Self::Offline,
             VerbTag::ReaderKeyboard => Self::Reader,
         }
@@ -116,16 +117,16 @@ impl Tier {
             | VerbTag::PinChange
             | VerbTag::PinUnblock
             | VerbTag::DocumentSign
-            | VerbTag::CardPair
-            | VerbTag::CardPairs
-            | VerbTag::CardUnpair => Self::Basic,
+            | VerbTag::PhonePair
+            | VerbTag::PhoneCheck
+            | VerbTag::PhoneUnpair => Self::Basic,
             VerbTag::CardEmrtd
             | VerbTag::CardSignAuth
             | VerbTag::CardSignQualified
             | VerbTag::CardDecryptAuth
             | VerbTag::CardPubkey
             | VerbTag::CardExportAll
-            | VerbTag::CardAuth
+            | VerbTag::PhoneAuth
             | VerbTag::Verify
             | VerbTag::CertShow
             | VerbTag::CertChain
@@ -224,9 +225,10 @@ fn push_listing(out: &mut String, tier: Tier) {
 }
 
 /// The help of a group named by its first word, as `refineid card
-/// help` asks for it: one line per command in the group, after bare
-/// `card`'s own help for the card group. `None` when `word` names no
-/// group of several words.
+/// help` asks for it: one line per command in the group, after the
+/// bare word's own help where the bare word is itself a command
+/// (`card`, `phone`). `None` when `word` names no group of several
+/// words.
 #[must_use]
 pub fn group(word: &str) -> Option<String> {
     let members: Vec<VerbTag> = VerbTag::ALL
@@ -238,8 +240,8 @@ pub fn group(word: &str) -> Option<String> {
         return None;
     }
     let mut out = String::new();
-    if word == VerbTag::CardCheck.label() {
-        out.push_str(VerbTag::CardCheck.help());
+    if let Some(own) = VerbTag::ALL.iter().find(|tag| tag.label() == word) {
+        out.push_str(own.help());
         out.push('\n');
     }
     out.push_str(GROUP_COMMANDS);
@@ -356,6 +358,13 @@ mod tests {
         check_true(card.starts_with(VerbTag::CardCheck.help()), "card readout")?;
         check_true(card.contains("card pubkey"), "card pubkey")?;
         check_true(!card.contains("pin change"), "no pin commands")?;
+        let phone = group("phone").ok_or("phone group")?;
+        check_true(
+            phone.starts_with(VerbTag::PhoneCheck.help()),
+            "phone readout",
+        )?;
+        check_true(phone.contains("phone pair"), "phone pair")?;
+        check_true(!phone.contains("card"), "no card commands")?;
         let pin = group("pin").ok_or("pin group")?;
         for command in ["pin activate", "pin change", "pin unblock"] {
             check_true(pin.contains(command), command)?;
