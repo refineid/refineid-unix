@@ -85,7 +85,7 @@ impl Block {
             | VerbTag::CardPubkey
             | VerbTag::CardExportAll => Self::Card,
             VerbTag::PinActivate | VerbTag::PinChange | VerbTag::PinUnblock => Self::Pin,
-            VerbTag::DocumentSign => Self::Document,
+            VerbTag::DocumentSign | VerbTag::DocumentVerify => Self::Document,
             VerbTag::PhonePair
             | VerbTag::PhoneCheck
             | VerbTag::PhoneUnpair
@@ -117,6 +117,7 @@ impl Tier {
             | VerbTag::PinChange
             | VerbTag::PinUnblock
             | VerbTag::DocumentSign
+            | VerbTag::DocumentVerify
             | VerbTag::PhonePair
             | VerbTag::PhoneCheck
             | VerbTag::PhoneUnpair => Self::Basic,

@@ -412,6 +412,12 @@ pub mod known {
     /// inside what the signature covers.
     pub const SIGNATURE_TIME_STAMP_TOKEN: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.2.14");
 
+    /// `1.2.840.113549.1.9.16.2.48` -- id-aa-ets-archiveTimestampV3.
+    ///
+    /// `ETSI EN 319 122-1` clause 5.5.3: an unsigned attribute carrying
+    /// a timestamp over the signature and its validation material.
+    pub const ARCHIVE_TIME_STAMP_V3: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.2.48");
+
     /// `1.2.840.113549.1.9.16.2.47` -- id-aa-signingCertificateV2.
     ///
     /// RFC 5035 sec.3, and mandatory in `CAdES`: it binds the signature

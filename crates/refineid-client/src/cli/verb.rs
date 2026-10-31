@@ -60,6 +60,9 @@ pub enum VerbTag {
     /// `document sign` -- a signature in a format a
     /// counterparty can open: `PAdES`, `CAdES`, `ASiC-E` or `BDOC`.
     DocumentSign,
+    /// `document verify` -- the signatures of a signed document and
+    /// their verdict.
+    DocumentVerify,
     /// `card decrypt-auth` -- PIN1-gated RSA decrypt on the
     /// auth key.
     CardDecryptAuth,
@@ -107,6 +110,7 @@ impl VerbTag {
             Self::CardSignAuth => "card sign-auth",
             Self::CardSignQualified => "card sign-qualified",
             Self::DocumentSign => "document sign",
+            Self::DocumentVerify => "document verify",
             Self::CardDecryptAuth => "card decrypt-auth",
             Self::CardPubkey => "card pubkey",
             Self::CardExportAll => "card export-all",
@@ -139,6 +143,7 @@ impl VerbTag {
         Self::PinChange,
         Self::PinUnblock,
         Self::DocumentSign,
+        Self::DocumentVerify,
         Self::PhoneCheck,
         Self::PhonePair,
         Self::PhoneUnpair,
@@ -165,6 +170,7 @@ impl VerbTag {
             Self::CardPubkey => "print a public key as SSH or PEM",
             Self::CardExportAll => "write every public artefact to a directory",
             Self::DocumentSign => "sign files as PAdES, CAdES or ASiC-E",
+            Self::DocumentVerify => "verify a signed document's signatures",
             Self::PhonePair => "pair with a phone",
             Self::PhoneCheck => "show the paired phone",
             Self::PhoneUnpair => "forget the paired phone",
@@ -192,6 +198,7 @@ impl VerbTag {
             Self::CardPubkey => super::card_pubkey::HELP,
             Self::CardExportAll => super::card_export_all::HELP,
             Self::DocumentSign => super::document_sign::HELP,
+            Self::DocumentVerify => super::document_verify::HELP,
             Self::PhonePair => super::card_pair::PAIR_HELP,
             Self::PhoneCheck => super::card_pair::PAIRS_HELP,
             Self::PhoneUnpair => super::card_pair::UNPAIR_HELP,
@@ -260,6 +267,9 @@ impl VerbTag {
             Self::DocumentSign => {
                 Verb::DocumentSign(super::document_sign::DocumentSignArgs::parse(rest)?)
             }
+            Self::DocumentVerify => {
+                Verb::DocumentVerify(super::document_verify::DocumentVerifyArgs::parse(rest)?)
+            }
             Self::CardDecryptAuth => {
                 Verb::CardDecryptAuth(super::card_decrypt_auth::DecryptAuthArgs::parse(rest)?)
             }
@@ -310,6 +320,8 @@ pub enum Verb {
     /// `document sign` -- a signed document rather than
     /// signature bytes.
     DocumentSign(super::document_sign::DocumentSignArgs),
+    /// `document verify` -- the signatures of a signed document.
+    DocumentVerify(super::document_verify::DocumentVerifyArgs),
     /// `card decrypt-auth`.
     CardDecryptAuth(super::card_decrypt_auth::DecryptAuthArgs),
     /// `card pubkey`.
@@ -356,6 +368,7 @@ impl Verb {
                 SignSlot::Qualified => VerbTag::CardSignQualified,
             },
             Self::DocumentSign(_) => VerbTag::DocumentSign,
+            Self::DocumentVerify(_) => VerbTag::DocumentVerify,
             Self::CardDecryptAuth(_) => VerbTag::CardDecryptAuth,
             Self::CardPubkey(_) => VerbTag::CardPubkey,
             Self::CardExportAll(_) => VerbTag::CardExportAll,
@@ -385,6 +398,7 @@ impl Verb {
             Self::CardEmrtd(a) => a.run(),
             Self::CardSign(a) => a.run(verbose),
             Self::DocumentSign(a) => a.run(verbose),
+            Self::DocumentVerify(a) => a.run(verbose),
             Self::CardDecryptAuth(a) => a.run(verbose),
             Self::CardPubkey(a) => a.run(),
             Self::CardExportAll(a) => a.run(verbose),
@@ -752,6 +766,10 @@ mod tests {
             (
                 vec!["doc", "s", "/documents/report.pdf"],
                 VerbTag::DocumentSign,
+            ),
+            (
+                vec!["doc", "v", "/documents/report-signed.pdf"],
+                VerbTag::DocumentVerify,
             ),
             (vec!["ph", "pa"], VerbTag::PhonePair),
             (vec!["phone"], VerbTag::PhoneCheck),

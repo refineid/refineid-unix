@@ -103,6 +103,21 @@ impl DigestAlgorithm {
         }
     }
 
+    /// The algorithm an `AlgorithmIdentifier` names, when it is one
+    /// of the two this crate signs and verifies under. SHA-1 and MD5
+    /// are not among them: `ETSI EN 319 142-1` clause 6.2.1 forbids
+    /// MD5 and `EN 319 142-2` clause 4.2.2 phases out SHA-1.
+    #[must_use]
+    pub fn from_oid(oid: oid::Oid<'_>) -> Option<Self> {
+        if oid == oid::known::SHA256 {
+            Some(Self::Sha256)
+        } else if oid == oid::known::SHA384 {
+            Some(Self::Sha384)
+        } else {
+            None
+        }
+    }
+
     /// The OID for this digest algorithm.
     #[must_use]
     pub(crate) const fn oid(self) -> oid::Oid<'static> {

@@ -94,6 +94,7 @@ pub mod cert_show;
 #[cfg(test)]
 pub(crate) mod completion;
 pub mod document_sign;
+pub mod document_verify;
 pub mod help;
 pub mod pin_activate;
 pub mod pin_change;

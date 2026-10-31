@@ -110,6 +110,7 @@ it prints its step report on the standard output.
 A query, such as
 .Cm card ,
 .Cm phone ,
+.Cm document verify ,
 .Cm verify
 or
 .Cm cert show ,
@@ -296,6 +297,25 @@ Its middle lines are in the language of the locale, see
 and its band carries the other two.
 The seal names no one; the signature in the file is the evidence.
 .El
+.It Cm document verify Ar file ...
+Verify the signatures of a signed document: a PDF carrying PAdES
+signatures, an ASiC-E or BDOC container, or a CMS structure with the
+document attached.
+Prints the file's name and one line per signature: the signer as the
+certificate names them, the time a timestamp proves the signature
+existed, and the verdict.
+A signature is valid when the document is unchanged since it was
+signed, the signature verifies, the signer chains to a DVV root, and
+a signature timestamp or a document timestamp covering it verifies.
+A signer the document carries no revocation answer for is looked up
+over OCSP or CRL; when the network does not answer the verdict says
+so.
+With
+.Fl v
+each fact is printed on its own row, with the document timestamps.
+The verdict is computed from the document's own bytes, including the
+certificates and revocation answers a level-LT signature embeds.
+Exits 0 when every signature of every file is valid, 1 otherwise.
 .It Cm phone
 Show the paired phone.
 .It Cm phone pair
@@ -515,7 +535,9 @@ under a Snap,
 Success, or help or version shown on request.
 .It 1
 .Cm verify
-rejected the signature, or
+rejected the signature,
+.Cm document verify
+found a signature that is not valid or a revoked signer, or
 .Cm cert chain
 reached no self-signed root, or
 .Cm phone auth
@@ -539,6 +561,9 @@ Read the card in the only reader:
 .Pp
 Sign a PDF with the qualified-signature key:
 .Dl $ refineid document sign report.pdf
+.Pp
+Verify the signed PDF:
+.Dl $ refineid document verify report-signed-20260131T101500Z.pdf
 .Pp
 Show the options of one command:
 .Dl $ refineid pin change help
