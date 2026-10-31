@@ -85,10 +85,10 @@ browsers afterwards; they read all of this only at startup.
 
 The VM has no display of its own. Two X paths work from a Mac.
 
-**VNC.** TigerVNC runs CDE in its own X server. As the desktop user:
+**VNC.** TigerVNC runs CDE in its own X server. As root, `pkg_add
+tigervnc`; then as the desktop user:
 
 ```sh
-pkg_add tigervnc
 vncpasswd
 printf 'geometry=1920x1080\ndepth=24\nSecurityTypes=VncAuth\n' > ~/.vnc/config
 printf '#!/bin/sh\nunset SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS\nexec /usr/local/dt/bin/Xsession\n' > ~/.vnc/xstartup
@@ -101,18 +101,20 @@ macOS Screen Sharing connects to `vnc://<host>.local:5900` once the host
 announces itself (section 8).
 
 **XDMCP.** With `dtlogin` enabled and every `:0 Local` line removed from
-`/etc/dt/config/Xservers`, dtlogin serves XDMCP queries only. XQuartz on
-the Mac, with `nolisten_tcp` off, runs
+`/etc/dt/config/Xservers` (the pkg-readme copies the templates there),
+dtlogin serves XDMCP queries only. XQuartz on the Mac, with its
+`nolisten_tcp` and `rootless` preferences both off, runs
 
 ```sh
-/opt/X11/bin/X :1 -listen tcp -query <host>.local -from <mac-address>
+/opt/X11/bin/X :1 -listen tcp -query <host>.local -from <mac-ip-address>
 ```
 
 dtlogin resolves the querying host's name before it answers, so the Mac
 needs an entry in the OpenBSD `/etc/hosts` when the network has no
-reverse DNS, and `-from` names the address the X server reaches, which
-stops dtlogin answering to a link-local one. The CDE pkg-readme's inetd
-lines (`dtspc`, `cmsd`) and `portmap` complete the session.
+reverse DNS, and `-from` names the Mac's own address on that network,
+the one dtlogin connects back to, so it does not pick a link-local one.
+The CDE pkg-readme's inetd lines (`dtspc`, `cmsd`), with `inetd` and
+`portmap` enabled through rcctl, complete the session.
 
 ## 8. Host name on the network
 
@@ -150,7 +152,9 @@ CanonicalDomains local
 CanonicalizeFallbackLocal yes
 ```
 
-`ssh <host>` then resolves live, with no address written anywhere.
+`ssh <host>` then resolves live, with no address written anywhere. The
+price is one mDNS lookup before every unqualified name that is not on
+the local link.
 
 ## 9. Card readers
 
