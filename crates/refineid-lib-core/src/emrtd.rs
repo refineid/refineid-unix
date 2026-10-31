@@ -1411,7 +1411,8 @@ pub fn read_personal_data<T: CardTransport>(
         numbers: sod_der
             .as_deref()
             .and_then(|s| crate::cms::SignedData::parse(s).ok())
-            .and_then(|sd| crate::cms::LdsSecurityObject::parse(sd.econtent_der).ok())
+            .and_then(|sd| sd.econtent_der)
+            .and_then(|lds| crate::cms::LdsSecurityObject::parse(lds).ok())
             .map(|lds| lds.data_group_hashes.iter().map(|(n, _)| *n).collect())
             .unwrap_or_default(),
     };

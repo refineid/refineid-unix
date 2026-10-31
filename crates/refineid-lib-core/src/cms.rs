@@ -23,15 +23,19 @@
 //!   form, or ICAO 9303's `[APPLICATION 23] IMPLICIT` form
 //!   (the byte stream you get when you read EF.SOD off an
 //!   eMRTD).
-//! - [`SignedData`] holds the encapsulated content
+//! - [`SignedData`] holds the encapsulated content when attached
 //!   (`econtent_der` = the `LDSSecurityObject` bytes for an
-//!   eMRTD SOD), the embedded certificates, and the sole
-//!   signerInfo's signature material.
+//!   eMRTD SOD), the embedded certificates and revocation
+//!   information, and the sole signerInfo's signature material
+//!   with its signed and unsigned attributes.
 //! - [`SignedData::verify`] verifies the signerInfo's signature
 //!   against a supplied signer public key. Handles
 //!   both the "signedAttrs present" path (sign over DER(SET OF
 //!   attrs)) and the "signedAttrs absent" path (sign over
 //!   eContent directly).
+//! - [`SignedData::verify_signer_signature`] checks the signature
+//!   alone, for detached content whose digest the caller compares
+//!   with the `messageDigest` attribute itself.
 //!
 //! Not in scope: countersignatures and non-X.509 certificate
 //! choices. Multiple signerInfos are rejected because every
@@ -184,8 +188,9 @@ pub enum CmsError {
     /// `Hash(eContent)`. Signature wasn't verified after this
     /// check failed (one of two PA preconditions per RFC 5652).
     SignerHashMismatch,
-    /// `eContent` OCTET STRING was missing -- detached `SignedData`
-    /// isn't supported (eMRTD SOD always carries eContent).
+    /// `eContent` OCTET STRING was missing where the operation needs
+    /// it -- the content of a detached `SignedData` is not in the
+    /// structure (eMRTD SOD always carries eContent).
     DetachedNotSupported,
     /// RSA signature verification (against the signer's
     /// PKCS#1 v1.5 key) failed.
@@ -239,13 +244,18 @@ pub struct SignedData<'a> {
     /// the OID structure at the trust boundary, so consumers
     /// never compare against arbitrary `&[u8]`.
     pub econtent_type_oid: crate::oid::Oid<'a>,
-    /// Inner `eContent` OCTET STRING value bytes. For an eMRTD
-    /// SOD this is the DER encoding of `LDSSecurityObject`.
-    pub econtent_der: &'a [u8],
+    /// Inner `eContent` OCTET STRING value bytes, `None` for a
+    /// detached `SignedData` (RFC 5652 sec.5.2: `eContent` is
+    /// OPTIONAL). For an eMRTD SOD this is the DER encoding of
+    /// `LDSSecurityObject`.
+    pub econtent_der: Option<&'a [u8]>,
     /// Embedded certificates (typically just the Document
     /// Signing Certificate). Each entry is the raw DER of one
     /// cert SEQUENCE.
     pub certificates_der: Vec<&'a [u8]>,
+    /// The `crls` field's `RevocationInfoChoice` entries, in
+    /// encoded order (RFC 5652 sec.10.2.1). Empty when absent.
+    pub revocation_info: Vec<RevocationInfoChoice<'a>>,
     /// The sole signerInfo's fields.
     pub signer: SignerInfo<'a>,
 }
@@ -264,10 +274,27 @@ pub enum SignerIdentifier<'a> {
     SubjectKeyIdentifier(&'a [u8]),
 }
 
-/// A structurally validated CMS attribute retained for profile-specific
-/// consumers such as RFC 3161 ESS certificate binding.
+/// One `RevocationInfoChoice` of a `SignedData.crls` field
+/// (RFC 5652 sec.10.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignedAttribute<'a> {
+pub enum RevocationInfoChoice<'a> {
+    /// `crl CertificateList`: the complete CRL DER.
+    Crl(&'a [u8]),
+    /// `other [1] IMPLICIT OtherRevocationInfoFormat`.
+    Other {
+        /// `otherRevInfoFormat`, e.g. `id-ri-ocsp-response` (RFC 5940).
+        format: crate::oid::Oid<'a>,
+        /// `otherRevInfo`: the complete DER of the one value that
+        /// follows the format OID.
+        info_der: &'a [u8],
+    },
+}
+
+/// A structurally validated CMS attribute (RFC 5652 sec.5.3), signed
+/// or unsigned, retained for profile-specific consumers such as
+/// RFC 3161 ESS certificate binding and `CAdES` timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CmsAttribute<'a> {
     /// Attribute type OID.
     pub oid: crate::oid::Oid<'a>,
     /// Contents of the attribute's `SET OF AttributeValue`.
@@ -293,7 +320,10 @@ pub struct SignerInfo<'a> {
     pub signed_data_to_verify: Option<Vec<u8>>,
     /// Signed attributes, in their encoded order. Empty when the
     /// signerInfo has no signed attributes.
-    pub signed_attributes: Vec<SignedAttribute<'a>>,
+    pub signed_attributes: Vec<CmsAttribute<'a>>,
+    /// Unsigned attributes, in their encoded order. Empty when the
+    /// signerInfo has no `unsignedAttrs`.
+    pub unsigned_attributes: Vec<CmsAttribute<'a>>,
     /// `messageDigest` attribute value, when `signedAttrs` was
     /// present. Used to cross-check that the signer's commitment
     /// to the eContent hash matches what we'd compute ourselves.
@@ -453,7 +483,7 @@ struct SignerInfoBody<'a> {
 /// Parsed mandatory fields from a signed-attribute set.
 struct ParsedSignedAttributes<'a> {
     /// All attributes, retained for profile-specific validation.
-    attributes: Vec<SignedAttribute<'a>>,
+    attributes: Vec<CmsAttribute<'a>>,
     /// Unique `contentType` value.
     content_type: Option<crate::oid::Oid<'a>>,
     /// Unique `messageDigest` value.
@@ -560,21 +590,22 @@ impl CmsHelpers {
         let econtent_type_oid = crate::oid::Oid::new(econtent_type.value).or(Err(
             CmsError::UnexpectedStructure("eContentType OID malformed"),
         ))?;
-        let econtent_explicit = e_it
-            .next()
-            .ok_or(CmsError::DetachedNotSupported)??
-            .expect::<Asn1ContentExplicit0>()
-            .or(Err(CmsError::DetachedNotSupported))?;
+        let econtent_der = match e_it.next() {
+            None => None,
+            Some(explicit) => {
+                let explicit = explicit?.expect::<Asn1ContentExplicit0>().or(Err(
+                    CmsError::UnexpectedStructure("eContent tag not [0] EXPLICIT"),
+                ))?;
+                let octet =
+                    Self::parse_exact::<OctetString>(explicit.value, "trailing bytes in eContent")?;
+                Some(octet.value)
+            }
+        };
         if e_it.next().is_some() {
             return Err(CmsError::UnexpectedStructure(
                 "encapContentInfo has trailing fields",
             ));
         }
-        let econtent_octet = Self::parse_exact::<OctetString>(
-            econtent_explicit.value,
-            "trailing bytes in eContent",
-        )?;
-        let econtent_der = econtent_octet.value;
 
         let mut remaining = Vec::new();
         for tlv in it {
@@ -583,6 +614,7 @@ impl CmsHelpers {
 
         let mut field_index = 0_usize;
         let mut certificates_der = Vec::new();
+        let mut revocation_info = Vec::new();
         if remaining
             .get(field_index)
             .is_some_and(|field| field.tag == <Asn1ContentExplicit0 as BerTag>::TAG)
@@ -600,7 +632,7 @@ impl CmsHelpers {
             let crls = remaining
                 .get(field_index)
                 .ok_or(CmsError::UnexpectedStructure("crls missing"))?;
-            Self::validate_nonempty_tlv_stream(crls.value, "empty crls field")?;
+            revocation_info = Self::parse_revocation_info(crls.value)?;
             field_index = field_index.saturating_add(1);
         }
 
@@ -653,6 +685,7 @@ impl CmsHelpers {
             econtent_type_oid,
             econtent_der,
             certificates_der,
+            revocation_info,
             signer,
         })
     }
@@ -734,6 +767,61 @@ impl CmsHelpers {
         Ok(result)
     }
 
+    /// Collect the `RevocationInfoChoice` entries and reject any
+    /// alternative RFC 5652 sec.10.2.1 does not define.
+    fn parse_revocation_info(crls: &[u8]) -> Result<Vec<RevocationInfoChoice<'_>>, CmsError> {
+        let mut result = Vec::new();
+        let mut cursor = 0_usize;
+        while cursor < crls.len() {
+            let tail = crls
+                .get(cursor..)
+                .ok_or(CmsError::UnexpectedStructure("crls cursor invalid"))?;
+            let choice = BerTlvAny::parse(tail)?;
+            let end = cursor.saturating_add(choice.size);
+            let choice_der = crls
+                .get(cursor..end)
+                .ok_or(CmsError::UnexpectedStructure("crls entry truncated"))?;
+            if choice.tag == <Sequence as BerTag>::TAG {
+                result.push(RevocationInfoChoice::Crl(choice_der));
+            } else if choice.tag == <Asn1ContentImplicit1 as BerTag>::TAG {
+                let mut fields = BerTlvIter::new(choice.value);
+                let format = fields
+                    .next()
+                    .ok_or(CmsError::UnexpectedStructure("otherRevInfoFormat missing"))??
+                    .expect::<Oid>()
+                    .or(Err(CmsError::UnexpectedStructure(
+                        "otherRevInfoFormat not OID",
+                    )))?;
+                let format = crate::oid::Oid::new(format.value).or(Err(
+                    CmsError::UnexpectedStructure("otherRevInfoFormat OID malformed"),
+                ))?;
+                let info = fields
+                    .next()
+                    .ok_or(CmsError::UnexpectedStructure("otherRevInfo missing"))??;
+                if fields.next().is_some() {
+                    return Err(CmsError::UnexpectedStructure(
+                        "OtherRevocationInfoFormat has trailing fields",
+                    ));
+                }
+                let info_start = choice.value.len().saturating_sub(info.size);
+                let info_der = choice
+                    .value
+                    .get(info_start..)
+                    .ok_or(CmsError::UnexpectedStructure("otherRevInfo truncated"))?;
+                result.push(RevocationInfoChoice::Other { format, info_der });
+            } else {
+                return Err(CmsError::UnexpectedStructure(
+                    "unsupported CMS RevocationInfoChoice entry",
+                ));
+            }
+            cursor = end;
+        }
+        if result.is_empty() {
+            return Err(CmsError::UnexpectedStructure("empty crls field"));
+        }
+        Ok(result)
+    }
+
     /// Require a constructed IMPLICIT field to contain complete TLVs.
     fn validate_nonempty_tlv_stream(values: &[u8], empty: &'static str) -> Result<(), CmsError> {
         let mut count = 0_usize;
@@ -806,6 +894,7 @@ impl CmsHelpers {
             )))?;
         let signature = sig_octet.value;
 
+        let mut unsigned_attributes = Vec::new();
         if let Some(unsigned_attrs) = children.next() {
             let unsigned_attrs = unsigned_attrs?;
             if unsigned_attrs.tag != <Asn1ContentImplicit1 as BerTag>::TAG {
@@ -813,7 +902,7 @@ impl CmsHelpers {
                     "signerInfo trailing field is not unsignedAttrs",
                 ));
             }
-            let _discarded = Self::parse_attributes(unsigned_attrs.value, false)?;
+            unsigned_attributes = Self::parse_attributes(unsigned_attrs.value, false)?.attributes;
         }
         if children.next().is_some() {
             return Err(CmsError::UnexpectedStructure(
@@ -849,6 +938,7 @@ impl CmsHelpers {
             signature,
             signed_data_to_verify,
             signed_attributes,
+            unsigned_attributes,
             message_digest,
         })
     }
@@ -978,7 +1068,7 @@ impl CmsHelpers {
                 )?;
                 message_digest = Some(value.value);
             }
-            attributes.push(SignedAttribute {
+            attributes.push(CmsAttribute {
                 oid,
                 values_der: values.value,
             });
@@ -1009,13 +1099,14 @@ impl SignedData<'_> {
     /// `hash(eContent)`.
     ///
     /// # Errors
-    /// Cross-check failure, unsupported algorithm, or RSA
-    /// verifier rejection.
+    /// [`CmsError::DetachedNotSupported`] when the `SignedData` carries
+    /// no `eContent`; otherwise cross-check failure, unsupported
+    /// algorithm, or RSA verifier rejection.
     #[inline]
     pub fn verify<B: AsRef<[u8]>>(&self, signer_spki_der: B) -> Result<(), CmsError> {
-        let signer_spki_der = signer_spki_der.as_ref();
         let digest_alg = HashAlgorithm::from_oid(self.signer.digest_algorithm_oid.as_bytes())
             .ok_or(CmsError::UnsupportedDigestAlgorithm)?;
+        let econtent = self.econtent_der.ok_or(CmsError::DetachedNotSupported)?;
 
         // Signed attributes are only safe when they bind the eContent.
         // The parser enforces this invariant; keep the check here too so
@@ -1027,25 +1118,38 @@ impl SignedData<'_> {
                 .ok_or(CmsError::UnexpectedStructure(
                     "signedAttrs missing messageDigest",
                 ))?;
-            let expected = digest_alg.digest(self.econtent_der);
+            let expected = digest_alg.digest(econtent);
             if expected != md {
                 return Err(CmsError::SignerHashMismatch);
             }
         }
+        self.verify_signer_signature(signer_spki_der)
+    }
 
-        // The data we actually verify with the signature is
-        // either the re-tagged signedAttrs SET (when present),
-        // or eContent directly.
-        let payload: &[u8] = self
-            .signer
-            .signed_data_to_verify
-            .as_deref()
-            .unwrap_or(self.econtent_der);
-
+    /// Verify only the signerInfo's signature against
+    /// `signer_spki_der`: over the re-tagged `signedAttrs` SET when
+    /// present (RFC 5652 sec.5.4), else over `eContent`. The
+    /// `messageDigest` attribute is not compared with any content.
+    ///
+    /// # Errors
+    /// [`CmsError::DetachedNotSupported`] when there are no signed
+    /// attributes and no `eContent`; otherwise unsupported algorithm
+    /// or verifier rejection.
+    #[inline]
+    pub fn verify_signer_signature<B: AsRef<[u8]>>(
+        &self,
+        signer_spki_der: B,
+    ) -> Result<(), CmsError> {
+        let digest_alg = HashAlgorithm::from_oid(self.signer.digest_algorithm_oid.as_bytes())
+            .ok_or(CmsError::UnsupportedDigestAlgorithm)?;
+        let payload: &[u8] = match self.signer.signed_data_to_verify.as_deref() {
+            Some(attributes) => attributes,
+            None => self.econtent_der.ok_or(CmsError::DetachedNotSupported)?,
+        };
         verify_dispatch(&SignatureDispatch {
             sig_alg_oid: self.signer.signature_algorithm_oid,
             digest_alg_fallback: digest_alg,
-            signer_spki_der,
+            signer_spki_der: signer_spki_der.as_ref(),
             payload,
             signature: self.signer.signature,
         })
@@ -1469,8 +1573,9 @@ mod tests {
     ) -> SignedData<'a> {
         SignedData {
             econtent_type_oid: known::ICAO_LDS_SECURITY_OBJECT,
-            econtent_der: econtent,
+            econtent_der: Some(econtent),
             certificates_der: Vec::new(),
+            revocation_info: Vec::new(),
             signer: SignerInfo {
                 signer_identifier: SignerIdentifier::SubjectKeyIdentifier(b"synthetic"),
                 digest_algorithm_oid: Oid::new(digest_oid).expect("digest OID well-formed"),
@@ -1478,6 +1583,7 @@ mod tests {
                 signature,
                 signed_data_to_verify: None,
                 signed_attributes: Vec::new(),
+                unsigned_attributes: Vec::new(),
                 message_digest,
             },
         }
@@ -1608,7 +1714,10 @@ mod tests {
         let sd = SignedData::parse(&der).expect("parse RSA CMS");
         assert_eq!(sd.econtent_type_oid, known::ICAO_LDS_SECURITY_OBJECT);
         // eContent is the embedded LDSSecurityObject SEQUENCE.
-        assert_eq!(sd.econtent_der.first(), Some(&0x30));
+        assert_eq!(
+            sd.econtent_der.and_then(|content| content.first()),
+            Some(&0x30)
+        );
         // Exactly the signer certificate was embedded.
         assert_eq!(sd.certificates_der.len(), 1);
         let cert = sd.certificates_der.first().expect("one cert");
@@ -1628,7 +1737,12 @@ mod tests {
         assert!(sd.signer.signed_data_to_verify.is_some());
         // messageDigest attr == SHA-256(eContent).
         let md = sd.signer.message_digest.expect("messageDigest present");
-        assert_eq!(md, HashAlgorithm::Sha256.digest(sd.econtent_der).as_slice());
+        assert_eq!(
+            md,
+            HashAlgorithm::Sha256
+                .digest(sd.econtent_der.expect("attached"))
+                .as_slice()
+        );
     }
 
     #[test]
@@ -1724,16 +1838,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_detached_signeddata() {
+    fn detached_signeddata_parses_and_refuses_attached_verification() {
+        /// Universal SEQUENCE.
+        const SEQUENCE: u8 = 0x30;
+        /// Universal SET.
+        const SET: u8 = 0x31;
+        /// Universal INTEGER.
+        const INTEGER: u8 = 0x02;
+        /// Universal OBJECT IDENTIFIER.
+        const OBJECT_IDENTIFIER: u8 = 0x06;
+        /// `SignedData` version 1 (RFC 5652 sec.5.1).
+        const VERSION_1: u8 = 0x01;
         // SignedData whose encapContentInfo carries eContentType but
-        // no eContent OCTET STRING -- the detached form is unsupported.
-        let encap = tlv(0x30, tlv(0x06, known::ICAO_LDS_SECURITY_OBJECT.as_bytes()));
-        let mut body = tlv(0x02, [0x03_u8]); // version
-        body.extend_from_slice(&tlv(0x31, tlv(0x30, tlv(0x06, known::SHA256.as_bytes()))));
+        // no eContent OCTET STRING: the detached form.
+        let encap = tlv(SEQUENCE, tlv(OBJECT_IDENTIFIER, known::DATA.as_bytes()));
+        let mut body = tlv(INTEGER, [VERSION_1]);
+        body.extend_from_slice(&tlv(
+            SET,
+            tlv(SEQUENCE, tlv(OBJECT_IDENTIFIER, known::SHA256.as_bytes())),
+        ));
         body.extend_from_slice(&encap);
-        let sd_seq = tlv(0x30, &body);
+        body.extend_from_slice(&tlv(SET, minimal_signer_info()));
+        let sd_seq = tlv(SEQUENCE, &body);
+        let sd = SignedData::parse(&sd_seq).expect("detached SignedData parses");
+        assert!(sd.econtent_der.is_none());
         assert!(matches!(
-            SignedData::parse(&sd_seq),
+            sd.verify(b"no key needed"),
+            Err(CmsError::DetachedNotSupported)
+        ));
+        assert!(matches!(
+            sd.verify_signer_signature(b"no key needed"),
             Err(CmsError::DetachedNotSupported)
         ));
     }
@@ -1880,7 +2014,7 @@ mod tests {
         let der = unhex(RSA_CMS_HEX);
         let spki = unhex(RSA_SPKI_HEX);
         let mut sd = SignedData::parse(&der).expect("parse");
-        sd.econtent_der = b"tampered LDS content -- not what was signed";
+        sd.econtent_der = Some(b"tampered LDS content -- not what was signed");
         assert!(matches!(
             sd.verify(&spki),
             Err(CmsError::SignerHashMismatch)
@@ -1940,7 +2074,7 @@ mod tests {
     fn parses_lds_security_object_directly() {
         let der = unhex(RSA_CMS_HEX);
         let sd = SignedData::parse(&der).expect("parse");
-        let lds = LdsSecurityObject::parse(sd.econtent_der).expect("LDS parses");
+        let lds = LdsSecurityObject::parse(sd.econtent_der.expect("attached")).expect("LDS parses");
         assert_eq!(lds.hash_algorithm, HashAlgorithm::Sha256);
         assert_eq!(lds.data_group_hashes.len(), 2);
         let mut dgs = lds.data_group_hashes.iter();

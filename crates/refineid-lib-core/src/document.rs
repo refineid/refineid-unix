@@ -45,6 +45,7 @@ pub mod xml;
 
 use crate::crypto::digest::Sha256;
 use crate::identity::Peuin;
+use crate::sign::validation::ValidationMaterial;
 use crate::x509::{DateTime, OwnedCert};
 
 /// The bytes of one document file, as read from disk or received from
@@ -69,28 +70,37 @@ impl DocumentFile {
     }
 }
 
-/// The roots a verifier trusts, by SHA-256 fingerprint of the
-/// certificate DER.
+/// The root certificates a verifier trusts, as DER.
 ///
 /// A path that ends in one of these is anchored; a path that ends in
 /// any other self-signed certificate is not, however well it verifies.
+/// The roots also serve as path candidates, since a document need not
+/// carry the anchor it chains to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustAnchors<'a> {
-    /// Fingerprints of the trusted root certificates.
-    fingerprints: &'a [Sha256],
+    /// DER of the trusted root certificates.
+    certificates: &'a [&'a [u8]],
 }
 
 impl<'a> TrustAnchors<'a> {
     /// Trust exactly these roots.
     #[must_use]
-    pub const fn new(fingerprints: &'a [Sha256]) -> Self {
-        Self { fingerprints }
+    pub const fn new(certificates: &'a [&'a [u8]]) -> Self {
+        Self { certificates }
     }
 
     /// Whether a certificate with this fingerprint is a trusted root.
     #[must_use]
     pub fn contains(&self, fingerprint: Sha256) -> bool {
-        self.fingerprints.contains(&fingerprint)
+        self.certificates
+            .iter()
+            .any(|certificate| Sha256::of(certificate) == fingerprint)
+    }
+
+    /// DER of every trusted root.
+    #[must_use]
+    pub const fn certificates(&self) -> &'a [&'a [u8]] {
+        self.certificates
     }
 }
 
@@ -217,3 +227,405 @@ impl core::fmt::Display for DocumentFailure {
 }
 
 impl core::error::Error for DocumentFailure {}
+
+/// The header every PDF file starts with (ISO 32000-1 sec.7.5.2).
+const PDF_HEADER: &[u8] = b"%PDF-";
+
+/// The local file header signature that opens a ZIP archive, and so an
+/// `ASiC` container (`ETSI EN 319 162-1` clause A.1; PKWARE APPNOTE
+/// sec.4.3.7).
+const ZIP_HEADER: &[u8] = b"PK\x03\x04";
+
+/// The DER tag of the SEQUENCE a `CMS` `ContentInfo` starts with
+/// (RFC 5652 sec.3; X.690 sec.8.9).
+const DER_SEQUENCE_TAG: u8 = 0x30;
+
+/// The kind of file the first bytes announce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileKind {
+    /// A PDF, judged by [`pdf`].
+    Pdf,
+    /// A ZIP archive, judged as an `ASiC` container by [`asic`].
+    Zip,
+    /// A DER SEQUENCE, judged as a `CMS` structure with the document
+    /// attached by [`cades`].
+    Der,
+}
+
+impl FileKind {
+    /// What the file's first bytes announce, if anything this module
+    /// judges.
+    fn of(file: &DocumentFile) -> Option<Self> {
+        let bytes = file.as_bytes();
+        if bytes.starts_with(PDF_HEADER) {
+            Some(Self::Pdf)
+        } else if bytes.starts_with(ZIP_HEADER) {
+            Some(Self::Zip)
+        } else if bytes.first() == Some(&DER_SEQUENCE_TAG) {
+            Some(Self::Der)
+        } else {
+            None
+        }
+    }
+}
+
+/// Verify every signature of the document, as of `now`.
+///
+/// `now` stands in for the validation time of a signature that proves
+/// no earlier existence; a signature with a verified timestamp is
+/// judged at that time (`ETSI EN 319 102-1` clause 5.6.2).
+///
+/// # Errors
+/// [`DocumentFailure`] when there is nothing to judge: the file is not
+/// a signed document, does not parse, carries no signature, or carries
+/// only signatures of a profile this module does not implement. A
+/// negative verdict is not an error; it lands on the report.
+pub fn verify(
+    file: &DocumentFile,
+    anchors: TrustAnchors<'_>,
+    now: DateTime,
+) -> Result<DocumentReport, DocumentFailure> {
+    match FileKind::of(file).ok_or(DocumentFailure::NotASignedDocument)? {
+        FileKind::Pdf => verify_pdf(file, anchors, now),
+        FileKind::Zip => verify_asic(file, anchors, now),
+        FileKind::Der => verify_attached_cades(file, anchors, now),
+    }
+}
+
+/// Judge every signature dictionary of a PDF (`ETSI EN 319 142-1`
+/// clause 6.3; `EN 319 142-2` clause 4.2.3 and annex A.4).
+fn verify_pdf(
+    file: &DocumentFile,
+    anchors: TrustAnchors<'_>,
+    now: DateTime,
+) -> Result<DocumentReport, DocumentFailure> {
+    let document = pdf::PdfDocument::parse(file)?;
+    if document.signatures().is_empty() {
+        return Err(DocumentFailure::NoSignatures);
+    }
+    let document_timestamps: Vec<VerifiedDocumentTimestamp> = document
+        .signatures()
+        .iter()
+        .filter(|signature| signature.kind == pdf::SignatureKind::DocumentTimestamp)
+        .filter_map(|signature| {
+            let token = crate::sign::timestamp::verify_token(&signature.cms, |algorithm| {
+                signature.byte_range.digest(file, algorithm)
+            })
+            .ok()?;
+            Some(VerifiedDocumentTimestamp {
+                generated_at: token.generated_at,
+                covers_up_to: signature.byte_range.end(),
+            })
+        })
+        .collect();
+    let mut signatures = Vec::new();
+    let mut unsupported = None;
+    for found in document.signatures() {
+        let ess = match found.kind {
+            pdf::SignatureKind::Signature(pdf::SubFilter::EtsiCadesDetached) => {
+                cades::EssBinding::Required
+            }
+            pdf::SignatureKind::Signature(pdf::SubFilter::AdbePkcs7Detached) => {
+                cades::EssBinding::NotRequired
+            }
+            pdf::SignatureKind::Signature(pdf::SubFilter::EtsiRfc3161 | pdf::SubFilter::Other) => {
+                unsupported = Some("PDF signature subfilter");
+                continue;
+            }
+            pdf::SignatureKind::DocumentTimestamp => continue,
+        };
+        let signature = match cades::CadesSignature::parse(found.cms.clone()) {
+            Ok(signature) => signature,
+            Err(error) => {
+                unsupported = Some(unsupported_cades(error));
+                continue;
+            }
+        };
+        let spans = found
+            .byte_range
+            .spans()
+            .map(|span| file.as_bytes().get(span).unwrap_or_default());
+        let digest = cades::ContentDigest::of_spans(signature.digest_algorithm(), &spans);
+        let verdict = signature.verify(cades::Content::Detached { digest: &digest }, ess);
+        let mut pool = trust::MaterialPool::new();
+        pool.add_material(document.validation_store());
+        signatures.push(report(
+            SignatureFacts {
+                signer: signature.signer_certificate(),
+                embedded_certificates: signature.embedded_certificates(),
+                material: signature.embedded_material(),
+                document_intact: verdict.document_intact,
+                signature_valid: verdict.signature_valid,
+                timestamps_present: verdict.signature_timestamps.present,
+                timestamps_verified: verdict.signature_timestamps.verified,
+                covering_document_timestamps: document_timestamps
+                    .iter()
+                    .filter(|stamp| stamp.covers_up_to >= found.byte_range.end())
+                    .map(|stamp| stamp.generated_at)
+                    .collect(),
+                covers_whole_document: found.covers_whole_document,
+            },
+            pool,
+            anchors,
+            now,
+        ));
+    }
+    if signatures.is_empty() {
+        return Err(unsupported.map_or(DocumentFailure::NoSignatures, |what| {
+            DocumentFailure::UnsupportedProfile(what)
+        }));
+    }
+    Ok(DocumentReport {
+        signatures,
+        document_timestamps: document_timestamps
+            .iter()
+            .map(|stamp| stamp.generated_at)
+            .collect(),
+    })
+}
+
+/// One verified document timestamp and how far into the file its
+/// byte range reaches (`ETSI EN 319 142-1` clause 5.4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifiedDocumentTimestamp {
+    /// The token's `genTime`.
+    generated_at: DateTime,
+    /// One past the last byte the token covers; a signature whose
+    /// own range ends at or before it is proven to have existed.
+    covers_up_to: usize,
+}
+
+/// Judge every signature of an `ASiC-E` or `BDOC` container: `XAdES`
+/// signature files (`ETSI EN 319 162-1` clause A.4) and `CAdES`
+/// signature files with their manifests (clause A.5).
+fn verify_asic(
+    file: &DocumentFile,
+    anchors: TrustAnchors<'_>,
+    now: DateTime,
+) -> Result<DocumentReport, DocumentFailure> {
+    let container = asic::AsicContainer::parse(file).map_err(|error| match error {
+        asic::AsicReadError::NotAZip => DocumentFailure::NotASignedDocument,
+        asic::AsicReadError::Malformed(what) => DocumentFailure::Unreadable(what),
+        asic::AsicReadError::Unsupported(what) => DocumentFailure::UnsupportedProfile(what),
+    })?;
+    let mut signatures = Vec::new();
+    let mut unsupported = None;
+    for entry in container.xades_signature_files() {
+        let Ok(found) = xades::signatures(entry) else {
+            unsupported = Some("XAdES signature file");
+            continue;
+        };
+        for signature in found {
+            if let Some(what) = signature.unsupported() {
+                unsupported = Some(what);
+                continue;
+            }
+            let verdict = signature.verify(&container);
+            signatures.push(report(
+                SignatureFacts {
+                    signer: signature.signer_certificate(),
+                    embedded_certificates: signature.embedded_certificates(),
+                    material: signature.embedded_material(),
+                    document_intact: verdict.document_intact,
+                    signature_valid: verdict.signature_valid,
+                    timestamps_present: verdict.signature_timestamps.present,
+                    timestamps_verified: verdict
+                        .signature_timestamps
+                        .verified
+                        .iter()
+                        .map(|token| token.generated_at)
+                        .collect(),
+                    covering_document_timestamps: Vec::new(),
+                    covers_whole_document: true,
+                },
+                trust::MaterialPool::new(),
+                anchors,
+                now,
+            ));
+        }
+    }
+    for entry in container.cades_signatures() {
+        let signature = match cades::CadesSignature::parse(entry.signature.content.clone()) {
+            Ok(signature) => signature,
+            Err(error) => {
+                unsupported = Some(unsupported_cades(error));
+                continue;
+            }
+        };
+        let Some(manifest) = &entry.manifest else {
+            unsupported = Some("CAdES signature without a manifest");
+            continue;
+        };
+        let digest =
+            cades::ContentDigest::of_spans(signature.digest_algorithm(), &[&manifest.content]);
+        let verdict = signature.verify(
+            cades::Content::Detached { digest: &digest },
+            cades::EssBinding::Required,
+        );
+        signatures.push(report(
+            SignatureFacts {
+                signer: signature.signer_certificate(),
+                embedded_certificates: signature.embedded_certificates(),
+                material: signature.embedded_material(),
+                document_intact: verdict.document_intact && container.manifest_intact(entry),
+                signature_valid: verdict.signature_valid,
+                timestamps_present: verdict.signature_timestamps.present,
+                timestamps_verified: verdict.signature_timestamps.verified,
+                covering_document_timestamps: Vec::new(),
+                covers_whole_document: true,
+            },
+            trust::MaterialPool::new(),
+            anchors,
+            now,
+        ));
+    }
+    if signatures.is_empty() {
+        return Err(unsupported.map_or(DocumentFailure::NoSignatures, |what| {
+            DocumentFailure::UnsupportedProfile(what)
+        }));
+    }
+    Ok(DocumentReport {
+        signatures,
+        document_timestamps: Vec::new(),
+    })
+}
+
+/// Judge a bare `CMS` structure carrying the document as its
+/// `eContent` (`ETSI EN 319 122-1`).
+fn verify_attached_cades(
+    file: &DocumentFile,
+    anchors: TrustAnchors<'_>,
+    now: DateTime,
+) -> Result<DocumentReport, DocumentFailure> {
+    let signature = cades::CadesSignature::parse(file.as_bytes().to_vec())
+        .map_err(|error| DocumentFailure::UnsupportedProfile(unsupported_cades(error)))?;
+    let verdict = signature.verify(cades::Content::Attached, cades::EssBinding::Required);
+    let report = report(
+        SignatureFacts {
+            signer: signature.signer_certificate(),
+            embedded_certificates: signature.embedded_certificates(),
+            material: signature.embedded_material(),
+            document_intact: verdict.document_intact,
+            signature_valid: verdict.signature_valid,
+            timestamps_present: verdict.signature_timestamps.present,
+            timestamps_verified: verdict.signature_timestamps.verified,
+            covering_document_timestamps: Vec::new(),
+            covers_whole_document: true,
+        },
+        trust::MaterialPool::new(),
+        anchors,
+        now,
+    );
+    Ok(DocumentReport {
+        signatures: vec![report],
+        document_timestamps: Vec::new(),
+    })
+}
+
+/// What a `CMS` structure this module cannot parse is reported as.
+const fn unsupported_cades(error: cades::CadesReadError) -> &'static str {
+    match error {
+        cades::CadesReadError::NotSignedData => "not a CMS SignedData with one signer",
+        cades::CadesReadError::NoSignedAttributes => "CMS signature without signed attributes",
+        cades::CadesReadError::UnsupportedDigest => "digest algorithm",
+        cades::CadesReadError::UnsupportedSignatureAlgorithm => "signature algorithm",
+        cades::CadesReadError::SignerCertificateMissing => "signer certificate not embedded",
+        cades::CadesReadError::SignerCertificateAmbiguous => "ambiguous signer certificate",
+    }
+}
+
+/// The facts a format reader established about one signature, before
+/// the chain and revocation are judged.
+struct SignatureFacts<'a> {
+    /// The signer certificate.
+    signer: &'a OwnedCert,
+    /// Every certificate the signature embeds.
+    embedded_certificates: &'a [Vec<u8>],
+    /// The validation material the signature embeds.
+    material: ValidationMaterial,
+    /// Whether the signed content and every reference recomputed.
+    document_intact: bool,
+    /// Whether the signature verifies under the signer.
+    signature_valid: bool,
+    /// How many signature timestamps are present.
+    timestamps_present: usize,
+    /// The generation times of the signature timestamps that verified.
+    timestamps_verified: Vec<DateTime>,
+    /// The generation times of verified document timestamps covering
+    /// this signature.
+    covering_document_timestamps: Vec<DateTime>,
+    /// Whether the signature's range runs to the end of the file.
+    covers_whole_document: bool,
+}
+
+/// Turn one signature's facts into a report row: chain and revocation
+/// judged from the signature's own material, `pool` and the anchors,
+/// at the earliest proof of existence.
+fn report(
+    facts: SignatureFacts<'_>,
+    mut pool: trust::MaterialPool,
+    anchors: TrustAnchors<'_>,
+    now: DateTime,
+) -> SignatureReport {
+    let proof_of_existence = facts
+        .timestamps_verified
+        .iter()
+        .chain(facts.covering_document_timestamps.iter())
+        .copied()
+        .min();
+    let timestamps_valid =
+        proof_of_existence.is_some() && facts.timestamps_verified.len() == facts.timestamps_present;
+    pool.add_material(&facts.material);
+    pool.add_certificates(facts.embedded_certificates);
+    pool.add_certificates(
+        &anchors
+            .certificates()
+            .iter()
+            .map(|der| der.to_vec())
+            .collect::<Vec<_>>(),
+    );
+    let chain = trust::judge(
+        facts.signer,
+        &pool,
+        anchors,
+        proof_of_existence.unwrap_or(now),
+    );
+    SignatureReport {
+        signer: SignerIdentity::of(facts.signer),
+        signer_certificate: facts.signer.clone(),
+        issuer_certificate: chain.issuer,
+        document_intact: facts.document_intact,
+        signature_valid: facts.signature_valid,
+        chain_verified: chain.anchored,
+        proof_of_existence,
+        timestamps_valid,
+        covers_whole_document: facts.covers_whole_document,
+        revocation: chain.revocation,
+    }
+}
+
+impl SignerIdentity {
+    /// The holder a certificate names: given names and surname when
+    /// present, else the common name; and the electronic identifier.
+    #[must_use]
+    pub fn of(certificate: &OwnedCert) -> Self {
+        let subject = certificate.view().subject;
+        let given = subject.given_names();
+        let mut parts: Vec<String> = Vec::new();
+        parts.extend(given.first.map(|name| name.as_str().to_owned()));
+        parts.extend(given.second.map(|name| name.as_str().to_owned()));
+        parts.extend(given.additional.iter().map(|name| name.as_str().to_owned()));
+        parts.extend(subject.surname().map(|name| name.as_str().to_owned()));
+        let name = if parts.is_empty() {
+            subject
+                .common_name()
+                .map_or_else(String::new, |name| name.as_str().to_owned())
+        } else {
+            parts.join(" ")
+        };
+        Self {
+            name,
+            identifier: subject.peuin(),
+        }
+    }
+}
