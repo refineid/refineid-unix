@@ -81,7 +81,82 @@ database, which the browser-token script fills at each desktop login; in
 CDE, `/etc/dt/config/Xsession.d/0100.refineid` runs it. Restart the
 browsers afterwards; they read all of this only at startup.
 
-## 7. Card readers
+## 7. Remote desktop
+
+The VM has no display of its own. Two X paths work from a Mac.
+
+**VNC.** TigerVNC runs CDE in its own X server. As root, `pkg_add
+tigervnc`; then as the desktop user:
+
+```sh
+vncpasswd
+printf 'geometry=1920x1080\ndepth=24\nSecurityTypes=VncAuth\n' > ~/.vnc/config
+printf '#!/bin/sh\nunset SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS\nexec /usr/local/dt/bin/Xsession\n' > ~/.vnc/xstartup
+chmod 755 ~/.vnc/xstartup
+vncserver :0
+```
+
+A crontab line `@reboot /usr/local/bin/vncserver :0` starts it at boot.
+macOS Screen Sharing connects to `vnc://<host>.local:5900` once the host
+announces itself (section 8).
+
+**XDMCP.** With `dtlogin` enabled and every `:0 Local` line removed from
+`/etc/dt/config/Xservers` (the pkg-readme copies the templates there),
+dtlogin serves XDMCP queries only. XQuartz on the Mac, with its
+`nolisten_tcp` and `rootless` preferences both off, runs
+
+```sh
+/opt/X11/bin/X :1 -listen tcp -query <host>.local -from <mac-ip-address>
+```
+
+dtlogin resolves the querying host's name before it answers, so the Mac
+needs an entry in the OpenBSD `/etc/hosts` when the network has no
+reverse DNS, and `-from` names the Mac's own address on that network,
+the one dtlogin connects back to, so it does not pick a link-local one.
+The CDE pkg-readme's inetd lines (`dtspc`, `cmsd`), with `inetd` and
+`portmap` enabled through rcctl, complete the session.
+
+## 8. Host name on the network
+
+OpenBSD ships no multicast DNS responder, so `<host>.local` answers
+nothing until one is installed. The openmdns package does that with the
+first label of `/etc/myname`; it needs the multicast route from section 5.
+As root:
+
+```sh
+pkg_add openmdns
+rcctl enable mdnsd
+rcctl set mdnsd flags vio0
+rcctl start mdnsd
+```
+
+`rcctl set` refuses flags for a service that is not yet enabled, and the
+default flags name `em0`, so the order matters. A service is announced
+with `mdnsctl publish`, which must stay running for the announcement to
+last and takes a TXT argument even when empty. This line in
+`/etc/rc.local` announces the VNC desktop, so the host appears under
+Network in the Finder with a Share Screen button:
+
+```sh
+/usr/local/bin/mdnsctl publish "$(hostname -s)" rfb tcp 5900 "" >/dev/null 2>&1 &
+```
+
+macOS resolves a `.local` name through mDNS only when the name is typed
+with the suffix. A `local` search domain does not help: the Mac appends it
+and then sends the result over unicast DNS, where nothing answers. For
+ssh, let ssh add the suffix itself in `~/.ssh/config`:
+
+```
+CanonicalizeHostname yes
+CanonicalDomains local
+CanonicalizeFallbackLocal yes
+```
+
+`ssh <host>` then resolves live, with no address written anywhere. The
+price is one mDNS lookup before every unqualified name that is not on
+the local link.
+
+## 9. Card readers
 
 A reader connected to a running system was found after restarting
 `pcscd`; whether a running `pcscd` notices it unaided is not verified.
