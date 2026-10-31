@@ -41,8 +41,14 @@ const SYNOPSIS_USAGE: &str = "usage: refineid [-vV] <command> [args]";
 const SYNOPSIS_VERBOSE: &str = "-v, --verbose  show each step; operations are silent otherwise";
 /// The synopsis line on the version option.
 const SYNOPSIS_VERSION: &str = "-V, --version  print the version";
+/// The synopsis line that points at the advanced commands.
+const SYNOPSIS_EXPERT: &str = "refineid expert lists the advanced commands";
 /// The synopsis's last line.
 const SYNOPSIS_POINTER: &str = "refineid <command> help shows its options; see refineid(1).";
+/// The word that, alone, asks for the advanced commands.
+const EXPERT_WORD: &str = "expert";
+/// The heading of the advanced commands' listing.
+const EXPERT_COMMANDS: &str = "advanced commands:";
 /// The heading of a group's command list.
 const GROUP_COMMANDS: &str = "commands:";
 /// The indent of a command line.
@@ -89,10 +95,55 @@ impl Block {
     }
 }
 
+/// The listing a subcommand appears in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// What a card holder does: check the card, manage the PINs, sign
+    /// a document, pair a phone. Bare `refineid` lists these.
+    Basic,
+    /// The card's raw keys and data, the test login through the phone,
+    /// offline certificate tools and the reader. `refineid expert`
+    /// lists these.
+    Expert,
+}
+
+impl Tier {
+    /// The listing a subcommand belongs to.
+    const fn of(tag: VerbTag) -> Self {
+        match tag {
+            VerbTag::CardCheck
+            | VerbTag::PinActivate
+            | VerbTag::PinChange
+            | VerbTag::PinUnblock
+            | VerbTag::DocumentSign
+            | VerbTag::CardPair
+            | VerbTag::CardPairs
+            | VerbTag::CardUnpair => Self::Basic,
+            VerbTag::CardEmrtd
+            | VerbTag::CardSignAuth
+            | VerbTag::CardSignQualified
+            | VerbTag::CardDecryptAuth
+            | VerbTag::CardPubkey
+            | VerbTag::CardExportAll
+            | VerbTag::CardAuth
+            | VerbTag::Verify
+            | VerbTag::CertShow
+            | VerbTag::CertChain
+            | VerbTag::ReaderKeyboard => Self::Expert,
+        }
+    }
+}
+
 /// `true` for a word that asks for help.
 #[must_use]
 pub fn is_help_word(token: &str) -> bool {
     HELP_WORDS.contains(&token)
+}
+
+/// `true` for the word that, alone, asks for the advanced commands.
+#[must_use]
+pub fn is_expert_word(token: &str) -> bool {
+    token == EXPERT_WORD
 }
 
 /// `true` for an option that asks for the version.
@@ -123,27 +174,48 @@ pub fn version() -> String {
     format!("{PROGRAM} {}", refineid_lib_core::VERSION)
 }
 
-/// The short synopsis: the usage line, one line per command, and the
-/// pointer to the per-command help and the man page.
+/// The short synopsis: the usage line, one line per everyday command,
+/// and the pointers to the advanced commands, the per-command help and
+/// the man page.
 #[must_use]
 pub fn synopsis() -> String {
     let mut out = format!("{SYNOPSIS_USAGE}\n");
-    let mut block = None;
-    for &tag in VerbTag::ALL {
-        if block != Some(Block::of(tag)) {
-            out.push('\n');
-            block = Some(Block::of(tag));
-        }
-        push_command_line(&mut out, tag);
-    }
+    push_listing(&mut out, Tier::Basic);
     out.push('\n');
     out.push_str(SYNOPSIS_VERBOSE);
     out.push('\n');
     out.push_str(SYNOPSIS_VERSION);
     out.push('\n');
+    out.push_str(SYNOPSIS_EXPERT);
+    out.push('\n');
     out.push_str(SYNOPSIS_POINTER);
     out.push('\n');
     out
+}
+
+/// What `refineid expert` prints: one line per advanced command and
+/// the pointer to the per-command help and the man page.
+#[must_use]
+pub fn expert() -> String {
+    let mut out = format!("{EXPERT_COMMANDS}\n");
+    push_listing(&mut out, Tier::Expert);
+    out.push('\n');
+    out.push_str(SYNOPSIS_POINTER);
+    out.push('\n');
+    out
+}
+
+/// Append one tier's commands in [`VerbTag::ALL`] order, a blank line
+/// before each block.
+fn push_listing(out: &mut String, tier: Tier) {
+    let mut block = None;
+    for &tag in VerbTag::ALL.iter().filter(|&&tag| Tier::of(tag) == tier) {
+        if block != Some(Block::of(tag)) {
+            out.push('\n');
+            block = Some(Block::of(tag));
+        }
+        push_command_line(out, tag);
+    }
 }
 
 /// The help of a group named by its first word, as `refineid card
@@ -210,22 +282,41 @@ mod tests {
     /// The most lines the synopsis may take: one terminal screen.
     const SCREEN_LINES: usize = 40;
 
+    /// `true` when `text` has a line for the command: its label, then
+    /// the gap before the summary.
+    fn lists(text: &str, tag: VerbTag) -> bool {
+        let gap = " ".repeat(SUMMARY_GAP);
+        text.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix(tag.label())
+                .is_some_and(|after| after.starts_with(&gap))
+        })
+    }
+
     #[test]
-    fn synopsis_fits_one_screen_and_names_every_command() -> TestResult {
-        let text = synopsis();
-        check_true(text.lines().count() <= SCREEN_LINES, "synopsis fits")?;
-        check_true(!text.contains(refineid_lib_core::VERSION), "no version")?;
-        for tag in VerbTag::ALL {
-            check_true(
-                text.lines().any(|line| {
-                    line.trim_start()
-                        .strip_prefix(tag.label())
-                        .is_some_and(|after| after.starts_with(' '))
-                }),
-                tag.label(),
+    fn synopsis_lists_the_everyday_commands_and_expert_the_rest() -> TestResult {
+        let basic = synopsis();
+        let expert = expert();
+        check_true(basic.lines().count() <= SCREEN_LINES, "synopsis fits")?;
+        check_true(expert.lines().count() <= SCREEN_LINES, "expert fits")?;
+        check_true(!basic.contains(refineid_lib_core::VERSION), "no version")?;
+        check_true(basic.contains(SYNOPSIS_EXPERT), "points at expert")?;
+        check_true(expert.contains(SYNOPSIS_POINTER), "expert points at help")?;
+        for &tag in VerbTag::ALL {
+            let in_basic = Tier::of(tag) == Tier::Basic;
+            check(
+                &lists(&basic, tag),
+                &in_basic,
+                &format!("{} in the synopsis", tag.label()),
+            )?;
+            check(
+                &lists(&expert, tag),
+                &!in_basic,
+                &format!("{} in expert", tag.label()),
             )?;
         }
-        Ok(())
+        check_true(is_expert_word("expert"), "expert word")?;
+        check_true(!is_expert_word("help"), "help is not the expert word")
     }
 
     #[test]
@@ -282,11 +373,19 @@ mod tests {
         )
     }
 
-    /// The command headings of the man page's COMMANDS section: each
-    /// `.It Cm ...` line and each line that opens an `.It Xo` item.
-    fn man_command_headings() -> Vec<Vec<&'static str>> {
+    /// The man page section that lists a tier's commands.
+    const fn man_section(tier: Tier) -> &'static str {
+        match tier {
+            Tier::Basic => ".Sh COMMANDS\n",
+            Tier::Expert => ".Sh ADVANCED COMMANDS\n",
+        }
+    }
+
+    /// The command headings of one man page section: each `.It Cm ...`
+    /// line and each line that opens an `.It Xo` item.
+    fn man_command_headings(tier: Tier) -> Vec<Vec<&'static str>> {
         let commands = MAN_PAGE
-            .split_once(".Sh COMMANDS")
+            .split_once(man_section(tier))
             .and_then(|(_, after)| after.split_once("\n.Sh "))
             .map_or("", |(section, _)| section);
         let mut headings = Vec::new();
@@ -300,6 +399,35 @@ mod tests {
         headings
     }
 
+    /// The command words of a heading: the tokens after `Cm` up to the
+    /// first macro, with `|` between alternative second words.
+    fn heading_command_words<'a>(heading: &[&'a str]) -> Vec<&'a str> {
+        heading
+            .iter()
+            .skip_while(|token| token.trim_start_matches('.') != "Cm")
+            .skip(1)
+            .take_while(|token| {
+                token
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c == '|')
+            })
+            .copied()
+            .collect()
+    }
+
+    /// `true` when the heading names exactly the command `words`: the
+    /// same first word, and the same second word or one of the
+    /// heading's alternatives.
+    fn heading_names(heading: &[&str], words: &[&str]) -> bool {
+        let command = heading_command_words(heading);
+        match (words, command.as_slice()) {
+            ([group], [only]) => group == only,
+            ([group, name], [first, rest @ ..]) => group == first && rest.contains(name),
+            _ => false,
+        }
+    }
+
     /// The options a subcommand's help text shows.
     fn help_options(tag: VerbTag) -> Vec<&'static str> {
         tag.help()
@@ -309,15 +437,28 @@ mod tests {
     }
 
     #[test]
-    fn man_page_names_every_command_and_option() -> TestResult {
-        let headings = man_command_headings();
+    fn man_page_names_every_command_and_option_in_its_section() -> TestResult {
+        let basic = man_command_headings(Tier::Basic);
+        let expert = man_command_headings(Tier::Expert);
+        check_true(!basic.is_empty() && !expert.is_empty(), "both sections")?;
         for &tag in VerbTag::ALL {
             let words: Vec<&str> = tag.label().split(' ').collect();
-            check_true(
+            let heads = |headings: &[Vec<&str>]| {
                 headings
                     .iter()
-                    .any(|heading| words.iter().all(|word| heading.contains(word))),
-                &format!("refineid.1 has a heading for {}", tag.label()),
+                    .any(|heading| heading_names(heading, &words))
+            };
+            let (own, other) = match Tier::of(tag) {
+                Tier::Basic => (&basic, &expert),
+                Tier::Expert => (&expert, &basic),
+            };
+            check_true(
+                heads(own),
+                &format!("refineid.1 lists {} in its section", tag.label()),
+            )?;
+            check_true(
+                !heads(other),
+                &format!("refineid.1 lists {} once", tag.label()),
             )?;
             for option in help_options(tag) {
                 // mdoc writes an option as `Fl` and its name without
