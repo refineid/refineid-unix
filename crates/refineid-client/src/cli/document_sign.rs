@@ -53,7 +53,7 @@ key by default. Prints nothing on success; -v shows each step.
                 Default: pades for one PDF, asice otherwise. The
                 one-file formats refuse a set of files.
   --out P       the finished document. Default: beside the first
-                FILE, '<stem> - signed <UTC time>.<ext>', with stem
+                FILE, '<stem>-signed-<UTC time>.<ext>', with stem
                 'portfolio' for several files.
   --slot S      qualified (default) or auth
   --reason T    PAdES /Reason
