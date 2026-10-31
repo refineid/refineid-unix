@@ -464,13 +464,13 @@ mod tests {
     use crate::ber::tlv;
     use crate::crypto::digest::Sha256;
     use crate::document::trust::testkit::{
-        CONTEXT_0, CertificateSpec, Curve, INTEGER, OBJECT_IDENTIFIER, OCTET_STRING, OcspSpec,
-        SEQUENCE, SET, TestKey, ca_extensions, certificate, crl, day, generalized_time,
-        ocsp_response, timestamping_extensions,
+        CertificateSpec, CmsParts, Curve, OBJECT_IDENTIFIER, OCTET_STRING, OcspSpec, SEQUENCE,
+        TestKey, attribute, attribute_set, ca_extensions, certificate, cms, crl, day,
+        ocsp_response, timestamp_token, timestamping_extensions,
     };
     use crate::document::trust::{MaterialPool, judge};
     use crate::document::{Revocation, TrustAnchors};
-    use crate::oid::{Oid, known};
+    use crate::oid::known;
     use crate::sign::cades::{
         DigestAlgorithm, Encapsulation, SignerParameters, SigningTime, signed_attributes,
         signed_data,
@@ -511,20 +511,6 @@ mod tests {
     const DOCUMENT: &[u8] = b"Synthetic declaration, signed for the verifier tests";
     /// Another document.
     const OTHER_DOCUMENT: &[u8] = b"A different declaration";
-    /// `TSTInfo` version 1 (RFC 3161 sec.2.4.2).
-    const TST_INFO_VERSION: u8 = 0x01;
-    /// `TSTInfo.serialNumber` of every fixture token.
-    const TOKEN_SERIAL: u8 = 0x01;
-    /// `SignerInfo` version 1: issuer and serial (RFC 5652 sec.5.3).
-    const SIGNER_INFO_VERSION: u8 = 0x01;
-    /// `SignedData` version 3: `eContentType` other than `id-data`
-    /// (RFC 5652 sec.5.1).
-    const SIGNED_DATA_VERSION: u8 = 0x03;
-    /// A TSA policy under the documentation enterprise number 32473
-    /// (RFC 5612).
-    const TEST_POLICY: Oid<'static> =
-        Oid::const_new(const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.32473.1").as_bytes());
-
     /// Keys and certificates of one test world.
     struct World {
         /// Root key.
@@ -614,44 +600,7 @@ mod tests {
 
         /// An RFC 3161 token over `imprint` (SHA-256) from the TSA.
         fn timestamp_token(&self, imprint: &[u8]) -> Vec<u8> {
-            let mut message_imprint = DigestAlgorithm::Sha256.algorithm_identifier();
-            message_imprint.extend_from_slice(&tlv(OCTET_STRING, imprint));
-            let mut tst_info = tlv(INTEGER, [TST_INFO_VERSION]);
-            tst_info.extend_from_slice(&tlv(OBJECT_IDENTIFIER, TEST_POLICY.as_bytes()));
-            tst_info.extend_from_slice(&tlv(SEQUENCE, message_imprint));
-            tst_info.extend_from_slice(&tlv(INTEGER, [TOKEN_SERIAL]));
-            tst_info.extend_from_slice(&generalized_time(day(SIGNED)));
-            let tst_info = tlv(SEQUENCE, tst_info);
-            let ess = tlv(
-                SEQUENCE,
-                tlv(
-                    SEQUENCE,
-                    tlv(
-                        SEQUENCE,
-                        tlv(OCTET_STRING, Sha256::of(&self.tsa).as_bytes()),
-                    ),
-                ),
-            );
-            let attributes = attribute_set(&[
-                attribute(
-                    known::CONTENT_TYPE,
-                    &tlv(OBJECT_IDENTIFIER, known::TST_INFO.as_bytes()),
-                ),
-                attribute(
-                    known::MESSAGE_DIGEST,
-                    &tlv(OCTET_STRING, Sha256::of(&tst_info).as_bytes()),
-                ),
-                attribute(known::SIGNING_CERTIFICATE_V2, &ess),
-            ]);
-            cms(&CmsParts {
-                econtent_type: known::TST_INFO,
-                econtent: Some(&tst_info),
-                digest_algorithm: DigestAlgorithm::Sha256.algorithm_identifier(),
-                signed_attributes: attributes,
-                key: &self.tsa_key,
-                signer: &self.tsa,
-                certificates: vec![self.tsa.clone()],
-            })
+            timestamp_token(&self.tsa, &self.tsa_key, imprint, day(SIGNED))
         }
     }
 
@@ -698,70 +647,6 @@ mod tests {
                 timestamp: None,
             }
         }
-    }
-
-    /// One `Attribute`.
-    fn attribute(oid: Oid<'_>, value: &[u8]) -> Vec<u8> {
-        let mut body = tlv(OBJECT_IDENTIFIER, oid.as_bytes());
-        body.extend_from_slice(&tlv(SET, value));
-        tlv(SEQUENCE, body)
-    }
-
-    /// The DER `SET OF Attribute` that is signed.
-    fn attribute_set(attributes: &[Vec<u8>]) -> Vec<u8> {
-        let mut sorted = attributes.to_vec();
-        sorted.sort_unstable();
-        tlv(SET, sorted.concat())
-    }
-
-    /// The parts of a hand-assembled `SignedData`.
-    struct CmsParts<'a> {
-        /// `eContentType`.
-        econtent_type: Oid<'a>,
-        /// `eContent`, when attached.
-        econtent: Option<&'a [u8]>,
-        /// `digestAlgorithm` `AlgorithmIdentifier`.
-        digest_algorithm: Vec<u8>,
-        /// Signed attributes in their signed `SET` form.
-        signed_attributes: Vec<u8>,
-        /// The signing key.
-        key: &'a TestKey,
-        /// The signer certificate.
-        signer: &'a [u8],
-        /// `SignedData.certificates`.
-        certificates: Vec<Vec<u8>>,
-    }
-
-    /// A `ContentInfo`-wrapped `SignedData` with one `SignerInfo`.
-    fn cms(parts: &CmsParts<'_>) -> Vec<u8> {
-        let signer = Certificate::from_der(parts.signer).expect("signer parses");
-        let mut sid = signer.issuer.as_der().to_vec();
-        sid.extend_from_slice(&tlv(INTEGER, signer.serial_der));
-        let mut tagged = parts.signed_attributes.clone();
-        if let Some(first) = tagged.first_mut() {
-            *first = CONTEXT_0;
-        }
-        let mut signer_info = tlv(INTEGER, [SIGNER_INFO_VERSION]);
-        signer_info.extend_from_slice(&tlv(SEQUENCE, sid));
-        signer_info.extend_from_slice(&parts.digest_algorithm);
-        signer_info.extend_from_slice(&tagged);
-        signer_info.extend_from_slice(&parts.key.algorithm_identifier());
-        signer_info.extend_from_slice(&tlv(OCTET_STRING, parts.key.sign(&parts.signed_attributes)));
-
-        let mut encapsulated = tlv(OBJECT_IDENTIFIER, parts.econtent_type.as_bytes());
-        if let Some(econtent) = parts.econtent {
-            encapsulated.extend_from_slice(&tlv(CONTEXT_0, tlv(OCTET_STRING, econtent)));
-        }
-        let mut body = tlv(INTEGER, [SIGNED_DATA_VERSION]);
-        body.extend_from_slice(&tlv(SET, parts.digest_algorithm.clone()));
-        body.extend_from_slice(&tlv(SEQUENCE, encapsulated));
-        if !parts.certificates.is_empty() {
-            body.extend_from_slice(&tlv(CONTEXT_0, parts.certificates.concat()));
-        }
-        body.extend_from_slice(&tlv(SET, tlv(SEQUENCE, signer_info)));
-        let mut content_info = tlv(OBJECT_IDENTIFIER, known::SIGNED_DATA.as_bytes());
-        content_info.extend_from_slice(&tlv(CONTEXT_0, tlv(SEQUENCE, body)));
-        tlv(SEQUENCE, content_info)
     }
 
     /// A `CAdES` structure over `DOCUMENT` signed by the world's signer,

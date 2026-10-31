@@ -393,10 +393,11 @@ fn may_issue(certificate: Certificate<'_>, intermediates_below: usize) -> bool {
 #[cfg(test)]
 pub(crate) mod testkit {
     use crate::ber::tlv;
+    use crate::crypto::digest::Sha256;
     use crate::ocsp::{IssuerKeyHash, IssuerNameHash};
     use crate::oid::{Oid, known};
     use crate::sign::cades::{DigestAlgorithm, SignatureAlgorithm};
-    use crate::x509::{DateTime, OwnedCert};
+    use crate::x509::{Certificate, DateTime, OwnedCert};
     use ring::rand::SystemRandom;
     use ring::signature::{
         ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _,
@@ -418,6 +419,8 @@ pub(crate) mod testkit {
     pub(crate) const ENUMERATED: u8 = 0x0A;
     /// Universal `UTF8String`.
     pub(crate) const UTF8_STRING: u8 = 0x0C;
+    /// Universal `PrintableString`.
+    pub(crate) const PRINTABLE_STRING: u8 = 0x13;
     /// Universal `UTCTime`.
     pub(crate) const UTC_TIME: u8 = 0x17;
     /// Universal `GeneralizedTime`.
@@ -449,6 +452,10 @@ pub(crate) mod testkit {
     const KEY_USAGE_CA: u8 = 0x06;
     /// Unused bits after `cRLSign`, the last named bit set.
     const KEY_USAGE_CA_UNUSED: u8 = 0x01;
+    /// Octets of one P-256 coordinate (SEC 1 sec.2.3.5).
+    const P256_COORDINATE_OCTETS: usize = 32;
+    /// Octets of one P-384 coordinate.
+    const P384_COORDINATE_OCTETS: usize = 48;
     /// Divisor for the two-digit `UTCTime` year.
     const CENTURY: u16 = 100;
 
@@ -517,6 +524,17 @@ pub(crate) mod testkit {
                 .to_vec()
         }
 
+        /// The signature over `message` as a card returns it: the raw
+        /// `r || s` pair (FINEID S1 v4.2 sec.3.8.3).
+        pub(crate) fn sign_raw(&self, message: &[u8]) -> Vec<u8> {
+            let coordinate_octets = match self.curve {
+                Curve::P256 => P256_COORDINATE_OCTETS,
+                Curve::P384 => P384_COORDINATE_OCTETS,
+            };
+            crate::sign::xades::ecdsa_signature_to_xml(&self.sign(message), coordinate_octets)
+                .expect("DER signature splits into coordinates")
+        }
+
         /// The `AlgorithmIdentifier` of this key's signatures.
         pub(crate) fn algorithm_identifier(&self) -> Vec<u8> {
             tlv(
@@ -559,9 +577,49 @@ pub(crate) mod testkit {
 
     /// A `Name` holding one common name.
     pub(crate) fn name(common_name: &str) -> Vec<u8> {
-        let mut attribute = tlv(OBJECT_IDENTIFIER, known::COMMON_NAME.as_bytes());
-        attribute.extend_from_slice(&tlv(UTF8_STRING, common_name.as_bytes()));
-        tlv(SEQUENCE, tlv(SET, tlv(SEQUENCE, attribute)))
+        name_of(&[(known::COMMON_NAME, UTF8_STRING, common_name)])
+    }
+
+    /// A `Name` with one RDN per `(type, string tag, value)`.
+    pub(crate) fn name_of(attributes: &[(Oid<'_>, u8, &str)]) -> Vec<u8> {
+        let mut rdns = Vec::new();
+        for (oid, tag, value) in attributes {
+            let mut attribute = tlv(OBJECT_IDENTIFIER, oid.as_bytes());
+            attribute.extend_from_slice(&tlv(*tag, value.as_bytes()));
+            rdns.extend_from_slice(&tlv(SET, tlv(SEQUENCE, attribute)));
+        }
+        tlv(SEQUENCE, rdns)
+    }
+
+    /// A minimal PDF: catalog, page tree, one page, a classic
+    /// cross-reference table and a trailer, with offsets computed from
+    /// the bytes (ISO 32000-1 sec.7.5).
+    pub(crate) fn minimal_pdf() -> Vec<u8> {
+        let bodies = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+        ];
+        let mut pdf = Vec::from("%PDF-1.7\n");
+        let mut offsets = Vec::new();
+        for (index, body) in bodies.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(
+                format!("{} 0 obj\n{body}\nendobj\n", index.saturating_add(1)).as_bytes(),
+            );
+        }
+        let xref_at = pdf.len();
+        let size = bodies.len().saturating_add(1);
+        pdf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in &offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
     }
 
     /// A `UTCTime` TLV (RFC 5280 sec.4.1.2.5.1).
@@ -655,6 +713,17 @@ pub(crate) mod testkit {
         subject_key: &TestKey,
         issuer_key: &TestKey,
     ) -> Vec<u8> {
+        certificate_named(spec, &name(spec.subject), subject_key, issuer_key)
+    }
+
+    /// A certificate whose subject is the `Name` DER `subject`, in
+    /// place of `spec.subject`.
+    pub(crate) fn certificate_named(
+        spec: &CertificateSpec<'_>,
+        subject: &[u8],
+        subject_key: &TestKey,
+        issuer_key: &TestKey,
+    ) -> Vec<u8> {
         let mut tbs = tlv(CONTEXT_0, tlv(INTEGER, [X509_VERSION_3]));
         tbs.extend_from_slice(&tlv(INTEGER, [spec.serial]));
         tbs.extend_from_slice(&issuer_key.algorithm_identifier());
@@ -662,7 +731,7 @@ pub(crate) mod testkit {
         let mut validity = utc_time(spec.not_before);
         validity.extend_from_slice(&utc_time(spec.not_after));
         tbs.extend_from_slice(&tlv(SEQUENCE, validity));
-        tbs.extend_from_slice(&name(spec.subject));
+        tbs.extend_from_slice(subject);
         tbs.extend_from_slice(&subject_key.spki());
         if !spec.extensions.is_empty() {
             tbs.extend_from_slice(&tlv(CONTEXT_3, tlv(SEQUENCE, spec.extensions.concat())));
@@ -774,6 +843,129 @@ pub(crate) mod testkit {
         let mut response = tlv(ENUMERATED, [OCSP_SUCCESSFUL]);
         response.extend_from_slice(&tlv(CONTEXT_0, tlv(SEQUENCE, response_bytes)));
         tlv(SEQUENCE, response)
+    }
+
+    /// `TSTInfo` version 1 (RFC 3161 sec.2.4.2).
+    pub(crate) const TST_INFO_VERSION: u8 = 0x01;
+    /// `TSTInfo.serialNumber` of every fixture token.
+    pub(crate) const TOKEN_SERIAL: u8 = 0x01;
+    /// `SignerInfo` version 1: issuer and serial (RFC 5652 sec.5.3).
+    pub(crate) const SIGNER_INFO_VERSION: u8 = 0x01;
+    /// `SignedData` version 3: `eContentType` other than `id-data`
+    /// (RFC 5652 sec.5.1).
+    pub(crate) const SIGNED_DATA_VERSION: u8 = 0x03;
+    /// A TSA policy under the documentation enterprise number 32473
+    /// (RFC 5612).
+    pub(crate) const TEST_POLICY: Oid<'static> =
+        Oid::const_new(const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.32473.1").as_bytes());
+
+    /// One `Attribute`.
+    pub(crate) fn attribute(oid: Oid<'_>, value: &[u8]) -> Vec<u8> {
+        let mut body = tlv(OBJECT_IDENTIFIER, oid.as_bytes());
+        body.extend_from_slice(&tlv(SET, value));
+        tlv(SEQUENCE, body)
+    }
+
+    /// The DER `SET OF Attribute` that is signed.
+    pub(crate) fn attribute_set(attributes: &[Vec<u8>]) -> Vec<u8> {
+        let mut sorted = attributes.to_vec();
+        sorted.sort_unstable();
+        tlv(SET, sorted.concat())
+    }
+
+    /// The parts of a hand-assembled `SignedData`.
+    pub(crate) struct CmsParts<'a> {
+        /// `eContentType`.
+        pub(crate) econtent_type: Oid<'a>,
+        /// `eContent`, when attached.
+        pub(crate) econtent: Option<&'a [u8]>,
+        /// `digestAlgorithm` `AlgorithmIdentifier`.
+        pub(crate) digest_algorithm: Vec<u8>,
+        /// Signed attributes in their signed `SET` form.
+        pub(crate) signed_attributes: Vec<u8>,
+        /// The signing key.
+        pub(crate) key: &'a TestKey,
+        /// The signer certificate.
+        pub(crate) signer: &'a [u8],
+        /// `SignedData.certificates`.
+        pub(crate) certificates: Vec<Vec<u8>>,
+    }
+
+    /// A `ContentInfo`-wrapped `SignedData` with one `SignerInfo`.
+    pub(crate) fn cms(parts: &CmsParts<'_>) -> Vec<u8> {
+        let signer = Certificate::from_der(parts.signer).expect("signer parses");
+        let mut sid = signer.issuer.as_der().to_vec();
+        sid.extend_from_slice(&tlv(INTEGER, signer.serial_der));
+        let mut tagged = parts.signed_attributes.clone();
+        if let Some(first) = tagged.first_mut() {
+            *first = CONTEXT_0;
+        }
+        let mut signer_info = tlv(INTEGER, [SIGNER_INFO_VERSION]);
+        signer_info.extend_from_slice(&tlv(SEQUENCE, sid));
+        signer_info.extend_from_slice(&parts.digest_algorithm);
+        signer_info.extend_from_slice(&tagged);
+        signer_info.extend_from_slice(&parts.key.algorithm_identifier());
+        signer_info.extend_from_slice(&tlv(OCTET_STRING, parts.key.sign(&parts.signed_attributes)));
+
+        let mut encapsulated = tlv(OBJECT_IDENTIFIER, parts.econtent_type.as_bytes());
+        if let Some(econtent) = parts.econtent {
+            encapsulated.extend_from_slice(&tlv(CONTEXT_0, tlv(OCTET_STRING, econtent)));
+        }
+        let mut body = tlv(INTEGER, [SIGNED_DATA_VERSION]);
+        body.extend_from_slice(&tlv(SET, parts.digest_algorithm.clone()));
+        body.extend_from_slice(&tlv(SEQUENCE, encapsulated));
+        if !parts.certificates.is_empty() {
+            body.extend_from_slice(&tlv(CONTEXT_0, parts.certificates.concat()));
+        }
+        body.extend_from_slice(&tlv(SET, tlv(SEQUENCE, signer_info)));
+        let mut content_info = tlv(OBJECT_IDENTIFIER, known::SIGNED_DATA.as_bytes());
+        content_info.extend_from_slice(&tlv(CONTEXT_0, tlv(SEQUENCE, body)));
+        tlv(SEQUENCE, content_info)
+    }
+
+    /// An RFC 3161 token over `imprint` (SHA-256) from the TSA `tsa`,
+    /// generated at `generated`.
+    pub(crate) fn timestamp_token(
+        tsa: &[u8],
+        tsa_key: &TestKey,
+        imprint: &[u8],
+        generated: DateTime,
+    ) -> Vec<u8> {
+        let mut message_imprint = DigestAlgorithm::Sha256.algorithm_identifier();
+        message_imprint.extend_from_slice(&tlv(OCTET_STRING, imprint));
+        let mut tst_info = tlv(INTEGER, [TST_INFO_VERSION]);
+        tst_info.extend_from_slice(&tlv(OBJECT_IDENTIFIER, TEST_POLICY.as_bytes()));
+        tst_info.extend_from_slice(&tlv(SEQUENCE, message_imprint));
+        tst_info.extend_from_slice(&tlv(INTEGER, [TOKEN_SERIAL]));
+        tst_info.extend_from_slice(&generalized_time(generated));
+        let tst_info = tlv(SEQUENCE, tst_info);
+        let ess = tlv(
+            SEQUENCE,
+            tlv(
+                SEQUENCE,
+                tlv(SEQUENCE, tlv(OCTET_STRING, Sha256::of(tsa).as_bytes())),
+            ),
+        );
+        let attributes = attribute_set(&[
+            attribute(
+                known::CONTENT_TYPE,
+                &tlv(OBJECT_IDENTIFIER, known::TST_INFO.as_bytes()),
+            ),
+            attribute(
+                known::MESSAGE_DIGEST,
+                &tlv(OCTET_STRING, Sha256::of(&tst_info).as_bytes()),
+            ),
+            attribute(known::SIGNING_CERTIFICATE_V2, &ess),
+        ]);
+        cms(&CmsParts {
+            econtent_type: known::TST_INFO,
+            econtent: Some(&tst_info),
+            digest_algorithm: DigestAlgorithm::Sha256.algorithm_identifier(),
+            signed_attributes: attributes,
+            key: tsa_key,
+            signer: tsa,
+            certificates: vec![tsa.to_vec()],
+        })
     }
 }
 

@@ -629,3 +629,517 @@ impl SignerIdentity {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DocumentFailure, DocumentFile, DocumentReport, Revocation, SignatureReport, SignerIdentity,
+        TrustAnchors, verify,
+    };
+    use crate::document::trust::testkit::{
+        CertificateSpec, Curve, OcspSpec, PRINTABLE_STRING, TestKey, UTF8_STRING, ca_extensions,
+        certificate, certificate_named, day, minimal_pdf, name_of, ocsp_response, timestamp_token,
+        timestamping_extensions,
+    };
+    use crate::oid::known;
+    use crate::sign::asic::DataObject;
+    use crate::sign::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime};
+    use crate::sign::document::{Format, plan};
+    use crate::sign::pades::{
+        DEFAULT_SIGNATURE_CAPACITY, SignatureMetadata, prepare_document_timestamp,
+    };
+    use crate::sign::validation::ValidationMaterial;
+    use crate::x509::{Certificate, OwnedCert};
+
+    /// Root common name.
+    const ROOT: &str = "Synthetic Root CA";
+    /// Intermediate common name.
+    const INTERMEDIATE: &str = "Synthetic Issuing CA";
+    /// Common name of the signer the root issues.
+    const DIRECT_SIGNER: &str = "Synthetic Signer";
+    /// Common name of the signer the intermediate issues.
+    const ISSUED_SIGNER: &str = "Synthetic Issued Signer";
+    /// TSA common name.
+    const TSA: &str = "Synthetic Time Stamping Unit";
+    /// Common name of a root nobody trusts.
+    const STRANGER: &str = "Synthetic Stranger CA";
+    /// Root serial.
+    const ROOT_SERIAL: u8 = 1;
+    /// Intermediate serial.
+    const INTERMEDIATE_SERIAL: u8 = 2;
+    /// Direct signer serial.
+    const DIRECT_SIGNER_SERIAL: u8 = 3;
+    /// Issued signer serial.
+    const ISSUED_SIGNER_SERIAL: u8 = 4;
+    /// TSA serial.
+    const TSA_SERIAL: u8 = 5;
+    /// Stranger root serial.
+    const STRANGER_SERIAL: u8 = 6;
+    /// Person certificate serial.
+    const PERSON_SERIAL: u8 = 7;
+    /// Day every certificate starts.
+    const ISSUED: u8 = 1;
+    /// Day of the timestamps.
+    const STAMPED: u8 = 10;
+    /// Day the OCSP answers are produced, after the timestamps.
+    const ANSWERED: u8 = 11;
+    /// The validation day.
+    const NOW: u8 = 20;
+    /// Day every certificate ends.
+    const ENDS: u8 = 28;
+    /// The signing time the writers assert.
+    const SIGNING_TIME: SigningTime = SigningTime {
+        year: 2026,
+        month: 6,
+        day: 10,
+        hour: 12,
+        minute: 0,
+        second: 0,
+    };
+    /// A container entry's content.
+    const NOTE: &[u8] = b"Synthetic note, signed for the verifier tests";
+    /// A container entry's name.
+    const NOTE_NAME: &str = "note.txt";
+    /// A container entry's media type.
+    const NOTE_TYPE: &str = "text/plain";
+    /// The PDF's entry name for the router.
+    const PDF_NAME: &str = "document.pdf";
+    /// The PDF media type.
+    const PDF_TYPE: &str = "application/pdf";
+    /// Text inside the first signed span of every signed fixture PDF.
+    const MEDIA_BOX: &[u8] = b"/MediaBox [0 0 200 200]";
+    /// The same text with one byte changed.
+    const TAMPERED_MEDIA_BOX: &[u8] = b"/MediaBox [0 0 200 201]";
+    /// Given name of the person certificate.
+    const GIVEN: &str = "Given";
+    /// Surname of the person certificate.
+    const SURNAME: &str = "Surname";
+    /// Common name of the person certificate.
+    const PERSON: &str = "Surname Given 12345678X";
+    /// A synthetic electronic identifier of the right shape.
+    const IDENTIFIER: &str = "12345678X";
+
+    /// Which signer signs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Signer {
+        /// Issued by the root.
+        Direct,
+        /// Issued by the intermediate.
+        Issued,
+    }
+
+    /// Keys and certificates of one test world.
+    struct World {
+        /// Root.
+        root: Vec<u8>,
+        /// Intermediate key.
+        intermediate_key: TestKey,
+        /// Intermediate, issued by the root.
+        intermediate: Vec<u8>,
+        /// Key of both signers.
+        signer_key: TestKey,
+        /// Signer issued by the root.
+        direct_signer: Vec<u8>,
+        /// Signer issued by the intermediate.
+        issued_signer: Vec<u8>,
+        /// TSA key.
+        tsa_key: TestKey,
+        /// TSA, issued by the root.
+        tsa: Vec<u8>,
+        /// A self-signed root nobody trusts.
+        stranger: Vec<u8>,
+    }
+
+    /// A certificate valid from `ISSUED` to `ENDS`.
+    fn spec<'a>(
+        serial: u8,
+        subject: &'a str,
+        issuer: &'a str,
+        extensions: Vec<Vec<u8>>,
+    ) -> CertificateSpec<'a> {
+        CertificateSpec {
+            serial,
+            subject,
+            issuer,
+            not_before: day(ISSUED),
+            not_after: day(ENDS),
+            extensions,
+        }
+    }
+
+    impl World {
+        /// Fresh keys and certificates.
+        fn new() -> Self {
+            let root_key = TestKey::generate(Curve::P384);
+            let intermediate_key = TestKey::generate(Curve::P384);
+            let signer_key = TestKey::generate(Curve::P256);
+            let tsa_key = TestKey::generate(Curve::P256);
+            let stranger_key = TestKey::generate(Curve::P256);
+            Self {
+                root: certificate(
+                    &spec(ROOT_SERIAL, ROOT, ROOT, ca_extensions()),
+                    &root_key,
+                    &root_key,
+                ),
+                intermediate: certificate(
+                    &spec(INTERMEDIATE_SERIAL, INTERMEDIATE, ROOT, ca_extensions()),
+                    &intermediate_key,
+                    &root_key,
+                ),
+                direct_signer: certificate(
+                    &spec(DIRECT_SIGNER_SERIAL, DIRECT_SIGNER, ROOT, Vec::new()),
+                    &signer_key,
+                    &root_key,
+                ),
+                issued_signer: certificate(
+                    &spec(
+                        ISSUED_SIGNER_SERIAL,
+                        ISSUED_SIGNER,
+                        INTERMEDIATE,
+                        Vec::new(),
+                    ),
+                    &signer_key,
+                    &intermediate_key,
+                ),
+                tsa: certificate(
+                    &spec(TSA_SERIAL, TSA, ROOT, timestamping_extensions()),
+                    &tsa_key,
+                    &root_key,
+                ),
+                stranger: certificate(
+                    &spec(STRANGER_SERIAL, STRANGER, STRANGER, ca_extensions()),
+                    &stranger_key,
+                    &stranger_key,
+                ),
+                intermediate_key,
+                signer_key,
+                tsa_key,
+            }
+        }
+
+        /// Sign `objects` as `format` through the repository's router,
+        /// optionally with a signature timestamp, embedding `material`.
+        fn sign(
+            &self,
+            format: Format,
+            objects: Vec<DataObject>,
+            signer: Signer,
+            timestamp: bool,
+            material: &ValidationMaterial,
+        ) -> Vec<u8> {
+            let der = match signer {
+                Signer::Direct => &self.direct_signer,
+                Signer::Issued => &self.issued_signer,
+            };
+            let certificate = Certificate::from_der(der).expect("signer parses");
+            let parameters = SignerParameters {
+                certificate: &certificate,
+                digest_algorithm: DigestAlgorithm::Sha256,
+                signature_algorithm: SignatureAlgorithm::EcdsaSha256,
+                signing_time: Some(SIGNING_TIME),
+            };
+            let planned =
+                plan(format, objects, &parameters, &SignatureMetadata::default()).expect("plans");
+            let signature = self.signer_key.sign_raw(planned.to_be_signed());
+            let mut timestamps = Vec::new();
+            if timestamp {
+                let imprint = planned
+                    .timestamp_digest(&parameters, &signature, DigestAlgorithm::Sha256)
+                    .expect("timestamp digest");
+                timestamps.push(timestamp_token(
+                    &self.tsa,
+                    &self.tsa_key,
+                    &imprint,
+                    day(STAMPED),
+                ));
+            }
+            planned
+                .finish(&parameters, &signature, &timestamps, material)
+                .expect("finishes")
+        }
+
+        /// A signed PDF.
+        fn pdf(&self, signer: Signer, timestamp: bool, material: &ValidationMaterial) -> Vec<u8> {
+            self.sign(
+                Format::Pades,
+                vec![DataObject {
+                    name: PDF_NAME.to_owned(),
+                    mime_type: PDF_TYPE.to_owned(),
+                    content: minimal_pdf(),
+                }],
+                signer,
+                timestamp,
+                material,
+            )
+        }
+
+        /// A signed container or CMS over the note.
+        fn note(&self, format: Format) -> Vec<u8> {
+            self.sign(
+                format,
+                vec![DataObject {
+                    name: NOTE_NAME.to_owned(),
+                    mime_type: NOTE_TYPE.to_owned(),
+                    content: NOTE.to_vec(),
+                }],
+                Signer::Direct,
+                false,
+                &ValidationMaterial::default(),
+            )
+        }
+
+        /// The issued signer's chain and an OCSP answer about it,
+        /// produced after the timestamps.
+        fn lt_material(&self, revoked: bool, with_root: bool) -> ValidationMaterial {
+            let issuer = OwnedCert::from_der(&self.intermediate).expect("intermediate parses");
+            let answer = ocsp_response(&OcspSpec {
+                responder_key: &self.intermediate_key,
+                responder: INTERMEDIATE,
+                issuer: &issuer,
+                serial: ISSUED_SIGNER_SERIAL,
+                revoked: revoked.then(|| day(ISSUED)),
+                produced_at: day(ANSWERED),
+                this_update: day(ANSWERED),
+                next_update: Some(day(ENDS)),
+                embedded: Vec::new(),
+            });
+            let mut certificates = vec![self.intermediate.clone()];
+            if with_root {
+                certificates.push(self.root.clone());
+            }
+            ValidationMaterial {
+                certificates,
+                ocsp_responses: vec![answer],
+                crls: Vec::new(),
+            }
+        }
+
+        /// Verify `bytes` trusting the root.
+        fn verify_trusting_root(&self, bytes: Vec<u8>) -> Result<DocumentReport, DocumentFailure> {
+            verify_with(bytes, &[&self.root])
+        }
+    }
+
+    /// Verify `bytes` at `NOW` trusting `anchors`.
+    fn verify_with(bytes: Vec<u8>, anchors: &[&[u8]]) -> Result<DocumentReport, DocumentFailure> {
+        verify(
+            &DocumentFile::from_file(bytes),
+            TrustAnchors::new(anchors),
+            day(NOW),
+        )
+    }
+
+    /// The one signature of a report.
+    fn only(report: &DocumentReport) -> &SignatureReport {
+        assert_eq!(report.signatures.len(), 1, "one signature");
+        report.signatures.first().expect("one signature")
+    }
+
+    /// Change one byte inside the first signed span.
+    fn tamper(mut pdf: Vec<u8>) -> Vec<u8> {
+        let at = pdf
+            .windows(MEDIA_BOX.len())
+            .position(|window| window == MEDIA_BOX)
+            .expect("media box present");
+        pdf.get_mut(at..at.saturating_add(MEDIA_BOX.len()))
+            .expect("in range")
+            .copy_from_slice(TAMPERED_MEDIA_BOX);
+        pdf
+    }
+
+    #[test]
+    fn a_level_b_pdf_is_intact_valid_and_anchored_without_proof_of_existence() {
+        let world = World::new();
+        let report = world
+            .verify_trusting_root(world.pdf(Signer::Direct, false, &ValidationMaterial::default()))
+            .expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact);
+        assert!(signature.signature_valid);
+        assert!(signature.chain_verified);
+        assert_eq!(signature.proof_of_existence, None);
+        assert!(!signature.timestamps_valid);
+        assert!(signature.covers_whole_document);
+        assert_eq!(signature.revocation, Revocation::Unavailable);
+        assert_eq!(signature.signer.name, DIRECT_SIGNER);
+        assert!(report.document_timestamps.is_empty());
+    }
+
+    #[test]
+    fn a_signature_timestamp_proves_existence() {
+        let world = World::new();
+        let report = world
+            .verify_trusting_root(world.pdf(Signer::Direct, true, &ValidationMaterial::default()))
+            .expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact);
+        assert!(signature.signature_valid);
+        assert!(signature.chain_verified);
+        assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
+        assert!(signature.timestamps_valid);
+        assert!(signature.is_valid());
+    }
+
+    #[test]
+    fn level_lt_chains_through_the_store_and_reads_a_later_ocsp_answer() {
+        let world = World::new();
+        let pdf = world.pdf(Signer::Issued, true, &world.lt_material(false, false));
+        let report = world.verify_trusting_root(pdf).expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact);
+        assert!(signature.signature_valid);
+        assert!(signature.chain_verified);
+        assert!(signature.timestamps_valid);
+        assert!(!signature.covers_whole_document);
+        assert_eq!(
+            signature.revocation,
+            Revocation::Good {
+                checked_at: day(ANSWERED)
+            }
+        );
+        assert!(report.is_valid());
+    }
+
+    #[test]
+    fn a_document_timestamp_covering_the_signature_proves_existence() {
+        let world = World::new();
+        let signed = world.pdf(Signer::Direct, false, &ValidationMaterial::default());
+        let placeholder =
+            prepare_document_timestamp(&signed, DEFAULT_SIGNATURE_CAPACITY).expect("prepares");
+        let token = timestamp_token(
+            &world.tsa,
+            &world.tsa_key,
+            &placeholder.digest(DigestAlgorithm::Sha256),
+            day(STAMPED),
+        );
+        let stamped = placeholder.finish(&token).expect("finishes");
+        let report = world.verify_trusting_root(stamped).expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact);
+        assert!(signature.signature_valid);
+        assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
+        assert!(signature.timestamps_valid);
+        assert!(!signature.covers_whole_document);
+        assert_eq!(report.document_timestamps, vec![day(STAMPED)]);
+    }
+
+    #[test]
+    fn a_changed_byte_in_the_signed_span_breaks_only_integrity() {
+        let world = World::new();
+        let pdf = tamper(world.pdf(Signer::Direct, false, &ValidationMaterial::default()));
+        let report = world.verify_trusting_root(pdf).expect("report");
+        let signature = only(&report);
+        assert!(!signature.document_intact);
+        assert!(signature.signature_valid);
+        assert!(signature.chain_verified);
+        assert_eq!(signature.proof_of_existence, None);
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn an_untrusted_root_leaves_the_chain_unverified_but_names_the_issuer() {
+        let world = World::new();
+        let pdf = world.pdf(Signer::Issued, true, &world.lt_material(false, true));
+        let report = verify_with(pdf, &[&world.stranger]).expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact);
+        assert!(signature.signature_valid);
+        assert!(!signature.chain_verified);
+        assert_eq!(
+            signature.issuer_certificate.as_ref().map(OwnedCert::as_der),
+            Some(world.intermediate.as_slice())
+        );
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn an_asic_e_xades_container_verifies() {
+        let world = World::new();
+        let report = world
+            .verify_trusting_root(world.note(Format::AsicEXades))
+            .expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact);
+        assert!(signature.signature_valid);
+        assert!(signature.chain_verified);
+    }
+
+    #[test]
+    fn an_asic_e_cades_container_verifies() {
+        let world = World::new();
+        let report = world
+            .verify_trusting_root(world.note(Format::AsicECades))
+            .expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact);
+        assert!(signature.signature_valid);
+        assert!(signature.chain_verified);
+    }
+
+    #[test]
+    fn an_attached_cades_file_verifies() {
+        let world = World::new();
+        let report = world
+            .verify_trusting_root(world.note(Format::Cades))
+            .expect("report");
+        let signature = only(&report);
+        assert!(signature.document_intact);
+        assert!(signature.signature_valid);
+        assert!(signature.chain_verified);
+    }
+
+    #[test]
+    fn files_without_a_signature_are_failures() {
+        let world = World::new();
+        assert_eq!(
+            world.verify_trusting_root(NOTE.to_vec()).map(|_report| ()),
+            Err(DocumentFailure::NotASignedDocument)
+        );
+        assert_eq!(
+            world.verify_trusting_root(minimal_pdf()).map(|_report| ()),
+            Err(DocumentFailure::NoSignatures)
+        );
+    }
+
+    #[test]
+    fn a_revoked_signer_makes_the_document_invalid() {
+        let world = World::new();
+        let pdf = world.pdf(Signer::Issued, true, &world.lt_material(true, false));
+        let report = world.verify_trusting_root(pdf).expect("report");
+        let signature = only(&report);
+        assert_eq!(signature.revocation, Revocation::Revoked);
+        assert!(signature.is_valid());
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn the_signer_identity_prefers_given_names_and_surname() {
+        let key = TestKey::generate(Curve::P256);
+        let person = certificate_named(
+            &spec(PERSON_SERIAL, PERSON, PERSON, Vec::new()),
+            &name_of(&[
+                (known::COMMON_NAME, UTF8_STRING, PERSON),
+                (known::SURNAME, UTF8_STRING, SURNAME),
+                (known::GIVEN_NAME, UTF8_STRING, GIVEN),
+                (known::SERIAL_NUMBER, PRINTABLE_STRING, IDENTIFIER),
+            ]),
+            &key,
+            &key,
+        );
+        let identity = SignerIdentity::of(&OwnedCert::from_der(person).expect("parses"));
+        assert_eq!(identity.name, format!("{GIVEN} {SURNAME}"));
+        assert_eq!(
+            identity.identifier.as_ref().map(|peuin| peuin.as_str()),
+            Some(IDENTIFIER)
+        );
+
+        let plain = certificate(
+            &spec(PERSON_SERIAL, DIRECT_SIGNER, DIRECT_SIGNER, Vec::new()),
+            &key,
+            &key,
+        );
+        let identity = SignerIdentity::of(&OwnedCert::from_der(plain).expect("parses"));
+        assert_eq!(identity.name, DIRECT_SIGNER);
+        assert!(identity.identifier.is_none());
+    }
+}
