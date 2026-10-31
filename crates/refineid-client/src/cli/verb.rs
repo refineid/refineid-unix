@@ -434,8 +434,9 @@ pub enum VerbParseError {
     },
     /// A shortened command word that starts several commands.
     Ambiguous {
-        /// The literal argv token, with its group word when it is a
-        /// second word. Tier 0 `String` from `std::env::args()`.
+        /// The words as typed, the group word first when the second
+        /// is the ambiguous one. Tier 0 `String` from
+        /// `std::env::args()`.
         got: String,
         /// The commands it could mean, in listing order.
         candidates: Vec<String>,
@@ -560,7 +561,7 @@ pub fn route(
                     Some((_, tag)) => (*tag, more),
                     None => {
                         return Err(VerbParseError::Unrecognized {
-                            got: format!("{group} {second}"),
+                            got: format!("{first} {second}"),
                         });
                     }
                 },
@@ -568,13 +569,13 @@ pub fn route(
                     Some(tag) => (tag, rest),
                     None => {
                         return Err(VerbParseError::Unrecognized {
-                            got: format!("{group} {second}"),
+                            got: format!("{first} {second}"),
                         });
                     }
                 },
                 Match::Several(words) => {
                     return Err(VerbParseError::Ambiguous {
-                        got: format!("{group} {second}"),
+                        got: format!("{first} {second}"),
                         candidates: words.iter().map(|word| format!("{group} {word}")).collect(),
                     });
                 }
@@ -584,7 +585,7 @@ pub fn route(
             Some(tag) => (tag, rest),
             None => {
                 return Err(VerbParseError::Unrecognized {
-                    got: format!("{group} (missing sub-verb, try: {group} {first_verb})"),
+                    got: format!("{first} (missing sub-verb, try: {group} {first_verb})"),
                 });
             }
         },
@@ -794,6 +795,29 @@ mod tests {
             &rest.into_vec(),
             &vec!["x".to_owned()],
             "card keeps the word",
+        )?;
+        let (tag, rest) = route(&argv(&["refineid", "card"]))?;
+        check(&tag, &VerbTag::CardCheck, "bare card")?;
+        check_true(rest.as_slice().is_empty(), "bare card has no arguments")?;
+        // `phone` is shaped like `card`: an unknown second word is its
+        // own argument, which its parser then refuses.
+        let (tag, rest) = route(&argv(&["refineid", "phone", "foo"]))?;
+        check(
+            &tag,
+            &VerbTag::PhoneCheck,
+            "a non-verb after phone is phone's own",
+        )?;
+        check(
+            &rest.into_vec(),
+            &vec!["foo".to_owned()],
+            "phone keeps the word",
+        )?;
+        check_true(
+            matches!(
+                parse_argv(&argv(&["refineid", "phone", "foo"])),
+                Err(ParseError::Args(_))
+            ),
+            "phone refuses the word as an argument",
         )
     }
 
@@ -809,6 +833,23 @@ mod tests {
                 )?;
             }
             other => return Err(format!("expected Ambiguous, got {other:?}").into()),
+        }
+        match route(&argv(&["refineid", "ca", "e"])) {
+            Err(VerbParseError::Ambiguous { got, candidates }) => {
+                check(got.as_str(), "ca e", "the words as typed")?;
+                check(
+                    &candidates,
+                    &vec!["card emrtd".to_owned(), "card export-all".to_owned()],
+                    "verbs",
+                )?;
+            }
+            other => return Err(format!("expected Ambiguous, got {other:?}").into()),
+        }
+        match route(&argv(&["refineid", "doc", "bogus"])) {
+            Err(VerbParseError::Unrecognized { got }) => {
+                check(got.as_str(), "doc bogus", "the words as typed")?;
+            }
+            other => return Err(format!("expected Unrecognized, got {other:?}").into()),
         }
         match route(&argv(&["refineid", "card", "s", "--in", "/i"])) {
             Err(VerbParseError::Ambiguous { got, candidates }) => {

@@ -65,7 +65,12 @@ mod tests {
         check(
             &resolve("pin", ["pin", "pinhole"]),
             &Match::One("pin"),
-            "exact wins",
+            "exact first",
+        )?;
+        check(
+            &resolve("pin", ["pinhole", "pin"]),
+            &Match::One("pin"),
+            "exact after a longer candidate it starts",
         )
     }
 
