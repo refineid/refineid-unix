@@ -42,10 +42,10 @@ usage: refineid document sign FILE [FILE ...] [--format F] [--out PATH]
                 [--can NNNNNN] [--no-stamp] [--timestamp U ...]
 
 Sign FILE into a format a counterparty can open. Several PDFs are
-signed one by one, each with its own seal; any other set goes into one
-container under one signature, as does --format asice. PIN2 and the
-qualified-signature key by default, asked once for the whole run.
-Prints nothing on success; -v shows each step.
+signed one by one, each with its own seal; any other set, or a
+container --format, goes into one container under one signature.
+PIN2 and the qualified-signature key by default, asked once for the
+whole run. Prints nothing on success; -v shows each step.
   --format F    pades          signature inside the PDF
                 cades          CMS, document attached
                 cades-detached CMS, document left outside
@@ -54,9 +54,9 @@ Prints nothing on success; -v shows each step.
                 Default: pades when every FILE is a PDF, asice
                 otherwise. A one-file format signs each FILE.
   --out P       the finished document; only when one is made.
-                Default: beside each FILE, '<stem>-signed-<UTC
-                time>.<ext>', with stem 'portfolio' for a container
-                of several files.
+                Default: '<stem>-signed-<UTC time>.<ext>' beside the
+                FILE, or beside the first FILE with stem 'portfolio'
+                for a container of several.
   --slot S      qualified (default) or auth
   --reason T    PAdES /Reason
   --location T  PAdES /Location
@@ -171,14 +171,12 @@ impl DocumentSignArgs {
             SignSlot::Auth => "REFINEID_PIN1",
             SignSlot::Qualified => "REFINEID_PIN2",
         };
-        // Every input is opened before the card is touched or a PIN is
-        // asked: a run that will fail on its third file fails before
+        // Every input is checked before the card is touched or a PIN
+        // is asked: a run that will fail on its third file fails before
         // the first signature.
-        for input in &inputs {
-            if let Err(e) = std::fs::File::open(input) {
-                eprintln!("{cmd}: {}: {e}", input.display());
-                return crate::exit_status::ExitStatus::RuntimeFailure.into();
-            }
+        if let Err(message) = check_inputs(&inputs) {
+            eprintln!("{cmd}: {message}");
+            return crate::exit_status::ExitStatus::RuntimeFailure.into();
         }
         let now = crate::card_check::now_date_time();
         let jobs = jobs_for(format, inputs, output, now);
@@ -250,8 +248,11 @@ impl DocumentSignArgs {
                 archive,
                 name.as_deref(),
             );
-            if status != crate::exit_status::ExitStatus::Ok
-                && worst == crate::exit_status::ExitStatus::Ok
+            // The run's status is its first failure's, unless a later
+            // one ended the run: that is the one to act on.
+            if stop
+                || (status != crate::exit_status::ExitStatus::Ok
+                    && worst == crate::exit_status::ExitStatus::Ok)
             {
                 worst = status;
             }
@@ -534,22 +535,47 @@ fn report_outcome(
     }
 }
 
-/// `true` when a failure ends the run: no reader or card, a PIN the
-/// card refused or that was not given. The next document would fail
-/// the same way or ask again for a PIN already refused. A document
-/// that fails on its own account, a format or an authority, lets the
-/// rest be signed.
+/// `true` when a failure ends the run: no reader or card, a CAN still
+/// missing after the one prompt, a PIN the card refused or that was
+/// not given. The next document would fail the same way or ask again
+/// for a code already refused. A document that fails on its own
+/// account, a format or an authority, lets the rest be signed.
 fn stops_the_run(
     result: &Result<crate::card_sign::SignReport, crate::card_sign::SignErrorKind>,
 ) -> bool {
     matches!(
         result,
         Err(crate::card_sign::SignErrorKind::ReaderPick(_)
+            | crate::card_sign::SignErrorKind::NeedCan
             | crate::card_sign::SignErrorKind::PinEntry(_)
             | crate::card_sign::SignErrorKind::PinRejected { .. }
             | crate::card_sign::SignErrorKind::RetryFloor(_)
             | crate::card_sign::SignErrorKind::PinPolicy { .. })
     )
+}
+
+/// Every input is a readable file, and no file is given twice: two
+/// jobs for one file would share one output name. Checked before the
+/// card is touched. The message names the first offending path.
+fn check_inputs(inputs: &[PathBuf]) -> Result<(), String> {
+    if inputs.is_empty() {
+        return Err("no input files".to_owned());
+    }
+    let mut seen: Vec<PathBuf> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let shown = input.display();
+        let metadata = std::fs::metadata(input).map_err(|e| format!("{shown}: {e}"))?;
+        if !metadata.is_file() {
+            return Err(format!("{shown}: not a file"));
+        }
+        std::fs::File::open(input).map_err(|e| format!("{shown}: {e}"))?;
+        let identity = std::fs::canonicalize(input).unwrap_or_else(|_| input.clone());
+        if seen.contains(&identity) {
+            return Err(format!("{shown}: given twice"));
+        }
+        seen.push(identity);
+    }
+    Ok(())
 }
 
 /// One document to make: its inputs and where it goes.
@@ -709,7 +735,7 @@ mod tests {
 
     use super::{
         DEFAULT_TIMESTAMP_AUTHORITY, DateTime, DocumentReport, DocumentSignArgs, Format, SignSlot,
-        describe_level, jobs_for, parse_format,
+        check_inputs, describe_level, jobs_for, parse_format, stops_the_run,
     };
     use crate::card_sign::{LocalVerifyOutcome, SignReport};
     use crate::cli::ArgParseError;
@@ -838,6 +864,52 @@ mod tests {
         let jobs = jobs_for(a.format, a.inputs, a.output, signed_at()?);
         check(&jobs.len(), &1, "asked for, the PDFs share one container")?;
         check(&jobs[0].inputs.len(), &2, "both inside")
+    }
+
+    #[test]
+    fn a_card_or_code_failure_ends_the_run_and_a_document_failure_does_not() -> TestResult {
+        use crate::card_sign::SignErrorKind;
+        check_true(
+            stops_the_run(&Err(SignErrorKind::NeedCan)),
+            "a CAN still missing stops",
+        )?;
+        check_true(
+            !stops_the_run(&Err(SignErrorKind::VisibleSignature(String::new()))),
+            "a document's own failure lets the rest be signed",
+        )
+    }
+
+    #[test]
+    fn inputs_are_checked_before_the_card() -> TestResult {
+        let dir =
+            std::env::temp_dir().join(format!("refineid-check-inputs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let file = dir.join("report.pdf");
+        std::fs::write(&file, b"%PDF").map_err(|e| e.to_string())?;
+        let outcome = (|| -> TestResult {
+            check_true(
+                check_inputs(std::slice::from_ref(&file)).is_ok(),
+                "a readable file passes",
+            )?;
+            check_true(
+                check_inputs(&[file.clone(), dir.clone()]).is_err(),
+                "a directory is not a file",
+            )?;
+            check_true(
+                check_inputs(&[file.clone(), dir.join("missing.pdf")]).is_err(),
+                "a missing file is named before any signature",
+            )?;
+            let twice = check_inputs(&[file.clone(), file.clone()])
+                .err()
+                .unwrap_or_default();
+            check_true(
+                twice.ends_with("given twice"),
+                "the same file twice is refused",
+            )?;
+            check_true(check_inputs(&[]).is_err(), "nothing to sign is refused")
+        })();
+        let _removed = std::fs::remove_dir_all(&dir);
+        outcome
     }
 
     #[test]
