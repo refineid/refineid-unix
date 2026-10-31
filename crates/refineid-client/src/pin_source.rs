@@ -22,6 +22,7 @@
 
 use alloc::boxed::Box;
 use core::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use refineid_lib_core::pin::PinBytes;
 
@@ -64,6 +65,47 @@ impl PinSource {
             Self::Given(pin) => Ok(pin.clone()),
             Self::Ask(prompt) => prompt(),
         }
+    }
+}
+
+/// One prompt shared by several sources: the first source to be
+/// obtained runs it, every later one answers with the same PIN. For a
+/// run that signs several documents with one PIN, asked once.
+pub struct SharedPin {
+    prompt: Arc<Mutex<PinPrompt>>,
+    answer: Arc<Mutex<Option<PinBytes>>>,
+}
+
+impl SharedPin {
+    /// Wrap `prompt` so that it runs at most once.
+    #[must_use]
+    pub fn new(prompt: PinPrompt) -> Self {
+        Self {
+            prompt: Arc::new(Mutex::new(prompt)),
+            answer: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A source that asks the shared prompt, or repeats its answer.
+    #[must_use]
+    pub fn source(&self) -> PinSource {
+        let prompt = Arc::clone(&self.prompt);
+        let answer = Arc::clone(&self.answer);
+        PinSource::Ask(Box::new(move || {
+            let mut answer = answer.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(pin) = answer.as_ref() {
+                return Ok(pin.clone());
+            }
+            let pin = (prompt.lock().unwrap_or_else(PoisonError::into_inner))()?;
+            *answer = Some(pin.clone());
+            Ok(pin)
+        }))
+    }
+}
+
+impl fmt::Debug for SharedPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SharedPin")
     }
 }
 
@@ -120,6 +162,21 @@ mod tests {
         check(&prompts(&asked), &0, "before obtain")?;
         let _pin: PinBytes = source.obtain()?;
         check(&prompts(&asked), &1, "after obtain")
+    }
+
+    #[test]
+    fn a_shared_prompt_runs_once_for_every_source() -> TestResult {
+        let (source, asked) = counting_source();
+        let PinSource::Ask(prompt) = source else {
+            return Err("counting source asks".into());
+        };
+        let shared = SharedPin::new(prompt);
+        let mut first = shared.source();
+        let mut second = shared.source();
+        let a: PinBytes = first.obtain()?;
+        let b: PinBytes = second.obtain()?;
+        check(&prompts(&asked), &1, "asked once")?;
+        check(&(a.as_bytes() == b.as_bytes()), &true, "the same PIN")
     }
 
     #[test]

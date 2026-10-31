@@ -227,8 +227,11 @@ bricks the card.
 Sign
 .Ar file
 into a format a counterparty can open.
-Several files go into one container under one signature.
-PIN2 and the qualified-signature key are used by default.
+Several PDFs are signed one by one, each with its own seal; any other
+set goes into one container under one signature, as does
+.Fl -format Cm asice .
+PIN2 and the qualified-signature key are used by default, and the PIN
+is asked once for the whole run, when everything else is in order.
 Signs at the highest level the format supports: LTA, embedded
 evidence plus an archive timestamp, for
 .Cm pades
@@ -252,19 +255,19 @@ ASiC-E container with CAdES
 .El
 The default is
 .Cm pades
-for one PDF and
+when every file is a PDF and
 .Cm asice
 otherwise.
-The one-file formats refuse a set of files.
+A one-file format signs each file.
 .It Fl -out Ar path
-The finished document.
-The default is beside the first
+The finished document; only when the run makes one.
+The default is beside each
 .Ar file ,
 named
 .Dq Ar stem Ns -signed- Ns Ar time . Ns Ar ext
 with the UTC time, and stem
 .Dq portfolio
-for several files.
+for a container of several files.
 .It Fl -slot Cm qualified | auth
 The key to sign with; qualified by default.
 .It Fl -reason Ar text
