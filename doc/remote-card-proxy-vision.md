@@ -88,7 +88,7 @@ Pairing establishes cryptographic association between the Unix workstation and t
    * User enables "Allow Remote Card Reader" in RefineID mobile settings and taps "Pair New Workstation".
    * Phone generates a 6-character Crockford Base32 human factor code (e.g. `7K X4 M9`) and begins advertising (via BLE and/or mDNS).
 2. **Initiation on Requester**:
-   * In `refineid-gui` (or CLI `refineid pair`), the user turns on "Remote Phone Reader" and selects the discovered phone.
+   * In `refineid-gui` (or CLI `refineid phone pair`), the user turns on "Remote Phone Reader" and selects the discovered phone.
    * Desktop prompts for the 6-character code displayed on the phone.
 3. **Mutual Authentication (`CPaceRistretto255` KC2 + `Noise_XXpsk3`)**:
    * The 6-character code is upper-cased; the letters `I`, `L`, `O` and `U` are not in the alphabet and a code carrying one is refused (RAPP v26.10.29 section 3.1).

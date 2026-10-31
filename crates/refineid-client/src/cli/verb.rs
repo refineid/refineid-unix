@@ -85,14 +85,14 @@ pub enum VerbTag {
     /// `cert chain` -- walk a cert's chain to a self-signed
     /// root.
     CertChain,
-    /// `pair` -- pair with a mobile device (iPhone/Android).
-    CardPair,
-    /// `pairs` -- list paired mobile devices.
-    CardPairs,
-    /// `unpair` -- forget the paired phone.
-    CardUnpair,
-    /// `auth` -- authenticate to a TLS site via paired mobile device.
-    CardAuth,
+    /// `phone` -- show the paired phone.
+    PhoneCheck,
+    /// `phone pair` -- pair with a phone.
+    PhonePair,
+    /// `phone unpair` -- forget the paired phone.
+    PhoneUnpair,
+    /// `phone auth` -- log in to a TLS site through the paired phone.
+    PhoneAuth,
 }
 
 impl VerbTag {
@@ -117,10 +117,10 @@ impl VerbTag {
             Self::Verify => "verify",
             Self::CertShow => "cert show",
             Self::CertChain => "cert chain",
-            Self::CardPair => "pair",
-            Self::CardPairs => "pairs",
-            Self::CardUnpair => "unpair",
-            Self::CardAuth => "auth",
+            Self::PhoneCheck => "phone",
+            Self::PhonePair => "phone pair",
+            Self::PhoneUnpair => "phone unpair",
+            Self::PhoneAuth => "phone auth",
         }
     }
 
@@ -139,10 +139,10 @@ impl VerbTag {
         Self::PinChange,
         Self::PinUnblock,
         Self::DocumentSign,
-        Self::CardPair,
-        Self::CardPairs,
-        Self::CardUnpair,
-        Self::CardAuth,
+        Self::PhoneCheck,
+        Self::PhonePair,
+        Self::PhoneUnpair,
+        Self::PhoneAuth,
         Self::Verify,
         Self::CertShow,
         Self::CertChain,
@@ -165,10 +165,10 @@ impl VerbTag {
             Self::CardPubkey => "print a public key as SSH or PEM",
             Self::CardExportAll => "write every public artefact to a directory",
             Self::DocumentSign => "sign files as PAdES, CAdES or ASiC-E",
-            Self::CardPair => "pair with a phone",
-            Self::CardPairs => "show the paired phone",
-            Self::CardUnpair => "forget the paired phone",
-            Self::CardAuth => "log in to a TLS site through the phone",
+            Self::PhonePair => "pair with a phone",
+            Self::PhoneCheck => "show the paired phone",
+            Self::PhoneUnpair => "forget the paired phone",
+            Self::PhoneAuth => "log in to a TLS site through the phone",
             Self::Verify => "verify a raw signature offline",
             Self::CertShow => "print a certificate",
             Self::CertChain => "walk a certificate chain to its root",
@@ -192,10 +192,10 @@ impl VerbTag {
             Self::CardPubkey => super::card_pubkey::HELP,
             Self::CardExportAll => super::card_export_all::HELP,
             Self::DocumentSign => super::document_sign::HELP,
-            Self::CardPair => super::card_pair::PAIR_HELP,
-            Self::CardPairs => super::card_pair::PAIRS_HELP,
-            Self::CardUnpair => super::card_pair::UNPAIR_HELP,
-            Self::CardAuth => super::card_pair::AUTH_HELP,
+            Self::PhonePair => super::card_pair::PAIR_HELP,
+            Self::PhoneCheck => super::card_pair::PAIRS_HELP,
+            Self::PhoneUnpair => super::card_pair::UNPAIR_HELP,
+            Self::PhoneAuth => super::card_pair::AUTH_HELP,
             Self::Verify => super::verify::HELP,
             Self::CertShow => super::cert_show::HELP,
             Self::CertChain => super::cert_chain::HELP,
@@ -252,10 +252,10 @@ impl VerbTag {
             Self::Verify => Verb::Verify(super::verify::VerifyArgs::parse(rest)?),
             Self::CertShow => Verb::CertShow(super::cert_show::CertShowArgs::parse(rest)?),
             Self::CertChain => Verb::CertChain(super::cert_chain::CertChainArgs::parse(rest)?),
-            Self::CardPair => Verb::CardPair(super::card_pair::PairArgs::parse(rest)?),
-            Self::CardPairs => Verb::CardPairs(super::card_pair::PairsArgs::parse(rest)?),
-            Self::CardUnpair => Verb::CardUnpair(super::card_pair::UnpairArgs::parse(rest)?),
-            Self::CardAuth => Verb::CardAuth(super::card_pair::AuthArgs::parse(rest)?),
+            Self::PhonePair => Verb::PhonePair(super::card_pair::PairArgs::parse(rest)?),
+            Self::PhoneCheck => Verb::PhoneCheck(super::card_pair::PairsArgs::parse(rest)?),
+            Self::PhoneUnpair => Verb::PhoneUnpair(super::card_pair::UnpairArgs::parse(rest)?),
+            Self::PhoneAuth => Verb::PhoneAuth(super::card_pair::AuthArgs::parse(rest)?),
         })
     }
 }
@@ -306,14 +306,14 @@ pub enum Verb {
     CertShow(super::cert_show::CertShowArgs),
     /// `cert chain` -- chain walk.
     CertChain(super::cert_chain::CertChainArgs),
-    /// `pair` -- pair with mobile device.
-    CardPair(super::card_pair::PairArgs),
-    /// `pairs` -- list paired mobile devices.
-    CardPairs(super::card_pair::PairsArgs),
-    /// `unpair` -- forget the paired phone.
-    CardUnpair(super::card_pair::UnpairArgs),
-    /// `auth` -- authenticate to a TLS site via paired mobile device.
-    CardAuth(super::card_pair::AuthArgs),
+    /// `phone` -- show the paired phone.
+    PhoneCheck(super::card_pair::PairsArgs),
+    /// `phone pair` -- pair with a phone.
+    PhonePair(super::card_pair::PairArgs),
+    /// `phone unpair` -- forget the paired phone.
+    PhoneUnpair(super::card_pair::UnpairArgs),
+    /// `phone auth` -- log in to a TLS site through the paired phone.
+    PhoneAuth(super::card_pair::AuthArgs),
 }
 
 impl Verb {
@@ -342,10 +342,10 @@ impl Verb {
             Self::Verify(_) => VerbTag::Verify,
             Self::CertShow(_) => VerbTag::CertShow,
             Self::CertChain(_) => VerbTag::CertChain,
-            Self::CardPair(_) => VerbTag::CardPair,
-            Self::CardPairs(_) => VerbTag::CardPairs,
-            Self::CardUnpair(_) => VerbTag::CardUnpair,
-            Self::CardAuth(_) => VerbTag::CardAuth,
+            Self::PhonePair(_) => VerbTag::PhonePair,
+            Self::PhoneCheck(_) => VerbTag::PhoneCheck,
+            Self::PhoneUnpair(_) => VerbTag::PhoneUnpair,
+            Self::PhoneAuth(_) => VerbTag::PhoneAuth,
         }
     }
 
@@ -371,10 +371,10 @@ impl Verb {
             Self::Verify(a) => a.run(),
             Self::CertShow(a) => a.run(),
             Self::CertChain(a) => a.run(),
-            Self::CardPair(a) => a.run(verbose),
-            Self::CardPairs(a) => a.run(),
-            Self::CardUnpair(a) => a.run(verbose),
-            Self::CardAuth(a) => a.run(verbose),
+            Self::PhonePair(a) => a.run(verbose),
+            Self::PhoneCheck(a) => a.run(),
+            Self::PhoneUnpair(a) => a.run(verbose),
+            Self::PhoneAuth(a) => a.run(verbose),
         }
     }
 }
@@ -521,10 +521,17 @@ pub fn route(
             return Err(VerbParseError::UnknownCertVerb { got: String::new() });
         }
         [c, rest @ ..] if c == "verify" => (VerbTag::Verify, rest),
-        [c, rest @ ..] if c == "pair" => (VerbTag::CardPair, rest),
-        [c, rest @ ..] if c == "pairs" => (VerbTag::CardPairs, rest),
-        [c, rest @ ..] if c == "unpair" => (VerbTag::CardUnpair, rest),
-        [c, rest @ ..] if c == "auth" => (VerbTag::CardAuth, rest),
+        [c, v, rest @ ..] if c == "phone" => match v.as_str() {
+            "pair" => (VerbTag::PhonePair, rest),
+            "unpair" => (VerbTag::PhoneUnpair, rest),
+            "auth" => (VerbTag::PhoneAuth, rest),
+            other => {
+                return Err(VerbParseError::Unrecognized {
+                    got: format!("phone {other}"),
+                });
+            }
+        },
+        [c] if c == "phone" => (VerbTag::PhoneCheck, &[][..]),
         [c, v, rest @ ..] if c == "reader" && v == "keyboard" => (VerbTag::ReaderKeyboard, rest),
         [c, v, ..] if c == "reader" => {
             return Err(VerbParseError::Unrecognized {
@@ -756,26 +763,46 @@ mod tests {
     }
 
     #[test]
-    fn pair_and_auth_subcommands() -> TestResult {
-        let sub = parse_argv(&argv(&["refineid", "pair"]))?;
-        check(&sub.tag(), &VerbTag::CardPair, "pair prompts for the code")?;
-        if parse_argv(&argv(&["refineid", "pair", "7K X4 M9"])).is_ok() {
+    fn phone_subcommands() -> TestResult {
+        let sub = parse_argv(&argv(&["refineid", "phone", "pair"]))?;
+        check(&sub.tag(), &VerbTag::PhonePair, "pair prompts for the code")?;
+        if parse_argv(&argv(&["refineid", "phone", "pair", "7K X4 M9"])).is_ok() {
             return Err("the code is never taken from the command line".into());
         }
-        if parse_argv(&argv(&["refineid", "pair", "--code", "7kx4m9"])).is_ok() {
+        if parse_argv(&argv(&["refineid", "phone", "pair", "--code", "7kx4m9"])).is_ok() {
             return Err("--code is not an option".into());
         }
-        let sub = parse_argv(&argv(&["refineid", "pairs"]))?;
-        check(&sub.tag(), &VerbTag::CardPairs, "pairs tag")?;
-        let sub = parse_argv(&argv(&["refineid", "unpair"]))?;
-        check(&sub.tag(), &VerbTag::CardUnpair, "unpair tag")?;
-        let sub = parse_argv(&argv(&["refineid", "auth", "https://card.refineid.fi"]))?;
-        check(&sub.tag(), &VerbTag::CardAuth, "auth tag")?;
-        let sub = parse_argv(&argv(&["refineid", "auth"]))?;
-        check(&sub.tag(), &VerbTag::CardAuth, "auth tag")?;
+        let sub = parse_argv(&argv(&["refineid", "phone"]))?;
+        check(
+            &sub.tag(),
+            &VerbTag::PhoneCheck,
+            "bare phone is the readout",
+        )?;
+        let sub = parse_argv(&argv(&["refineid", "phone", "unpair"]))?;
+        check(&sub.tag(), &VerbTag::PhoneUnpair, "unpair tag")?;
+        let sub = parse_argv(&argv(&[
+            "refineid",
+            "phone",
+            "auth",
+            "https://card.refineid.fi",
+        ]))?;
+        check(&sub.tag(), &VerbTag::PhoneAuth, "auth tag")?;
+        let sub = parse_argv(&argv(&["refineid", "phone", "auth"]))?;
+        check(&sub.tag(), &VerbTag::PhoneAuth, "auth tag")?;
+        for old in [
+            &["refineid", "pair"][..],
+            &["refineid", "pairs"],
+            &["refineid", "unpair"],
+            &["refineid", "auth"],
+        ] {
+            check_true(
+                parse_argv(&argv(old)).is_err(),
+                "the bare spellings are gone",
+            )?;
+        }
         check_true(
-            parse_argv(&argv(&["refineid", "card", "auth"])).is_err(),
-            "auth has no card spelling",
+            parse_argv(&argv(&["refineid", "phone", "bogus"])).is_err(),
+            "an unknown phone verb is an error",
         )
     }
 }

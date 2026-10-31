@@ -187,9 +187,9 @@ With remote access on in the phone's RefineID and the phone on the same
 network:
 
 ```sh
-./target/release/refineid pair
+./target/release/refineid phone pair
 ```
 
 The command browses for the phone, the phone shows a six-character
-code, and the code is typed at the prompt. `refineid pairs` lists the
-pairing and `refineid auth` uses the phone's card.
+code, and the code is typed at the prompt. `refineid phone` shows the
+pairing and `refineid phone auth` uses the phone's card.

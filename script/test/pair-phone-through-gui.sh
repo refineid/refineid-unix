@@ -100,14 +100,14 @@ EOS
 
 host_pairs() {
     host_sh <<'EOS'
-refineid pairs 2>/dev/null
+refineid phone 2>/dev/null
 EOS
 }
 
 # Forgets the host's phone, so that the window shows the code boxes.
 host_forget() {
     host_sh <<'EOS'
-refineid unpair >/dev/null 2>&1 || true
+refineid phone unpair >/dev/null 2>&1 || true
 EOS
 }
 

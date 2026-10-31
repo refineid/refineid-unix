@@ -31,7 +31,7 @@
 .Nm
 reads, manages and signs with a FINEID card, the Finnish identity card,
 in a PC/SC reader or in a phone paired with
-.Nm pair .
+.Nm phone pair .
 .Pp
 Without a command, or with
 .Cm help ,
@@ -58,6 +58,8 @@ among a command's arguments, shows that command's options.
 .Nm
 .Cm document help ,
 .Nm
+.Cm phone help ,
+.Nm
 .Cm cert help
 and
 .Nm
@@ -73,7 +75,7 @@ keys.
 The card's PINs: activation, change and unblock.
 .It Cm document
 Signed documents a counterparty can open.
-.It Cm pair , pairs , unpair , auth
+.It Cm phone
 The paired phone, whose card the computer uses over the network.
 .It Cm verify , cert
 Offline signature and certificate tools.
@@ -96,7 +98,7 @@ With
 it prints its step report on the standard output.
 A query, such as
 .Cm card ,
-.Cm pairs ,
+.Cm phone ,
 .Cm verify
 or
 .Cm cert show ,
@@ -283,13 +285,13 @@ Stop at level T: no embedded evidence.
 .It Fl -no-timestamp
 Sign at level B: no authority is contacted.
 .El
-.It Cm pair
+.It Cm phone
+Show the paired phone.
+.It Cm phone pair
 Pair with a phone running RefineID.
 Start pairing on the phone and type the six-character code it shows.
 The code is read from the prompt only, never from the command line.
-.It Cm pairs
-Show the paired phone.
-.It Cm unpair
+.It Cm phone unpair
 Forget the paired phone.
 .El
 .Sh ADVANCED COMMANDS
@@ -385,7 +387,7 @@ serial number.
 Write every public artefact to
 .Ar dir .
 No PIN, no network.
-.It Cm auth Op Ar url
+.It Cm phone auth Op Ar url
 Log in to a TLS site with the card in the paired phone and print the
 response's status line.
 .Ar url
@@ -460,7 +462,7 @@ A CA bundle file for TLS connections, used instead of the system
 bundle.
 .It Ev SSL_CERT_FILE , SSL_CERT_DIR
 Searched before the system bundle paths for the CA bundle of
-.Cm auth .
+.Cm phone auth .
 .It Ev REFINEID_TLS_MAX
 Set to
 .Li 1.2
@@ -505,7 +507,7 @@ Success, or help or version shown on request.
 rejected the signature, or
 .Cm cert chain
 reached no self-signed root, or
-.Cm auth
+.Cm phone auth
 received a 4xx or 5xx status; a redirect counts as success.
 .It 64
 The command line was not understood
