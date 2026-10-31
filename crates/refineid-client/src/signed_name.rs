@@ -18,10 +18,15 @@
 //! with the RFC 3339 time's colons as dashes. The stem keeps its own
 //! spaces; the suffix adds none, so the name passes through a shell
 //! unquoted when the input did.
+//!
+//! The time is the signature's best-signature-time (ETSI EN 319 102-1
+//! clause 5.5), the earliest generation time of its signature
+//! timestamps, and the signer's clock when it carries none.
 
 use std::path::{Path, PathBuf};
 
 use refineid_lib_core::sign::document::Format;
+use refineid_lib_core::sign::timestamp::VerifiedTimestampToken;
 use refineid_lib_core::x509::DateTime;
 
 /// The word between a signed document's stem and its signing time.
@@ -64,14 +69,72 @@ pub fn signed_document_path(inputs: &[PathBuf], format: Format, signed_at: DateT
         .map_or_else(|| PathBuf::from(&name), |dir| dir.join(&name))
 }
 
+/// The earliest authenticated `genTime` among a signature's verified
+/// signature timestamps: its best-signature-time (ETSI EN 319 102-1
+/// clause 5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BestSignatureTime(DateTime);
+
+impl BestSignatureTime {
+    /// The earliest generation time among `tokens`, the timestamps over
+    /// the signature value; `None` when there are none. An archive or
+    /// document timestamp covers more than the signature and is not
+    /// one of them.
+    #[must_use]
+    pub fn of_signature_timestamps(tokens: &[VerifiedTimestampToken]) -> Option<Self> {
+        tokens
+            .iter()
+            .map(|token| token.generated_at)
+            .min()
+            .map(Self)
+    }
+
+    /// The instant.
+    #[must_use]
+    pub const fn instant(self) -> DateTime {
+        self.0
+    }
+}
+
+/// The default name of a document not yet signed: its inputs, its
+/// format and the clock reading that stands in when the signature
+/// carries no timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSignedName {
+    inputs: Vec<PathBuf>,
+    format: Format,
+    clock: DateTime,
+}
+
+impl PendingSignedName {
+    /// The name of `inputs` signed as `format`, falling back to `clock`.
+    #[must_use]
+    pub const fn new(inputs: Vec<PathBuf>, format: Format, clock: DateTime) -> Self {
+        Self {
+            inputs,
+            format,
+            clock,
+        }
+    }
+
+    /// The path, named by `best` when the signature has one and by the
+    /// clock otherwise.
+    #[must_use]
+    pub fn path(&self, best: Option<BestSignatureTime>) -> PathBuf {
+        let at = best.map_or(self.clock, BestSignatureTime::instant);
+        signed_document_path(&self.inputs, self.format, at)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use refineid_lib_core::sign::document::Format;
+    use refineid_lib_core::sign::timestamp::VerifiedTimestampToken;
     use refineid_lib_core::x509::DateTime;
 
-    use super::signed_document_path;
+    use super::{BestSignatureTime, PendingSignedName, signed_document_path};
     use crate::test_util::{TestResult, check};
 
     /// A synthetic signing time, 2001-02-03T04:05:06Z.
@@ -168,6 +231,89 @@ mod tests {
             &named(&["report.pdf"], Format::Pades)?,
             &PathBuf::from("report-signed-2001-02-03T04-05-06Z.pdf"),
             "relative",
+        )
+    }
+
+    /// A synthetic clock reading, 2001-02-03T05:00:00Z.
+    const CLOCK_HOUR: u8 = 5;
+    const CLOCK_MINUTE: u8 = 0;
+    const CLOCK_SECOND: u8 = 0;
+    /// A later synthetic timestamp generation time,
+    /// 2001-02-03T04:05:07Z.
+    const LATER_SECOND: u8 = 7;
+
+    fn clock() -> Result<DateTime, String> {
+        DateTime::new(
+            SIGNED_YEAR,
+            SIGNED_MONTH,
+            SIGNED_DAY,
+            CLOCK_HOUR,
+            CLOCK_MINUTE,
+            CLOCK_SECOND,
+        )
+        .map_err(|e| format!("clock: {e}"))
+    }
+
+    fn later() -> Result<DateTime, String> {
+        DateTime::new(
+            SIGNED_YEAR,
+            SIGNED_MONTH,
+            SIGNED_DAY,
+            SIGNED_HOUR,
+            SIGNED_MINUTE,
+            LATER_SECOND,
+        )
+        .map_err(|e| format!("later time: {e}"))
+    }
+
+    fn token_at(generated_at: DateTime) -> VerifiedTimestampToken {
+        VerifiedTimestampToken {
+            token: Vec::new(),
+            signer_certificate: Vec::new(),
+            embedded_certificates: Vec::new(),
+            generated_at,
+        }
+    }
+
+    fn pending() -> Result<PendingSignedName, String> {
+        Ok(PendingSignedName::new(
+            vec![PathBuf::from("/documents/report.pdf")],
+            Format::Pades,
+            clock()?,
+        ))
+    }
+
+    #[test]
+    fn the_name_carries_the_signature_timestamp_time() -> TestResult {
+        let best = BestSignatureTime::of_signature_timestamps(&[token_at(signed_at()?)]);
+        check(
+            &pending()?.path(best),
+            &PathBuf::from("/documents/report-signed-2001-02-03T04-05-06Z.pdf"),
+            "timestamp time, not the clock",
+        )
+    }
+
+    #[test]
+    fn without_a_signature_timestamp_the_name_carries_the_clock() -> TestResult {
+        let best = BestSignatureTime::of_signature_timestamps(&[]);
+        check(&best, &None, "no timestamp, no best time")?;
+        check(
+            &pending()?.path(best),
+            &PathBuf::from("/documents/report-signed-2001-02-03T05-00-00Z.pdf"),
+            "the clock",
+        )
+    }
+
+    #[test]
+    fn several_signature_timestamps_give_the_earliest_time() -> TestResult {
+        let best = BestSignatureTime::of_signature_timestamps(&[
+            token_at(later()?),
+            token_at(signed_at()?),
+        ]);
+        check(
+            &best.map(BestSignatureTime::instant),
+            &Some(signed_at()?),
+            "earliest genTime",
         )
     }
 }

@@ -29,7 +29,10 @@ Citations are BibTeX keys in [`references.md`](references.md).
   nothing is echoed while it is typed.
 - **Names a shell can pass back.** A signed document is
   `<stem>-signed-<UTC time>.<ext>`: the user's stem untouched, and a
-  suffix that adds no spaces.
+  suffix that adds no spaces. The time is the signature timestamp's
+  time, else the clock's: the best-signature-time of ETSI EN 319 102-1
+  clause 5.5, where a claimed signing time has only prima facie
+  value.
 - **Prefixes for typing, full words for scripts.** A command word may
   be shortened to any prefix that names one command, so `refineid doc
   s` signs a document; a prefix that fits several is refused with the
