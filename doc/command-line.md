@@ -30,11 +30,13 @@ Citations are BibTeX keys in [`references.md`](references.md).
 - **Names a shell can pass back.** A signed document is
   `<stem>-signed-<UTC time>.<ext>`: the user's stem untouched, and a
   suffix that adds no spaces.
+- **Prefixes for typing, full words for scripts.** A command word may
+  be shortened to any prefix that names one command, so `refineid doc
+  s` signs a document; a prefix that fits several is refused with the
+  candidates, never guessed.
 
-Planned on the same reasoning: a unique prefix of a command word is
-accepted (`refineid doc s`), an ambiguous one is an error that names the
-candidates, and a zsh completion file is generated from the command
-table.
+Planned on the same reasoning: a zsh completion file generated from the
+command table.
 
 ## Why
 

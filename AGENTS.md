@@ -74,6 +74,9 @@
   `refineid expert` the advanced ones; `refineid <command> help` shows that
   command's options; the man page refineid(1) carries the detail, split the
   same way, and stays in step with every command's help text.
+- A command word may be shortened to any prefix that names one command
+  (`refineid doc s`); a prefix that fits several is an error naming the
+  candidates, never a guess. Scripts and documents spell commands out.
 - Operations are silent on success; details only with `-v`/`--verbose`.
   `-V`/`--version` prints the version; nothing else prints it, and no
   command prints a banner.

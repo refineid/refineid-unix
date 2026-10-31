@@ -67,6 +67,16 @@ and
 .Cm reader help
 list a group's commands.
 .Pp
+A command word may be shortened to any prefix that names one command:
+.Nm
+.Cm doc s
+is
+.Nm
+.Cm document sign .
+A prefix that fits several commands is refused with the candidates.
+Scripts spell commands out; a prefix that is unique today may not be
+after a command is added.
+.Pp
 The commands fall into groups:
 .Bl -tag -width Ds
 .It Cm card
