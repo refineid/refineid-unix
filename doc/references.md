@@ -211,6 +211,117 @@ Published by DVV at <https://dvv.fi/en/fineid-specifications>.
   visible and reversible, degrading can be kinder than refusing.
 - **Source quality:** peer-reviewed (Automatica 1983).
 
+#### The command line
+
+These inform [`command-line.md`](command-line.md). They are
+laboratory studies of command languages from the 1980s; they justify the shape of the
+command set, not any particular word in it.
+
+### carroll1982paradigms
+
+- **Supports:** two properties of a command vocabulary that make it
+  easier to learn: congruence, where opposed actions get names that
+  are opposites (`raise`/`lower`, not `reach`/`down`), and
+  hierarchicalness, where a family shares a head word and differs in a
+  modifier (`move forward`/`move backward`, not `advance`/`retreat`).
+  The reason the commands are noun-first families: `pin activate`,
+  `pin change`, `pin unblock`; `pair` and `unpair`.
+- **Does NOT prove:** that noun-first beats verb-first. The
+  experiments varied the structure of names, not which word leads.
+- **Source quality:** peer-reviewed (Behaviour and Information
+  Technology 1982). The original is paywalled; the findings as stated
+  here are taken from rosenberg1984lexical, which reports them with the
+  examples above. Bibliographic data from Crossref.
+
+### rosenberg1984lexical
+
+- **Supports:** a survey of the command-naming studies of its time;
+  the source for the carroll1982paradigms and black1982commandnames
+  findings as stated here, with the examples. Open access.
+- **Does NOT prove:** anything on its own; it reports others' results.
+- **Source quality:** peer-reviewed (COLING/ACL 1984); read in full.
+
+### black1982commandnames
+
+- **Supports:** names that are specific and discriminable are
+  remembered better than general, high-frequency words, and users'
+  own choices of names varied widely and tended to the general. The
+  reason naming debates are settled by the family's regularity and by
+  distinctness, not by polling.
+- **Does NOT prove:** anything about two-word commands; the study
+  used single words.
+- **Source quality:** peer-reviewed (CHI 1982); findings as reported
+  in rosenberg1984lexical and the ACM abstract.
+
+### landauer1983naturalnames
+
+- **Supports:** giving operations that take different syntax
+  different names greatly reduced learning difficulty, while names
+  chosen to be natural gave no advantage over arbitrary ones in
+  initial learning. Together with black1982commandnames, structure
+  over wording.
+- **Does NOT prove:** that names are irrelevant to anything but
+  initial learning; the task was text editing with a small set.
+- **Source quality:** peer-reviewed (CACM 1983); abstract checked.
+
+### streeter1983abbreviating
+
+- **Supports:** across their production studies, truncation was the
+  best single abbreviation scheme for producing an abbreviation from a
+  command name, and the one that best captured what people do
+  unprompted for words of two or more syllables. On "minimum to
+  distinguish" (a unique prefix) they note two problems and answer
+  both: it is harder to learn than fixed-length truncation, and a new
+  command can make an old prefix ambiguous; their remedy is a system
+  that presents the collisions and asks, and command tables structured
+  hierarchically so a prefix need only be unique within its group. The
+  reason an ambiguous prefix is an error naming the candidates, scripts
+  spell commands out, and prefixes resolve within a noun group.
+- **Does NOT prove:** that prefixes suit everyone; the paper also
+  finds vowel deletion better for the reverse task (recovering the
+  word from the abbreviation), and that one-syllable words and
+  multi-word terms are abbreviated differently.
+- **Source quality:** peer-reviewed (Bell System Technical Journal
+  1983); full text read in the scanned issue.
+
+### furnas1987vocabulary
+
+- **Supports:** two people choose the same word for the same thing
+  rarely more than one time in five, so a single name will be missed
+  by most first guesses.
+- **Does NOT prove:** that synonyms are the right remedy here. The
+  paper's remedy is many aliases; this repository refuses aliases and
+  bridges the gap with the listing and completion. Counter-evidence to
+  that choice, recorded as such.
+- **Source quality:** peer-reviewed (CACM 1987).
+
+### grudin1989consistency
+
+- **Supports:** consistency is not an end; forcing unlike things into
+  like shapes harms use. The reason `card` and `phone` are parallel
+  only where the parallel is real.
+- **Does NOT prove:** where the line falls in any given case.
+- **Source quality:** peer-reviewed (CACM 1989).
+
+### norman1981unix
+
+- **Supports:** a command set that shows everything to everyone, with
+  no cue to the frequent and the rare, is hard to learn. The reason the
+  everyday commands are listed alone and the rest behind `expert`.
+- **Does NOT prove:** where the split belongs; that is judgement about
+  who the users are.
+- **Source quality:** industry-published (Datamation 1981, essay by a
+  cognitive scientist, not a study).
+
+### raymond2003unix
+
+- **Supports:** the Rule of Silence as the recorded UNIX convention:
+  say nothing when there is nothing surprising to say. The reason
+  operations print nothing on success.
+- **Does NOT prove:** anything; it is a statement of convention and
+  cited as such.
+- **Source quality:** industry-published (book).
+
 ## Evidence we do not have
 
 Listing what cannot be cited is part of avoiding echo-chamber
@@ -235,3 +346,24 @@ rather than evidence.
   *shape* of the reasoning, not the conclusion. The concrete evidence
   is that the core stays testable without hardware and that adapters
   have been swapped without touching it.
+
+### On noun-first versus verb-first commands
+
+- **No controlled study** compares `document sign` with `sign
+  document` or `sign-document` on a command line. carroll1982paradigms
+  shows that hierarchical families help; it does not say which word
+  leads. Shneiderman's object-action model argues object-first matches
+  how people decide, but that argument comes from direct-manipulation
+  interfaces. In practice both orders ship: PowerShell chose verb-noun
+  with an approved verb list; git, docker and kubectl chose noun-verb.
+- The honest framing is "noun-first makes the hierarchy fall out of
+  the grammar," a design argument, not "the literature prefers it".
+
+### On refusing synonyms
+
+- furnas1987vocabulary measured the problem and prescribed aliases.
+  This repository keeps one name per command and relies on the listing
+  and completion instead. That is a decision against the paper's
+  remedy, made for the sake of one vocabulary across the man page,
+  the help and the scripts people write; no study of this trade-off is
+  known to us.
