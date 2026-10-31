@@ -273,7 +273,7 @@ pub(super) fn new_pin_env_or_prompt(
 /// prompt failure into the standard `cmd: <error>` stderr line
 /// + `RuntimeFailure` exit.
 ///
-/// Thin shim over [`read_pin_masked`] that writes the stderr
+/// Thin shim over [`read_pin`] that writes the stderr
 /// line and returns the [`ExitStatus`] the handler exits with.
 ///
 /// # Errors
@@ -281,7 +281,7 @@ pub(super) fn new_pin_env_or_prompt(
 /// stdin read fails or ends without a PIN. The stderr line is
 /// already written.
 pub(super) fn prompt_pin(cmd: &str, prompt: &str) -> Result<PinBytes, ExitStatus> {
-    read_pin_masked(prompt).map_err(|msg| {
+    read_pin(prompt).map_err(|msg| {
         eprintln!("{cmd}: {msg}");
         ExitStatus::RuntimeFailure
     })
@@ -340,21 +340,17 @@ pub(super) fn prompt_new_pin_pair(
     Ok(new1)
 }
 
-/// Read a PIN from stdin, showing one `*` per entered character when
-/// stdin is a TTY,
+/// Read a PIN from stdin: with no echo at all when stdin is a TTY, so
+/// the screen shows neither the digits nor how many there were;
 /// line-read when it isn't. Returns the bytes wrapped in a
 /// [`PinBytes`] (which zeroizes on drop).
 ///
 /// # Errors
 /// Returns the prompt failure or stdin read failure as a
 /// human-readable string. The caller maps it to an exit code.
-pub(super) fn read_pin_masked(prompt: &str) -> Result<PinBytes, String> {
+pub(super) fn read_pin(prompt: &str) -> Result<PinBytes, String> {
     let pin_str = if IsTerminal::is_terminal(&io::stdin()) {
-        let config = rpassword::ConfigBuilder::new()
-            .password_feedback_mask('*')
-            .build();
-        rpassword::prompt_password_with_config(prompt, config)
-            .map_err(|e| format!("PIN prompt failed: {e}"))?
+        rpassword::prompt_password(prompt).map_err(|e| format!("PIN prompt failed: {e}"))?
     } else {
         let mut line = String::new();
         let stdin = io::stdin();
@@ -418,7 +414,7 @@ mod tests {
     // (NoReaders/NoCardPresent) vs "your argv didn't pin a unique
     // card" (BadInvocation) vs "everything else" (RuntimeFailure).
     // The interactive prompt helpers (prompt_pin / prompt_can /
-    // read_pin_masked) read stdin and are deliberately left
+    // read_pin) read stdin and are deliberately left
     // untested: under `cargo test` stdin is often still a TTY, so
     // exercising them would block the harness on a real read.
 
