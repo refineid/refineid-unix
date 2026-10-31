@@ -212,6 +212,30 @@ impl VerbTag {
             .map_or(self.label(), |(group, _)| group)
     }
 
+    /// Every group word once, in listing order: the first words of
+    /// the labels.
+    pub fn groups() -> impl Iterator<Item = &'static str> {
+        let mut seen: Vec<&'static str> = Vec::new();
+        Self::ALL.iter().filter_map(move |tag| {
+            let group = tag.group();
+            if seen.contains(&group) {
+                None
+            } else {
+                seen.push(group);
+                Some(group)
+            }
+        })
+    }
+
+    /// The verbs of `group` with their subcommands, in listing order:
+    /// the second word of every two-word label in the group.
+    pub fn verbs_of(group: &str) -> impl Iterator<Item = (&'static str, Self)> + '_ {
+        Self::ALL.iter().filter_map(move |tag| {
+            let (own, verb) = tag.label().split_once(' ')?;
+            (own == group).then_some((verb, *tag))
+        })
+    }
+
     /// Parse the argv that follows this subcommand's words into the
     /// typed [`Verb`].
     ///
@@ -408,12 +432,13 @@ pub enum VerbParseError {
         /// subcommand. Tier 0 `String` from `std::env::args()`.
         got: String,
     },
-    /// `refineid cert <verb>` reached without a recognised
-    /// `<verb>` (`show` / `chain`).
-    UnknownCertVerb {
-        /// The literal argv token after `cert` that wasn't
-        /// recognised. Tier 0 `String` from `std::env::args()`.
+    /// A shortened command word that starts several commands.
+    Ambiguous {
+        /// The literal argv token, with its group word when it is a
+        /// second word. Tier 0 `String` from `std::env::args()`.
         got: String,
+        /// The commands it could mean, in listing order.
+        candidates: Vec<String>,
     },
 }
 
@@ -422,8 +447,8 @@ impl core::fmt::Display for VerbParseError {
         match self {
             Self::Missing => f.write_str("no subcommand supplied"),
             Self::Unrecognized { got } => write!(f, "unrecognised subcommand {got:?}"),
-            Self::UnknownCertVerb { got } => {
-                write!(f, "unknown `cert` verb {got:?}; try `show` or `chain`")
+            Self::Ambiguous { got, candidates } => {
+                write!(f, "ambiguous command {got:?}: {}", candidates.join(", "))
             }
         }
     }
@@ -476,7 +501,7 @@ impl From<super::ArgParseError> for ParseError {
 ///
 /// # Errors
 /// [`ParseError::Verb`] on verb dispatch failure (no
-/// subcommand / unrecognised / unknown cert verb);
+/// subcommand / unrecognised / ambiguous);
 /// [`ParseError::Args`] when the verb is recognised but the
 /// subcommand's typed Args parser rejects the remaining argv.
 pub fn parse_argv(argv: &super::argv::ProcessArgv) -> Result<Verb, ParseError> {
@@ -484,109 +509,91 @@ pub fn parse_argv(argv: &super::argv::ProcessArgv) -> Result<Verb, ParseError> {
     Ok(tag.parse_args(rest)?)
 }
 
-/// Name the subcommand the argv's leading words select and return
-/// the argv that follows them. Bare `card` and `card --flag ...`
-/// route to [`VerbTag::CardCheck`] with every token after `card`.
+/// Resolve the leading argv words to a subcommand and hand back the
+/// rest. A command word may be shortened to any prefix that names one
+/// command; a prefix that fits several is refused with the
+/// candidates. The first word names a group (`card`, `pin`, `phone`,
+/// ...) or a one-word command (`verify`); the second names the verb
+/// in a group that has them. A group whose bare word is itself a
+/// command (`card`, `phone`) takes a second word that names no verb
+/// as the first of its own arguments.
 ///
 /// # Errors
-/// [`VerbParseError`] when no subcommand is given or the words name
-/// none.
+/// [`VerbParseError::Missing`] with no words, `Unrecognized` for a
+/// word that starts nothing or a group given no verb, `Ambiguous` for
+/// a word that starts several.
 pub fn route(
     argv: &super::argv::ProcessArgv,
 ) -> Result<(VerbTag, super::argv::RemainingArgv), VerbParseError> {
     use super::argv::RemainingArgv;
-    let (tag, rest) = match argv.after_program() {
-        [c, v, rest @ ..] if c == "card" => match card_verb(v) {
+    use super::word::{Match, resolve};
+    let [first, rest @ ..] = argv.after_program() else {
+        return Err(VerbParseError::Missing);
+    };
+    let group = match resolve(first, VerbTag::groups()) {
+        Match::One(group) => group,
+        Match::None => {
+            return Err(VerbParseError::Unrecognized { got: first.clone() });
+        }
+        Match::Several(candidates) => {
+            return Err(VerbParseError::Ambiguous {
+                got: first.clone(),
+                candidates: candidates.into_iter().map(str::to_owned).collect(),
+            });
+        }
+    };
+    let bare = VerbTag::ALL
+        .iter()
+        .copied()
+        .find(|tag| tag.label() == group);
+    let verbs: Vec<(&str, VerbTag)> = VerbTag::verbs_of(group).collect();
+    let Some((&(first_verb, _), _)) = verbs.split_first() else {
+        // A one-word command: `verify`.
+        return bare
+            .map(|tag| (tag, RemainingArgv::from_slice(rest)))
+            .ok_or_else(|| VerbParseError::Unrecognized { got: first.clone() });
+    };
+    let (tag, rest) = match rest {
+        [second, more @ ..] if !second.starts_with(OPTION_START) => {
+            match resolve(second, verbs.iter().map(|(word, _)| *word)) {
+                Match::One(word) => match verbs.iter().find(|(verb, _)| *verb == word) {
+                    Some((_, tag)) => (*tag, more),
+                    None => {
+                        return Err(VerbParseError::Unrecognized {
+                            got: format!("{group} {second}"),
+                        });
+                    }
+                },
+                Match::None => match bare {
+                    Some(tag) => (tag, rest),
+                    None => {
+                        return Err(VerbParseError::Unrecognized {
+                            got: format!("{group} {second}"),
+                        });
+                    }
+                },
+                Match::Several(words) => {
+                    return Err(VerbParseError::Ambiguous {
+                        got: format!("{group} {second}"),
+                        candidates: words.iter().map(|word| format!("{group} {word}")).collect(),
+                    });
+                }
+            }
+        }
+        _ => match bare {
             Some(tag) => (tag, rest),
-            // Not a verb: the token is the first of bare `card`'s
-            // own arguments.
             None => {
-                let mut full = Vec::with_capacity(rest.len().saturating_add(1));
-                full.push(v.clone());
-                full.extend_from_slice(rest);
-                return Ok((VerbTag::CardCheck, RemainingArgv::from_vec(full)));
-            }
-        },
-        [c] if c == "card" => (VerbTag::CardCheck, &[][..]),
-        [c, v, rest @ ..] if c == "cert" => match v.as_str() {
-            "show" => (VerbTag::CertShow, rest),
-            "chain" => (VerbTag::CertChain, rest),
-            other => {
-                return Err(VerbParseError::UnknownCertVerb {
-                    got: other.to_owned(),
-                });
-            }
-        },
-        [c] if c == "cert" => {
-            return Err(VerbParseError::UnknownCertVerb { got: String::new() });
-        }
-        [c, rest @ ..] if c == "verify" => (VerbTag::Verify, rest),
-        [c, v, rest @ ..] if c == "phone" => match v.as_str() {
-            "pair" => (VerbTag::PhonePair, rest),
-            "unpair" => (VerbTag::PhoneUnpair, rest),
-            "auth" => (VerbTag::PhoneAuth, rest),
-            other => {
                 return Err(VerbParseError::Unrecognized {
-                    got: format!("phone {other}"),
+                    got: format!("{group} (missing sub-verb, try: {group} {first_verb})"),
                 });
             }
         },
-        [c] if c == "phone" => (VerbTag::PhoneCheck, &[][..]),
-        [c, v, rest @ ..] if c == "reader" && v == "keyboard" => (VerbTag::ReaderKeyboard, rest),
-        [c, v, ..] if c == "reader" => {
-            return Err(VerbParseError::Unrecognized {
-                got: format!("reader {v}"),
-            });
-        }
-        [c] if c == "reader" => {
-            return Err(VerbParseError::Unrecognized {
-                got: "reader (missing sub-verb, try: reader keyboard)".to_owned(),
-            });
-        }
-        [c, v, rest @ ..] if c == "pin" => match v.as_str() {
-            "activate" => (VerbTag::PinActivate, rest),
-            "change" => (VerbTag::PinChange, rest),
-            "unblock" => (VerbTag::PinUnblock, rest),
-            other => {
-                return Err(VerbParseError::Unrecognized {
-                    got: format!("pin {other}"),
-                });
-            }
-        },
-        [c] if c == "pin" => {
-            return Err(VerbParseError::Unrecognized {
-                got: "pin (missing sub-verb, try: pin change)".to_owned(),
-            });
-        }
-        [c, v, rest @ ..] if c == "document" && v == "sign" => (VerbTag::DocumentSign, rest),
-        [c, v, ..] if c == "document" => {
-            return Err(VerbParseError::Unrecognized {
-                got: format!("document {v}"),
-            });
-        }
-        [c] if c == "document" => {
-            return Err(VerbParseError::Unrecognized {
-                got: "document (missing sub-verb, try: document sign)".to_owned(),
-            });
-        }
-        [other, ..] => return Err(VerbParseError::Unrecognized { got: other.clone() }),
-        [] => return Err(VerbParseError::Missing),
     };
     Ok((tag, RemainingArgv::from_slice(rest)))
 }
 
-/// The `card <verb>` sub-verbs. `None` for a token that is not one.
-fn card_verb(token: &str) -> Option<VerbTag> {
-    Some(match token {
-        "emrtd" => VerbTag::CardEmrtd,
-        "sign-auth" => VerbTag::CardSignAuth,
-        "sign-qualified" => VerbTag::CardSignQualified,
-        "decrypt-auth" => VerbTag::CardDecryptAuth,
-        "pubkey" => VerbTag::CardPubkey,
-        "export-all" => VerbTag::CardExportAll,
-        _ => return None,
-    })
-}
+/// The first character of an option, which a verb never starts with.
+const OPTION_START: char = '-';
 
 #[cfg(test)]
 mod tests {
@@ -726,13 +733,103 @@ mod tests {
 
     #[test]
     fn unknown_cert_verb_rejected() -> TestResult {
-        let r = parse_argv(&argv(&["refineid", "cert", "bogus"]));
+        for unknown in [vec!["refineid", "cert"], vec!["refineid", "cert", "bogus"]] {
+            check_true(
+                matches!(
+                    parse_argv(&argv(&unknown)),
+                    Err(ParseError::Verb(VerbParseError::Unrecognized { .. }))
+                ),
+                "missing or unknown cert verb",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_unique_prefix_names_the_command() -> TestResult {
+        for (words, expected) in [
+            (
+                vec!["doc", "s", "/documents/report.pdf"],
+                VerbTag::DocumentSign,
+            ),
+            (vec!["ph", "pa"], VerbTag::PhonePair),
+            (vec!["phone"], VerbTag::PhoneCheck),
+            (vec!["pin", "c", "1"], VerbTag::PinChange),
+            (vec!["pin", "u", "2"], VerbTag::PinUnblock),
+            (
+                vec!["v", "--cert", "/c", "--in", "/i", "--sig", "/s"],
+                VerbTag::Verify,
+            ),
+            (vec!["r", "k"], VerbTag::ReaderKeyboard),
+            (vec!["card", "em", "--can", "123456"], VerbTag::CardEmrtd),
+            (
+                vec!["card", "sign-a", "--in", "/i", "--out", "/o"],
+                VerbTag::CardSignAuth,
+            ),
+            (vec!["ce", "sh", "/c"], VerbTag::CertShow),
+        ] {
+            let mut a = vec!["refineid"];
+            a.extend(words.iter().copied());
+            let (tag, _) = route(&argv(&a))?;
+            check(&tag, &expected, &format!("tag for {words:?}"))?;
+        }
+        let (tag, rest) = route(&argv(&["refineid", "card", "--offline"]))?;
+        check(
+            &tag,
+            &VerbTag::CardCheck,
+            "an option after card is card's own",
+        )?;
+        check(
+            &rest.into_vec(),
+            &vec!["--offline".to_owned()],
+            "card keeps its option",
+        )?;
+        let (tag, rest) = route(&argv(&["refineid", "card", "x"]))?;
+        check(
+            &tag,
+            &VerbTag::CardCheck,
+            "a non-verb after card is card's own",
+        )?;
+        check(
+            &rest.into_vec(),
+            &vec!["x".to_owned()],
+            "card keeps the word",
+        )
+    }
+
+    #[test]
+    fn an_ambiguous_prefix_names_the_candidates() -> TestResult {
+        match route(&argv(&["refineid", "c"])) {
+            Err(VerbParseError::Ambiguous { got, candidates }) => {
+                check(got.as_str(), "c", "got")?;
+                check(
+                    &candidates,
+                    &vec!["card".to_owned(), "cert".to_owned()],
+                    "groups",
+                )?;
+            }
+            other => return Err(format!("expected Ambiguous, got {other:?}").into()),
+        }
+        match route(&argv(&["refineid", "card", "s", "--in", "/i"])) {
+            Err(VerbParseError::Ambiguous { got, candidates }) => {
+                check(got.as_str(), "card s", "got")?;
+                check(
+                    &candidates,
+                    &vec![
+                        "card sign-auth".to_owned(),
+                        "card sign-qualified".to_owned(),
+                    ],
+                    "verbs",
+                )?;
+            }
+            other => return Err(format!("expected Ambiguous, got {other:?}").into()),
+        }
         check_true(
             matches!(
-                r,
-                Err(ParseError::Verb(VerbParseError::UnknownCertVerb { .. }))
+                route(&argv(&["refineid", "p", "change"])),
+                Err(VerbParseError::Ambiguous { .. })
             ),
-            "UnknownCertVerb",
+            "p is pin or phone",
         )
     }
 

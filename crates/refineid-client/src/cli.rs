@@ -99,6 +99,7 @@ pub mod pin_unblock;
 pub mod reader_keyboard;
 pub(crate) mod util;
 mod verb;
+pub(crate) mod word;
 // `verb` is private (mod, not pub mod); the parse-argv API
 // surfaces through cli::* so cli/* command modules import via
 // `super::Verb` rather than reaching into `super::verb::Verb`.

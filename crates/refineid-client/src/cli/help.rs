@@ -231,6 +231,9 @@ fn push_listing(out: &mut String, tier: Tier) {
 /// words.
 #[must_use]
 pub fn group(word: &str) -> Option<String> {
+    let super::word::Match::One(word) = super::word::resolve(word, VerbTag::groups()) else {
+        return None;
+    };
     let members: Vec<VerbTag> = VerbTag::ALL
         .iter()
         .copied()
@@ -374,6 +377,12 @@ mod tests {
             &card,
             "card help is the group",
         )?;
+        check(
+            &group("doc"),
+            &group("document"),
+            "a prefix names the group",
+        )?;
+        check_true(group("p").is_none(), "an ambiguous prefix names none")?;
         check_true(group("verify").is_none(), "verify is one command")?;
         check_true(group("bogus").is_none(), "no such group")
     }
