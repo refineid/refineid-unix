@@ -70,9 +70,10 @@
 
 ## Command line
 
-- `refineid` alone lists the commands, one line each; `refineid <command>
-  help` shows that command's options; the man page refineid(1) carries the
-  detail and stays in step with every command's help text.
+- `refineid` alone lists the everyday commands, one line each, and
+  `refineid expert` the advanced ones; `refineid <command> help` shows that
+  command's options; the man page refineid(1) carries the detail, split the
+  same way, and stays in step with every command's help text.
 - Operations are silent on success; details only with `-v`/`--verbose`.
   `-V`/`--version` prints the version; nothing else prints it, and no
   command prints a banner.

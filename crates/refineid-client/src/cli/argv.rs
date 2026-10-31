@@ -191,16 +191,18 @@ impl ProcessArgv {
     ///    stdout, `Err(ExitStatus::Ok)`.
     /// 3. `-V` / `--version` first: `refineid <version>` to stdout,
     ///    `Err(ExitStatus::Ok)`. Nothing else prints the version.
-    /// 4. `<group> help` (`card help`, `document help`, ...): that
+    /// 4. `expert`, alone or with a help word: the advanced commands
+    ///    to stdout, `Err(ExitStatus::Ok)`.
+    /// 5. `<group> help` (`card help`, `document help`, ...): that
     ///    group's one-line list to stdout, `Err(ExitStatus::Ok)`.
-    /// 5. A missing or unknown command: the error line and the
+    /// 6. A missing or unknown command: the error line and the
     ///    short synopsis to stderr, `Err(ExitStatus::BadInvocation)`.
-    /// 6. `<command> help`, or `-h` / `--help` among its arguments:
+    /// 7. `<command> help`, or `-h` / `--help` among its arguments:
     ///    that command's help to stdout, `Err(ExitStatus::Ok)`.
-    /// 7. The command's arguments rejected: the error line and the
+    /// 8. The command's arguments rejected: the error line and the
     ///    hint `try: refineid <command> help` to stderr,
     ///    `Err(ExitStatus::BadInvocation)`.
-    /// 8. Otherwise `Ok(Invocation)` for the caller to dispatch on.
+    /// 9. Otherwise `Ok(Invocation)` for the caller to dispatch on.
     ///
     /// # Errors
     /// Help and version return `Err(ExitStatus::Ok.into())`; a parse
@@ -227,6 +229,10 @@ impl ProcessArgv {
             }
             [first, ..] if help::is_version_option(first) => {
                 println!("{}", help::version());
+                return Err(ExitStatus::Ok.into());
+            }
+            rest if help::asks_expert(rest) => {
+                print!("{}", help::expert());
                 return Err(ExitStatus::Ok.into());
             }
             [word, next, ..] if help::is_help_word(next) => {
