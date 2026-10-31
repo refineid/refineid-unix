@@ -223,7 +223,6 @@ bricks the card.
 .Op Fl -can Ar can
 .Op Fl -no-stamp
 .Op Fl -timestamp Ar url ...
-.Op Fl -no-archive | Fl -no-long-term | Fl -no-timestamp
 .Xc
 Sign
 .Ar file
@@ -236,6 +235,7 @@ evidence plus an archive timestamp, for
 and
 .Cm asice-cades ;
 LT, embedded evidence, for the rest.
+There is no lower level.
 .Bl -tag -width Ds
 .It Fl -format Ar format
 .Bl -tag -width "cades-detached" -compact
@@ -289,12 +289,6 @@ Its middle lines are in the language of the locale, see
 .Sx ENVIRONMENT ,
 and its band carries the other two.
 The seal names no one; the signature in the file is the evidence.
-.It Fl -no-archive
-Stop at level LT: no archive timestamp.
-.It Fl -no-long-term
-Stop at level T: no embedded evidence.
-.It Fl -no-timestamp
-Sign at level B: no authority is contacted.
 .El
 .It Cm phone
 Show the paired phone.
