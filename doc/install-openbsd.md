@@ -48,12 +48,18 @@ As root:
 install -m 755 target/release/refineid /usr/local/bin/refineid
 install -d /usr/local/man/man1
 install -m 444 crates/refineid-client/man/refineid.1 /usr/local/man/man1/refineid.1
+install -d /usr/local/share/zsh/site-functions
+install -m 444 packaging/zsh/_refineid /usr/local/share/zsh/site-functions/_refineid
 install -d /usr/local/lib/refineid
 install -m 755 target/release/librefineid_pkcs11.so /usr/local/lib/refineid/
 BIN=target/release/refineid-gui script/install-desktop.sh --prefix /usr/local
 rcctl enable pcscd
 rcctl start pcscd
 ```
+
+The zsh package puts `/usr/local/share/zsh/site-functions` on `fpath`;
+a user's `~/.zshrc` still needs `autoload -Uz compinit && compinit` for
+`refineid doc<Tab>` to complete.
 
 ## 5. Multicast for phone pairing
 

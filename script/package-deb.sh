@@ -306,11 +306,13 @@ rm -rf "$STAGING_CLI" "$DEB_DIR/${PKG_CLI}.deb"
 mkdir -p \
     "$STAGING_CLI/DEBIAN" \
     "$STAGING_CLI/usr/bin" \
-    "$STAGING_CLI/usr/share/man/man1"
+    "$STAGING_CLI/usr/share/man/man1" \
+    "$STAGING_CLI/usr/share/zsh/vendor-completions"
 
 install -m 755 target/release/refineid "$STAGING_CLI/usr/bin/refineid"
 gzip -9n < crates/refineid-client/man/refineid.1 > "$STAGING_CLI/usr/share/man/man1/refineid.1.gz"
 chmod 644 "$STAGING_CLI/usr/share/man/man1/refineid.1.gz"
+install -m 644 packaging/zsh/_refineid "$STAGING_CLI/usr/share/zsh/vendor-completions/_refineid"
 write_copyright "$STAGING_CLI/usr/share/doc/refineid-cli/copyright" "refineid-cli"
 
 CLI_SHLIBS="$(calc_shlibdeps target/release/refineid "libc6, libpcsclite1")"

@@ -77,6 +77,8 @@
 - A command word may be shortened to any prefix that names one command
   (`refineid doc s`); a prefix that fits several is an error naming the
   candidates, never a guess. Scripts and documents spell commands out.
+- `packaging/zsh/_refineid` completes every command word and option and
+  is installed by every package; a test holds it to the command table.
 - Operations are silent on success; details only with `-v`/`--verbose`.
   `-V`/`--version` prints the version; nothing else prints it, and no
   command prints a banner.

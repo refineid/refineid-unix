@@ -109,9 +109,10 @@ Binaries will be placed in `target/release/`:
 sudo install -m 755 target/release/refineid /usr/local/bin/refineid
 sudo install -m 755 target/release/refineid-gui /usr/local/bin/refineid-gui
 
-# Manual page
-sudo install -d /usr/local/share/man/man1
+# Manual page and zsh completion
+sudo install -d /usr/local/share/man/man1 /usr/local/share/zsh/site-functions
 sudo install -m 644 crates/refineid-client/man/refineid.1 /usr/local/share/man/man1/refineid.1
+sudo install -m 644 packaging/zsh/_refineid /usr/local/share/zsh/site-functions/_refineid
 
 # PKCS#11 shared module
 sudo install -m 755 target/release/librefineid_pkcs11.so /usr/local/lib/librefineid_pkcs11.so

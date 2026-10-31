@@ -164,6 +164,7 @@ craneLib.buildPackage (
 
       # The CLI's manual page; the fixup phase compresses it.
       install -Dm644 crates/refineid-client/man/refineid.1 $out/share/man/man1/refineid.1
+      install -Dm644 packaging/zsh/_refineid $out/share/zsh/site-functions/_refineid
     '';
 
     meta = {

@@ -91,11 +91,13 @@ install -d \
     "$ROOT/share/p11-kit/modules" \
     "$ROOT/share/applications" \
     "$ROOT/share/icons/hicolor/scalable/apps" \
-    "$ROOT/share/man/man1"
+    "$ROOT/share/man/man1" \
+    "$ROOT/share/zsh/site-functions"
 
 install -m 755 target/release/refineid "$ROOT/bin/refineid"
 gzip -9n < crates/refineid-client/man/refineid.1 > "$ROOT/share/man/man1/refineid.1.gz"
 chmod 644 "$ROOT/share/man/man1/refineid.1.gz"
+install -m 644 packaging/zsh/_refineid "$ROOT/share/zsh/site-functions/_refineid"
 install -m 755 target/release/refineid-gui "$ROOT/bin/refineid-gui"
 install -m 755 target/release/librefineid_pkcs11.so "$STAGE$MODULE"
 

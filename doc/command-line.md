@@ -34,9 +34,9 @@ Citations are BibTeX keys in [`references.md`](references.md).
   be shortened to any prefix that names one command, so `refineid doc
   s` signs a document; a prefix that fits several is refused with the
   candidates, never guessed.
-
-Planned on the same reasoning: a zsh completion file generated from the
-command table.
+- **Completion that cannot drift.** `packaging/zsh/_refineid` completes
+  every command word and option; every package installs it, and a test
+  fails when a command or option exists that the file does not name.
 
 ## Why
 
