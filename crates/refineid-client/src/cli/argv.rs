@@ -192,8 +192,7 @@ impl ProcessArgv {
     /// 3. `-V` / `--version` first: `refineid <version>` to stdout,
     ///    `Err(ExitStatus::Ok)`. Nothing else prints the version.
     /// 4. `expert`, alone or with a help word: the advanced commands
-    ///    to stdout,
-    ///    `Err(ExitStatus::Ok.into())`.
+    ///    to stdout, `Err(ExitStatus::Ok)`.
     /// 5. `<group> help` (`card help`, `document help`, ...): that
     ///    group's one-line list to stdout, `Err(ExitStatus::Ok)`.
     /// 6. A missing or unknown command: the error line and the
