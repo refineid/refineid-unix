@@ -65,6 +65,7 @@ use refineid_lib_pcsc::{PcscBackend, PcscCard, PcscError};
 use zeroize::Zeroizing;
 
 use crate::pin_source::{PinEntryError, PinSource};
+use crate::signed_name::{BestSignatureTime, PendingSignedName};
 use crate::validation_material::{ChainStart, NoncePolicy};
 
 /// Maximum tolerated difference between this host and a live TSA.
@@ -367,9 +368,9 @@ pub struct SignOptions {
     /// and sent to the card via `PSO:HASH` per FINEID S1
     /// v4.2 §3.5.
     pub input: PathBuf,
-    /// Filesystem path where the resulting raw RSA-PKCS#1 v1.5
-    /// signature bytes will be written (no envelope).
-    pub output: PathBuf,
+    /// Where the raw signature, or the finished document when
+    /// [`Self::document`] is set, is written.
+    pub output: SignOutput,
     /// The targeted slot's PIN, obtained after the card is found and
     /// checked, right before VERIFY. Zeroized at function return.
     pub pin: PinSource,
@@ -394,6 +395,52 @@ pub struct SignOptions {
     /// signature the card computed over the input file, and nothing
     /// else.
     pub document: Option<DocumentRequest>,
+}
+
+/// Where [`SignOptions`] writes its result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignOutput {
+    /// This path.
+    At(PathBuf),
+    /// The default signed-document name, carrying the signature's
+    /// best-signature-time once the signature exists. Never replaces
+    /// an existing file.
+    SignedName(PendingSignedName),
+}
+
+impl SignOutput {
+    /// The path, given the signature's best-signature-time.
+    #[must_use]
+    pub fn path(&self, best: Option<BestSignatureTime>) -> PathBuf {
+        match self {
+            Self::At(path) => path.clone(),
+            Self::SignedName(pending) => pending.path(best),
+        }
+    }
+
+    /// Write `bytes` to [`Self::path`] and return that path. A given
+    /// path is created or truncated; a default name must not exist
+    /// yet.
+    fn write(
+        &self,
+        best: Option<BestSignatureTime>,
+        bytes: &[u8],
+    ) -> Result<PathBuf, SignErrorKind> {
+        use std::io::Write as _;
+        let path = self.path(best);
+        let written = match self {
+            Self::At(_) => std::fs::write(&path, bytes),
+            Self::SignedName(_) => std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(bytes)),
+        };
+        match written {
+            Ok(()) => Ok(path),
+            Err(source) => Err(SignErrorKind::SignatureWrite { path, source }),
+        }
+    }
 }
 
 /// One reader's worth of sign output.
@@ -953,12 +1000,9 @@ where
 
     let signature_len = chain.signature_bytes.len();
     let output_len = chain.output_bytes.len();
-    std::fs::write(&options.output, &chain.output_bytes).map_err(|source| {
-        SignErrorKind::SignatureWrite {
-            path: options.output.clone(),
-            source,
-        }
-    })?;
+    let output = options
+        .output
+        .write(chain.best_signature_time, &chain.output_bytes)?;
 
     let cert_path = if let Some(path) = &options.save_cert {
         std::fs::write(path, chain.cert_der.as_bytes()).map_err(|source| {
@@ -977,7 +1021,7 @@ where
         slot,
         input_len,
         input_sha256,
-        signature_path: options.output,
+        signature_path: output,
         cert_path,
         signature_len,
         timestamps: chain.timestamps,
@@ -1002,6 +1046,8 @@ struct SignChainOutput {
     signature_bytes: Vec<u8>,
     /// Timestamp tokens actually obtained.
     timestamps: usize,
+    /// The earliest signature timestamp's `genTime`; `None` without one.
+    best_signature_time: Option<BestSignatureTime>,
     /// What gets written to `--out`: the raw signature for a bare
     /// sign, or the finished document when a format was asked for.
     output_bytes: Vec<u8>,
@@ -1141,8 +1187,12 @@ fn sign_chain<T: CardTransport>(
     // Local verify above proved the card signed what we asked it to.
     // Only now is it worth assembling, because assembly can still
     // fail -- a CAdES that outgrew the hole reserved in a PDF.
-    let (output_bytes, timestamps) = match document {
-        None => (signature_bytes.clone(), 0),
+    let AssembledDocument {
+        bytes: output_bytes,
+        timestamps,
+        best_signature_time,
+    } = match document {
+        None => AssembledDocument::new(signature_bytes.clone(), &[], false),
         Some((plan, parameters)) => {
             assemble_document(options, plan, &parameters, &signature_bytes, &cert_der)?
         }
@@ -1154,6 +1204,7 @@ fn sign_chain<T: CardTransport>(
         pin_retries_after,
         signature_bytes,
         timestamps,
+        best_signature_time,
         output_bytes,
         local_verify,
     })
@@ -1444,6 +1495,36 @@ fn collect_document_timestamps(
     Ok(CollectedTimestamps { tokens, material })
 }
 
+/// What [`assemble_document`] made.
+#[derive(Debug, PartialEq, Eq)]
+struct AssembledDocument {
+    /// The finished document.
+    bytes: Vec<u8>,
+    /// Timestamp tokens in it, archive timestamp included.
+    timestamps: usize,
+    /// The best-signature-time of its signature timestamps.
+    best_signature_time: Option<BestSignatureTime>,
+}
+
+impl AssembledDocument {
+    /// `bytes` carrying `signature_timestamps`, plus one archive
+    /// timestamp when `archive_timestamp_obtained`.
+    fn new(
+        bytes: Vec<u8>,
+        signature_timestamps: &[VerifiedTimestampToken],
+        archive_timestamp_obtained: bool,
+    ) -> Self {
+        Self {
+            bytes,
+            timestamps: reported_timestamp_tokens(
+                signature_timestamps.len(),
+                archive_timestamp_obtained,
+            ),
+            best_signature_time: BestSignatureTime::of_signature_timestamps(signature_timestamps),
+        }
+    }
+}
+
 /// Fetch the timestamps and evidence a document signature asked for,
 /// then assemble it.
 ///
@@ -1457,7 +1538,7 @@ fn assemble_document(
     parameters: &SignerParameters<'_>,
     signature_bytes: &[u8],
     cert_der: &CertDer,
-) -> Result<(Vec<u8>, usize), SignErrorKind> {
+) -> Result<AssembledDocument, SignErrorKind> {
     // The timestamp is over the signature, so it can only be
     // fetched now. That is a network round trip with the card
     // still held exclusively; the alternative is dropping the
@@ -1533,7 +1614,7 @@ fn assemble_document(
                 &token.token,
             )
             .map_err(SignErrorKind::Document)?;
-        return Ok((archived, reported_timestamp_tokens(tokens.len(), true)));
+        return Ok(AssembledDocument::new(archived, &tokens, true));
     }
     let document = plan
         .finish(parameters, signature_bytes, &token_bytes, &material)
@@ -1555,9 +1636,10 @@ fn assemble_document(
     } else {
         (document, false)
     };
-    Ok((
+    Ok(AssembledDocument::new(
         bytes,
-        reported_timestamp_tokens(tokens.len(), archive_timestamp_obtained),
+        &tokens,
+        archive_timestamp_obtained,
     ))
 }
 
@@ -2461,6 +2543,122 @@ mod tests {
     }
 
     #[test]
+    fn an_archived_document_is_named_by_its_signature_timestamp() -> TestResult {
+        /// A synthetic signature timestamp generation time.
+        const SIGNATURE_TIMESTAMP_AT: u64 = 1_000_000_000;
+        /// The document timestamp a synthetic archive step adds later.
+        const DOCUMENT_TIMESTAMP_DELAY: u64 = 60;
+        /// A synthetic clock reading, after both.
+        const CLOCK_DELAY: u64 = 3_600;
+        let at = |seconds| DateTime::from_unix_duration(core::time::Duration::from_secs(seconds));
+        let signature_timestamp = VerifiedTimestampToken {
+            token: Vec::new(),
+            signer_certificate: Vec::new(),
+            embedded_certificates: Vec::new(),
+            generated_at: at(SIGNATURE_TIMESTAMP_AT)?,
+        };
+        let document_timestamp_at =
+            at(SIGNATURE_TIMESTAMP_AT.saturating_add(DOCUMENT_TIMESTAMP_DELAY))?;
+        let assembled = AssembledDocument::new(
+            b"synthetic document".to_vec(),
+            core::slice::from_ref(&signature_timestamp),
+            true,
+        );
+        check(
+            &assembled.timestamps,
+            &reported_timestamp_tokens(1, true),
+            "signature timestamp and document timestamp both counted",
+        )?;
+        let best = assembled
+            .best_signature_time
+            .map(BestSignatureTime::instant);
+        check(
+            &best,
+            &Some(signature_timestamp.generated_at),
+            "the signature timestamp's time",
+        )?;
+        check_true(
+            best != Some(document_timestamp_at),
+            "not the document timestamp's time",
+        )?;
+        let pending = PendingSignedName::new(
+            vec![PathBuf::from("/documents/report.pdf")],
+            Format::Pades,
+            at(SIGNATURE_TIMESTAMP_AT.saturating_add(CLOCK_DELAY))?,
+        );
+        check(
+            &SignOutput::SignedName(pending).path(assembled.best_signature_time),
+            &PathBuf::from("/documents/report-signed-2001-09-09T01-46-40Z.pdf"),
+            "named by the signature timestamp",
+        )
+    }
+
+    /// The pending default name of `/documents/report.pdf` at the
+    /// synthetic clock reading `seconds` after the epoch.
+    fn pending_report(
+        dir: &std::path::Path,
+        seconds: u64,
+    ) -> Result<PendingSignedName, Box<dyn core::error::Error>> {
+        Ok(PendingSignedName::new(
+            vec![dir.join("report.pdf")],
+            Format::Pades,
+            DateTime::from_unix_duration(core::time::Duration::from_secs(seconds))?,
+        ))
+    }
+
+    /// A synthetic clock reading.
+    const CLOCK_AT: u64 = 1_000_000_000;
+
+    #[test]
+    fn a_given_path_ignores_the_best_signature_time() -> TestResult {
+        let given = PathBuf::from("/documents/chosen.pdf");
+        let best = BestSignatureTime::of_signature_timestamps(&[VerifiedTimestampToken {
+            token: Vec::new(),
+            signer_certificate: Vec::new(),
+            embedded_certificates: Vec::new(),
+            generated_at: DateTime::from_unix_duration(core::time::Duration::from_secs(CLOCK_AT))?,
+        }]);
+        check_true(best.is_some(), "a best signature time")?;
+        check(
+            &SignOutput::At(given.clone()).path(best),
+            &given,
+            "the given path",
+        )
+    }
+
+    #[test]
+    fn a_default_name_never_replaces_an_existing_file() -> TestResult {
+        let dir = TempDir::new("signed-name-exists")?;
+        let output = SignOutput::SignedName(pending_report(dir.path(), CLOCK_AT)?);
+        let taken = output.path(None);
+        std::fs::write(&taken, b"earlier signature")?;
+        check_true(
+            matches!(
+                output.write(None, b"later signature"),
+                Err(SignErrorKind::SignatureWrite { ref path, .. }) if *path == taken
+            ),
+            "refused",
+        )?;
+        check(
+            &std::fs::read(&taken)?,
+            &b"earlier signature".to_vec(),
+            "the existing file is untouched",
+        )
+    }
+
+    #[test]
+    fn a_default_name_is_written_when_free_and_a_given_path_is_replaced() -> TestResult {
+        let dir = TempDir::new("signed-name-free")?;
+        let output = SignOutput::SignedName(pending_report(dir.path(), CLOCK_AT)?);
+        let written = output.write(None, b"signature")?;
+        check(&written, &output.path(None), "the default name")?;
+        check(&std::fs::read(&written)?, &b"signature".to_vec(), "content")?;
+        let given = dir.write("chosen.pdf", b"earlier")?;
+        SignOutput::At(given.clone()).write(None, b"later")?;
+        check(&std::fs::read(&given)?, &b"later".to_vec(), "replaced")
+    }
+
+    #[test]
     fn live_timestamp_time_is_bounded_by_the_exchange() -> TestResult {
         let requested_at =
             DateTime::from_unix_duration(core::time::Duration::from_secs(1_700_000_000))?;
@@ -2808,7 +3006,7 @@ mod tests {
         let (pin, asked) = counting_source();
         let options = SignOptions {
             input,
-            output: dir.path().join("signature.bin"),
+            output: SignOutput::At(dir.path().join("signature.bin")),
             pin,
             save_cert: None,
             reader_filter: None,

@@ -30,9 +30,10 @@ use refineid_lib_core::x509::DateTime;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_sign::{
-    DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES, SignSlot,
-    process_visible_signature,
+    DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES, SignOutput,
+    SignSlot, process_visible_signature,
 };
+use crate::signed_name::PendingSignedName;
 
 /// What `refineid document sign help`
 /// prints. The man page refineid(1) carries the same facts.
@@ -56,7 +57,8 @@ whole run. Prints nothing on success; -v shows each step.
   --out P       the finished document; only when one is made.
                 Default: '<stem>-signed-<UTC time>.<ext>' beside the
                 FILE, or beside the first FILE with stem 'portfolio'
-                for a container of several.
+                for a container of several. The time is the
+                signature timestamp's, else the clock's.
   --slot S      qualified (default) or auth
   --reason T    PAdES /Reason
   --location T  PAdES /Location
@@ -98,8 +100,8 @@ pub struct DocumentSignArgs {
     /// makes one document.
     ///
     /// `None` names each with
-    /// [`crate::signed_name::signed_document_path`] at run time, since
-    /// the name carries the signing instant.
+    /// [`crate::signed_name::PendingSignedName`] once it is signed,
+    /// since the name carries the signature timestamp's time.
     pub output: Option<PathBuf>,
     /// Which key signs.
     ///
@@ -582,12 +584,13 @@ fn check_inputs(inputs: &[PathBuf]) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Job {
     inputs: Vec<PathBuf>,
-    output: PathBuf,
+    output: SignOutput,
 }
 
 /// The documents a run makes: one per input for a one-file format,
 /// one container for the rest. `output` names the single document a
-/// run makes; `resolve` refuses it for several.
+/// run makes; `resolve` refuses it for several. Without it each is
+/// named once signed, by its signature timestamp's time, else `now`.
 fn jobs_for(
     format: Format,
     inputs: Vec<PathBuf>,
@@ -595,9 +598,10 @@ fn jobs_for(
     now: DateTime,
 ) -> Vec<Job> {
     let named = |inputs: Vec<PathBuf>| {
-        let output = output
-            .clone()
-            .unwrap_or_else(|| crate::signed_name::signed_document_path(&inputs, format, now));
+        let output = output.clone().map_or_else(
+            || SignOutput::SignedName(PendingSignedName::new(inputs.clone(), format, now)),
+            SignOutput::At,
+        );
         Job { inputs, output }
     };
     if format.is_single_file() {
@@ -802,6 +806,25 @@ mod tests {
         check_true(text.contains("signature level:  B-T"), "level line")
     }
 
+    #[test]
+    fn the_report_names_the_path_the_sign_flow_wrote() -> TestResult {
+        /// A synthetic path the sign flow chose after signing.
+        const WRITTEN: &str = "/documents/report-signed-2001-02-03T04-05-06Z.pdf";
+        let mut sign = signed_report();
+        sign.signature_path = PathBuf::from(WRITTEN);
+        let report = DocumentReport {
+            sign: &sign,
+            format: Format::Pades,
+            long_term: false,
+            archive: false,
+        };
+        let mut out = Vec::new();
+        write_report(&mut out, true, &report)?;
+        let text = String::from_utf8(out)?;
+        check_true(text.contains(WRITTEN), "the written path")?;
+        check_true(!text.contains(OUT), "no other path")
+    }
+
     /// A synthetic PDF to sign.
     const PDF: &str = "/documents/report.pdf";
     /// A synthetic non-PDF file to sign.
@@ -855,7 +878,7 @@ mod tests {
         let jobs = jobs_for(a.format, a.inputs, a.output, signed_at()?);
         check(&jobs.len(), &2, "one document per PDF")?;
         check(
-            &jobs[1].output,
+            &jobs[1].output.path(None),
             &PathBuf::from("/documents/Another-signed-2001-02-03T04-05-06Z.pdf"),
             "each named beside its input",
         )?;

@@ -15,7 +15,7 @@
 //! Headless controller: smart-card monitoring, PIN operations, and ceremony execution.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -25,7 +25,8 @@ use refineid_client::card_check::{CardCheckError, CardCheckReport};
 use refineid_client::card_pin::{
     ActivateOptions, ChangePinOptions, PinManageSlot, UnblockPinOptions,
 };
-use refineid_client::card_sign::DEFAULT_TIMESTAMP_AUTHORITY;
+use refineid_client::card_sign::{DEFAULT_TIMESTAMP_AUTHORITY, SignOutput};
+use refineid_client::signed_name::PendingSignedName;
 use refineid_lib_core::auth::{ChangePinOutcome, PinSlot, UnblockOutcome};
 use refineid_lib_core::backend::{ReaderFilter, ReaderPickError};
 use refineid_lib_core::identity::{CredentialIdentity, TokenSerial, render_token_serial};
@@ -33,6 +34,7 @@ use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
 use refineid_lib_core::pkcs15::CardGeneration;
+use refineid_lib_core::x509::DateTime;
 use refineid_rapp_core::engine::{OperationOutcome, PairingSearchError};
 
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
@@ -43,6 +45,16 @@ use crate::image::{RgbaImageBuffer, decode_document_image};
 use crate::model::{
     CardSource, ManagedCard, PairedPhone, RappPairingState, SignFormat, UiState, UserIntent,
 };
+
+/// Where the signed form of `document` goes: its default name, carrying
+/// the signature's best-signature-time once signed, else `clock`.
+fn signed_output(document: &Path, format: SignFormat, clock: DateTime) -> SignOutput {
+    SignOutput::SignedName(PendingSignedName::new(
+        vec![document.to_path_buf()],
+        format.into(),
+        clock,
+    ))
+}
 
 const DENIED_PINS: &[&[u8]] = &[
     b"1122", b"1004", b"2000", b"2001", b"2002", b"2020", b"2580", b"5683", b"0852", b"112233",
@@ -753,17 +765,14 @@ impl RefineIdController {
             let mut results = Vec::new();
 
             for doc in &documents {
-                let out_path = refineid_client::signed_name::signed_document_path(
-                    core::slice::from_ref(doc),
-                    format.into(),
-                    refineid_client::card_check::now_date_time(),
-                );
+                let output =
+                    signed_output(doc, format, refineid_client::card_check::now_date_time());
                 let res = if format == SignFormat::AsicE {
                     refineid_client::card_manager::sign_asice(
                         refineid_client::card_manager::AsicSignOptions {
                             input: doc.clone(),
                             additional_inputs: Vec::new(),
-                            output: out_path.clone(),
+                            output: output.clone(),
                             pin2: pin2.clone(),
                             can: None,
                             reader_filter: Some(reader.clone()),
@@ -772,7 +781,7 @@ impl RefineIdController {
                             timestamp_credentials: None,
                         },
                     )
-                    .map(|_| out_path.display().to_string())
+                    .map(|report| report.signature_path.display().to_string())
                     .inspect_err(|error| {
                         refineid_dev_errors::report!(Gui, "document not signed", error)
                     })
@@ -781,7 +790,7 @@ impl RefineIdController {
                     refineid_client::card_manager::sign_pdf(
                         refineid_client::card_manager::PdfSignOptions {
                             input: doc.clone(),
-                            output: out_path.clone(),
+                            output: output.clone(),
                             pin2: pin2.clone(),
                             can: None,
                             reader_filter: Some(reader.clone()),
@@ -790,7 +799,7 @@ impl RefineIdController {
                             timestamp_credentials: None,
                         },
                     )
-                    .map(|_| out_path.display().to_string())
+                    .map(|report| report.signature_path.display().to_string())
                     .inspect_err(|error| {
                         refineid_dev_errors::report!(Gui, "document not signed", error)
                     })
@@ -1061,6 +1070,46 @@ mod tests {
     use super::*;
     use refineid_lib_core::auth::PinStatus;
     use refineid_rapp_core::message::ResultError;
+
+    /// A synthetic signature timestamp generation time,
+    /// 2001-09-09T01:46:40Z.
+    const SIGNATURE_TIMESTAMP_AT: u64 = 1_000_000_000;
+    /// How much later a synthetic clock reads.
+    const CLOCK_DELAY: u64 = 3_600;
+
+    fn instant(seconds: u64) -> DateTime {
+        DateTime::from_unix_duration(Duration::from_secs(seconds))
+            .unwrap_or_else(|e| panic!("synthetic instant: {e}"))
+    }
+
+    #[test]
+    fn a_signed_document_is_named_by_its_signature_timestamp_else_the_clock() {
+        use refineid_client::signed_name::BestSignatureTime;
+        use refineid_lib_core::sign::timestamp::VerifiedTimestampToken;
+
+        let clock = instant(SIGNATURE_TIMESTAMP_AT.saturating_add(CLOCK_DELAY));
+        let token = VerifiedTimestampToken {
+            token: Vec::new(),
+            signer_certificate: Vec::new(),
+            embedded_certificates: Vec::new(),
+            generated_at: instant(SIGNATURE_TIMESTAMP_AT),
+        };
+        let best = BestSignatureTime::of_signature_timestamps(core::slice::from_ref(&token));
+        let pdf = signed_output(Path::new("/documents/report.pdf"), SignFormat::Pades, clock);
+        assert_eq!(
+            pdf.path(best),
+            PathBuf::from("/documents/report-signed-2001-09-09T01-46-40Z.pdf")
+        );
+        assert_eq!(
+            pdf.path(None),
+            PathBuf::from("/documents/report-signed-2001-09-09T02-46-40Z.pdf")
+        );
+        let container = signed_output(Path::new("/documents/notes.txt"), SignFormat::AsicE, clock);
+        assert_eq!(
+            container.path(best),
+            PathBuf::from("/documents/notes-signed-2001-09-09T01-46-40Z.asice")
+        );
+    }
 
     #[test]
     fn the_pairing_line_says_only_what_stands_in_the_way() {

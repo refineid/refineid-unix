@@ -37,7 +37,7 @@ use crate::card_pin::{
     ChangePinReport, UnblockPinOptions, UnblockPinReport,
 };
 use crate::card_sign::{
-    DocumentRequest, SignErrorKind, SignOptions, SignReport, TimestampCredentials,
+    DocumentRequest, SignErrorKind, SignOptions, SignOutput, SignReport, TimestampCredentials,
     process_visible_signature,
 };
 use crate::pin_source::PinSource;
@@ -47,8 +47,8 @@ use crate::pin_source::PinSource;
 pub struct PdfSignOptions {
     /// Existing PDF chosen by the user.
     pub input: PathBuf,
-    /// Distinct destination chosen before the card PIN is used.
-    pub output: PathBuf,
+    /// Where the signed document goes; distinct from every original.
+    pub output: SignOutput,
     /// Qualified-signature PIN, consumed and zeroized by the sign operation.
     pub pin2: PinBytes,
     /// Optional CAN for contactless signing.
@@ -79,8 +79,8 @@ pub struct AsicSignOptions {
     /// timestamp over all of them, which is the shape `ASiC-E` exists
     /// for; signing them one at a time would attest each separately.
     pub additional_inputs: Vec<PathBuf>,
-    /// Distinct destination chosen before the card PIN is used.
-    pub output: PathBuf,
+    /// Where the signed document goes; distinct from every original.
+    pub output: SignOutput,
     /// Qualified-signature PIN, consumed and zeroized by the sign operation.
     pub pin2: PinBytes,
     /// Optional CAN for contactless signing.
@@ -176,9 +176,11 @@ pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, SignErrorKind> {
         timestamp_authority,
         timestamp_credentials,
     } = options;
-    if input == output {
+    if let SignOutput::At(path) = &output
+        && *path == input
+    {
         return Err(SignErrorKind::SignatureWrite {
-            path: output,
+            path: path.clone(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "signed PDF destination must differ from the original",
@@ -230,9 +232,11 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind>
         timestamp_authority,
         timestamp_credentials,
     } = options;
-    if input == output || additional_inputs.contains(&output) {
+    if let SignOutput::At(path) = &output
+        && (*path == input || additional_inputs.contains(path))
+    {
         return Err(SignErrorKind::SignatureWrite {
-            path: output,
+            path: path.clone(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "signed container destination must differ from every original",

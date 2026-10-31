@@ -272,6 +272,7 @@ or beside the first
 with stem
 .Dq portfolio
 for a container of several.
+The time is the signature timestamp's, else the clock's.
 .It Fl -slot Cm qualified | auth
 The key to sign with; qualified by default.
 .It Fl -reason Ar text
@@ -563,7 +564,7 @@ Sign a PDF with the qualified-signature key:
 .Dl $ refineid document sign report.pdf
 .Pp
 Verify the signed PDF:
-.Dl $ refineid document verify report-signed-20260131T101500Z.pdf
+.Dl $ refineid document verify report-signed-2026-01-31T10-15-00Z.pdf
 .Pp
 Show the options of one command:
 .Dl $ refineid pin change help

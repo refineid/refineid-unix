@@ -97,7 +97,7 @@ impl SignArgs {
         let run_once = |can: Option<Can>| {
             let options = crate::card_sign::SignOptions {
                 input: input.clone(),
-                output: output.clone(),
+                output: crate::card_sign::SignOutput::At(output.clone()),
                 pin: super::util::pin_source_at_use(
                     cmd,
                     env_var,
