@@ -92,6 +92,7 @@ pub mod card_sign;
 pub mod cert_chain;
 pub mod cert_show;
 pub mod document_sign;
+pub mod document_verify;
 pub mod help;
 pub mod pin_activate;
 pub mod pin_change;

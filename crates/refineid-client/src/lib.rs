@@ -54,6 +54,7 @@ pub mod card_sign;
 pub mod cert_chain;
 pub mod cert_show;
 pub mod cli;
+pub mod document_verify;
 pub mod events;
 pub mod exit_status;
 pub mod http;
