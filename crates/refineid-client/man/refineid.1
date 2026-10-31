@@ -369,10 +369,16 @@ one line per signature timestamp: its time and
 .Li proven ,
 or
 .Li unproven
-when it does not verify over the signature.
+when it does not verify over the signature or its signer's path
+reaches neither a DVV root nor the pinned Sectigo Qualified Time
+Stamping Root R45.
+Only a proven timestamp sets
+.Li signed\&: .
 .It Li timestamp-chain\&:
 after each timestamp, its signer's path in the same form, starting
-at the signer and ending at a root the document carries.
+at the signer, or
+.Li -
+when the timestamp did not verify.
 .It Li revocation\&:
 .Li good
 and the time of the answer,
@@ -380,7 +386,12 @@ and the time of the answer,
 and the revocation time, or
 .Li not checked .
 .It Li document-timestamp\&:
-one line per document timestamp covering the signature.
+one line per document timestamp covering the signature: its time and
+.Li proven ,
+or
+.Li unproven
+on the same terms as a signature timestamp.
+An unproven document timestamp proves nothing.
 .El
 .Pp
 A file that cannot be judged prints a record of
@@ -390,8 +401,17 @@ and
 The verdict is computed from the document's own bytes, including the
 certificates and revocation answers a level-LT signature embeds.
 Times are ISO 8601 in UTC.
-Exits 0 when every signature of every file is valid, 1 when one is
-not valid, revoked or unsupported, 70 when a file cannot be judged.
+Control characters in a value are written as
+.Li \ex
+and two hexadecimal digits, and a
+.Li >
+in a name on a path as
+.Li \e> ,
+so every record line stays one line and
+.Li " > "
+only separates.
+Exits 70 when any file cannot be judged, else 1 when any signature
+is not valid, revoked or unsupported, else 0.
 .It Cm phone
 Show the paired phone.
 .It Cm phone pair
@@ -613,7 +633,8 @@ Success, or help or version shown on request.
 .Cm verify
 rejected the signature,
 .Cm document verify
-found a signature that is not valid, unsupported or revoked, or
+judged every file and found a signature that is not valid,
+unsupported or revoked, or
 .Cm cert chain
 reached no self-signed root, or
 .Cm phone auth

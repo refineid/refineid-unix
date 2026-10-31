@@ -231,10 +231,7 @@ impl CadesSignature {
                 .map_err(|_ignored| CadesReadError::SignerCertificateMissing)?;
             let embedded = embedded_certificates(&signed);
             let material = embedded_material(&signed, &embedded, signer.raw_der);
-            let signing_time =
-                attribute_values(&signed.signer.signed_attributes, known::SIGNING_TIME)
-                    .first()
-                    .and_then(|value| asn1_time(value));
+            let signing_time = single_signing_time(&signed.signer.signed_attributes);
             (
                 digest_algorithm,
                 signer_certificate,
@@ -427,6 +424,19 @@ fn signature_timestamps(signed: &SignedData<'_>) -> Vec<TimestampCheck> {
     .collect()
 }
 
+/// The `signing-time` attribute's value, when there is exactly one such
+/// attribute with exactly one value (RFC 5652 sec.11.3).
+fn single_signing_time(attributes: &[CmsAttribute<'_>]) -> Option<DateTime> {
+    let attributes_present = attributes
+        .iter()
+        .filter(|attribute| attribute.oid == known::SIGNING_TIME)
+        .count();
+    match attribute_values(attributes, known::SIGNING_TIME).as_slice() {
+        [value] if attributes_present == 1 => asn1_time(value),
+        _ => None,
+    }
+}
+
 /// A `Time` value (RFC 5652 sec.11.3: `UTCTime` or `GeneralizedTime`)
 /// as DER.
 fn asn1_time(value_der: &[u8]) -> Option<DateTime> {
@@ -469,7 +479,7 @@ mod tests {
     use crate::document::trust::testkit::{
         CertificateSpec, CmsParts, Curve, OBJECT_IDENTIFIER, OCTET_STRING, OcspSpec, SEQUENCE,
         TestKey, attribute, attribute_set, ca_extensions, certificate, cms, crl, day,
-        ocsp_response, timestamp_token, timestamping_extensions,
+        ocsp_response, timestamp_token, timestamping_extensions, utc_time,
     };
     use crate::document::trust::{MaterialPool, judge};
     use crate::document::{Revocation, TrustAnchors};
@@ -799,6 +809,64 @@ mod tests {
         let ignored = signature.verify(Content::Attached, EssBinding::NotRequired);
         assert!(ignored.document_intact);
         assert!(ignored.signature_valid);
+    }
+
+    /// A signature whose signed attributes carry `signing_time`
+    /// verbatim beside the content type and message digest.
+    fn with_signing_times(world: &World, signing_time: &[Vec<u8>]) -> CadesSignature {
+        let mut attributes = vec![
+            attribute(
+                known::CONTENT_TYPE,
+                &tlv(OBJECT_IDENTIFIER, known::DATA.as_bytes()),
+            ),
+            attribute(
+                known::MESSAGE_DIGEST,
+                &tlv(OCTET_STRING, Sha256::of(DOCUMENT).as_bytes()),
+            ),
+        ];
+        attributes.extend_from_slice(signing_time);
+        CadesSignature::parse(cms(&CmsParts {
+            econtent_type: known::DATA,
+            econtent: Some(DOCUMENT),
+            digest_algorithm: DigestAlgorithm::Sha256.algorithm_identifier(),
+            signed_attributes: attribute_set(&attributes),
+            key: &world.signer_key,
+            signer: &world.signer,
+            certificates: vec![world.signer.clone()],
+            unsigned_attributes: Vec::new(),
+        }))
+        .expect("parses")
+    }
+
+    #[test]
+    fn one_signing_time_with_one_value_is_read() {
+        let world = World::new(Curve::P256);
+        let signature = with_signing_times(
+            &world,
+            &[attribute(known::SIGNING_TIME, &utc_time(day(SIGNED)))],
+        );
+        assert_eq!(signature.signing_time(), Some(day(SIGNED)));
+    }
+
+    #[test]
+    fn two_signing_times_are_refused() {
+        let world = World::new(Curve::P256);
+        let two_attributes = with_signing_times(
+            &world,
+            &[
+                attribute(known::SIGNING_TIME, &utc_time(day(SIGNED))),
+                attribute(known::SIGNING_TIME, &utc_time(day(ENDS))),
+            ],
+        );
+        assert_eq!(two_attributes.signing_time(), None);
+        let two_values = with_signing_times(
+            &world,
+            &[attribute(
+                known::SIGNING_TIME,
+                &[utc_time(day(SIGNED)), utc_time(day(ENDS))].concat(),
+            )],
+        );
+        assert_eq!(two_values.signing_time(), None);
     }
 
     #[test]

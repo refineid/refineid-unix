@@ -581,8 +581,9 @@ impl XadesSignature {
 /// An `xsd:dateTime` (XML Schema Part 2 sec.3.2.7) with a time zone,
 /// as UTC: `YYYY-MM-DDThh:mm:ss`, optional fractional seconds, then
 /// `Z` or an offset `+hh:mm` / `-hh:mm`. Fractional seconds are
-/// dropped; a value without a time zone names no instant and yields
-/// `None`.
+/// dropped. A value without a time zone names no instant, an offset
+/// beyond `14:00` or with minutes of 60 or more is malformed, and an
+/// instant before 1970 is not representable; each yields `None`.
 fn xml_date_time(text: &str) -> Option<DateTime> {
     /// Separator of date and time.
     const DATE_TIME_SEPARATOR: char = 'T';
@@ -598,6 +599,9 @@ fn xml_date_time(text: &str) -> Option<DateTime> {
     const SECONDS_PER_MINUTE: u64 = 60;
     /// Minutes in an hour.
     const MINUTES_PER_HOUR: u64 = 60;
+    /// The largest time zone offset, in minutes (XML Schema Part 2
+    /// sec.3.2.7.3: `14:00`).
+    const MAX_OFFSET_MINUTES: u64 = 14 * MINUTES_PER_HOUR;
 
     /// Exactly three fields separated by `separator`.
     fn three<T: core::str::FromStr>(text: &str, separator: char) -> Option<(T, T, T)> {
@@ -621,10 +625,14 @@ fn xml_date_time(text: &str) -> Option<DateTime> {
         let (hours, minutes) = zone.get(1..)?.split_once(CLOCK_SEPARATOR)?;
         let hours: u64 = hours.parse().ok()?;
         let minutes: u64 = minutes.parse().ok()?;
-        let seconds = hours
-            .checked_mul(MINUTES_PER_HOUR)?
-            .checked_add(minutes)?
-            .checked_mul(SECONDS_PER_MINUTE)?;
+        if minutes >= MINUTES_PER_HOUR {
+            return None;
+        }
+        let offset_minutes = hours.checked_mul(MINUTES_PER_HOUR)?.checked_add(minutes)?;
+        if offset_minutes > MAX_OFFSET_MINUTES {
+            return None;
+        }
+        let seconds = offset_minutes.checked_mul(SECONDS_PER_MINUTE)?;
         (clock, east, Some(core::time::Duration::from_secs(seconds)))
     };
     let whole = clock
@@ -1227,6 +1235,23 @@ mod tests {
         assert_eq!(super::xml_date_time(EAST), Some(noon));
         assert_eq!(super::xml_date_time(WEST), Some(noon));
         assert_eq!(super::xml_date_time(FLOATING), None);
+    }
+
+    #[test]
+    fn an_unrepresentable_or_malformed_xml_date_time_is_none() {
+        /// A second before the epoch.
+        const BEFORE_EPOCH: &str = "1969-12-31T23:59:59Z";
+        /// Half an hour after the epoch, written an hour east of UTC:
+        /// half an hour before the epoch.
+        const EAST_OF_EPOCH: &str = "1970-01-01T00:30:00+01:00";
+        /// An offset with sixty minutes.
+        const SIXTY_MINUTES: &str = "2026-06-15T12:00:00+01:60";
+        /// An offset beyond fourteen hours.
+        const FIFTEEN_HOURS: &str = "2026-06-15T12:00:00+15:00";
+        assert_eq!(super::xml_date_time(BEFORE_EPOCH), None);
+        assert_eq!(super::xml_date_time(EAST_OF_EPOCH), None);
+        assert_eq!(super::xml_date_time(SIXTY_MINUTES), None);
+        assert_eq!(super::xml_date_time(FIFTEEN_HOURS), None);
     }
 
     #[test]

@@ -108,23 +108,42 @@ impl<'a> TrustAnchors<'a> {
 /// The holder a signer certificate names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerIdentity {
-    /// The subject's common name as the certificate spells it, see
-    /// [`subject_name`].
-    pub name: String,
+    /// The name the subject goes by.
+    pub name: SubjectName,
     /// The Finnish electronic identifier, on certificates issued to a
     /// person.
     pub identifier: Option<Peuin>,
 }
 
-/// The name a certificate's subject goes by: its common name as the
-/// certificate spells it, else the whole subject as an RFC 4514
-/// string.
-#[must_use]
-pub fn subject_name(certificate: &OwnedCert) -> String {
-    let subject = certificate.view().subject;
-    subject
-        .common_name()
-        .map_or_else(|| subject.rfc4514(), |name| name.as_str().to_owned())
+/// The name a certificate's subject goes by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectName {
+    /// The subject's common name as the certificate spells it.
+    CommonName(String),
+    /// The whole subject as an RFC 4514 string, when it has no common
+    /// name; empty when the subject is empty.
+    Distinguished(String),
+}
+
+impl SubjectName {
+    /// The name `certificate`'s subject goes by: its common name, else
+    /// the whole subject.
+    #[must_use]
+    pub fn of(certificate: &OwnedCert) -> Self {
+        let subject = certificate.view().subject;
+        subject.common_name().map_or_else(
+            || Self::Distinguished(subject.rfc4514()),
+            |name| Self::CommonName(name.as_str().to_owned()),
+        )
+    }
+
+    /// The name as the certificate spells it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::CommonName(name) | Self::Distinguished(name) => name,
+        }
+    }
 }
 
 /// A certificate path, nearest certificate first.
@@ -180,7 +199,29 @@ pub enum SignatureTimestamp {
         /// The token signer's path, signer first.
         chain: CertificatePath,
     },
-    /// A token that did not verify over this signature.
+    /// A token that did not verify over this signature, or whose
+    /// signer's path reaches no pinned root.
+    Unproven {
+        /// The `genTime` the token states, when it parses.
+        claimed_at: Option<DateTime>,
+        /// The token signer's path as far as it was built, signer
+        /// first, when the token verified.
+        chain: Option<CertificatePath>,
+    },
+}
+
+/// One document timestamp covering a signature (`ETSI EN 319 142-1`
+/// clause 5.4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentTimestamp {
+    /// The token verifies over its byte range and its signer's path
+    /// reaches a pinned root; it proves the signature existed.
+    Proven {
+        /// The token's authenticated `genTime`.
+        generated_at: DateTime,
+    },
+    /// The token does not verify over its byte range, or its signer's
+    /// path reaches no pinned root; it proves nothing.
     Unproven {
         /// The `genTime` the token states, when it parses.
         claimed_at: Option<DateTime>,
@@ -218,9 +259,9 @@ pub struct SignatureReport {
     /// Every signature timestamp the signature carries, in encoded
     /// order.
     pub signature_timestamps: Vec<SignatureTimestamp>,
-    /// The generation times of the verified document timestamps whose
-    /// byte range covers this signature, in document order.
-    pub document_timestamps: Vec<DateTime>,
+    /// Every document timestamp whose byte range covers this
+    /// signature, in document order.
+    pub document_timestamps: Vec<DocumentTimestamp>,
     /// Whether every signature timestamp present verified against its
     /// own embedded chain and imprints this signature, and at least one
     /// proof of existence was found.
@@ -389,19 +430,42 @@ fn verify_pdf(
     if document.signatures().is_empty() {
         return Err(DocumentFailure::NoSignatures);
     }
+    let mut store = trust::MaterialPool::new();
+    store.add_material(document.validation_store());
+    let timestamp_anchor_ders = timestamp_anchors(anchors);
     let document_timestamps: Vec<VerifiedDocumentTimestamp> = document
         .signatures()
         .iter()
         .filter(|signature| signature.kind == pdf::SignatureKind::DocumentTimestamp)
-        .filter_map(|signature| {
-            let token = crate::sign::timestamp::verify_token(&signature.cms, |algorithm| {
+        .map(|signature| {
+            let verified = crate::sign::timestamp::verify_token(&signature.cms, |algorithm| {
                 signature.byte_range.digest(file, algorithm)
             })
-            .ok()?;
-            Some(VerifiedDocumentTimestamp {
-                generated_at: token.generated_at,
+            .ok();
+            let stamp = match verified {
+                Some(token)
+                    if trust::token_path(
+                        &token,
+                        &store,
+                        TrustAnchors::new(&timestamp_anchor_ders),
+                    )
+                    .anchored =>
+                {
+                    DocumentTimestamp::Proven {
+                        generated_at: token.generated_at,
+                    }
+                }
+                Some(token) => DocumentTimestamp::Unproven {
+                    claimed_at: Some(token.generated_at),
+                },
+                None => DocumentTimestamp::Unproven {
+                    claimed_at: crate::sign::timestamp::claimed_generation_time(&signature.cms),
+                },
+            };
+            VerifiedDocumentTimestamp {
+                stamp,
                 covers_up_to: signature.byte_range.end(),
-            })
+            }
         })
         .collect();
     let mut signatures = Vec::new();
@@ -446,7 +510,7 @@ fn verify_pdf(
                 covering_document_timestamps: document_timestamps
                     .iter()
                     .filter(|stamp| stamp.covers_up_to >= found.byte_range.end())
-                    .map(|stamp| stamp.generated_at)
+                    .map(|stamp| stamp.stamp)
                     .collect(),
                 covers_whole_document: found.covers_whole_document,
             },
@@ -461,12 +525,12 @@ fn verify_pdf(
     Ok(DocumentReport { signatures })
 }
 
-/// One verified document timestamp and how far into the file its
-/// byte range reaches (`ETSI EN 319 142-1` clause 5.4.3).
+/// One document timestamp and how far into the file its byte range
+/// reaches (`ETSI EN 319 142-1` clause 5.4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VerifiedDocumentTimestamp {
-    /// The token's `genTime`.
-    generated_at: DateTime,
+    /// What the token proves.
+    stamp: DocumentTimestamp,
     /// One past the last byte the token covers; a signature whose
     /// own range ends at or before it is proven to have existed.
     covers_up_to: usize,
@@ -611,6 +675,22 @@ const fn unsupported_cades(error: cades::CadesReadError) -> &'static str {
     }
 }
 
+/// The roots a timestamp's signer must chain to for the timestamp to
+/// prove a time: the caller's anchors and the pinned time-stamping
+/// roots.
+fn timestamp_anchors<'a>(anchors: TrustAnchors<'a>) -> Vec<&'a [u8]> {
+    anchors
+        .certificates()
+        .iter()
+        .copied()
+        .chain(
+            crate::trust_roots::PINNED_TIME_STAMPING_ROOT_DER
+                .iter()
+                .copied(),
+        )
+        .collect()
+}
+
 /// The facts a format reader established about one signature, before
 /// the chain and revocation are judged.
 struct SignatureFacts<'a> {
@@ -628,9 +708,8 @@ struct SignatureFacts<'a> {
     claimed_signing_time: Option<DateTime>,
     /// Every signature timestamp, in encoded order.
     timestamps: Vec<TimestampCheck>,
-    /// The generation times of verified document timestamps covering
-    /// this signature.
-    covering_document_timestamps: Vec<DateTime>,
+    /// The document timestamps covering this signature.
+    covering_document_timestamps: Vec<DocumentTimestamp>,
     /// Whether the signature's range runs to the end of the file.
     covers_whole_document: bool,
 }
@@ -653,16 +732,29 @@ fn report(
             .map(|der| der.to_vec())
             .collect::<Vec<_>>(),
     );
+    let timestamp_anchor_ders = timestamp_anchors(anchors);
+    let timestamp_anchors = TrustAnchors::new(&timestamp_anchor_ders);
     let signature_timestamps: Vec<SignatureTimestamp> = facts
         .timestamps
         .iter()
         .map(|check| match check {
-            TimestampCheck::Verified(token) => SignatureTimestamp::Proven {
-                generated_at: token.generated_at,
-                chain: trust::token_path(token, &pool, anchors),
-            },
+            TimestampCheck::Verified(token) => {
+                let chain = trust::token_path(token, &pool, timestamp_anchors);
+                if chain.anchored {
+                    SignatureTimestamp::Proven {
+                        generated_at: token.generated_at,
+                        chain,
+                    }
+                } else {
+                    SignatureTimestamp::Unproven {
+                        claimed_at: Some(token.generated_at),
+                        chain: Some(chain),
+                    }
+                }
+            }
             TimestampCheck::Unverified { claimed_at } => SignatureTimestamp::Unproven {
                 claimed_at: *claimed_at,
+                chain: None,
             },
         })
         .collect();
@@ -675,8 +767,16 @@ fn report(
         .collect();
     let proof_of_existence = proven
         .iter()
-        .chain(facts.covering_document_timestamps.iter())
         .copied()
+        .chain(
+            facts
+                .covering_document_timestamps
+                .iter()
+                .filter_map(|stamp| match stamp {
+                    DocumentTimestamp::Proven { generated_at } => Some(*generated_at),
+                    DocumentTimestamp::Unproven { .. } => None,
+                }),
+        )
         .min();
     let timestamps_valid =
         proof_of_existence.is_some() && proven.len() == signature_timestamps.len();
@@ -704,12 +804,12 @@ fn report(
 }
 
 impl SignerIdentity {
-    /// The holder a certificate names: its [`subject_name`], and the
+    /// The holder a certificate names: its [`SubjectName`], and the
     /// electronic identifier.
     #[must_use]
     pub fn of(certificate: &OwnedCert) -> Self {
         Self {
-            name: subject_name(certificate),
+            name: SubjectName::of(certificate),
             identifier: certificate.view().subject.peuin(),
         }
     }
@@ -718,15 +818,17 @@ impl SignerIdentity {
 #[cfg(test)]
 mod tests {
     use super::{
-        CertificatePath, DocumentFailure, DocumentFile, DocumentReport, Revocation, SignatureEntry,
-        SignatureReport, SignatureTimestamp, SignerIdentity, TrustAnchors, UnsupportedSignature,
-        subject_name, verify,
+        CertificatePath, DocumentFailure, DocumentFile, DocumentReport, DocumentTimestamp,
+        Revocation, SignatureEntry, SignatureReport, SignatureTimestamp, SignerIdentity,
+        SubjectName, TrustAnchors, UnsupportedSignature, verify,
     };
+    use crate::ber::tlv;
     use crate::document::trust::testkit::{
         CertificateSpec, Curve, OcspSpec, PRINTABLE_STRING, TestKey, UTF8_STRING, ca_extensions,
         certificate, certificate_named, day, minimal_pdf, name_of, ocsp_response, timestamp_token,
         timestamping_extensions,
     };
+    use crate::hex::Hex;
     use crate::oid::known;
     use crate::sign::asic::DataObject;
     use crate::sign::cades::{DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime};
@@ -808,6 +910,10 @@ mod tests {
     const COUNTRY: &str = "FI";
     /// An organization name with a character RFC 4514 escapes.
     const ORGANIZATION: &str = "Synthetic, Org";
+    /// An organization name carrying NUL.
+    const WITH_NUL: &str = "Synthetic\0Org";
+    /// [`WITH_NUL`] as RFC 4514 writes it.
+    const ESCAPED_WITH_NUL: &str = r"Synthetic\00Org";
     /// [`ORGANIZATION`] as RFC 4514 writes it.
     const ESCAPED_ORGANIZATION: &str = "Synthetic\\, Org";
 
@@ -1046,7 +1152,10 @@ mod tests {
 
     /// The subject names along `path`.
     fn names(path: &CertificatePath) -> Vec<String> {
-        path.certificates.iter().map(subject_name).collect()
+        path.certificates
+            .iter()
+            .map(|certificate| SubjectName::of(certificate).as_str().to_owned())
+            .collect()
     }
 
     /// Change one byte inside the first signed span.
@@ -1075,7 +1184,10 @@ mod tests {
         assert!(!signature.timestamps_valid);
         assert!(signature.covers_whole_document);
         assert_eq!(signature.revocation, Revocation::Unavailable);
-        assert_eq!(signature.signer.name, DIRECT_SIGNER);
+        assert_eq!(
+            signature.signer.name,
+            SubjectName::CommonName(DIRECT_SIGNER.to_owned())
+        );
         assert_eq!(signature.claimed_signing_time, Some(day(STAMPED)));
         assert!(signature.signature_timestamps.is_empty());
         assert!(signature.document_timestamps.is_empty());
@@ -1111,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_whose_root_is_unknown_ends_unanchored() {
+    fn a_timestamp_whose_root_is_not_pinned_proves_no_time() {
         let world = World::new();
         let report = verify_with(
             world.pdf(Signer::Direct, true, &ValidationMaterial::default()),
@@ -1119,12 +1231,20 @@ mod tests {
         )
         .expect("report");
         let signature = only(&report);
-        let [SignatureTimestamp::Proven { chain, .. }] = signature.signature_timestamps.as_slice()
+        let [
+            SignatureTimestamp::Unproven {
+                claimed_at,
+                chain: Some(chain),
+            },
+        ] = signature.signature_timestamps.as_slice()
         else {
-            panic!("one proven timestamp");
+            panic!("one unproven timestamp");
         };
+        assert_eq!(*claimed_at, Some(day(STAMPED)));
         assert_eq!(names(chain), vec![TSA.to_owned()]);
         assert!(!chain.anchored);
+        assert_eq!(signature.proof_of_existence, None);
+        assert!(!signature.timestamps_valid);
     }
 
     #[test]
@@ -1167,7 +1287,37 @@ mod tests {
         assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
         assert!(signature.timestamps_valid);
         assert!(!signature.covers_whole_document);
-        assert_eq!(signature.document_timestamps, vec![day(STAMPED)]);
+        assert_eq!(
+            signature.document_timestamps,
+            vec![DocumentTimestamp::Proven {
+                generated_at: day(STAMPED)
+            }]
+        );
+    }
+
+    #[test]
+    fn a_document_timestamp_under_an_unknown_root_is_listed_and_proves_nothing() {
+        let world = World::new();
+        let signed = world.pdf(Signer::Direct, false, &ValidationMaterial::default());
+        let placeholder =
+            prepare_document_timestamp(&signed, DEFAULT_SIGNATURE_CAPACITY).expect("prepares");
+        let token = timestamp_token(
+            &world.tsa,
+            &world.tsa_key,
+            &placeholder.digest(DigestAlgorithm::Sha256),
+            day(STAMPED),
+        );
+        let stamped = placeholder.finish(&token).expect("finishes");
+        let report = verify_with(stamped, &[&world.stranger]).expect("report");
+        let signature = only(&report);
+        assert_eq!(
+            signature.document_timestamps,
+            vec![DocumentTimestamp::Unproven {
+                claimed_at: Some(day(STAMPED))
+            }]
+        );
+        assert_eq!(signature.proof_of_existence, None);
+        assert!(!signature.timestamps_valid);
     }
 
     #[test]
@@ -1294,7 +1444,7 @@ mod tests {
             &key,
         );
         let identity = SignerIdentity::of(&OwnedCert::from_der(person).expect("parses"));
-        assert_eq!(identity.name, PERSON);
+        assert_eq!(identity.name, SubjectName::CommonName(PERSON.to_owned()));
         assert_eq!(
             identity.identifier.as_ref().map(|peuin| peuin.as_str()),
             Some(IDENTIFIER)
@@ -1306,7 +1456,10 @@ mod tests {
             &key,
         );
         let identity = SignerIdentity::of(&OwnedCert::from_der(plain).expect("parses"));
-        assert_eq!(identity.name, DIRECT_SIGNER);
+        assert_eq!(
+            identity.name,
+            SubjectName::CommonName(DIRECT_SIGNER.to_owned())
+        );
         assert!(identity.identifier.is_none());
     }
 
@@ -1326,10 +1479,26 @@ mod tests {
         let identity = SignerIdentity::of(&OwnedCert::from_der(person).expect("parses"));
         assert_eq!(
             identity.name,
-            format!(
-                "{}={SURNAME},O={ESCAPED_ORGANIZATION},C={COUNTRY}",
-                known::SURNAME
-            )
+            SubjectName::Distinguished(format!(
+                "{}=#{},O={ESCAPED_ORGANIZATION},C={COUNTRY}",
+                known::SURNAME,
+                Hex::encode(&tlv(UTF8_STRING, SURNAME.as_bytes()))
+            ))
+        );
+    }
+
+    #[test]
+    fn rfc_4514_writes_nul_as_an_escaped_pair() {
+        let key = TestKey::generate(Curve::P256);
+        let subject = certificate_named(
+            &spec(PERSON_SERIAL, PERSON, PERSON, Vec::new()),
+            &name_of(&[(known::ORGANIZATION_NAME, UTF8_STRING, WITH_NUL)]),
+            &key,
+            &key,
+        );
+        assert_eq!(
+            SubjectName::of(&OwnedCert::from_der(subject).expect("parses")),
+            SubjectName::Distinguished(format!("O={ESCAPED_WITH_NUL}"))
         );
     }
 }

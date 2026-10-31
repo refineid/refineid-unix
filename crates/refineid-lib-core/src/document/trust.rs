@@ -360,9 +360,9 @@ pub fn judge(
 }
 
 /// The path of a verified timestamp token's signer, signer first,
-/// built from the certificates the token embeds and those of `pool`,
-/// at the token's generation time. A self-signed certificate among
-/// them counts as an anchor, as does any of `anchors`.
+/// built from the certificates the token embeds, those of `pool` and
+/// `anchors`, at the token's generation time. The path is anchored
+/// when it ends in one of `anchors`.
 #[must_use]
 pub fn token_path(
     token: &VerifiedTimestampToken,
@@ -384,19 +384,7 @@ pub fn token_path(
             .map(|der| der.to_vec())
             .collect::<Vec<_>>(),
     );
-    let mut roots: Vec<&[u8]> = pool
-        .certificates
-        .iter()
-        .map(OwnedCert::as_der)
-        .filter(|der| Certificate::from_der(der).is_ok_and(is_self_signed))
-        .collect();
-    roots.extend(anchors.certificates().iter().copied());
-    let verdict = judge(
-        &signer,
-        &pool,
-        TrustAnchors::new(&roots),
-        token.generated_at,
-    );
+    let verdict = judge(&signer, &pool, anchors, token.generated_at);
     if is_self_signed(signer.view()) {
         return verdict.path;
     }
@@ -1113,9 +1101,11 @@ mod tests {
         CertificateSpec, Curve, OcspSpec, TestKey, ca_extensions, certificate, crl, day,
         ocsp_response,
     };
-    use super::{MaterialPool, judge};
+    use super::{MaterialPool, judge, token_path};
     use crate::document::{CertificatePath, Revocation, TrustAnchors};
+    use crate::sign::timestamp::VerifiedTimestampToken;
     use crate::sign::validation::ValidationMaterial;
+    use crate::trust_roots::PINNED_TIME_STAMPING_ROOT_DER;
     use crate::x509::OwnedCert;
 
     /// Root common name.
@@ -1279,6 +1269,61 @@ mod tests {
             .iter()
             .map(|certificate| certificate.as_der().to_vec())
             .collect()
+    }
+
+    /// Sectigo Qualified Time Stamping Signer #3, as the qualified
+    /// service at `http://timestamp.sectigo.com/qualified` embeds it.
+    const SECTIGO_SIGNER_DER: &[u8] =
+        include_bytes!("../../tests/data/sectigo-qualified-tsa-signer-3.der");
+    /// Sectigo Qualified Time Stamping CA R35, embedded beside it.
+    const SECTIGO_CA_DER: &[u8] =
+        include_bytes!("../../tests/data/sectigo-qualified-tsa-ca-r35.der");
+
+    /// A token as the qualified service returns it, minus the token
+    /// bytes the path does not read, generated inside both
+    /// certificates' validity.
+    fn sectigo_token() -> VerifiedTimestampToken {
+        VerifiedTimestampToken {
+            token: Vec::new(),
+            signer_certificate: SECTIGO_SIGNER_DER.to_vec(),
+            embedded_certificates: vec![SECTIGO_SIGNER_DER.to_vec(), SECTIGO_CA_DER.to_vec()],
+            generated_at: day(VALIDATED),
+        }
+    }
+
+    #[test]
+    fn a_token_under_the_pinned_time_stamping_root_is_anchored() {
+        let path = token_path(
+            &sectigo_token(),
+            &MaterialPool::new(),
+            TrustAnchors::new(PINNED_TIME_STAMPING_ROOT_DER),
+        );
+        assert!(path.anchored);
+        assert_eq!(
+            ders(&path),
+            vec![
+                SECTIGO_SIGNER_DER.to_vec(),
+                SECTIGO_CA_DER.to_vec(),
+                PINNED_TIME_STAMPING_ROOT_DER
+                    .first()
+                    .expect("one root")
+                    .to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_token_under_an_unknown_root_is_not_anchored() {
+        let path = token_path(
+            &sectigo_token(),
+            &MaterialPool::new(),
+            TrustAnchors::new(&[]),
+        );
+        assert!(!path.anchored);
+        assert_eq!(
+            ders(&path),
+            vec![SECTIGO_SIGNER_DER.to_vec(), SECTIGO_CA_DER.to_vec()]
+        );
     }
 
     #[test]

@@ -40,6 +40,25 @@ pub const PINNED_DVV_G3_ECC_SHA256: Sha256 = Sha256::from_bytes([
     0xDE, 0x3B, 0x9C, 0x9D, 0x07, 0xE5, 0x02, 0x59, 0x28, 0x31, 0xCC, 0xDA, 0x9B, 0x36, 0x9F, 0xD3,
 ]);
 
+/// The time-stamping root certificates a signature timestamp's path
+/// must reach to prove a time, as DER. The default timestamp
+/// authority's qualified service chains to this root; the DER is the
+/// one Sectigo publishes at
+/// `https://crt.sectigo.com/SectigoQualifiedTimeStampingRootR45.crt`.
+pub const PINNED_TIME_STAMPING_ROOT_DER: &[&[u8]] = &[SECTIGO_QUALIFIED_TIME_STAMPING_ROOT_R45_DER];
+
+/// SHA-256 fingerprint of Sectigo Qualified Time Stamping Root R45,
+/// from Sectigo's root publication.
+pub const PINNED_SECTIGO_TSA_R45_SHA256: Sha256 = Sha256::from_bytes([
+    0xF8, 0x71, 0xF8, 0x97, 0x6B, 0x40, 0x68, 0xD7, 0x00, 0xD5, 0xF2, 0x81, 0x08, 0x4B, 0x4A, 0x29,
+    0xEA, 0xF4, 0xB8, 0xF3, 0x57, 0x43, 0x33, 0x0B, 0xA0, 0x62, 0xFA, 0xB4, 0x6F, 0x58, 0xC2, 0xED,
+]);
+
+/// Sectigo Qualified Time Stamping Root R45, as published at
+/// `https://crt.sectigo.com/SectigoQualifiedTimeStampingRootR45.crt`.
+const SECTIGO_QUALIFIED_TIME_STAMPING_ROOT_R45_DER: &[u8] =
+    include_bytes!("../trust-anchors/sectigo-qualified-time-stamping-root-r45.der");
+
 /// Global in-memory dynamic root certificate cache.
 static ROOT_CERTIFICATES: OnceLock<Box<RootCertificates>> = OnceLock::new();
 
@@ -236,6 +255,17 @@ fn encode_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pinned_time_stamping_root_matches_its_fingerprint() {
+        assert_eq!(
+            PINNED_TIME_STAMPING_ROOT_DER
+                .iter()
+                .map(Sha256::of)
+                .collect::<Vec<_>>(),
+            vec![PINNED_SECTIGO_TSA_R45_SHA256]
+        );
+    }
 
     #[test]
     fn test_root_certificates_empty() {

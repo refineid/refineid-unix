@@ -363,11 +363,12 @@ impl<'a> Name<'a> {
 
     /// The name as an RFC 4514 string: relative distinguished names
     /// last first, separated by `,`, multi-valued ones joined by `+`.
-    /// Attribute types of RFC 4514 sec.3 appear by their short names,
-    /// others in dotted decimal; a value that is not a directory
-    /// string appears as `#` and the hexadecimal of its DER
-    /// (RFC 4514 sec.2.4). A name that does not decode yields an
-    /// empty string.
+    /// An attribute type of RFC 4514 sec.3 appears by its short name
+    /// with its directory string value escaped (sec.2.4); any other
+    /// type, and a value that is not a directory string, appears as
+    /// the type, `=`, `#` and the hexadecimal of the value's DER, the
+    /// type in dotted decimal when it has no short name (sec.2.3,
+    /// sec.2.4). A name that does not decode yields an empty string.
     #[must_use]
     pub fn rfc4514(&self) -> String {
         use spki::der::asn1::AnyRef;
@@ -425,11 +426,17 @@ impl<'a> Name<'a> {
                 let Ok(oid) = Oid::new(oid.value()) else {
                     return String::new();
                 };
-                let value = X509Helpers::decode_directory_string(value).map_or_else(
-                    || format!("{DER_VALUE_MARKER}{}", crate::hex::Hex::encode(value_tlv)),
-                    |text| escape_rfc4514_value(&text),
-                );
-                values.push(format!("{}={value}", rfc4514_attribute_type(oid)));
+                let short_name = rfc4514_short_name(oid);
+                let text = short_name.and_then(|_| X509Helpers::decode_directory_string(value));
+                let der_value =
+                    || format!("{DER_VALUE_MARKER}{}", crate::hex::Hex::encode(value_tlv));
+                values.push(match (short_name, text) {
+                    (Some(short_name), Some(text)) => {
+                        format!("{short_name}={}", escape_rfc4514_value(&text))
+                    }
+                    (Some(short_name), None) => format!("{short_name}={}", der_value()),
+                    (None, _) => format!("{oid}={}", der_value()),
+                });
             }
             rendered.push(values.join(MULTI_VALUE_SEPARATOR));
         }
@@ -474,9 +481,8 @@ impl<'a> Name<'a> {
     }
 }
 
-/// The RFC 4514 sec.3 short name of an attribute type, or its dotted
-/// decimal form.
-fn rfc4514_attribute_type(oid: Oid<'_>) -> String {
+/// The RFC 4514 sec.3 short name of an attribute type, if it has one.
+fn rfc4514_short_name(oid: Oid<'_>) -> Option<&'static str> {
     /// The short names RFC 4514 sec.3 lists.
     const SHORT_NAMES: [(Oid<'static>, &str); 9] = [
         (known::COMMON_NAME, "CN"),
@@ -492,22 +498,29 @@ fn rfc4514_attribute_type(oid: Oid<'_>) -> String {
     SHORT_NAMES
         .iter()
         .find(|(known, _)| *known == oid)
-        .map_or_else(|| oid.to_string(), |(_, short)| (*short).to_owned())
+        .map(|(_, short)| *short)
 }
 
 /// Escape a string value as RFC 4514 sec.2.4 requires: a leading space
 /// or `#`, a trailing space, and every `"`, `+`, `,`, `;`, `<`, `>` and
-/// `\` take a backslash.
+/// `\` take a backslash, and NUL is written `\00`.
 fn escape_rfc4514_value(value: &str) -> String {
     /// The characters escaped wherever they occur.
     const SPECIAL: [char; 7] = ['"', '+', ',', ';', '<', '>', '\\'];
     /// The escape character.
     const ESCAPE: char = '\\';
+    /// NUL as RFC 4514 sec.2.4 writes it after the escape character.
+    const ESCAPED_NUL: &str = "00";
     let last = value.chars().count().saturating_sub(1);
     let mut out = String::with_capacity(value.len());
     for (index, character) in value.chars().enumerate() {
         let leading = index == 0 && (character == ' ' || character == '#');
         let trailing = index == last && character == ' ';
+        if character == '\0' {
+            out.push(ESCAPE);
+            out.push_str(ESCAPED_NUL);
+            continue;
+        }
         if leading || trailing || SPECIAL.contains(&character) {
             out.push(ESCAPE);
         }
