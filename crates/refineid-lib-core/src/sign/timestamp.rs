@@ -361,6 +361,43 @@ pub fn verified_token(
     })
 }
 
+/// Verify a `TimeStampToken` found in a document, where the token
+/// itself names the imprint algorithm.
+///
+/// A verifier reading a signature does not know which digest the
+/// authority was asked for; the token's `TSTInfo.messageImprint` says.
+/// `imprint_of` computes the digest of the timestamped data under that
+/// algorithm, and the token is accepted when it matches. The signer
+/// certificate, its ESS binding and its fitness for timestamping at
+/// `genTime` are checked as for a fresh response; chaining the signer
+/// to a trust anchor remains the caller's work.
+///
+/// # Errors
+/// [`TimestampError`] for a malformed token, an imprint algorithm this
+/// crate does not digest under, an imprint over other data, or a token
+/// whose signer does not authenticate.
+pub fn verify_token(
+    token: &[u8],
+    imprint_of: impl FnOnce(DigestAlgorithm) -> Vec<u8>,
+) -> Result<VerifiedTimestampToken, TimestampError> {
+    let (signed_data, tst_info) = parse_token(token)?;
+    let algorithm = DigestAlgorithm::from_oid(
+        crate::oid::Oid::new(tst_info.imprint_algorithm_oid)
+            .map_err(|_ignored| TimestampError::Malformed("imprint algorithm is not an OID"))?,
+    )
+    .ok_or(TimestampError::Malformed("imprint algorithm unsupported"))?;
+    if tst_info.message_imprint != imprint_of(algorithm).as_slice() {
+        return Err(TimestampError::ImprintMismatch);
+    }
+    let binding = authenticate_signer(&signed_data, &tst_info)?;
+    Ok(VerifiedTimestampToken {
+        token: token.to_vec(),
+        signer_certificate: binding.signer_certificate,
+        embedded_certificates: binding.embedded_certificates,
+        generated_at: binding.generated_at,
+    })
+}
+
 /// Check the token answers this request and no other.
 fn check_binding(
     token: &[u8],
@@ -368,6 +405,23 @@ fn check_binding(
     expected_algorithm: DigestAlgorithm,
     nonce: Option<&[u8]>,
 ) -> Result<VerifiedBinding, TimestampError> {
+    let (signed_data, tst_info) = parse_token(token)?;
+    if tst_info.imprint_algorithm_oid != expected_algorithm.oid().as_bytes()
+        || tst_info.message_imprint != expected_digest
+    {
+        return Err(TimestampError::ImprintMismatch);
+    }
+    if let Some(nonce) = nonce
+        && tst_info.nonce != Some(positive_integer(nonce).as_slice())
+    {
+        return Err(TimestampError::NonceMismatch);
+    }
+    authenticate_signer(&signed_data, &tst_info)
+}
+
+/// Parse the token as `SignedData` over a `TSTInfo` with signed
+/// attributes, the shape RFC 3161 sec.2.4.2 requires.
+fn parse_token(token: &[u8]) -> Result<(SignedData<'_>, TstInfo<'_>), TimestampError> {
     let signed_data = SignedData::parse(token)
         .map_err(|_ignored| TimestampError::Malformed("token is not CMS SignedData"))?;
     if signed_data.econtent_type_oid != known::TST_INFO {
@@ -381,17 +435,17 @@ fn check_binding(
         ));
     }
     let tst_info = parse_tst_info(signed_data.econtent_der)?;
-    if tst_info.imprint_algorithm_oid != expected_algorithm.oid().as_bytes()
-        || tst_info.message_imprint != expected_digest
-    {
-        return Err(TimestampError::ImprintMismatch);
-    }
-    if let Some(nonce) = nonce
-        && tst_info.nonce != Some(positive_integer(nonce).as_slice())
-    {
-        return Err(TimestampError::NonceMismatch);
-    }
-    let certificate = select_signer_certificate(&signed_data)?;
+    Ok((signed_data, tst_info))
+}
+
+/// Select the signer the token names, check that it signed the token,
+/// that the ESS attribute binds it, and that it was fit to timestamp
+/// at `genTime`.
+fn authenticate_signer(
+    signed_data: &SignedData<'_>,
+    tst_info: &TstInfo<'_>,
+) -> Result<VerifiedBinding, TimestampError> {
+    let certificate = select_signer_certificate(signed_data)?;
     if let Some(tsa) = tst_info.tsa
         && !tsa_name_matches_certificate(tsa, certificate)?
     {
@@ -400,11 +454,11 @@ fn check_binding(
     signed_data
         .verify(certificate.spki.as_der())
         .map_err(|_ignored| TimestampError::TokenSignatureInvalid)?;
-    verify_signing_certificate_attribute(&signed_data, &certificate)?;
+    verify_signing_certificate_attribute(signed_data, &certificate)?;
     tsa_certificate_is_usable(&certificate, tst_info.gen_time)?;
     Ok(VerifiedBinding {
         signer_certificate: certificate.raw_der.to_vec(),
-        embedded_certificates: parseable_embedded_certificates(&signed_data),
+        embedded_certificates: parseable_embedded_certificates(signed_data),
         generated_at: tst_info.gen_time,
     })
 }

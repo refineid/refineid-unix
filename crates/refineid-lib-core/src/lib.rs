@@ -85,6 +85,7 @@ pub mod cms;
 pub mod country;
 pub mod crl;
 pub mod crypto;
+pub mod document;
 pub mod emrtd;
 pub mod error;
 pub mod events;
