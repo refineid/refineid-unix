@@ -299,6 +299,14 @@ pub const fn arguments(tag: VerbTag) -> Arguments {
                 },
             ],
         },
+        VerbTag::DocumentVerify => Arguments {
+            positionals: &[Positional {
+                name: "file",
+                value: Value::File,
+                repeated: true,
+            }],
+            options: &[],
+        },
         VerbTag::PhoneCheck | VerbTag::PhonePair | VerbTag::PhoneUnpair => NOTHING,
         VerbTag::PhoneAuth => Arguments {
             positionals: &[Positional {
@@ -386,6 +394,7 @@ fn group_summary(group: &str) -> Option<&'static str> {
 /// The groups whose listing line is not any one command's summary.
 const GROUP_SUMMARIES: &[(&str, &str)] = &[
     ("pin", "activate, change or unblock a PIN"),
+    ("document", "sign or verify a document"),
     ("cert", "print a certificate or walk its chain"),
 ];
 
