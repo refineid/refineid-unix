@@ -21,7 +21,7 @@ _refineid() {
       commands=(
         'card:read the card\: certificates, revocation, PINs'
         'pin:activate, change or unblock a PIN'
-        'document:sign files as PAdES, CAdES or ASiC-E'
+        'document:sign or verify a document'
         'phone:show the paired phone'
         'verify:verify a raw signature offline'
         'cert:print a certificate or walk its chain'
@@ -197,13 +197,14 @@ _refineid_document() {
     local -a verbs
     verbs=(
       'sign:sign files as PAdES, CAdES or ASiC-E'
+      'verify:verify a signed document'\''s signatures'
       'help:show the document commands'
     )
     _describe -t verbs 'document command' verbs
     return
   fi
   local verb
-  verb=$(_refineid_expand "$words[2]" sign)
+  verb=$(_refineid_expand "$words[2]" sign verify)
   case $verb in
     sign)
       shift words; (( CURRENT-- ))
@@ -218,6 +219,11 @@ _refineid_document() {
         '--can[CAN from the card front]:six digits' \
         '--timestamp[timestamp authority URL or named set]:url:_urls' \
         '--no-stamp[no visible seal on the PDF]'
+      ;;
+    verify)
+      shift words; (( CURRENT-- ))
+      _arguments \
+        '*:file:_files'
       ;;
   esac
 }
