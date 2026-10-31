@@ -76,6 +76,9 @@
 - Operations are silent on success; details only with `-v`/`--verbose`.
   `-V`/`--version` prints the version; nothing else prints it, and no
   command prints a banner.
+- [doc/command-line.md](doc/command-line.md) holds the reasoning behind
+  these rules and the literature it rests on; a new rule goes there with
+  its evidence, or with a note that there is none.
 
 ## Source comments
 
