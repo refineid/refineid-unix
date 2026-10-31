@@ -41,19 +41,22 @@ usage: refineid document sign FILE [FILE ...] [--format F] [--out PATH]
                 [--slot S] [--reason T] [--location T] [--reader SUBSTR]
                 [--can NNNNNN] [--no-stamp] [--timestamp U ...]
 
-Sign FILE into a format a counterparty can open. Several files go into
-one container under one signature. PIN2 and the qualified-signature
-key by default. Prints nothing on success; -v shows each step.
+Sign FILE into a format a counterparty can open. Several PDFs are
+signed one by one, each with its own seal; any other set, or a
+container --format, goes into one container under one signature.
+PIN2 and the qualified-signature key by default, asked once for the
+whole run. Prints nothing on success; -v shows each step.
   --format F    pades          signature inside the PDF
                 cades          CMS, document attached
                 cades-detached CMS, document left outside
                 asice | bdoc   ASiC-E container with XAdES
                 asice-cades    ASiC-E container with CAdES
-                Default: pades for one PDF, asice otherwise. The
-                one-file formats refuse a set of files.
-  --out P       the finished document. Default: beside the first
-                FILE, '<stem>-signed-<UTC time>.<ext>', with stem
-                'portfolio' for several files.
+                Default: pades when every FILE is a PDF, asice
+                otherwise. A one-file format signs each FILE.
+  --out P       the finished document; only when one is made.
+                Default: '<stem>-signed-<UTC time>.<ext>' beside the
+                FILE, or beside the first FILE with stem 'portfolio'
+                for a container of several.
   --slot S      qualified (default) or auth
   --reason T    PAdES /Reason
   --location T  PAdES /Location
@@ -84,14 +87,17 @@ const OPTION_PREFIX: &str = "--";
 /// [--reader SUBSTR] [--can NNNNNN]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentSignArgs {
-    /// Which format to produce (`--format`). Without it, one PDF is
-    /// signed as `PAdES` and anything else as `ASiC-E` with `XAdES`.
+    /// Which format to produce (`--format`). Without it, PDFs are
+    /// signed as `PAdES`, one by one, and anything else as one
+    /// `ASiC-E` with `XAdES` container.
     pub format: Format,
     /// Files to sign, in the order given (positional, at least one).
+    /// A one-file format signs each; a container holds them all.
     pub inputs: Vec<PathBuf>,
-    /// Where the finished document goes (`--out`).
+    /// Where the finished document goes (`--out`); only when the run
+    /// makes one document.
     ///
-    /// `None` names it with
+    /// `None` names each with
     /// [`crate::signed_name::signed_document_path`] at run time, since
     /// the name carries the signing instant.
     pub output: Option<PathBuf>,
@@ -148,7 +154,7 @@ impl DocumentSignArgs {
     pub fn run(self, verbose: bool) -> std::process::ExitCode {
         let Self {
             format,
-            mut inputs,
+            inputs,
             output,
             slot,
             reason,
@@ -165,67 +171,96 @@ impl DocumentSignArgs {
             SignSlot::Auth => "REFINEID_PIN1",
             SignSlot::Qualified => "REFINEID_PIN2",
         };
-
-        // `parse` guarantees at least one; `remove(0)` splits the
-        // primary from the rest the way `SignOptions` is shaped.
-        if inputs.is_empty() {
-            eprintln!("{cmd}: no input files");
+        // Every input is checked before the card is touched or a PIN
+        // is asked: a run that will fail on its third file fails before
+        // the first signature.
+        if let Err(message) = check_inputs(&inputs) {
+            eprintln!("{cmd}: {message}");
             return crate::exit_status::ExitStatus::RuntimeFailure.into();
         }
         let now = crate::card_check::now_date_time();
-        let output = output
-            .unwrap_or_else(|| crate::signed_name::signed_document_path(&inputs, format, now));
-        let primary = inputs.remove(0);
+        let jobs = jobs_for(format, inputs, output, now);
+        let several = jobs.len() > 1;
         let metadata = SignatureMetadata {
             reason,
             location,
             ..SignatureMetadata::default()
         };
         let signing_time = signing_time_at(now);
+        // One PIN for the run: the first document asks for it at its
+        // point of use, once the card is in hand; the rest repeat it.
+        let pin = crate::pin_source::SharedPin::new(Box::new(move || {
+            super::util::pin_env_or_prompt(cmd, env_var, super::util::sign_pin_prompt(slot))
+                .map_err(|status| crate::pin_source::PinEntryError { status })
+        }));
 
         let backend = refineid_lib_pcsc::PcscBackend;
-        let run_once = |can: Option<Can>| {
-            let options = crate::card_sign::SignOptions {
-                input: primary.clone(),
-                output: output.clone(),
-                pin: super::util::pin_source_at_use(
-                    cmd,
-                    env_var,
-                    super::util::sign_pin_prompt(slot),
-                ),
-                save_cert: None,
-                reader_filter: reader_filter.clone(),
-                can,
-                document: Some(DocumentRequest {
-                    format,
-                    additional_inputs: inputs.clone(),
-                    signing_time,
-                    metadata: metadata.clone(),
-                    // The CLI signs whichever card is present; there is
-                    // no prior inspection view to bind to.
-                    expected_serial: None,
-                    visible_signature: (stamp && format == Format::Pades)
-                        .then(process_visible_signature),
-                    timestamp_authorities: timestamp_authorities.clone(),
-                    timestamp_credentials: None,
-                    long_term,
-                    archive,
-                }),
+        let mut can = can;
+        let mut worst = crate::exit_status::ExitStatus::Ok;
+        for job in jobs {
+            let mut inputs = job.inputs;
+            let primary = inputs.remove(0);
+            let run_once = |can: Option<Can>| {
+                let options = crate::card_sign::SignOptions {
+                    input: primary.clone(),
+                    output: job.output.clone(),
+                    pin: pin.source(),
+                    save_cert: None,
+                    reader_filter: reader_filter.clone(),
+                    can,
+                    document: Some(DocumentRequest {
+                        format,
+                        additional_inputs: inputs.clone(),
+                        signing_time,
+                        metadata: metadata.clone(),
+                        // The CLI signs whichever card is present; there
+                        // is no prior inspection view to bind to.
+                        expected_serial: None,
+                        visible_signature: (stamp && format == Format::Pades)
+                            .then(process_visible_signature),
+                        timestamp_authorities: timestamp_authorities.clone(),
+                        timestamp_credentials: None,
+                        long_term,
+                        archive,
+                    }),
+                };
+                crate::card_sign::sign_with_slot(backend, slot, options)
             };
-            crate::card_sign::sign_with_slot(backend, slot, options)
-        };
 
-        let mut result = run_once(can);
-        // Same contactless retry as the bare sign verbs: the PACE seal
-        // is reported by the first SELECT, before any PIN counter has
-        // been touched.
-        if matches!(result, Err(crate::card_sign::SignErrorKind::NeedCan))
-            && let Some(prompted) = super::util::prompt_can_if_tty()
-        {
-            result = run_once(Some(prompted));
+            let mut result = run_once(can);
+            // Same contactless retry as the bare sign verbs: the PACE
+            // seal is reported by the first SELECT, before any PIN
+            // counter has been touched.
+            if matches!(result, Err(crate::card_sign::SignErrorKind::NeedCan))
+                && let Some(prompted) = super::util::prompt_can_if_tty()
+            {
+                can = Some(prompted);
+                result = run_once(Some(prompted));
+            }
+            let stop = stops_the_run(&result);
+            let name = several.then(|| primary.display().to_string());
+            let status = report_outcome(
+                cmd,
+                verbose,
+                result,
+                format,
+                long_term,
+                archive,
+                name.as_deref(),
+            );
+            // The run's status is its first failure's, unless a later
+            // one ended the run: that is the one to act on.
+            if stop
+                || (status != crate::exit_status::ExitStatus::Ok
+                    && worst == crate::exit_status::ExitStatus::Ok)
+            {
+                worst = status;
+            }
+            if stop {
+                break;
+            }
         }
-
-        report_outcome(cmd, verbose, result, format, long_term, archive)
+        worst.into()
     }
 
     /// Parse the post-subcommand argv slice.
@@ -336,23 +371,21 @@ impl DocumentSignArgs {
         }
         let format = match format_raw.as_deref() {
             None => default_format(&inputs),
-            Some(raw) => {
-                let format = parse_format(raw)?;
-                // Caught here rather than at the card, so a mistyped
-                // command costs nothing: a PIN prompt the operator
-                // answers before being told the arguments were wrong
-                // is a PIN typed for nothing.
-                if format.is_single_file() && inputs.len() > 1 {
-                    return Err(ArgParseError::BadValue {
-                        cmd: CMD,
-                        flag: "--format",
-                        value: format!("{} files", inputs.len()),
-                        reason: format!("{raw} signs one file; use asice or bdoc to cover a set"),
-                    });
-                }
-                format
-            }
+            Some(raw) => parse_format(raw)?,
         };
+        // Caught here rather than at the card, so a mistyped command
+        // costs nothing: a PIN prompt the operator answers before
+        // being told the arguments were wrong is a PIN typed for
+        // nothing.
+        if output.is_some() && format.is_single_file() && inputs.len() > 1 {
+            return Err(ArgParseError::BadValue {
+                cmd: CMD,
+                flag: "--out",
+                value: format!("{} files", inputs.len()),
+                reason: "one name for several documents; use asice to make one container"
+                    .to_owned(),
+            });
+        }
         let slot = match slot_raw {
             None | Some("qualified") => SignSlot::Qualified,
             Some("auth") => SignSlot::Auth,
@@ -443,6 +476,9 @@ impl core::fmt::Display for DocumentReport<'_> {
 }
 
 /// Turn the signing outcome into a report and an exit code.
+/// One document's outcome: nothing on success unless `verbose`, the
+/// error on stderr otherwise, prefixed with `name` when the run has
+/// several documents. Returns the status the document earns.
 fn report_outcome(
     cmd: &str,
     verbose: bool,
@@ -450,7 +486,10 @@ fn report_outcome(
     format: Format,
     long_term: bool,
     archive: bool,
-) -> std::process::ExitCode {
+    name: Option<&str>,
+) -> crate::exit_status::ExitStatus {
+    use crate::exit_status::ExitStatus;
+    let whose = name.map(|name| format!("{name}: ")).unwrap_or_default();
     match result {
         Ok(report) => {
             let verified = !report.local_verify.is_failed();
@@ -464,17 +503,18 @@ fn report_outcome(
                     archive,
                 },
             );
-            if !verified {
-                eprintln!("{cmd}: local verify: {}", report.local_verify);
-                crate::exit_status::ExitStatus::RuntimeFailure.into()
+            if verified {
+                ExitStatus::Ok
             } else {
-                crate::exit_status::ExitStatus::Ok.into()
+                eprintln!("{cmd}: {whose}local verify: {}", report.local_verify);
+                ExitStatus::RuntimeFailure
             }
         }
         Err(crate::card_sign::SignErrorKind::ReaderPick(pe)) => {
-            super::util::reader_pick_exit(cmd, &pe)
+            eprintln!("{cmd}: {whose}{pe}");
+            super::util::reader_pick_status(&pe)
         }
-        Err(crate::card_sign::SignErrorKind::PinEntry(entry)) => entry.status.into(),
+        Err(crate::card_sign::SignErrorKind::PinEntry(entry)) => entry.status,
         Err(e)
             if matches!(
                 &e,
@@ -484,14 +524,86 @@ fn report_outcome(
             ) =>
         {
             refineid_dev_errors::report!(Cli, "document not signed", e);
-            eprintln!("{cmd}: {e}");
-            crate::exit_status::ExitStatus::CardCredentialRejected.into()
+            eprintln!("{cmd}: {whose}{e}");
+            ExitStatus::CardCredentialRejected
         }
         Err(e) => {
             refineid_dev_errors::report!(Cli, "document not signed", e);
-            eprintln!("{cmd}: {e}");
-            crate::exit_status::ExitStatus::RuntimeFailure.into()
+            eprintln!("{cmd}: {whose}{e}");
+            ExitStatus::RuntimeFailure
         }
+    }
+}
+
+/// `true` when a failure ends the run: no reader or card, a CAN still
+/// missing after the one prompt, a PIN the card refused or that was
+/// not given. The next document would fail the same way or ask again
+/// for a code already refused. A document that fails on its own
+/// account, a format or an authority, lets the rest be signed.
+fn stops_the_run(
+    result: &Result<crate::card_sign::SignReport, crate::card_sign::SignErrorKind>,
+) -> bool {
+    matches!(
+        result,
+        Err(crate::card_sign::SignErrorKind::ReaderPick(_)
+            | crate::card_sign::SignErrorKind::NeedCan
+            | crate::card_sign::SignErrorKind::PinEntry(_)
+            | crate::card_sign::SignErrorKind::PinRejected { .. }
+            | crate::card_sign::SignErrorKind::RetryFloor(_)
+            | crate::card_sign::SignErrorKind::PinPolicy { .. })
+    )
+}
+
+/// Every input is a readable file, and no file is given twice: two
+/// jobs for one file would share one output name. Checked before the
+/// card is touched. The message names the first offending path.
+fn check_inputs(inputs: &[PathBuf]) -> Result<(), String> {
+    if inputs.is_empty() {
+        return Err("no input files".to_owned());
+    }
+    let mut seen: Vec<PathBuf> = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let shown = input.display();
+        let metadata = std::fs::metadata(input).map_err(|e| format!("{shown}: {e}"))?;
+        if !metadata.is_file() {
+            return Err(format!("{shown}: not a file"));
+        }
+        std::fs::File::open(input).map_err(|e| format!("{shown}: {e}"))?;
+        let identity = std::fs::canonicalize(input).unwrap_or_else(|_| input.clone());
+        if seen.contains(&identity) {
+            return Err(format!("{shown}: given twice"));
+        }
+        seen.push(identity);
+    }
+    Ok(())
+}
+
+/// One document to make: its inputs and where it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Job {
+    inputs: Vec<PathBuf>,
+    output: PathBuf,
+}
+
+/// The documents a run makes: one per input for a one-file format,
+/// one container for the rest. `output` names the single document a
+/// run makes; `resolve` refuses it for several.
+fn jobs_for(
+    format: Format,
+    inputs: Vec<PathBuf>,
+    output: Option<PathBuf>,
+    now: DateTime,
+) -> Vec<Job> {
+    let named = |inputs: Vec<PathBuf>| {
+        let output = output
+            .clone()
+            .unwrap_or_else(|| crate::signed_name::signed_document_path(&inputs, format, now));
+        Job { inputs, output }
+    };
+    if format.is_single_file() {
+        inputs.into_iter().map(|input| named(vec![input])).collect()
+    } else {
+        vec![named(inputs)]
     }
 }
 
@@ -504,18 +616,20 @@ const fn levels_for(format: Format) -> (bool, bool) {
     (true, matches!(format, Format::Pades | Format::AsicECades))
 }
 
-/// The format signed without `--format`: `PAdES` for exactly one PDF,
-/// `ASiC-E` with `XAdES` for anything else.
+/// The format signed without `--format`: `PAdES` when every input is
+/// a PDF, each signed on its own; `ASiC-E` with `XAdES` for anything
+/// else, as one container.
 fn default_format(inputs: &[PathBuf]) -> Format {
-    match inputs {
-        [only]
-            if only
+    let all_pdf = !inputs.is_empty()
+        && inputs.iter().all(|input| {
+            input
                 .extension()
-                .is_some_and(|own| own.eq_ignore_ascii_case(Format::Pades.extension())) =>
-        {
-            Format::Pades
-        }
-        _ => Format::AsicEXades,
+                .is_some_and(|own| own.eq_ignore_ascii_case(Format::Pades.extension()))
+        });
+    if all_pdf {
+        Format::Pades
+    } else {
+        Format::AsicEXades
     }
 }
 
@@ -620,8 +734,8 @@ mod tests {
     use refineid_lib_core::crypto::digest::Sha256;
 
     use super::{
-        DEFAULT_TIMESTAMP_AUTHORITY, DocumentReport, DocumentSignArgs, Format, SignSlot,
-        describe_level, parse_format,
+        DEFAULT_TIMESTAMP_AUTHORITY, DateTime, DocumentReport, DocumentSignArgs, Format, SignSlot,
+        check_inputs, describe_level, jobs_for, parse_format, stops_the_run,
     };
     use crate::card_sign::{LocalVerifyOutcome, SignReport};
     use crate::cli::ArgParseError;
@@ -728,10 +842,111 @@ mod tests {
     }
 
     #[test]
-    fn several_inputs_are_signed_into_one_container() -> TestResult {
+    fn a_mixed_set_is_signed_into_one_container() -> TestResult {
         let a = DocumentSignArgs::parse(argv(&[PDF, TEXT]))?;
         check(&a.inputs.len(), &2, "input count")?;
         check(&a.format, &Format::AsicEXades, "format")
+    }
+
+    #[test]
+    fn several_pdfs_are_signed_one_by_one() -> TestResult {
+        let a = DocumentSignArgs::parse(argv(&[PDF, "/documents/Another.pdf"]))?;
+        check(&a.format, &Format::Pades, "all PDFs stay PAdES")?;
+        let jobs = jobs_for(a.format, a.inputs, a.output, signed_at()?);
+        check(&jobs.len(), &2, "one document per PDF")?;
+        check(
+            &jobs[1].output,
+            &PathBuf::from("/documents/Another-signed-2001-02-03T04-05-06Z.pdf"),
+            "each named beside its input",
+        )?;
+        let a =
+            DocumentSignArgs::parse(argv(&[PDF, "/documents/Another.pdf", "--format", "asice"]))?;
+        let jobs = jobs_for(a.format, a.inputs, a.output, signed_at()?);
+        check(&jobs.len(), &1, "asked for, the PDFs share one container")?;
+        check(&jobs[0].inputs.len(), &2, "both inside")
+    }
+
+    #[test]
+    fn a_card_or_code_failure_ends_the_run_and_a_document_failure_does_not() -> TestResult {
+        use crate::card_sign::SignErrorKind;
+        check_true(
+            stops_the_run(&Err(SignErrorKind::NeedCan)),
+            "a CAN still missing stops",
+        )?;
+        check_true(
+            !stops_the_run(&Err(SignErrorKind::VisibleSignature(String::new()))),
+            "a document's own failure lets the rest be signed",
+        )
+    }
+
+    #[test]
+    fn inputs_are_checked_before_the_card() -> TestResult {
+        let dir =
+            std::env::temp_dir().join(format!("refineid-check-inputs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let file = dir.join("report.pdf");
+        std::fs::write(&file, b"%PDF").map_err(|e| e.to_string())?;
+        let outcome = (|| -> TestResult {
+            check_true(
+                check_inputs(std::slice::from_ref(&file)).is_ok(),
+                "a readable file passes",
+            )?;
+            check_true(
+                check_inputs(&[file.clone(), dir.clone()]).is_err(),
+                "a directory is not a file",
+            )?;
+            check_true(
+                check_inputs(&[file.clone(), dir.join("missing.pdf")]).is_err(),
+                "a missing file is named before any signature",
+            )?;
+            let twice = check_inputs(&[file.clone(), file.clone()])
+                .err()
+                .unwrap_or_default();
+            check_true(
+                twice.ends_with("given twice"),
+                "the same file twice is refused",
+            )?;
+            check_true(check_inputs(&[]).is_err(), "nothing to sign is refused")
+        })();
+        let _removed = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    #[test]
+    fn out_names_one_document_only() -> TestResult {
+        check_true(
+            matches!(
+                DocumentSignArgs::parse(argv(&[PDF, "/documents/Another.pdf", "--out", OUT])),
+                Err(ArgParseError::BadValue { flag: "--out", .. })
+            ),
+            "two PDFs cannot share one output name",
+        )?;
+        let a = DocumentSignArgs::parse(argv(&[PDF, TEXT, "--out", OUT]))?;
+        check(
+            &a.output,
+            &Some(PathBuf::from(OUT)),
+            "a container may be named",
+        )
+    }
+
+    /// A synthetic signing time, 2001-02-03T04:05:06Z.
+    const SIGNED_YEAR: u16 = 2001;
+    const SIGNED_MONTH: u8 = 2;
+    const SIGNED_DAY: u8 = 3;
+    const SIGNED_HOUR: u8 = 4;
+    const SIGNED_MINUTE: u8 = 5;
+    const SIGNED_SECOND: u8 = 6;
+
+    fn signed_at() -> Result<DateTime, String> {
+        DateTime::new(
+            SIGNED_YEAR,
+            SIGNED_MONTH,
+            SIGNED_DAY,
+            SIGNED_HOUR,
+            SIGNED_MINUTE,
+            SIGNED_SECOND,
+        )
+        .map_err(|e| format!("signing time: {e}"))
     }
 
     #[test]
@@ -794,26 +1009,6 @@ mod tests {
             &"B-LTA (time attested by 1 timestamp authority, evidence embedded, plus one archive timestamp)".to_owned(),
             "one signature token plus one archive token",
         )
-    }
-
-    /// A one-file format given a set is refused at parse time, before
-    /// the operator has been asked for a PIN.
-    #[test]
-    fn single_file_formats_refuse_a_set_before_the_pin_prompt() -> TestResult {
-        for format in ["pades", "cades", "cades-detached"] {
-            let r = DocumentSignArgs::parse(argv(&["--format", format, PDF, TEXT]));
-            check_true(
-                matches!(
-                    r,
-                    Err(ArgParseError::BadValue {
-                        flag: "--format",
-                        ..
-                    })
-                ),
-                "two files refused",
-            )?;
-        }
-        Ok(())
     }
 
     /// `.bdoc` and `.asice` are the same format under two names, so
