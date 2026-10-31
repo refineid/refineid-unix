@@ -282,6 +282,15 @@ fn push_command_line(out: &mut String, tag: VerbTag) {
     out.push('\n');
 }
 
+/// The options a subcommand's help text shows: every `--word` in it.
+#[cfg(test)]
+pub(super) fn help_options(tag: VerbTag) -> Vec<&'static str> {
+    tag.help()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|word| word.starts_with("--") && word.len() > "--".len())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,8 +298,6 @@ mod tests {
 
     /// The man page the help texts must agree with.
     const MAN_PAGE: &str = include_str!("../../man/refineid.1");
-    /// The zsh completion that must name every command word and option.
-    const COMPLETION: &str = include_str!("../../../../packaging/zsh/_refineid");
     /// The most lines the synopsis may take: one terminal screen.
     const SCREEN_LINES: usize = 40;
 
@@ -461,40 +468,6 @@ mod tests {
             ([group, name], [first, rest @ ..]) => group == first && rest.contains(name),
             _ => false,
         }
-    }
-
-    #[test]
-    fn zsh_completion_names_every_command_word_and_option() -> TestResult {
-        for &tag in VerbTag::ALL {
-            // A command word is a completion entry `'word:description'`.
-            for word in tag.label().split(' ') {
-                check_true(
-                    COMPLETION.contains(&format!("'{word}:")),
-                    &format!("_refineid completes {word} of {}", tag.label()),
-                )?;
-            }
-            for option in help_options(tag) {
-                check_true(
-                    COMPLETION.contains(&format!("'{option}[")),
-                    &format!("_refineid completes {option} of {}", tag.label()),
-                )?;
-            }
-        }
-        for word in ["expert", "help"] {
-            check_true(COMPLETION.contains(&format!("'{word}:")), word)?;
-        }
-        check_true(
-            COMPLETION.contains("'(-v --verbose)'") && COMPLETION.contains("'(-V --version)'"),
-            "global options",
-        )
-    }
-
-    /// The options a subcommand's help text shows.
-    fn help_options(tag: VerbTag) -> Vec<&'static str> {
-        tag.help()
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-            .filter(|word| word.starts_with("--") && word.len() > "--".len())
-            .collect()
     }
 
     #[test]

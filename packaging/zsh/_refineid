@@ -1,7 +1,9 @@
 #compdef refineid
-# zsh completion for refineid(1). A test in the refineid-client crate
-# holds this file to the command table: every command word and every
-# option the help texts name must appear here.
+# zsh completion for refineid(1), generated from the command table by
+# crates/refineid-client/src/cli/completion.rs. Do not edit; run
+#   cargo test -p refineid-client regenerate_zsh_completion -- --ignored
+# after a command or option changes. A test fails while this file is
+# stale.
 
 _refineid() {
   local curcontext="$curcontext" state line ret=1
@@ -20,18 +22,21 @@ _refineid() {
         'card:read the card\: certificates, revocation, PINs'
         'pin:activate, change or unblock a PIN'
         'document:sign files as PAdES, CAdES or ASiC-E'
-        'phone:the paired phone'
+        'phone:show the paired phone'
         'verify:verify a raw signature offline'
         'cert:print a certificate or walk its chain'
-        'reader:the card reader'
+        'reader:show or set an ACS reader'\''s keyboard mode'
         'expert:list the advanced commands'
         'help:list the commands'
       )
       _describe -t commands 'command' commands && ret=0
       ;;
     arguments)
-      curcontext="${curcontext%:*:*}:refineid-$line[1]:"
-      case $line[1] in
+      # words[1] is the command word, possibly shortened.
+      local group
+      group=$(_refineid_expand "$words[1]" card pin document phone verify cert reader expert help)
+      curcontext="${curcontext%:*:*}:refineid-$group:"
+      case $group in
         card) _refineid_card && ret=0 ;;
         pin) _refineid_pin && ret=0 ;;
         document) _refineid_document && ret=0 ;;
@@ -39,21 +44,33 @@ _refineid() {
         verify) _refineid_verify && ret=0 ;;
         cert) _refineid_cert && ret=0 ;;
         reader) _refineid_reader && ret=0 ;;
+        expert) _refineid_expert && ret=0 ;;
       esac
       ;;
   esac
   return ret
 }
 
-# The options shared by the commands that act on a card.
-_refineid_reader_option=(
-  '--reader[narrow to readers whose name contains S]:substring'
-)
-_refineid_can_option=(
-  '--can[CAN from the card front]:six digits'
-)
+# The whole word among the candidates that a possibly shortened word
+# names: the word itself when it is one, else the only candidate it
+# starts. Prints the word unchanged when it names nothing or several.
+_refineid_expand() {
+  local word=$1; shift
+  local -a candidates=("$@")
+  if (( ${candidates[(Ie)$word]} )); then
+    print -r -- "$word"
+    return
+  fi
+  local -a hits=(${(M)candidates:#${word}*})
+  if (( $#hits == 1 )); then
+    print -r -- "$hits[1]"
+  else
+    print -r -- "$word"
+  fi
+}
 
-# Second word of a group: its verbs, unless an option is being typed.
+# True while the second word of a group is being typed and is not an
+# option: the verbs are offered then.
 _refineid_verbs() {
   (( CURRENT == 2 )) && [[ $words[2] != -* ]]
 }
@@ -73,49 +90,65 @@ _refineid_card() {
     _describe -t verbs 'card command' verbs
     return
   fi
-  case $words[2] in
+  local verb
+  verb=$(_refineid_expand "$words[2]" emrtd sign-auth sign-qualified decrypt-auth pubkey export-all)
+  case $verb in
     emrtd)
+      shift words; (( CURRENT-- ))
       _arguments \
-        $_refineid_can_option \
+        '--can[CAN from the card front]:six digits' \
         '--save-face[face image]:file:_files' \
         '--save-signature[displayed-signature image]:file:_files' \
-        $_refineid_reader_option
+        '--reader[narrow to readers whose name contains S]:substring'
       ;;
-    sign-auth|sign-qualified)
+    sign-auth)
+      shift words; (( CURRENT-- ))
       _arguments \
         '--in[input file]:file:_files' \
         '--out[output file for the raw signature]:file:_files' \
-        '--save-cert[also write the signing certificate DER]:file:_files' \
-        $_refineid_reader_option \
-        $_refineid_can_option
+        '--save-cert[also write the signing certificate'\''s DER]:file:_files' \
+        '--reader[narrow to readers whose name contains S]:substring' \
+        '--can[CAN from the card front]:six digits'
+      ;;
+    sign-qualified)
+      shift words; (( CURRENT-- ))
+      _arguments \
+        '--in[input file]:file:_files' \
+        '--out[output file for the raw signature]:file:_files' \
+        '--save-cert[also write the signing certificate'\''s DER]:file:_files' \
+        '--reader[narrow to readers whose name contains S]:substring' \
+        '--can[CAN from the card front]:six digits'
       ;;
     decrypt-auth)
+      shift words; (( CURRENT-- ))
       _arguments \
         '--in[ciphertext]:file:_files' \
         '--out[output file for the plaintext]:file:_files' \
-        $_refineid_reader_option
+        '--reader[narrow to readers whose name contains S]:substring'
       ;;
     pubkey)
+      shift words; (( CURRENT-- ))
       _arguments \
         '--slot[which key]:slot:(auth qualified)' \
         '--format[key format]:format:(ssh pem)' \
         '--out[write all blocks to a file]:file:_files' \
-        $_refineid_reader_option \
+        '--reader[narrow to readers whose name contains S]:substring' \
         '--comment[SSH comment]:comment'
       ;;
     export-all)
+      shift words; (( CURRENT-- ))
       _arguments \
         '1:directory:_files -/' \
-        $_refineid_reader_option
+        '--reader[narrow to readers whose name contains S]:substring'
       ;;
     *)
       _arguments \
         '--offline[skip every network fetch]' \
-        $_refineid_reader_option \
-        $_refineid_can_option \
+        '--reader[narrow to readers whose name contains S]:substring' \
+        '--can[CAN from the card front]:six digits' \
         '--no-can[skip the eMRTD section]' \
         '--crl-file[use a pre-fetched CRL]:file:_files' \
-        '--save-cert[write each slot DER to a directory]:directory:_files -/' \
+        '--save-cert[write each slot'\''s DER to a directory]:directory:_files -/' \
         '--remote[read the card through the paired phone only]'
       ;;
   esac
@@ -125,7 +158,7 @@ _refineid_pin() {
   if _refineid_verbs; then
     local -a verbs
     verbs=(
-      'activate:activate a new card PINs'
+      'activate:activate a new card'\''s PINs'
       'change:change PIN 1 or PIN 2'
       'unblock:unblock PIN 1 or PIN 2 with the PUK'
       'help:show the pin commands'
@@ -133,23 +166,28 @@ _refineid_pin() {
     _describe -t verbs 'pin command' verbs
     return
   fi
-  case $words[2] in
+  local verb
+  verb=$(_refineid_expand "$words[2]" activate change unblock)
+  case $verb in
     activate)
+      shift words; (( CURRENT-- ))
       _arguments \
         '1:PIN:(1 2)' \
         '--allow-reactivate[run on a card that already looks activated]' \
-        $_refineid_reader_option
+        '--reader[narrow to readers whose name contains S]:substring'
       ;;
     change)
+      shift words; (( CURRENT-- ))
       _arguments \
         '1:PIN:(1 2)' \
-        $_refineid_reader_option \
-        $_refineid_can_option
+        '--reader[narrow to readers whose name contains S]:substring' \
+        '--can[CAN from the card front]:six digits'
       ;;
     unblock)
+      shift words; (( CURRENT-- ))
       _arguments \
         '1:PIN:(1 2)' \
-        $_refineid_reader_option
+        '--reader[narrow to readers whose name contains S]:substring'
       ;;
   esac
 }
@@ -164,8 +202,11 @@ _refineid_document() {
     _describe -t verbs 'document command' verbs
     return
   fi
-  case $words[2] in
+  local verb
+  verb=$(_refineid_expand "$words[2]" sign)
+  case $verb in
     sign)
+      shift words; (( CURRENT-- ))
       _arguments \
         '*:file:_files' \
         '--format[signature format]:format:(pades cades cades-detached asice bdoc asice-cades)' \
@@ -173,14 +214,12 @@ _refineid_document() {
         '--slot[which key]:slot:(qualified auth)' \
         '--reason[PAdES /Reason]:text' \
         '--location[PAdES /Location]:text' \
-        $_refineid_reader_option \
-        $_refineid_can_option \
-        '--timestamp[timestamp authority URL or named set]:url' \
+        '--reader[narrow to readers whose name contains S]:substring' \
+        '--can[CAN from the card front]:six digits' \
+        '--timestamp[timestamp authority URL or named set]:url:_urls' \
         '--no-timestamp[sign at level B]' \
         '--no-long-term[stop at level T]' \
-        '--long-term[embed the validation material]' \
         '--no-archive[stop at level LT]' \
-        '--archive[add the archive timestamp]' \
         '--no-stamp[no visible seal on the PDF]'
       ;;
   esac
@@ -198,8 +237,14 @@ _refineid_phone() {
     _describe -t verbs 'phone command' verbs
     return
   fi
-  case $words[2] in
-    auth) _arguments '1:url:_urls' ;;
+  local verb
+  verb=$(_refineid_expand "$words[2]" pair unpair auth)
+  case $verb in
+    auth)
+      shift words; (( CURRENT-- ))
+      _arguments \
+        '1:url:_urls'
+      ;;
   esac
 }
 
@@ -221,11 +266,16 @@ _refineid_cert() {
     _describe -t verbs 'cert command' verbs
     return
   fi
-  case $words[2] in
+  local verb
+  verb=$(_refineid_expand "$words[2]" show chain)
+  case $verb in
     show)
-      _arguments '1:certificate:_files'
+      shift words; (( CURRENT-- ))
+      _arguments \
+        '1:certificate:_files'
       ;;
     chain)
+      shift words; (( CURRENT-- ))
       _arguments \
         '1:certificate:_files' \
         '--issuer-dir[directory of candidate issuer certificates]:directory:_files -/' \
@@ -238,19 +288,30 @@ _refineid_reader() {
   if _refineid_verbs; then
     local -a verbs
     verbs=(
-      'keyboard:show or set an ACS reader keyboard mode'
+      'keyboard:show or set an ACS reader'\''s keyboard mode'
       'help:show the reader commands'
     )
     _describe -t verbs 'reader command' verbs
     return
   fi
-  case $words[2] in
+  local verb
+  verb=$(_refineid_expand "$words[2]" keyboard)
+  case $verb in
     keyboard)
+      shift words; (( CURRENT-- ))
       _arguments \
         '1:mode:(status on off)' \
-        $_refineid_reader_option
+        '--reader[narrow to readers whose name contains S]:substring'
       ;;
   esac
+}
+
+_refineid_expert() {
+  if (( CURRENT == 2 )); then
+    local -a words_after
+    words_after=('help:list the advanced commands')
+    _describe -t words 'word' words_after
+  fi
 }
 
 _refineid "$@"

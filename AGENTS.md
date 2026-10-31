@@ -77,8 +77,11 @@
 - A command word may be shortened to any prefix that names one command
   (`refineid doc s`); a prefix that fits several is an error naming the
   candidates, never a guess. Scripts and documents spell commands out.
-- `packaging/zsh/_refineid` completes every command word and option and
-  is installed by every package; a test holds it to the command table.
+- `packaging/zsh/_refineid` is generated from the command table by
+  `cargo test -p refineid-client regenerate_zsh_completion -- --ignored`
+  and checked in; a test fails while it is stale, and every package
+  installs it. A command's completable options live in
+  `cli/completion.rs` and must match its help text.
 - Operations are silent on success; details only with `-v`/`--verbose`.
   `-V`/`--version` prints the version; nothing else prints it, and no
   command prints a banner.

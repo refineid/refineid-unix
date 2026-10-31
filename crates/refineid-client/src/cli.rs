@@ -91,6 +91,8 @@ pub mod card_pubkey;
 pub mod card_sign;
 pub mod cert_chain;
 pub mod cert_show;
+#[cfg(test)]
+pub(crate) mod completion;
 pub mod document_sign;
 pub mod help;
 pub mod pin_activate;
