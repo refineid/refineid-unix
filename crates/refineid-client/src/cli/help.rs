@@ -140,10 +140,15 @@ pub fn is_help_word(token: &str) -> bool {
     HELP_WORDS.contains(&token)
 }
 
-/// `true` for the word that, alone, asks for the advanced commands.
+/// `true` when the argv after the program is `expert`, alone or
+/// followed by a help word: both ask for the advanced commands.
 #[must_use]
-pub fn is_expert_word(token: &str) -> bool {
-    token == EXPERT_WORD
+pub fn asks_expert(rest: &[String]) -> bool {
+    match rest {
+        [word] => word == EXPERT_WORD,
+        [word, next] => word == EXPERT_WORD && is_help_word(next),
+        _ => false,
+    }
 }
 
 /// `true` for an option that asks for the version.
@@ -315,8 +320,18 @@ mod tests {
                 &format!("{} in expert", tag.label()),
             )?;
         }
-        check_true(is_expert_word("expert"), "expert word")?;
-        check_true(!is_expert_word("help"), "help is not the expert word")
+        let words = |s: &[&str]| s.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        check_true(asks_expert(&words(&["expert"])), "expert alone")?;
+        check_true(asks_expert(&words(&["expert", "help"])), "expert help")?;
+        check_true(asks_expert(&words(&["expert", "--help"])), "expert --help")?;
+        check_true(
+            !asks_expert(&words(&["expert", "card"])),
+            "expert is not a prefix",
+        )?;
+        check_true(
+            !asks_expert(&words(&["help"])),
+            "help alone is the synopsis",
+        )
     }
 
     #[test]

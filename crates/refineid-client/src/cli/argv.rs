@@ -191,7 +191,8 @@ impl ProcessArgv {
     ///    stdout, `Err(ExitStatus::Ok)`.
     /// 3. `-V` / `--version` first: `refineid <version>` to stdout,
     ///    `Err(ExitStatus::Ok)`. Nothing else prints the version.
-    /// 4. `expert` alone: the advanced commands to stdout,
+    /// 4. `expert`, alone or with a help word: the advanced commands
+    ///    to stdout,
     ///    `Err(ExitStatus::Ok.into())`.
     /// 5. `<group> help` (`card help`, `document help`, ...): that
     ///    group's one-line list to stdout, `Err(ExitStatus::Ok)`.
@@ -231,7 +232,7 @@ impl ProcessArgv {
                 println!("{}", help::version());
                 return Err(ExitStatus::Ok.into());
             }
-            [first] if help::is_expert_word(first) => {
+            rest if help::asks_expert(rest) => {
                 print!("{}", help::expert());
                 return Err(ExitStatus::Ok.into());
             }
