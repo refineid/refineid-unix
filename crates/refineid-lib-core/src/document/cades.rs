@@ -47,10 +47,12 @@
 
 use crate::ber::BerTlvAny;
 use crate::cms::{CmsAttribute, RevocationInfoChoice, SignedData};
+use crate::document::TimestampCheck;
 use crate::oid::{Oid, known};
 use crate::sign::cades::DigestAlgorithm;
 use crate::sign::timestamp::{
-    TimestampError, select_signer_certificate, verify_signing_certificate_attribute, verify_token,
+    TimestampError, claimed_generation_time, select_signer_certificate,
+    verify_signing_certificate_attribute, verify_token,
 };
 use crate::sign::validation::ValidationMaterial;
 use crate::x509::{Certificate, DateTime, EcCurve, OwnedCert, PublicKeyAlgorithm};
@@ -160,17 +162,6 @@ pub enum EssBinding {
     NotRequired,
 }
 
-/// The signature timestamps one signature carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Timestamps {
-    /// How many `signature-time-stamp` tokens are present.
-    pub present: usize,
-    /// The `genTime` of each token that verifies under its embedded
-    /// TSA certificate and imprints this signature value, in
-    /// encoded order.
-    pub verified: Vec<DateTime>,
-}
-
 /// The facts [`CadesSignature::verify`] establishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CadesVerdict {
@@ -181,8 +172,9 @@ pub struct CadesVerdict {
     /// signer key, `content-type` is `id-data`, and, when required,
     /// the ESS attribute binds the signer certificate.
     pub signature_valid: bool,
-    /// The `signature-time-stamp` tokens.
-    pub signature_timestamps: Timestamps,
+    /// Every `signature-time-stamp` token, checked under its embedded
+    /// TSA certificate against this signature value, in encoded order.
+    pub signature_timestamps: Vec<TimestampCheck>,
     /// How many `archive-time-stamp-v3` and `archive-time-stamp` (v2)
     /// tokens are present; they are not verified.
     pub archive_timestamps_present: usize,
@@ -202,8 +194,8 @@ pub struct CadesSignature {
     embedded_certificates: Vec<Vec<u8>>,
     /// Chain certificates and revocation answers from the structure.
     embedded_material: ValidationMaterial,
-    /// Whether a `signing-time` signed attribute is present.
-    has_signing_time: bool,
+    /// The `signing-time` signed attribute, when present and readable.
+    signing_time: Option<DateTime>,
 }
 
 impl CadesSignature {
@@ -239,11 +231,7 @@ impl CadesSignature {
                 .map_err(|_ignored| CadesReadError::SignerCertificateMissing)?;
             let embedded = embedded_certificates(&signed);
             let material = embedded_material(&signed, &embedded, signer.raw_der);
-            let signing_time = signed
-                .signer
-                .signed_attributes
-                .iter()
-                .any(|attribute| attribute.oid == known::SIGNING_TIME);
+            let signing_time = single_signing_time(&signed.signer.signed_attributes);
             (
                 digest_algorithm,
                 signer_certificate,
@@ -258,7 +246,7 @@ impl CadesSignature {
             signer_certificate,
             embedded_certificates,
             embedded_material: material,
-            has_signing_time: signing_time,
+            signing_time,
         })
     }
 
@@ -291,10 +279,11 @@ impl CadesSignature {
         self.embedded_material.clone()
     }
 
-    /// Whether a `signing-time` signed attribute is present.
+    /// The `signing-time` signed attribute (RFC 5652 sec.11.3), when
+    /// present and readable.
     #[must_use]
-    pub const fn has_signing_time_attribute(&self) -> bool {
-        self.has_signing_time
+    pub const fn signing_time(&self) -> Option<DateTime> {
+        self.signing_time
     }
 
     /// Judge the signature against `content`.
@@ -342,10 +331,7 @@ impl CadesVerdict {
         Self {
             document_intact: false,
             signature_valid: false,
-            signature_timestamps: Timestamps {
-                present: 0,
-                verified: Vec::new(),
-            },
+            signature_timestamps: Vec::new(),
             archive_timestamps_present: 0,
         }
     }
@@ -421,22 +407,45 @@ fn embedded_material(
 
 /// The `signature-time-stamp` tokens, each checked with an imprint over
 /// the `SignerInfo.signature` octets.
-fn signature_timestamps(signed: &SignedData<'_>) -> Timestamps {
-    let tokens = attribute_values(
+fn signature_timestamps(signed: &SignedData<'_>) -> Vec<TimestampCheck> {
+    attribute_values(
         &signed.signer.unsigned_attributes,
         known::SIGNATURE_TIME_STAMP_TOKEN,
-    );
-    let verified = tokens
+    )
+    .iter()
+    .map(|token| {
+        verify_token(token, |algorithm| algorithm.digest(signed.signer.signature)).map_or_else(
+            |_ignored| TimestampCheck::Unverified {
+                claimed_at: claimed_generation_time(token),
+            },
+            TimestampCheck::Verified,
+        )
+    })
+    .collect()
+}
+
+/// The `signing-time` attribute's value, when there is exactly one such
+/// attribute with exactly one value (RFC 5652 sec.11.3).
+fn single_signing_time(attributes: &[CmsAttribute<'_>]) -> Option<DateTime> {
+    let attributes_present = attributes
         .iter()
-        .filter_map(|token| {
-            verify_token(token, |algorithm| algorithm.digest(signed.signer.signature)).ok()
-        })
-        .map(|token| token.generated_at)
-        .collect();
-    Timestamps {
-        present: tokens.len(),
-        verified,
+        .filter(|attribute| attribute.oid == known::SIGNING_TIME)
+        .count();
+    match attribute_values(attributes, known::SIGNING_TIME).as_slice() {
+        [value] if attributes_present == 1 => asn1_time(value),
+        _ => None,
     }
+}
+
+/// A `Time` value (RFC 5652 sec.11.3: `UTCTime` or `GeneralizedTime`)
+/// as DER.
+fn asn1_time(value_der: &[u8]) -> Option<DateTime> {
+    use spki::der::Decode as _;
+    use spki::der::asn1::{GeneralizedTime, UtcTime};
+    UtcTime::from_der(value_der)
+        .map(|time| time.to_date_time())
+        .or_else(|_ignored| GeneralizedTime::from_der(value_der).map(|time| time.to_date_time()))
+        .ok()
 }
 
 /// The complete DER of every value of every attribute of type `oid`.
@@ -466,10 +475,11 @@ mod tests {
     };
     use crate::ber::tlv;
     use crate::crypto::digest::Sha256;
+    use crate::document::TimestampCheck;
     use crate::document::trust::testkit::{
         CertificateSpec, CmsParts, Curve, OBJECT_IDENTIFIER, OCTET_STRING, OcspSpec, SEQUENCE,
         TestKey, attribute, attribute_set, ca_extensions, certificate, cms, crl, day,
-        ocsp_response, timestamp_token, timestamping_extensions,
+        ocsp_response, timestamp_token, timestamping_extensions, utc_time,
     };
     use crate::document::trust::{MaterialPool, judge};
     use crate::document::{Revocation, TrustAnchors};
@@ -510,6 +520,18 @@ mod tests {
         minute: 0,
         second: 0,
     };
+    /// [`SIGNING_TIME`] as the reader returns it.
+    fn signing_time() -> DateTime {
+        DateTime::new(
+            SIGNING_TIME.year,
+            SIGNING_TIME.month,
+            SIGNING_TIME.day,
+            SIGNING_TIME.hour,
+            SIGNING_TIME.minute,
+            SIGNING_TIME.second,
+        )
+        .expect("signing time")
+    }
     /// The signed document.
     const DOCUMENT: &[u8] = b"Synthetic declaration, signed for the verifier tests";
     /// Another document.
@@ -702,11 +724,11 @@ mod tests {
             signature.signer_certificate().as_der(),
             world.signer.as_slice()
         );
-        assert!(signature.has_signing_time_attribute());
+        assert_eq!(signature.signing_time(), Some(signing_time()));
         let verdict = signature.verify(Content::Attached, EssBinding::Required);
         assert!(verdict.document_intact);
         assert!(verdict.signature_valid);
-        assert_eq!(verdict.signature_timestamps.present, 0);
+        assert!(verdict.signature_timestamps.is_empty());
         assert_eq!(verdict.archive_timestamps_present, 0);
     }
 
@@ -780,13 +802,71 @@ mod tests {
             DigestAlgorithm::Sha256.algorithm_identifier(),
         ))
         .expect("parses");
-        assert!(!signature.has_signing_time_attribute());
+        assert_eq!(signature.signing_time(), None);
         let required = signature.verify(Content::Attached, EssBinding::Required);
         assert!(required.document_intact);
         assert!(!required.signature_valid);
         let ignored = signature.verify(Content::Attached, EssBinding::NotRequired);
         assert!(ignored.document_intact);
         assert!(ignored.signature_valid);
+    }
+
+    /// A signature whose signed attributes carry `signing_time`
+    /// verbatim beside the content type and message digest.
+    fn with_signing_times(world: &World, signing_time: &[Vec<u8>]) -> CadesSignature {
+        let mut attributes = vec![
+            attribute(
+                known::CONTENT_TYPE,
+                &tlv(OBJECT_IDENTIFIER, known::DATA.as_bytes()),
+            ),
+            attribute(
+                known::MESSAGE_DIGEST,
+                &tlv(OCTET_STRING, Sha256::of(DOCUMENT).as_bytes()),
+            ),
+        ];
+        attributes.extend_from_slice(signing_time);
+        CadesSignature::parse(cms(&CmsParts {
+            econtent_type: known::DATA,
+            econtent: Some(DOCUMENT),
+            digest_algorithm: DigestAlgorithm::Sha256.algorithm_identifier(),
+            signed_attributes: attribute_set(&attributes),
+            key: &world.signer_key,
+            signer: &world.signer,
+            certificates: vec![world.signer.clone()],
+            unsigned_attributes: Vec::new(),
+        }))
+        .expect("parses")
+    }
+
+    #[test]
+    fn one_signing_time_with_one_value_is_read() {
+        let world = World::new(Curve::P256);
+        let signature = with_signing_times(
+            &world,
+            &[attribute(known::SIGNING_TIME, &utc_time(day(SIGNED)))],
+        );
+        assert_eq!(signature.signing_time(), Some(day(SIGNED)));
+    }
+
+    #[test]
+    fn two_signing_times_are_refused() {
+        let world = World::new(Curve::P256);
+        let two_attributes = with_signing_times(
+            &world,
+            &[
+                attribute(known::SIGNING_TIME, &utc_time(day(SIGNED))),
+                attribute(known::SIGNING_TIME, &utc_time(day(ENDS))),
+            ],
+        );
+        assert_eq!(two_attributes.signing_time(), None);
+        let two_values = with_signing_times(
+            &world,
+            &[attribute(
+                known::SIGNING_TIME,
+                &[utc_time(day(SIGNED)), utc_time(day(ENDS))].concat(),
+            )],
+        );
+        assert_eq!(two_values.signing_time(), None);
     }
 
     #[test]
@@ -826,15 +906,19 @@ mod tests {
         let signature = CadesSignature::parse(world.written(&written)).expect("parses");
         let verdict = signature.verify(Content::Attached, EssBinding::Required);
         assert!(verdict.signature_valid);
-        assert_eq!(verdict.signature_timestamps.present, 1);
-        assert_eq!(verdict.signature_timestamps.verified, vec![day(SIGNED)]);
+        let [TimestampCheck::Verified(token)] = verdict.signature_timestamps.as_slice() else {
+            panic!("one verified token");
+        };
+        assert_eq!(token.generated_at, day(SIGNED));
 
         written.timestamp = Some(Stamp::Corrupt);
         let signature = CadesSignature::parse(world.written(&written)).expect("parses");
         let verdict = signature.verify(Content::Attached, EssBinding::Required);
         assert!(verdict.signature_valid);
-        assert_eq!(verdict.signature_timestamps.present, 1);
-        assert!(verdict.signature_timestamps.verified.is_empty());
+        assert!(matches!(
+            verdict.signature_timestamps.as_slice(),
+            [TimestampCheck::Unverified { .. }]
+        ));
     }
 
     #[test]

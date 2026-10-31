@@ -25,7 +25,8 @@
 use std::path::{Path, PathBuf};
 
 use refineid_lib_core::document::{
-    DocumentFailure, DocumentFile, DocumentReport, Revocation, SignatureReport, TrustAnchors,
+    DocumentFailure, DocumentFile, DocumentReport, Revocation, SignatureEntry, SignatureReport,
+    TrustAnchors,
 };
 use refineid_lib_core::x509::DateTime;
 
@@ -86,8 +87,10 @@ pub fn verify_file(path: &Path, now: DateTime) -> Result<DocumentReport, Documen
         path: path.to_path_buf(),
         failure,
     })?;
-    for signature in &mut report.signatures {
-        if signature.revocation == Revocation::Unavailable {
+    for entry in &mut report.signatures {
+        if let SignatureEntry::Judged(signature) = entry
+            && signature.revocation == Revocation::Unavailable
+        {
             signature.revocation = live_revocation(signature, now);
         }
     }
@@ -102,9 +105,10 @@ pub fn verify_file(path: &Path, now: DateTime) -> Result<DocumentReport, Documen
 fn live_revocation(signature: &SignatureReport, now: DateTime) -> Revocation {
     let anchors: Vec<&[u8]> = PINNED_ROOT_DER.iter().map(|(_, der)| *der).collect();
     let candidates: Vec<&[u8]> = signature
-        .issuer_certificate
+        .chain
+        .certificates
         .iter()
-        .map(|issuer| issuer.as_der())
+        .map(|certificate| certificate.as_der())
         .collect();
     let start = ChainStart {
         leaf_der: signature.signer_certificate.as_der(),
@@ -116,7 +120,7 @@ fn live_revocation(signature: &SignatureReport, now: DateTime) -> Revocation {
     };
     match collect_chains_with_candidates(&[start], &candidates) {
         Ok(_) => Revocation::Good { checked_at: now },
-        Err(MaterialError::Revoked(_)) => Revocation::Revoked,
+        Err(MaterialError::Revoked { revoked_at, .. }) => Revocation::Revoked { revoked_at },
         Err(_) => Revocation::Unavailable,
     }
 }

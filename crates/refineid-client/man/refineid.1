@@ -302,21 +302,116 @@ The seal names no one; the signature in the file is the evidence.
 Verify the signatures of a signed document: a PDF carrying PAdES
 signatures, an ASiC-E or BDOC container, or a CMS structure with the
 document attached.
-Prints the file's name and one line per signature: the signer as the
-certificate names them, the time a timestamp proves the signature
-existed, and the verdict.
+Prints one record per signature, records separated by one blank
+line.
+Each line of a record is a key, a colon, a space and the value; no
+line is indented or padded.
+.Bl -tag -width "revocation:"
+.It Li file\&:
+the file as named on the command line.
+.It Li signer\&:
+the signer certificate's common name exactly as the certificate
+spells it, or its whole subject when it has none.
+.It Li signed\&:
+the time a verified timestamp proves the signature existed, or
+.Li - .
+.It Li verdict\&:
+.Li valid ,
+.Li not valid ,
+.Li revoked
+or
+.Li unsupported .
+.It Li reason\&:
+one line per cause of a
+.Li not valid
+or
+.Li unsupported
+verdict:
+.Li document changed ,
+.Li signature invalid ,
+.Li certificate chain unverified ,
+.Li no proven time
+or
+.Li profile not supported .
+.It Li revocation\&:
+.Li not checked ,
+when the verdict is valid but the signer's revocation could not be
+checked.
+.El
+.Pp
 A signature is valid when the document is unchanged since it was
 signed, the signature verifies, the signer chains to a DVV root, and
 a signature timestamp or a document timestamp covering it verifies.
 A signer the document carries no revocation answer for is looked up
-over OCSP or CRL; when the network does not answer the verdict says
-so.
+over OCSP or CRL.
 With
 .Fl v
-each fact is printed on its own row, with the document timestamps.
+a record also carries, after the verdict and its reasons:
+.Bl -tag -width "document-timestamp:"
+.It Li intact\&:
+.Li yes
+or
+.Li no .
+.It Li signature\&:
+.Li yes
+or
+.Li no .
+.It Li chain\&:
+the common names of the certificates above the signer, joined by
+.Li " > " ,
+ending in the trust anchor; a path that reaches no anchor ends in
+.Li " > -" .
+.It Li claimed\&:
+the signing time the signature claims, or
+.Li - .
+.It Li timestamp\&:
+one line per signature timestamp: its time and
+.Li proven ,
+or
+.Li unproven
+when it does not verify over the signature or its signer's path
+reaches neither a DVV root nor the pinned Sectigo Qualified Time
+Stamping Root R45.
+Only a proven timestamp sets
+.Li signed\&: .
+.It Li timestamp-chain\&:
+after each timestamp, its signer's path in the same form, starting
+at the signer, or
+.Li -
+when the timestamp did not verify.
+.It Li revocation\&:
+.Li good
+and the time of the answer,
+.Li revoked
+and the revocation time, or
+.Li not checked .
+.It Li document-timestamp\&:
+one line per document timestamp covering the signature: its time and
+.Li proven ,
+or
+.Li unproven
+on the same terms as a signature timestamp.
+An unproven document timestamp proves nothing.
+.El
+.Pp
+A file that cannot be judged prints a record of
+.Li file\&:
+and
+.Li error\&: .
 The verdict is computed from the document's own bytes, including the
 certificates and revocation answers a level-LT signature embeds.
-Exits 0 when every signature of every file is valid, 1 otherwise.
+Times are ISO 8601 in UTC.
+Control characters in a value are written as
+.Li \ex
+and two hexadecimal digits, and a
+.Li >
+in a name on a path as
+.Li \e> ,
+so every record line stays one line and
+.Li " > "
+only separates.
+Exits 70 when any file cannot be judged, else 1 when any signature
+is not valid, revoked or unsupported, else 0.
 .It Cm phone
 Show the paired phone.
 .It Cm phone pair
@@ -538,7 +633,8 @@ Success, or help or version shown on request.
 .Cm verify
 rejected the signature,
 .Cm document verify
-found a signature that is not valid or a revoked signer, or
+judged every file and found a signature that is not valid,
+unsupported or revoked, or
 .Cm cert chain
 reached no self-signed root, or
 .Cm phone auth
@@ -564,7 +660,16 @@ Sign a PDF with the qualified-signature key:
 .Dl $ refineid document sign report.pdf
 .Pp
 Verify the signed PDF:
-.Dl $ refineid document verify report-signed-2026-01-31T10-15-00Z.pdf
+.Bd -literal -offset indent
+$ refineid document verify report-signed-2026-01-31T10-15-00Z.pdf
+file: report-signed-2026-01-31T10-15-00Z.pdf
+signer: SURNAME GIVEN 12345678X
+signed: 2026-01-31T10:15:09Z
+verdict: valid
+.Ed
+.Pp
+List the signers of every valid signature:
+.Dl $ refineid document verify *.pdf | awk -F': ' '$1 == \(dqsigner\(dq { s = $2 } $0 == \(dqverdict: valid\(dq { print s }'
 .Pp
 Show the options of one command:
 .Dl $ refineid pin change help

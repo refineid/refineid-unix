@@ -262,6 +262,27 @@ pub mod known {
     /// `2.5.4.6` -- id-at-countryName.
     pub const COUNTRY_NAME: Oid<'static> = oid_dotted!("2.5.4.6");
 
+    /// `2.5.4.7` -- id-at-localityName.
+    pub const LOCALITY_NAME: Oid<'static> = oid_dotted!("2.5.4.7");
+
+    /// `2.5.4.8` -- id-at-stateOrProvinceName.
+    pub const STATE_OR_PROVINCE_NAME: Oid<'static> = oid_dotted!("2.5.4.8");
+
+    /// `2.5.4.9` -- id-at-streetAddress.
+    pub const STREET_ADDRESS: Oid<'static> = oid_dotted!("2.5.4.9");
+
+    /// `2.5.4.10` -- id-at-organizationName.
+    pub const ORGANIZATION_NAME: Oid<'static> = oid_dotted!("2.5.4.10");
+
+    /// `2.5.4.11` -- id-at-organizationalUnitName.
+    pub const ORGANIZATIONAL_UNIT_NAME: Oid<'static> = oid_dotted!("2.5.4.11");
+
+    /// `0.9.2342.19200300.100.1.25` -- domainComponent (RFC 4519 sec.2.4).
+    pub const DOMAIN_COMPONENT: Oid<'static> = oid_dotted!("0.9.2342.19200300.100.1.25");
+
+    /// `0.9.2342.19200300.100.1.1` -- userId (RFC 4519 sec.2.39).
+    pub const USER_ID: Oid<'static> = oid_dotted!("0.9.2342.19200300.100.1.1");
+
     /// `2.5.29.31` -- id-ce-cRLDistributionPoints.
     pub const CRL_DISTRIBUTION_POINTS: Oid<'static> = oid_dotted!("2.5.29.31");
 

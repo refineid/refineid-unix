@@ -44,9 +44,10 @@
 
 use crate::crl::{OwnedCrl, VerifiedCrl};
 use crate::crypto::digest::Sha256;
-use crate::document::{Revocation, TrustAnchors};
+use crate::document::{CertificatePath, Revocation, TrustAnchors};
 use crate::ocsp::{CertStatus, OcspResponseStatus, OwnedOcspResponse, VerifiedOcspResponse};
 use crate::revocation::{RevocationStatus, check_against_crl};
+use crate::sign::timestamp::VerifiedTimestampToken;
 use crate::sign::validation::ValidationMaterial;
 use crate::x509::{Certificate, DateTime, OwnedCert, path_extension_profile};
 
@@ -73,10 +74,10 @@ pub struct MaterialPool {
 /// What the pool says about one signer certificate.
 #[derive(Debug, Clone)]
 pub struct ChainVerdict {
-    /// The certificate that verifiably issued the signer, when one
-    /// in the pool did; the issuer on the anchored path when there is
-    /// one.
-    pub issuer: Option<OwnedCert>,
+    /// The certificates above the signer, issuer first: the anchored
+    /// path ending in its anchor when there is one, else the longest
+    /// path the search built. A self-signed signer is its own path.
+    pub path: CertificatePath,
     /// Whether a path from the signer ends in a self-signed
     /// certificate whose SHA-256 fingerprint is a trust anchor, with
     /// every certificate on it valid at the validation time.
@@ -92,8 +93,8 @@ pub struct ChainVerdict {
 enum Answer {
     /// Good, as of this production time.
     Good(DateTime),
-    /// Revoked.
-    Revoked,
+    /// Revoked at this revocation time.
+    Revoked(DateTime),
 }
 
 impl MaterialPool {
@@ -166,32 +167,37 @@ impl MaterialPool {
     }
 
     /// Whether a path from `certificate` upward ends in a trust
-    /// anchor. `path` holds the DER of the certificates below it,
-    /// signer first, and `certificate` last.
+    /// anchor. `search.path` holds the DER of the certificates below
+    /// it, signer first, and `certificate` last.
     fn anchored_above(
         &self,
         certificate: &OwnedCert,
         anchors: TrustAnchors<'_>,
         at: DateTime,
-        path: &mut Vec<Vec<u8>>,
+        search: &mut PathSearch,
     ) -> bool {
+        search.record_depth();
         let view = certificate.view();
         if is_self_signed(view) {
             return anchors.contains(Sha256::of(view.raw_der));
         }
-        if path.len() > MAX_PATH_DEPTH {
+        if search.path.len() > MAX_PATH_DEPTH {
             return false;
         }
-        let intermediates_below = path.len().saturating_sub(1);
+        let intermediates_below = search.path.len().saturating_sub(1);
         for issuer in self.issuers_of(view, at, intermediates_below) {
-            if path.iter().any(|seen| seen.as_slice() == issuer.as_der()) {
+            if search
+                .path
+                .iter()
+                .any(|seen| seen.as_slice() == issuer.as_der())
+            {
                 continue;
             }
-            path.push(issuer.as_der().to_vec());
-            if self.anchored_above(issuer, anchors, at, path) {
+            search.path.push(issuer.as_der().to_vec());
+            if self.anchored_above(issuer, anchors, at, search) {
                 return true;
             }
-            path.pop();
+            search.path.pop();
         }
         false
     }
@@ -230,7 +236,7 @@ impl MaterialPool {
             };
             let revocation = self.revocation_of(*certificate, *issuer, at);
             match revocation {
-                Revocation::Revoked => return Revocation::Revoked,
+                revoked @ Revocation::Revoked { .. } => return revoked,
                 Revocation::Unavailable => unanswered = true,
                 Revocation::Good { .. } => {}
             }
@@ -271,7 +277,7 @@ impl MaterialPool {
                 let verified = VerifiedOcspResponse::verify(basic, candidate, issuer).ok()?;
                 let single = verified.response_for(signer)?;
                 match single.status {
-                    CertStatus::Revoked { .. } => Some(Answer::Revoked),
+                    CertStatus::Revoked { revoked_at, .. } => Some(Answer::Revoked(revoked_at)),
                     CertStatus::Good => {
                         accepted_window(signer, single.this_update, single.next_update, at)
                             .then_some(Answer::Good(basic.produced_at))
@@ -301,35 +307,110 @@ pub fn judge(
     let view = signer.view();
     let signer_valid = valid_at(view, at);
     if is_self_signed(view) {
+        let anchor = anchors.contains(Sha256::of(view.raw_der));
         return ChainVerdict {
-            issuer: None,
-            anchored: signer_valid && anchors.contains(Sha256::of(view.raw_der)),
+            path: CertificatePath {
+                certificates: vec![signer.clone()],
+                anchored: anchor,
+            },
+            anchored: signer_valid && anchor,
             revocation: Revocation::Unavailable,
         };
     }
     let candidates = pool.issuers_of(view, at, 0);
-    let mut path = vec![view.raw_der.to_vec()];
+    let mut search = PathSearch {
+        path: vec![view.raw_der.to_vec()],
+        deepest: Vec::new(),
+    };
     let anchored_issuer = candidates.iter().copied().find(|issuer| {
-        path.truncate(1);
-        path.push(issuer.as_der().to_vec());
-        pool.anchored_above(issuer, anchors, at, &mut path)
+        search.path.truncate(1);
+        search.path.push(issuer.as_der().to_vec());
+        pool.anchored_above(issuer, anchors, at, &mut search)
     });
-    let issuer = anchored_issuer.or_else(|| candidates.first().copied());
-    let revocation = if anchored_issuer.is_some() {
-        let anchored_path: Vec<Certificate<'_>> = path
-            .iter()
-            .filter_map(|der| Certificate::from_der(der).ok())
-            .collect();
-        pool.path_revocation(&anchored_path, at)
+    let found = if anchored_issuer.is_some() {
+        search.path
     } else {
-        issuer.map_or(Revocation::Unavailable, |issuer| {
-            pool.revocation_of(view, issuer.view(), at)
-        })
+        search.deepest
+    };
+    let certificates: Vec<Certificate<'_>> = found
+        .iter()
+        .filter_map(|der| Certificate::from_der(der).ok())
+        .collect();
+    let revocation = if anchored_issuer.is_some() {
+        pool.path_revocation(&certificates, at)
+    } else {
+        certificates
+            .get(1)
+            .map_or(Revocation::Unavailable, |issuer| {
+                pool.revocation_of(view, *issuer, at)
+            })
     };
     ChainVerdict {
-        issuer: issuer.cloned(),
+        path: CertificatePath {
+            certificates: found
+                .iter()
+                .skip(1)
+                .filter_map(|der| OwnedCert::from_der(der).ok())
+                .collect(),
+            anchored: anchored_issuer.is_some(),
+        },
         anchored: signer_valid && anchored_issuer.is_some(),
         revocation,
+    }
+}
+
+/// The path of a verified timestamp token's signer, signer first,
+/// built from the certificates the token embeds, those of `pool` and
+/// `anchors`, at the token's generation time. The path is anchored
+/// when it ends in one of `anchors`.
+#[must_use]
+pub fn token_path(
+    token: &VerifiedTimestampToken,
+    pool: &MaterialPool,
+    anchors: TrustAnchors<'_>,
+) -> CertificatePath {
+    let Ok(signer) = OwnedCert::from_der(&token.signer_certificate) else {
+        return CertificatePath {
+            certificates: Vec::new(),
+            anchored: false,
+        };
+    };
+    let mut pool = pool.clone();
+    pool.add_certificates(&token.embedded_certificates);
+    pool.add_certificates(
+        &anchors
+            .certificates()
+            .iter()
+            .map(|der| der.to_vec())
+            .collect::<Vec<_>>(),
+    );
+    let verdict = judge(&signer, &pool, anchors, token.generated_at);
+    if is_self_signed(signer.view()) {
+        return verdict.path;
+    }
+    let mut certificates = vec![signer];
+    certificates.extend(verdict.path.certificates);
+    CertificatePath {
+        certificates,
+        anchored: verdict.path.anchored,
+    }
+}
+
+/// The state of the depth-first path search: the path being tried,
+/// signer first, and the longest one tried so far.
+struct PathSearch {
+    /// The path under trial, as DER.
+    path: Vec<Vec<u8>>,
+    /// The longest path reached, as DER.
+    deepest: Vec<Vec<u8>>,
+}
+
+impl PathSearch {
+    /// Keep the current path when it is the longest yet.
+    fn record_depth(&mut self) {
+        if self.path.len() > self.deepest.len() {
+            self.deepest.clone_from(&self.path);
+        }
     }
 }
 
@@ -348,7 +429,7 @@ fn crl_answer(
     match check_against_crl(signer, &verified, view.this_update) {
         RevocationStatus::Good => accepted_window(signer, view.this_update, view.next_update, at)
             .then_some(Answer::Good(view.this_update)),
-        RevocationStatus::Revoked { .. } => Some(Answer::Revoked),
+        RevocationStatus::Revoked { at, .. } => Some(Answer::Revoked(at)),
         RevocationStatus::Inapplicable(_) | RevocationStatus::Stale | RevocationStatus::Unknown => {
             None
         }
@@ -381,7 +462,7 @@ fn strongest(answers: impl Iterator<Item = Answer>) -> Option<Revocation> {
     let mut good: Option<DateTime> = None;
     for answer in answers {
         match answer {
-            Answer::Revoked => return Some(Revocation::Revoked),
+            Answer::Revoked(revoked_at) => return Some(Revocation::Revoked { revoked_at }),
             Answer::Good(checked_at) => {
                 good = Some(good.map_or(checked_at, |known| known.max(checked_at)));
             }
@@ -1020,9 +1101,11 @@ mod tests {
         CertificateSpec, Curve, OcspSpec, TestKey, ca_extensions, certificate, crl, day,
         ocsp_response,
     };
-    use super::{MaterialPool, judge};
-    use crate::document::{Revocation, TrustAnchors};
+    use super::{MaterialPool, judge, token_path};
+    use crate::document::{CertificatePath, Revocation, TrustAnchors};
+    use crate::sign::timestamp::VerifiedTimestampToken;
     use crate::sign::validation::ValidationMaterial;
+    use crate::trust_roots::PINNED_TIME_STAMPING_ROOT_DER;
     use crate::x509::OwnedCert;
 
     /// Root common name.
@@ -1180,6 +1263,69 @@ mod tests {
         }
     }
 
+    /// The DER of every certificate on `path`.
+    fn ders(path: &CertificatePath) -> Vec<Vec<u8>> {
+        path.certificates
+            .iter()
+            .map(|certificate| certificate.as_der().to_vec())
+            .collect()
+    }
+
+    /// Sectigo Qualified Time Stamping Signer #3, as the qualified
+    /// service at `http://timestamp.sectigo.com/qualified` embeds it.
+    const SECTIGO_SIGNER_DER: &[u8] =
+        include_bytes!("../../tests/data/sectigo-qualified-tsa-signer-3.der");
+    /// Sectigo Qualified Time Stamping CA R35, embedded beside it.
+    const SECTIGO_CA_DER: &[u8] =
+        include_bytes!("../../tests/data/sectigo-qualified-tsa-ca-r35.der");
+
+    /// A token as the qualified service returns it, minus the token
+    /// bytes the path does not read, generated inside both
+    /// certificates' validity.
+    fn sectigo_token() -> VerifiedTimestampToken {
+        VerifiedTimestampToken {
+            token: Vec::new(),
+            signer_certificate: SECTIGO_SIGNER_DER.to_vec(),
+            embedded_certificates: vec![SECTIGO_SIGNER_DER.to_vec(), SECTIGO_CA_DER.to_vec()],
+            generated_at: day(VALIDATED),
+        }
+    }
+
+    #[test]
+    fn a_token_under_the_pinned_time_stamping_root_is_anchored() {
+        let path = token_path(
+            &sectigo_token(),
+            &MaterialPool::new(),
+            TrustAnchors::new(PINNED_TIME_STAMPING_ROOT_DER),
+        );
+        assert!(path.anchored);
+        assert_eq!(
+            ders(&path),
+            vec![
+                SECTIGO_SIGNER_DER.to_vec(),
+                SECTIGO_CA_DER.to_vec(),
+                PINNED_TIME_STAMPING_ROOT_DER
+                    .first()
+                    .expect("one root")
+                    .to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_token_under_an_unknown_root_is_not_anchored() {
+        let path = token_path(
+            &sectigo_token(),
+            &MaterialPool::new(),
+            TrustAnchors::new(&[]),
+        );
+        assert!(!path.anchored);
+        assert_eq!(
+            ders(&path),
+            vec![SECTIGO_SIGNER_DER.to_vec(), SECTIGO_CA_DER.to_vec()]
+        );
+    }
+
     #[test]
     fn a_two_step_path_to_a_trusted_root_is_anchored() {
         let chain = chain(ENDS);
@@ -1191,9 +1337,10 @@ mod tests {
             day(VALIDATED),
         );
         assert!(verdict.anchored);
+        assert!(verdict.path.anchored);
         assert_eq!(
-            verdict.issuer.map(OwnedCert::into_der),
-            Some(chain.intermediate.clone())
+            ders(&verdict.path),
+            vec![chain.intermediate.clone(), chain.root.clone()]
         );
         assert_eq!(verdict.revocation, Revocation::Unavailable);
     }
@@ -1208,9 +1355,10 @@ mod tests {
             day(VALIDATED),
         );
         assert!(!verdict.anchored);
+        assert!(!verdict.path.anchored);
         assert_eq!(
-            verdict.issuer.map(OwnedCert::into_der),
-            Some(chain.intermediate.clone())
+            ders(&verdict.path),
+            vec![chain.intermediate.clone(), chain.root.clone()]
         );
     }
 
@@ -1225,7 +1373,8 @@ mod tests {
             day(VALIDATED),
         );
         assert!(!verdict.anchored);
-        assert!(verdict.issuer.is_none());
+        assert!(verdict.path.certificates.is_empty());
+        assert!(!verdict.path.anchored);
         assert_eq!(verdict.revocation, Revocation::Unavailable);
     }
 
@@ -1240,9 +1389,10 @@ mod tests {
             day(VALIDATED),
         );
         assert!(!verdict.anchored);
+        assert!(verdict.path.anchored);
         assert_eq!(
-            verdict.issuer.map(OwnedCert::into_der),
-            Some(chain.intermediate.clone())
+            ders(&verdict.path),
+            vec![chain.intermediate.clone(), chain.root.clone()]
         );
     }
 
@@ -1280,7 +1430,12 @@ mod tests {
             crls: Vec::new(),
         });
         let verdict = judge(&chain.signer, &pool, TrustAnchors::new(&[]), day(VALIDATED));
-        assert_eq!(verdict.revocation, Revocation::Revoked);
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ISSUED)
+            }
+        );
     }
 
     /// A pool of the chain plus one OCSP answer.
@@ -1333,7 +1488,12 @@ mod tests {
         let chain = chain(ENDS);
         let pool = pool_with_ocsp(&chain, chain.ocsp_on(true, ISSUED, ENDED_EARLY));
         let verdict = judge(&chain.signer, &pool, TrustAnchors::new(&[]), day(VALIDATED));
-        assert_eq!(verdict.revocation, Revocation::Revoked);
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ISSUED)
+            }
+        );
     }
 
     #[test]
@@ -1379,7 +1539,12 @@ mod tests {
             crls: vec![listing],
         });
         let verdict = judge(&chain.signer, &pool, TrustAnchors::new(&[]), day(VALIDATED));
-        assert_eq!(verdict.revocation, Revocation::Revoked);
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ISSUED)
+            }
+        );
 
         let clean = crl(
             INTERMEDIATE,
@@ -1439,7 +1604,12 @@ mod tests {
             day(VALIDATED),
         );
         assert!(verdict.anchored);
-        assert_eq!(verdict.revocation, Revocation::Revoked);
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ISSUED)
+            }
+        );
     }
 
     #[test]
@@ -1457,7 +1627,12 @@ mod tests {
             TrustAnchors::new(&anchors),
             day(VALIDATED),
         );
-        assert_eq!(verdict.revocation, Revocation::Revoked);
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ISSUED)
+            }
+        );
     }
 
     #[test]
