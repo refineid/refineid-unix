@@ -48,8 +48,8 @@ use crate::document::{DocumentFailure, DocumentFile};
 use crate::sign::cades::DigestAlgorithm;
 use crate::sign::pades::PdfError;
 use crate::sign::pades::index::{
-    PdfDictionary, PdfIndex, PdfValueParser, complete_object_reference, dictionary_at, find_first,
-    parse_usize, validation_references,
+    ObjectDictionary, PdfDictionary, PdfIndex, PdfValueParser, complete_object_reference,
+    dictionary_at, find_first, parse_usize, validation_references,
 };
 use crate::sign::validation::ValidationMaterial;
 use crate::x509::DateTime;
@@ -356,11 +356,15 @@ impl<'a> PdfDocument<'a> {
         }
 
         let mut signatures = Vec::new();
-        for (_reference, dictionary) in index.object_dictionaries() {
-            if let Some(signature) = signature_from_dictionary(&dictionary, bytes)? {
+        let dictionaries = index
+            .object_dictionaries()
+            .map_err(|error| PdfReadError::from_index(error, "object"))?;
+        for dictionary in &dictionaries {
+            if let Some(signature) = signature_from_dictionary(dictionary, bytes)? {
                 signatures.push(signature);
             }
         }
+        signatures.sort_by_key(|signature: &PdfSignature| signature.byte_range.end());
         let validation_store = validation_store(&index, index.trailer(), &trailer)?;
         Ok(Self {
             file,
@@ -394,10 +398,11 @@ impl<'a> PdfDocument<'a> {
 /// The signature `dictionary` declares, or `None` when it carries no
 /// `/ByteRange` and `/Contents` pair.
 fn signature_from_dictionary(
-    dictionary: &[u8],
+    object: &ObjectDictionary,
     file: &[u8],
 ) -> Result<Option<PdfSignature>, PdfReadError> {
     const MALFORMED: PdfReadError = PdfReadError::Malformed("signature dictionary");
+    let dictionary = object.bytes.as_slice();
     if find_first(dictionary, KEY_BYTE_RANGE).is_none()
         || find_first(dictionary, KEY_CONTENTS).is_none()
     {
@@ -408,21 +413,33 @@ fn signature_from_dictionary(
         let entry = parsed.entry(key).map_err(|_ignored| MALFORMED)?;
         Ok(entry.and_then(|entry| dictionary.get(entry.value.clone())))
     };
-    let (Some(byte_range), Some(contents)) = (value(KEY_BYTE_RANGE)?, value(KEY_CONTENTS)?) else {
+    let Some(contents_span) = parsed
+        .entry(KEY_CONTENTS)
+        .map_err(|_ignored| MALFORMED)?
+        .map(|entry| entry.value.clone())
+    else {
+        return Ok(None);
+    };
+    let Some(byte_range) = value(KEY_BYTE_RANGE)? else {
         return Ok(None);
     };
 
     let byte_range = ByteRange::from_declaration(byte_range_values(byte_range)?, file.len())?;
-    let hole = file
-        .get(byte_range.hole())
-        .ok_or(PdfReadError::Malformed("ByteRange"))?;
-    let carried = hex_string(hole).ok_or(PdfReadError::Malformed("ByteRange hole"))?;
-    let declared = hex_string(contents).ok_or(PdfReadError::Malformed("Contents"))?;
-    if carried != declared {
+    // The hole must be this dictionary's own `/Contents` value, in
+    // place in the file; a dictionary inside an object stream has no
+    // bytes of its own in the file and cannot name a hole.
+    let contents_in_file = object.file_offset.and_then(|offset| {
+        Some(offset.checked_add(contents_span.start)?..offset.checked_add(contents_span.end)?)
+    });
+    if contents_in_file != Some(byte_range.hole()) {
         return Err(PdfReadError::Malformed(
             "Contents outside the ByteRange hole",
         ));
     }
+    let hole = file
+        .get(byte_range.hole())
+        .ok_or(PdfReadError::Malformed("ByteRange"))?;
+    let carried = hex_string(hole).ok_or(PdfReadError::Malformed("Contents"))?;
     let element = BerTlv::<Sequence>::parse(&carried)
         .map_err(|_ignored| PdfReadError::Malformed("Contents"))?;
     let cms = carried
@@ -744,6 +761,7 @@ mod tests {
     use crate::ber::{BerTag, Sequence, tlv};
     use crate::document::DocumentFile;
     use crate::sign::cades::DigestAlgorithm;
+    use crate::sign::pades::index::{PdfIndex, find_last, find_start_xref};
     use crate::sign::pades::{
         SignatureMetadata, append_validation_store, prepare, prepare_document_timestamp,
     };
@@ -804,6 +822,34 @@ mod tests {
     /// (ISO 32000-1 sec.7.5.8.3, Table 18).
     const XREF_TYPE_DIRECT: u8 = 1;
 
+    /// Cross-reference table keyword of an object in use
+    /// (ISO 32000-1 sec.7.5.4).
+    const IN_USE: &str = "n";
+
+    /// Cross-reference table keyword of a free entry.
+    const FREE: &str = "f";
+
+    /// A keyword ISO 32000-1 sec.7.5.4 does not define.
+    const UNDEFINED_FLAG: &str = "x";
+
+    /// Number of the object the fixtures add after the page objects.
+    const EXTRA_OBJECT: usize = PAGE_OBJECTS.len() + FIRST_OBJECT;
+
+    /// A white-space character (ISO 32000-1 sec.7.2.2, Table 1).
+    const NUL: u8 = b'\0';
+
+    /// LINE TABULATION, which ISO 32000-1 sec.7.2.2 does not list as
+    /// white space.
+    const VERTICAL_TAB: u8 = 0x0B;
+
+    /// `/Size` of a fixture whose first update takes high object
+    /// numbers.
+    const HIGH_SIZE: usize = 40;
+
+    /// `/Size` patched in so a later update takes lower numbers; the
+    /// same digit count as the size the first update writes.
+    const LOW_SIZE: usize = 10;
+
     /// `miniz_oxide` compression level for the flate fixture.
     const FLATE_LEVEL: u8 = 6;
 
@@ -860,6 +906,68 @@ mod tests {
             .as_bytes(),
         );
         pdf
+    }
+
+    /// One classic cross-reference entry line (ISO 32000-1 sec.7.5.4).
+    fn entry_line(offset: usize, flag: &str) -> String {
+        format!(
+            "{offset:0width$} {ZERO:0generation$} {flag} \n",
+            width = XREF_OFFSET_DIGITS,
+            generation = XREF_GENERATION_DIGITS
+        )
+    }
+
+    /// `pdf` with the one occurrence of `old` replaced by `new`.
+    fn replaced(pdf: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+        let at = find_first(pdf, old).expect("the fixture carries the text");
+        let mut out = pdf[..at].to_vec();
+        out.extend_from_slice(new);
+        out.extend_from_slice(&pdf[at + old.len()..]);
+        out
+    }
+
+    /// Offset of the header of object `number`.
+    fn object_offset(pdf: &[u8], number: usize) -> usize {
+        find_first(pdf, format!("\n{number} 0 obj").as_bytes()).expect("the object is written")
+            + FIRST_OBJECT
+    }
+
+    /// `pdf` with the classic entry of object `number` flagged `flag`.
+    fn reflagged(pdf: &[u8], number: usize, flag: &str) -> Vec<u8> {
+        let offset = object_offset(pdf, number);
+        replaced(
+            pdf,
+            entry_line(offset, IN_USE).as_bytes(),
+            entry_line(offset, flag).as_bytes(),
+        )
+    }
+
+    /// `pdf` extended by an incremental update adding `objects`, its
+    /// trailer carrying `trailer_extra` before `/Prev`.
+    fn append_update(pdf: &[u8], objects: &[(usize, &str)], trailer_extra: &str) -> Vec<u8> {
+        let previous = find_start_xref(pdf).expect("the base has a startxref");
+        let mut out = pdf.to_vec();
+        let mut entries = String::new();
+        for (number, body) in objects {
+            entries.push_str(&format!("{number} 1\n{}", entry_line(out.len(), IN_USE)));
+            out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_at = out.len();
+        let size = EXTRA_OBJECT + objects.len();
+        out.extend_from_slice(
+            format!(
+                "xref\n{entries}trailer\n<< /Size {size} /Root 1 0 R{trailer_extra} /Prev {previous} \
+                 >>\nstartxref\n{xref_at}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// The outcome of reading `pdf`, reduced to the signature count.
+    fn read(pdf: Vec<u8>) -> Result<usize, PdfReadError> {
+        let file = DocumentFile::from_file(pdf);
+        PdfDocument::parse(&file).map(|document| document.signatures().len())
     }
 
     /// The page objects as owned bodies.
@@ -1151,6 +1259,156 @@ mod tests {
             pdf_date(SIGNING_TIME_ENTRY.as_bytes()),
             None,
             "a bare value is not a string"
+        );
+    }
+
+    #[test]
+    fn a_longer_name_or_a_string_does_not_shadow_prev() {
+        let base = classic_pdf(&page_objects(), "");
+        let longer = append_update(&base, &[], " /Preview 0");
+        assert_eq!(read(longer), Ok(ZERO), "the chain reaches the catalog");
+        let quoted = append_update(&base, &[], " /Note (/Prev 1)");
+        assert_eq!(read(quoted), Ok(ZERO), "a string is not a key");
+    }
+
+    #[test]
+    fn only_in_use_and_free_flags_are_accepted() {
+        let mut objects = page_objects();
+        objects.push(Vec::from("(synthetic string object)"));
+        let pdf = classic_pdf(&objects, "");
+        assert_eq!(
+            read(pdf.clone()),
+            Ok(ZERO),
+            "a string object is no dictionary"
+        );
+        assert_eq!(read(reflagged(&pdf, EXTRA_OBJECT, FREE)), Ok(ZERO));
+        assert_eq!(
+            read(reflagged(&pdf, EXTRA_OBJECT, UNDEFINED_FLAG)),
+            Err(PdfReadError::Malformed("cross-reference chain"))
+        );
+    }
+
+    #[test]
+    fn nul_is_white_space_and_vertical_tab_is_not() {
+        let pdf = classic_pdf(&page_objects(), "");
+        let line = entry_line(object_offset(&pdf, FIRST_OBJECT), IN_USE);
+        let separated = |separator: u8| {
+            let mut changed = line.clone().into_bytes();
+            let at = XREF_OFFSET_DIGITS;
+            changed[at] = separator;
+            replaced(&pdf, line.as_bytes(), &changed)
+        };
+        assert_eq!(read(separated(NUL)), Ok(ZERO));
+        assert_eq!(
+            read(separated(VERTICAL_TAB)),
+            Err(PdfReadError::Malformed("cross-reference chain"))
+        );
+    }
+
+    #[test]
+    fn a_chain_longer_than_the_depth_bound_is_refused() {
+        let mut pdf = classic_pdf(&page_objects(), "");
+        for _ in FIRST_OBJECT..PdfIndex::MAX_XREF_DEPTH {
+            pdf = append_update(&pdf, &[], "");
+        }
+        assert_eq!(read(pdf.clone()), Ok(ZERO), "a chain at the bound is read");
+        assert_eq!(
+            read(append_update(&pdf, &[], "")),
+            Err(PdfReadError::Malformed("cross-reference chain"))
+        );
+    }
+
+    #[test]
+    fn a_malformed_live_signature_dictionary_is_an_error() {
+        let mut objects = page_objects();
+        objects.push(Vec::from(
+            "<< /Type /Sig /ByteRange [0 1 2 3] /Contents (unterminated",
+        ));
+        assert_eq!(
+            read(classic_pdf(&objects, "")),
+            Err(PdfReadError::Malformed("object"))
+        );
+    }
+
+    #[test]
+    fn a_store_reference_to_a_freed_or_missing_object_is_malformed() {
+        let mut stream = Vec::from(
+            format!("<< /Length {} >>\nstream\n", SYNTHETIC_CERTIFICATE.len()).as_bytes(),
+        );
+        stream.extend_from_slice(SYNTHETIC_CERTIFICATE);
+        stream.extend_from_slice(b"\nendstream");
+        let mut objects = page_objects();
+        objects[ZERO] = Vec::from(
+            format!("<< /Type /Catalog /Pages 2 0 R /DSS << /Certs [{EXTRA_OBJECT} 0 R] >> >>")
+                .as_bytes(),
+        );
+        objects.push(stream);
+        let pdf = classic_pdf(&objects, "");
+        assert_eq!(read(pdf.clone()), Ok(ZERO), "the live store reads");
+        assert_eq!(
+            read(reflagged(&pdf, EXTRA_OBJECT, FREE)),
+            Err(PdfReadError::Malformed("DSS stream"))
+        );
+        objects.pop();
+        assert_eq!(
+            read(classic_pdf(&objects, "")),
+            Err(PdfReadError::Malformed("DSS stream"))
+        );
+    }
+
+    #[test]
+    fn a_byte_range_naming_another_dictionarys_hole_is_malformed() {
+        let (pdf, _digest) = signed(&classic_pdf(&page_objects(), ""));
+        let file = DocumentFile::from_file(pdf.clone());
+        let document = PdfDocument::parse(&file).expect("the signed PDF parses");
+        let [signature] = document.signatures() else {
+            panic!("exactly one signature");
+        };
+        let hole = signature.byte_range.hole();
+        let end = signature.byte_range.end();
+        let contents = String::from_utf8(pdf[hole.clone()].to_vec()).expect("hex is ASCII");
+        let claimant = format!(
+            "<< /Type /Sig /SubFilter /ETSI.CAdES.detached /ByteRange [{ZERO} {} {} {}] \
+             /Contents {contents} >>",
+            hole.start,
+            hole.end,
+            end - hole.end
+        );
+        let extended = append_update(&pdf, &[(HIGH_SIZE, &claimant)], "");
+        assert_eq!(
+            read(extended),
+            Err(PdfReadError::Malformed(
+                "Contents outside the ByteRange hole"
+            ))
+        );
+    }
+
+    #[test]
+    fn signatures_come_back_in_revision_order() {
+        let base = classic_pdf(&page_objects(), "");
+        let base = replaced(
+            &base,
+            format!("/Size {EXTRA_OBJECT} ").as_bytes(),
+            format!("/Size {HIGH_SIZE} ").as_bytes(),
+        );
+        let (mut once, _digest) = signed(&base);
+        let size_at =
+            find_last(&once, b"/Size ").expect("the update has a trailer") + b"/Size ".len();
+        let low = LOW_SIZE.to_string();
+        once[size_at..size_at + low.len()].copy_from_slice(low.as_bytes());
+        let (twice, _digest) = signed(&once);
+        let file = DocumentFile::from_file(twice);
+        let document = PdfDocument::parse(&file).expect("the twice-signed PDF parses");
+        let [first, second] = document.signatures() else {
+            panic!("two signatures");
+        };
+        assert!(first.byte_range.end() < second.byte_range.end());
+        assert!(!first.covers_whole_document);
+        assert!(second.covers_whole_document);
+        assert!(
+            find_first(file.as_bytes(), format!("\n{HIGH_SIZE} 0 obj").as_bytes())
+                < find_first(file.as_bytes(), format!("\n{LOW_SIZE} 0 obj").as_bytes()),
+            "the earlier revision holds the higher object number"
         );
     }
 }

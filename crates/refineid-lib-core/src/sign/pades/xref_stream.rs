@@ -16,9 +16,9 @@
 
 use super::PdfError;
 use super::index::{
-    PdfDictionary, PdfObjectReference, XrefEntry, XrefLocation, XrefSection, dictionary_at,
-    dictionary_usize, find_first, parse_u16, parse_u32, parse_usize, read_pdf_token,
-    skip_pdf_whitespace,
+    PdfDictionary, PdfObjectReference, PdfValueParser, XrefEntry, XrefLocation, XrefSection,
+    dictionary_at, dictionary_usize, dictionary_value, find_first, parse_u16, parse_u32,
+    parse_usize, read_pdf_token, skip_pdf_whitespace,
 };
 
 /// Bound on any one decoded stream, so a hostile document cannot make
@@ -154,7 +154,7 @@ impl ObjectStream {
         }
         let header = self.payload.get(..first)?;
         let tokens: Vec<&[u8]> = header
-            .split(u8::is_ascii_whitespace)
+            .split(|byte| PdfValueParser::is_whitespace(*byte))
             .filter(|token| !token.is_empty())
             .collect();
         let declared = parse_u32(tokens.get(position.saturating_mul(PAIR_TOKENS)).copied()?)?;
@@ -500,25 +500,21 @@ fn entry_from_row(number: u32, row: &[u8], widths: &[usize]) -> Result<XrefEntry
     })
 }
 
-/// The integer array under `key`, empty when absent or malformed.
+/// The direct integer array under `key`, empty when absent or
+/// malformed.
 fn integer_array(dictionary: &[u8], key: &[u8]) -> Vec<usize> {
-    let Some(at) = find_first(dictionary, key) else {
+    let Some(value) = dictionary_value(dictionary, key) else {
         return Vec::new();
     };
-    let rest = &dictionary[at.saturating_add(key.len())..];
-    let Some(open) = rest.iter().position(|byte| !byte.is_ascii_whitespace()) else {
-        return Vec::new();
-    };
-    if rest.get(open) != Some(&b'[') {
-        return Vec::new();
-    }
-    let body = &rest[open.saturating_add(1)..];
-    let Some(close) = find_first(body, b"]") else {
+    let Some(body) = trim(value)
+        .strip_prefix(b"[")
+        .and_then(|inner| inner.strip_suffix(b"]"))
+    else {
         return Vec::new();
     };
     let mut values = Vec::new();
-    for token in body[..close]
-        .split(u8::is_ascii_whitespace)
+    for token in body
+        .split(|byte| PdfValueParser::is_whitespace(*byte))
         .filter(|token| !token.is_empty())
     {
         let Some(value) = parse_usize(token) else {
@@ -533,11 +529,11 @@ fn integer_array(dictionary: &[u8], key: &[u8]) -> Vec<usize> {
 fn trim(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
+        .position(|byte| !PdfValueParser::is_whitespace(*byte))
         .unwrap_or(bytes.len());
     let end = bytes
         .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
+        .rposition(|byte| !PdfValueParser::is_whitespace(*byte))
         .map_or(start, |found| found.saturating_add(1));
     &bytes[start..end]
 }

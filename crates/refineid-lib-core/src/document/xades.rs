@@ -307,8 +307,11 @@ pub struct XadesVerdict {
     /// covered by a reference.
     pub document_intact: bool,
     /// The signature value verifies over the canonical `ds:SignedInfo`
-    /// under the signer certificate, and the `SigningCertificate`
-    /// digest, when present, matches that certificate.
+    /// under the signer certificate, and the signed properties carry a
+    /// `SigningCertificateV2` or `SigningCertificate` whose digest
+    /// matches that certificate. The property is mandatory at every
+    /// baseline level (`ETSI EN 319 132-1` sec.5.2.2), so a signature
+    /// without it is not valid.
     pub signature_valid: bool,
     /// The `SignatureTimeStamp` tokens.
     pub signature_timestamps: Timestamps,
@@ -523,7 +526,8 @@ impl XadesSignature {
         every_reference_matches && properties_covered && files_covered
     }
 
-    /// The signature verifies and the signer binding holds.
+    /// The signature verifies and the mandatory signer binding is
+    /// present and holds (EN 319 132-1 sec.5.2.2).
     fn signature_valid(&self) -> bool {
         let Some(algorithm) = self.signature_method else {
             return false;
@@ -534,7 +538,7 @@ impl XadesSignature {
             .spki
             .verify_message_signature(algorithm, &self.signed_info, &self.signature_value)
             .is_ok();
-        let bound = self.signing_certificate.as_ref().is_none_or(|binding| {
+        let bound = self.signing_certificate.as_ref().is_some_and(|binding| {
             binding
                 .method
                 .is_some_and(|method| method.digest(self.signer.as_der()) == binding.value)
@@ -703,9 +707,12 @@ fn read_reference(
 
     let mut resolves_to_properties = false;
     let target = if let Some(id) = uri.strip_prefix(FRAGMENT_MARK) {
-        // A same-document reference yields the element's subtree
-        // without comments (XML Signature 1.1 sec.4.4.3.3); without a
-        // transform it would be serialised by inclusive Canonical XML.
+        // A bare-name reference `#id` yields the element's subtree with
+        // every comment node deleted (XML Signature 1.1 sec.4.4.3.3),
+        // so a `WithComments` transform after it has no comment to
+        // keep; only `#xpointer(id('id'))` retains them, and that form
+        // does not resolve here. Without a transform the node set would
+        // be serialised by inclusive Canonical XML.
         let mut matches = document
             .elements()
             .filter(|element| element.attribute(ATTRIBUTE_ID) == Some(id));
@@ -1187,6 +1194,113 @@ mod tests {
         let stripped = format!("{}{}", &document[..start], &document[end..]);
         let verdict = verdict(&objects(), &stripped);
         assert!(!verdict.document_intact);
+    }
+
+    /// Rewrite `document`'s signed subtrees and sign again: `properties`
+    /// edits the `SignedProperties` text, `signed_info` the `SignedInfo`
+    /// text; the `SignedProperties` digest and the signature value are
+    /// recomputed, so only the edits differ from a genuine signature.
+    fn resign(
+        document: &str,
+        signer: &Signer,
+        signature: &[u8],
+        properties: impl Fn(&str) -> String,
+        signed_info: impl Fn(&str) -> String,
+    ) -> String {
+        let element = |open: &str, close: &str| {
+            let start = document.find(open).expect("element");
+            let end = document.find(close).expect("end tag") + close.len();
+            document[start..end].to_owned()
+        };
+        let old_properties = element("<xades:SignedProperties", "</xades:SignedProperties>");
+        let old_signed_info = element("<ds:SignedInfo", "</ds:SignedInfo>");
+        let new_properties = properties(&old_properties);
+        let canonical_properties = XmlDocument::parse(new_properties.clone().into_bytes())
+            .expect("properties parse")
+            .root()
+            .canonicalize(Comments::Omitted);
+        let digest = |octets: &[u8]| base64::encode(&DigestAlgorithm::Sha256.digest(octets));
+        let new_signed_info = signed_info(&old_signed_info.replace(
+            &digest(old_properties.as_bytes()),
+            &digest(&canonical_properties),
+        ));
+        let new_signature = signer.sign_xml(new_signed_info.as_bytes());
+        document
+            .replace(&old_properties, &new_properties)
+            .replace(&old_signed_info, &new_signed_info)
+            .replace(&base64::encode(signature), &base64::encode(&new_signature))
+    }
+
+    /// `SigningCertificateV2` is mandatory (EN 319 132-1 sec.5.2.2): a
+    /// signature whose signed properties lack it is not valid, though
+    /// its value verifies and every reference matches.
+    #[test]
+    fn a_signature_without_a_signing_certificate_is_not_valid() {
+        let signer = Signer::rsa();
+        let signed = Signed::new(&signer, &objects());
+        let document = signed.document(&[]);
+        let stripped = resign(
+            &document,
+            &signer,
+            &signed.signature,
+            |properties| {
+                let start = properties
+                    .find("<xades:SigningCertificateV2>")
+                    .expect("property");
+                let close = "</xades:SigningCertificateV2>\n";
+                let end = properties.find(close).expect("end tag") + close.len();
+                format!("{}{}", &properties[..start], &properties[end..])
+            },
+            str::to_owned,
+        );
+        assert!(!stripped.contains("SigningCertificate"));
+        let verdict = verdict(&objects(), &stripped);
+        assert!(verdict.document_intact, "the re-signed references hold");
+        assert!(!verdict.signature_valid);
+    }
+
+    /// A bare-name reference drops comments before its transforms run
+    /// (XML Signature 1.1 sec.4.4.3.3), so a `WithComments` transform
+    /// over a `SignedProperties` holding a comment digests the
+    /// comment-free form, and the signature is intact.
+    #[test]
+    fn a_with_comments_transform_on_a_bare_name_reference_digests_without_comments() {
+        let signer = Signer::rsa();
+        let signed = Signed::new(&signer, &objects());
+        let document = signed.document(&[]);
+        let open = "<xades:SignedSignatureProperties>";
+        let with_comment = resign(
+            &document,
+            &signer,
+            &signed.signature,
+            |properties| properties.replacen(open, &format!("{open}<!-- a note -->"), 1),
+            |signed_info| {
+                signed_info.replace(
+                    &format!("<ds:Transform Algorithm=\"{CANONICALIZATION_EXCLUSIVE}\">"),
+                    &format!(
+                        "<ds:Transform Algorithm=\"{}\">",
+                        super::CANONICALIZATION_EXCLUSIVE_COMMENTS
+                    ),
+                )
+            },
+        );
+        assert!(with_comment.contains("<!-- a note -->"));
+        assert!(with_comment.contains(super::CANONICALIZATION_EXCLUSIVE_COMMENTS));
+
+        // The comment would change the digest if it were kept.
+        let parsed = XmlDocument::parse(with_comment.clone().into_bytes()).expect("parses");
+        let properties = parsed
+            .elements()
+            .find(|element| element.is(NAMESPACE_XADES, "SignedProperties"))
+            .expect("properties");
+        assert_ne!(
+            properties.canonicalize(Comments::Retained),
+            properties.canonicalize(Comments::Omitted)
+        );
+
+        let verdict = verdict(&objects(), &with_comment);
+        assert!(verdict.document_intact);
+        assert!(verdict.signature_valid);
     }
 
     #[test]

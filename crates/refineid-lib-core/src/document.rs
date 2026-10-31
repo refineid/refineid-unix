@@ -730,6 +730,8 @@ mod tests {
 
     /// Keys and certificates of one test world.
     struct World {
+        /// Root key.
+        root_key: TestKey,
         /// Root.
         root: Vec<u8>,
         /// Intermediate key.
@@ -811,6 +813,7 @@ mod tests {
                     &stranger_key,
                     &stranger_key,
                 ),
+                root_key,
                 intermediate_key,
                 signer_key,
                 tsa_key,
@@ -888,8 +891,8 @@ mod tests {
             )
         }
 
-        /// The issued signer's chain and an OCSP answer about it,
-        /// produced after the timestamps.
+        /// The issued signer's chain and OCSP answers about the signer
+        /// and the intermediate, produced after the timestamps.
         fn lt_material(&self, revoked: bool, with_root: bool) -> ValidationMaterial {
             let issuer = OwnedCert::from_der(&self.intermediate).expect("intermediate parses");
             let answer = ocsp_response(&OcspSpec {
@@ -903,13 +906,25 @@ mod tests {
                 next_update: Some(day(ENDS)),
                 embedded: Vec::new(),
             });
+            let root = OwnedCert::from_der(&self.root).expect("root parses");
+            let intermediate_answer = ocsp_response(&OcspSpec {
+                responder_key: &self.root_key,
+                responder: ROOT,
+                issuer: &root,
+                serial: INTERMEDIATE_SERIAL,
+                revoked: None,
+                produced_at: day(ANSWERED),
+                this_update: day(ANSWERED),
+                next_update: Some(day(ENDS)),
+                embedded: Vec::new(),
+            });
             let mut certificates = vec![self.intermediate.clone()];
             if with_root {
                 certificates.push(self.root.clone());
             }
             ValidationMaterial {
                 certificates,
-                ocsp_responses: vec![answer],
+                ocsp_responses: vec![answer, intermediate_answer],
                 crls: Vec::new(),
             }
         }

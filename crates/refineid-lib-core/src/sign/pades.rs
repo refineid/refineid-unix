@@ -350,8 +350,9 @@ fn prepare_kind(
     if find_first(trailer, b"/Encrypt").is_some() {
         return Err(PdfError::UnsupportedEncryption);
     }
-    let catalog_number =
-        dictionary_reference(trailer, b"/Root").ok_or(PdfError::MissingCatalogReference)?;
+    let catalog_number = dictionary_reference(trailer, b"/Root")
+        .and_then(reissued_number)
+        .ok_or(PdfError::MissingCatalogReference)?;
     let next_object = dictionary_integer(trailer, b"/Size").unwrap_or(0).max(1);
 
     // Object numbers for what the update adds.
@@ -1309,8 +1310,9 @@ pub fn append_validation_store(
     }
     let index = PdfIndex::parse(signed_pdf)?;
     let trailer = index.trailer();
-    let catalog_number =
-        dictionary_reference(trailer, b"/Root").ok_or(PdfError::MissingCatalogReference)?;
+    let catalog_number = dictionary_reference(trailer, b"/Root")
+        .and_then(reissued_number)
+        .ok_or(PdfError::MissingCatalogReference)?;
     let mut next_object = dictionary_integer(trailer, b"/Size").unwrap_or(0).max(1);
 
     let mut out = signed_pdf.to_vec();
@@ -1471,7 +1473,9 @@ fn first_page_number(index: &PdfIndex<'_>, catalog: &[u8]) -> Result<u32, PdfErr
     /// a `/Kids` cycle would otherwise spin here forever.
     const MAX_DEPTH: usize = 32;
 
-    let mut number = dictionary_reference(catalog, b"/Pages").ok_or(PdfError::MissingPageTree)?;
+    let mut number = dictionary_reference(catalog, b"/Pages")
+        .and_then(reissued_number)
+        .ok_or(PdfError::MissingPageTree)?;
     for _ in 0..MAX_DEPTH {
         let node = index
             .object_body(number)
@@ -1498,7 +1502,9 @@ fn last_page_number(index: &PdfIndex<'_>, catalog: &[u8]) -> Result<u32, PdfErro
     /// a `/Kids` cycle would otherwise spin here forever.
     const MAX_DEPTH: usize = 32;
 
-    let mut number = dictionary_reference(catalog, b"/Pages").ok_or(PdfError::MissingPageTree)?;
+    let mut number = dictionary_reference(catalog, b"/Pages")
+        .and_then(reissued_number)
+        .ok_or(PdfError::MissingPageTree)?;
     for _ in 0..MAX_DEPTH {
         let node = index
             .object_body(number)
@@ -1610,13 +1616,25 @@ fn inherited_page_rectangle(
         let Some(parent) = dictionary_reference(&body, b"/Parent") else {
             break;
         };
-        if parent == number {
+        if parent.number == number {
             break;
         }
-        number = parent;
-        body = index.object_body(number)?;
+        number = parent.number;
+        body = index.object_body_reference(parent)?;
     }
     media_box
+}
+
+/// The number of an object this writer reissues in its update.
+///
+/// Every object the update rewrites is emitted at generation zero, so
+/// a reference to another generation is one it cannot reissue.
+const fn reissued_number(reference: PdfObjectReference) -> Option<u32> {
+    if reference.generation == 0 {
+        Some(reference.number)
+    } else {
+        None
+    }
 }
 
 /// Four finite numbers carried by one direct page-box array.
@@ -1996,9 +2014,11 @@ mod tests {
     /// The stream objects named by one top-level DSS category.
     fn validation_object_bodies(pdf: &[u8], category: &[u8]) -> Vec<Vec<u8>> {
         let index = PdfIndex::parse(pdf).expect("PDF indexes");
-        let catalog_number =
+        let catalog_reference =
             dictionary_reference(index.trailer(), b"/Root").expect("catalog reference");
-        let catalog = index.object_body(catalog_number).expect("catalog object");
+        let catalog = index
+            .object_body_reference(catalog_reference)
+            .expect("catalog object");
         let catalog_dictionary = PdfDictionary::parse(&catalog).expect("catalog dictionary");
         let dss_entry = catalog_dictionary
             .entry(b"DSS")

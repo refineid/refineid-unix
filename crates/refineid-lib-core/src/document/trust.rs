@@ -14,10 +14,11 @@
 //!
 //! [`judge`] builds a path upward from the signer through the
 //! certificates of a [`MaterialPool`], reports whether it ends in one
-//! of the caller's [`TrustAnchors`], and reads the signer's revocation
-//! status from the OCSP responses and CRLs in the same pool. The
-//! anchors are fingerprints only, so the caller adds its trusted root
-//! certificates to the pool with [`MaterialPool::add_certificates`].
+//! of the caller's [`TrustAnchors`], and reads the revocation status of
+//! every certificate on that path below the anchor from the OCSP
+//! responses and CRLs in the same pool. Path building reads only the
+//! pool, so the caller adds its trusted root certificates to it with
+//! [`MaterialPool::add_certificates`].
 //!
 //! # Conformance
 //!
@@ -80,8 +81,9 @@ pub struct ChainVerdict {
     /// certificate whose SHA-256 fingerprint is a trust anchor, with
     /// every certificate on it valid at the validation time.
     pub anchored: bool,
-    /// The signer's revocation status from a verified answer in the
-    /// pool that was current at the validation time.
+    /// The revocation status of the anchored path (of the signer alone
+    /// when there is none), from verified answers in the pool accepted
+    /// at the validation time.
     pub revocation: Revocation,
 }
 
@@ -194,26 +196,51 @@ impl MaterialPool {
         false
     }
 
-    /// The signer's revocation status: a verified OCSP answer, else
-    /// a verified CRL from `issuer`.
+    /// The revocation status of `certificate` from every verified
+    /// OCSP answer and every CRL `issuer` signed: revoked when any says
+    /// so, else good when any accepted answer says so.
     fn revocation_of(
         &self,
-        signer: Certificate<'_>,
+        certificate: Certificate<'_>,
         issuer: Certificate<'_>,
         at: DateTime,
     ) -> Revocation {
         let ocsp = self
             .ocsp_responses
             .iter()
-            .filter_map(|response| self.ocsp_answer(response, signer, issuer, at));
-        if let Some(revocation) = strongest(ocsp) {
-            return revocation;
-        }
+            .filter_map(|response| self.ocsp_answer(response, certificate, issuer, at));
         let crl = self
             .crls
             .iter()
-            .filter_map(|crl| crl_answer(crl, signer, issuer, at));
-        strongest(crl).unwrap_or(Revocation::Unavailable)
+            .filter_map(|crl| crl_answer(crl, certificate, issuer, at));
+        strongest(ocsp.chain(crl)).unwrap_or(Revocation::Unavailable)
+    }
+
+    /// The revocation status of a path, signer first and anchor last:
+    /// every certificate below the anchor is checked against its
+    /// issuer (RFC 5280 section 6.1.3 (a)(3), `ETSI EN 319 102-1`
+    /// clause 5.2.6). Revoked when any is revoked, else unavailable
+    /// when any is unanswered, else the signer's good answer.
+    fn path_revocation(&self, path: &[Certificate<'_>], at: DateTime) -> Revocation {
+        let mut signer = None;
+        let mut unanswered = false;
+        for step in path.windows(2) {
+            let [certificate, issuer] = step else {
+                continue;
+            };
+            let revocation = self.revocation_of(*certificate, *issuer, at);
+            match revocation {
+                Revocation::Revoked => return Revocation::Revoked,
+                Revocation::Unavailable => unanswered = true,
+                Revocation::Good { .. } => {}
+            }
+            signer.get_or_insert(revocation);
+        }
+        if unanswered {
+            Revocation::Unavailable
+        } else {
+            signer.unwrap_or(Revocation::Unavailable)
+        }
     }
 
     /// What one OCSP response says about `signer`, when its signer
@@ -259,10 +286,11 @@ impl MaterialPool {
 ///
 /// `issuer` is reported whenever a pool certificate verifiably issued
 /// the signer, anchored or not; `anchored` additionally needs the
-/// signer valid at `at` and a path ending in one of `anchors`. The
-/// revocation status is read only for an issuer that was found, and is
-/// [`Revocation::Unavailable`] without one: no unverified answer is
-/// ever reported.
+/// signer valid at `at` and a path ending in one of `anchors`. On an
+/// anchored path every certificate below the anchor is checked for
+/// revocation; without one only the signer is, against `issuer`. The
+/// status is [`Revocation::Unavailable`] without an issuer: no
+/// unverified answer is ever reported.
 #[must_use]
 pub fn judge(
     signer: &OwnedCert,
@@ -287,9 +315,17 @@ pub fn judge(
         pool.anchored_above(issuer, anchors, at, &mut path)
     });
     let issuer = anchored_issuer.or_else(|| candidates.first().copied());
-    let revocation = issuer.map_or(Revocation::Unavailable, |issuer| {
-        pool.revocation_of(view, issuer.view(), at)
-    });
+    let revocation = if anchored_issuer.is_some() {
+        let anchored_path: Vec<Certificate<'_>> = path
+            .iter()
+            .filter_map(|der| Certificate::from_der(der).ok())
+            .collect();
+        pool.path_revocation(&anchored_path, at)
+    } else {
+        issuer.map_or(Revocation::Unavailable, |issuer| {
+            pool.revocation_of(view, issuer.view(), at)
+        })
+    };
     ChainVerdict {
         issuer: issuer.cloned(),
         anchored: signer_valid && anchored_issuer.is_some(),
@@ -319,22 +355,23 @@ fn crl_answer(
     }
 }
 
-/// Whether a good answer with this window speaks for the signer at
-/// `at`: its window contains `at` (an absent `nextUpdate` leaves it
-/// open), or it was issued at or after `at` while the signer
-/// certificate was still valid (`thisUpdate <= notAfter`). The second
+/// Whether a good answer with this window speaks for `certificate` at
+/// `at`: its window `thisUpdate..=nextUpdate` contains `at` (with
+/// `nextUpdate` absent the window is `thisUpdate` alone), or it was
+/// issued at or after `at` while the certificate was still valid
+/// (`thisUpdate <= notAfter`). The second
 /// case is evidence gathered right after signing, which a level-LT
 /// document embeds; it shows the certificate was not revoked when the
 /// signature already existed (`ETSI EN 319 102-1` clauses 5.2.5 and
 /// 5.6.2).
 fn accepted_window(
-    signer: Certificate<'_>,
+    certificate: Certificate<'_>,
     this_update: DateTime,
     next_update: Option<DateTime>,
     at: DateTime,
 ) -> bool {
-    let contains_at = this_update <= at && next_update.is_none_or(|next| at <= next);
-    let issued_after_at = at <= this_update && this_update <= signer.not_after;
+    let contains_at = this_update <= at && at <= next_update.unwrap_or(this_update);
+    let issued_after_at = at <= this_update && this_update <= certificate.not_after;
     contains_at || issued_after_at
 }
 
@@ -1098,6 +1135,28 @@ mod tests {
 
         /// An OCSP answer about the signer produced on `answered`.
         fn ocsp_on(&self, revoked: bool, answered: u8, next_update: u8) -> Vec<u8> {
+            self.ocsp_until(revoked, answered, Some(next_update))
+        }
+
+        /// An OCSP answer about the intermediate, signed by the root.
+        fn intermediate_ocsp(&self, revoked: bool) -> Vec<u8> {
+            let issuer = OwnedCert::from_der(&self.root).expect("root parses");
+            ocsp_response(&OcspSpec {
+                responder_key: &self.root_key,
+                responder: ROOT,
+                issuer: &issuer,
+                serial: INTERMEDIATE_SERIAL,
+                revoked: revoked.then(|| day(ISSUED)),
+                produced_at: day(ANSWERED),
+                this_update: day(ANSWERED),
+                next_update: Some(day(ENDS)),
+                embedded: Vec::new(),
+            })
+        }
+
+        /// An OCSP answer about the signer produced on `answered`, with
+        /// `nextUpdate` on `next_update` when given.
+        fn ocsp_until(&self, revoked: bool, answered: u8, next_update: Option<u8>) -> Vec<u8> {
             let issuer = OwnedCert::from_der(&self.intermediate).expect("intermediate parses");
             ocsp_response(&OcspSpec {
                 responder_key: &self.intermediate_key,
@@ -1107,7 +1166,7 @@ mod tests {
                 revoked: revoked.then(|| day(ISSUED)),
                 produced_at: day(answered),
                 this_update: day(answered),
-                next_update: Some(day(next_update)),
+                next_update: next_update.map(day),
                 embedded: Vec::new(),
             })
         }
@@ -1185,7 +1244,7 @@ mod tests {
         let mut pool = chain.pool();
         pool.add_material(&ValidationMaterial {
             certificates: Vec::new(),
-            ocsp_responses: vec![chain.ocsp(false, ENDS)],
+            ocsp_responses: vec![chain.ocsp(false, ENDS), chain.intermediate_ocsp(false)],
             crls: Vec::new(),
         });
         let anchors = [chain.root.as_slice()];
@@ -1329,6 +1388,116 @@ mod tests {
             crls: vec![clean],
         });
         let verdict = judge(&chain.signer, &pool, TrustAnchors::new(&[]), day(VALIDATED));
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Good {
+                checked_at: day(ANSWERED)
+            }
+        );
+    }
+
+    /// A pool of the chain plus these OCSP answers and CRLs.
+    fn pool_with(chain: &Chain, ocsp_responses: Vec<Vec<u8>>, crls: Vec<Vec<u8>>) -> MaterialPool {
+        let mut pool = chain.pool();
+        pool.add_material(&ValidationMaterial {
+            certificates: Vec::new(),
+            ocsp_responses,
+            crls,
+        });
+        pool
+    }
+
+    #[test]
+    fn a_crl_revocation_outweighs_an_ocsp_good() {
+        let chain = chain(ENDS);
+        let listing = crl(
+            INTERMEDIATE,
+            &chain.intermediate_key,
+            day(ANSWERED),
+            Some(day(ENDS)),
+            &[SIGNER_SERIAL],
+            day(ISSUED),
+        );
+        let pool = pool_with(
+            &chain,
+            vec![chain.ocsp(false, ENDS), chain.intermediate_ocsp(false)],
+            vec![listing],
+        );
+        let anchors = [chain.root.as_slice()];
+        let verdict = judge(
+            &chain.signer,
+            &pool,
+            TrustAnchors::new(&anchors),
+            day(VALIDATED),
+        );
+        assert!(verdict.anchored);
+        assert_eq!(verdict.revocation, Revocation::Revoked);
+    }
+
+    #[test]
+    fn a_revoked_intermediate_revokes_the_path() {
+        let chain = chain(ENDS);
+        let pool = pool_with(
+            &chain,
+            vec![chain.ocsp(false, ENDS), chain.intermediate_ocsp(true)],
+            Vec::new(),
+        );
+        let anchors = [chain.root.as_slice()];
+        let verdict = judge(
+            &chain.signer,
+            &pool,
+            TrustAnchors::new(&anchors),
+            day(VALIDATED),
+        );
+        assert_eq!(verdict.revocation, Revocation::Revoked);
+    }
+
+    #[test]
+    fn an_unanswered_intermediate_leaves_the_path_unavailable() {
+        let chain = chain(ENDS);
+        let pool = pool_with(&chain, vec![chain.ocsp(false, ENDS)], Vec::new());
+        let anchors = [chain.root.as_slice()];
+        let verdict = judge(
+            &chain.signer,
+            &pool,
+            TrustAnchors::new(&anchors),
+            day(VALIDATED),
+        );
+        assert!(verdict.anchored);
+        assert_eq!(verdict.revocation, Revocation::Unavailable);
+
+        // The signer's own answer is good.
+        let verdict = judge(&chain.signer, &pool, TrustAnchors::new(&[]), day(VALIDATED));
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Good {
+                checked_at: day(ANSWERED)
+            }
+        );
+    }
+
+    #[test]
+    fn an_answer_without_next_update_counts_only_when_produced_after_the_validation_time() {
+        let chain = chain(ENDS);
+        let early = pool_with(
+            &chain,
+            vec![chain.ocsp_until(false, ISSUED, None)],
+            Vec::new(),
+        );
+        let verdict = judge(
+            &chain.signer,
+            &early,
+            TrustAnchors::new(&[]),
+            day(VALIDATED),
+        );
+        assert_eq!(verdict.revocation, Revocation::Unavailable);
+
+        let later = pool_with(
+            &chain,
+            vec![chain.ocsp_until(false, ANSWERED, None)],
+            Vec::new(),
+        );
+        let verdict = judge(&chain.signer, &later, TrustAnchors::new(&[]), day(EARLY));
         assert_eq!(
             verdict.revocation,
             Revocation::Good {
