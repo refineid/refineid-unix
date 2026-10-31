@@ -412,11 +412,19 @@ pub mod known {
     /// inside what the signature covers.
     pub const SIGNATURE_TIME_STAMP_TOKEN: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.2.14");
 
-    /// `1.2.840.113549.1.9.16.2.48` -- id-aa-ets-archiveTimestampV3.
+    /// `1.2.840.113549.1.9.16.2.48` -- id-aa-ets-archiveTimestampV2.
+    ///
+    /// RFC 5126 sec.6.4.1: an unsigned attribute carrying a timestamp
+    /// over the signature and its validation material. `ETSI EN 319
+    /// 122-1` clause A.2.4 deprecates it in favour of the v3 below.
+    pub const ARCHIVE_TIME_STAMP_V2: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.2.48");
+
+    /// `0.4.0.1733.2.4` -- id-aa-ets-archiveTimestampV3.
     ///
     /// `ETSI EN 319 122-1` clause 5.5.3: an unsigned attribute carrying
-    /// a timestamp over the signature and its validation material.
-    pub const ARCHIVE_TIME_STAMP_V3: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.2.48");
+    /// a timestamp over the signature and the components its
+    /// `ats-hash-index-v3` protects.
+    pub const ARCHIVE_TIME_STAMP_V3: Oid<'static> = oid_dotted!("0.4.0.1733.2.4");
 
     /// `1.2.840.113549.1.9.16.2.47` -- id-aa-signingCertificateV2.
     ///
@@ -565,5 +573,17 @@ mod tests {
         // same OID -- the const constructor doesn't mangle.
         let runtime = Oid::new(&[0x55, 0x04, 0x03]).expect("commonName DER encoding parses");
         assert_eq!(known::COMMON_NAME.as_bytes(), runtime.as_bytes());
+    }
+
+    #[test]
+    fn archive_timestamp_identifiers_render_dotted() {
+        assert_eq!(
+            format!("{}", known::ARCHIVE_TIME_STAMP_V2),
+            "1.2.840.113549.1.9.16.2.48"
+        );
+        assert_eq!(
+            format!("{}", known::ARCHIVE_TIME_STAMP_V3),
+            "0.4.0.1733.2.4"
+        );
     }
 }

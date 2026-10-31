@@ -926,6 +926,8 @@ pub(crate) mod testkit {
         pub(crate) signer: &'a [u8],
         /// `SignedData.certificates`.
         pub(crate) certificates: Vec<Vec<u8>>,
+        /// Unsigned attributes, each a DER `Attribute`; none when empty.
+        pub(crate) unsigned_attributes: Vec<Vec<u8>>,
     }
 
     /// A `ContentInfo`-wrapped `SignedData` with one `SignerInfo`.
@@ -943,6 +945,11 @@ pub(crate) mod testkit {
         signer_info.extend_from_slice(&tagged);
         signer_info.extend_from_slice(&parts.key.algorithm_identifier());
         signer_info.extend_from_slice(&tlv(OCTET_STRING, parts.key.sign(&parts.signed_attributes)));
+        if !parts.unsigned_attributes.is_empty() {
+            let mut unsigned = parts.unsigned_attributes.clone();
+            unsigned.sort_unstable();
+            signer_info.extend_from_slice(&tlv(CONTEXT_1, unsigned.concat()));
+        }
 
         let mut encapsulated = tlv(OBJECT_IDENTIFIER, parts.econtent_type.as_bytes());
         if let Some(econtent) = parts.econtent {
@@ -1002,6 +1009,7 @@ pub(crate) mod testkit {
             key: tsa_key,
             signer: tsa,
             certificates: vec![tsa.to_vec()],
+            unsigned_attributes: Vec::new(),
         })
     }
 }

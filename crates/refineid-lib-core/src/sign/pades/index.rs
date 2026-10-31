@@ -16,7 +16,7 @@
 //! - ISO 32000-1 sec.7.5.7, sec.7.5.8: object and cross-reference
 //!   streams, read in `xref_stream`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::PdfError;
 use super::xref_stream;
@@ -28,6 +28,17 @@ use super::xref_stream;
 /// fixed bound keeps that preservation from becoming an unbounded parser
 /// recursion on an attacker-supplied PDF.
 pub(crate) const MAX_PDF_VALUE_DEPTH: usize = 64;
+
+/// Most cross-reference entries a file may declare through `/Size`, a
+/// classic subsection or a stream's `/Index` pairs. ISO 32000-1 Annex
+/// C, Table C.1, caps a file at 8 388 607 indirect objects; with entry
+/// zero, which heads the free list, that is two to the twenty-third
+/// entries.
+///
+/// The same value bounds the entries read across all sections of the
+/// `/Prev` chain together; that total is an implementation limit equal
+/// to the Annex C object ceiling, not a rule of the file format.
+pub(crate) const MAX_XREF_ENTRIES: usize = 1 << 23;
 
 /// One indirect PDF object reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -518,6 +529,8 @@ impl<'a> PdfIndex<'a> {
         let mut trailer = None;
         let mut newest_is_stream = false;
         let mut objects = Vec::new();
+        let mut numbers = HashSet::new();
+        let mut read = 0_usize;
 
         for _ in 0..Self::MAX_XREF_DEPTH {
             let Some(offset) = next else { break };
@@ -527,6 +540,10 @@ impl<'a> PdfIndex<'a> {
             visited.push(offset);
 
             let section = parse_xref_section(pdf, offset)?;
+            read = read
+                .checked_add(section.entries.len())
+                .filter(|total| *total <= MAX_XREF_ENTRIES)
+                .ok_or(PdfError::MissingTrailer)?;
             if trailer.is_none() {
                 trailer = Some(section.trailer.clone());
                 newest_is_stream = section.is_stream;
@@ -534,10 +551,7 @@ impl<'a> PdfIndex<'a> {
             for entry in section.entries {
                 // Newer xref sections win. Keep a newer free entry too:
                 // it deletes the object and must suppress older copies.
-                if !objects
-                    .iter()
-                    .any(|existing: &XrefEntry| existing.number == entry.number)
-                {
+                if numbers.insert(entry.number) {
                     objects.push(entry);
                 }
             }
@@ -751,12 +765,29 @@ pub(crate) fn parse_xref_section(pdf: &[u8], offset: usize) -> Result<XrefSectio
         let token = read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?;
         if token == b"trailer" {
             let (trailer, _after) = dictionary_at(pdf, cursor).ok_or(PdfError::MissingTrailer)?;
+            if dictionary_usize(&trailer, b"/Size").is_some_and(|size| size > MAX_XREF_ENTRIES) {
+                return Err(PdfError::MissingTrailer);
+            }
             return hybrid_merged(pdf, trailer, entries);
         }
 
         let start = parse_u32(token).ok_or(PdfError::MissingTrailer)?;
         let count = parse_u32(read_pdf_token(pdf, &mut cursor).ok_or(PdfError::MissingTrailer)?)
             .ok_or(PdfError::MissingTrailer)?;
+        // Every number in the subsection is below the ceiling, and the
+        // subsections together declare no more entries than it.
+        let end = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(count).ok())
+            .and_then(|(start, count)| start.checked_add(count))
+            .ok_or(PdfError::MissingTrailer)?;
+        let total = usize::try_from(count)
+            .ok()
+            .and_then(|count| entries.len().checked_add(count))
+            .ok_or(PdfError::MissingTrailer)?;
+        if end > MAX_XREF_ENTRIES || total > MAX_XREF_ENTRIES {
+            return Err(PdfError::MissingTrailer);
+        }
 
         for index in 0..count {
             let object_offset =
@@ -1041,4 +1072,59 @@ pub(crate) fn find_last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .rposition(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_XREF_ENTRIES, PdfError, PdfIndex, XrefLocation, parse_xref_section};
+
+    /// A classic table at offset zero with one subsection of `count`
+    /// entries from `start`, `rows` free rows written, and `/Size`.
+    fn classic_table(start: usize, count: usize, rows: usize, size: usize) -> Vec<u8> {
+        let mut table = format!("xref\n{start} {count}\n");
+        for _ in 0..rows {
+            table.push_str("0000000000 65535 f \n");
+        }
+        table.push_str(&format!("trailer\n<< /Size {size} >>\n"));
+        table.into_bytes()
+    }
+
+    #[test]
+    fn a_classic_subsection_over_the_ceiling_is_refused() {
+        let rows = 1;
+        assert!(matches!(
+            parse_xref_section(&classic_table(0, MAX_XREF_ENTRIES + 1, rows, rows), 0),
+            Err(PdfError::MissingTrailer)
+        ));
+        assert!(matches!(
+            parse_xref_section(&classic_table(MAX_XREF_ENTRIES, rows, rows, rows), 0),
+            Err(PdfError::MissingTrailer)
+        ));
+        assert!(matches!(
+            parse_xref_section(&classic_table(0, rows, rows, MAX_XREF_ENTRIES + 1), 0),
+            Err(PdfError::MissingTrailer)
+        ));
+        let section = parse_xref_section(&classic_table(0, rows, rows, MAX_XREF_ENTRIES), 0)
+            .expect("a size at the ceiling is read");
+        assert_eq!(section.entries.len(), rows);
+    }
+
+    #[test]
+    fn the_newest_section_wins_the_merge() {
+        let original = "1 0 obj\n<< >>\nendobj\n";
+        let first_xref = original.len();
+        let older = format!(
+            "{original}xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n\
+             trailer\n<< /Size 2 >>\n"
+        );
+        let newest_xref = older.len();
+        let pdf = format!(
+            "{older}xref\n1 1\n0000000000 00000 f \n\
+             trailer\n<< /Size 2 /Prev {first_xref} >>\nstartxref\n{newest_xref}\n%%EOF\n"
+        );
+        let index = PdfIndex::parse(pdf.as_bytes()).expect("the chain indexes");
+        let numbers: Vec<u32> = index.objects.iter().map(|entry| entry.number).collect();
+        assert_eq!(numbers, [1, 0]);
+        assert_eq!(index.objects[0].location, XrefLocation::Free);
+    }
 }
