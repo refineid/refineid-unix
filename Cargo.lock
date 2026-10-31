@@ -2062,7 +2062,7 @@ source = "git+https://github.com/refineid/refineid-core.git?branch=main#a1b0dbf3
 
 [[package]]
 name = "refineid-client"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "hex",
  "hickory-resolver",
@@ -2095,7 +2095,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-dev-errors"
-version = "26.10.30"
+version = "26.10.31"
 
 [[package]]
 name = "refineid-digest"
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "refineid-dev-errors",
  "refineid-gui-core",
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-core"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "hex",
  "image",
@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-fltk"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "arboard",
  "fltk",
@@ -2149,7 +2149,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-gtk4"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "gtk4",
  "image",
@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-core"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "aes 0.9.3",
  "cbc",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-pcsc"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "pcsc",
  "refineid-dev-errors",
@@ -2196,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-tls"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "refineid-lib-core",
  "refineid-rapp-core",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-rapp-core"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "getrandom 0.4.3",
  "refineid-dev-errors",
@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-unix-pkcs11"
-version = "26.10.30"
+version = "26.10.31"
 dependencies = [
  "libc",
  "refineid-dev-errors",

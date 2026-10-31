@@ -12,10 +12,12 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! The name every RefineID app gives a signed document.
+//! The name the unix apps give a signed document.
 //!
-//! `<stem> - signed <UTC time>.<extension>`, beside the (first) input,
-//! with the RFC 3339 time's colons as dashes.
+//! `<stem>-signed-<UTC time>.<extension>`, beside the (first) input,
+//! with the RFC 3339 time's colons as dashes. The stem keeps its own
+//! spaces; the suffix adds none, so the name passes through a shell
+//! unquoted when the input did.
 
 use std::path::{Path, PathBuf};
 
@@ -30,6 +32,8 @@ const PORTFOLIO_STEM: &str = "portfolio";
 const TIME_SEPARATOR: char = ':';
 /// What [`TIME_SEPARATOR`] becomes in a file name.
 const FILE_NAME_TIME_SEPARATOR: &str = "-";
+/// What joins the stem, the label and the time.
+const NAME_SEPARATOR: &str = "-";
 
 /// Where the signed form of `inputs` goes.
 ///
@@ -53,7 +57,7 @@ pub fn signed_document_path(inputs: &[PathBuf], format: Format, signed_at: DateT
     let time = signed_at
         .to_string()
         .replace(TIME_SEPARATOR, FILE_NAME_TIME_SEPARATOR);
-    let name = format!("{stem} - {SIGNED_LABEL} {time}.{extension}");
+    let name = format!("{stem}{NAME_SEPARATOR}{SIGNED_LABEL}{NAME_SEPARATOR}{time}.{extension}");
     inputs
         .first()
         .and_then(|first| first.parent())
@@ -99,12 +103,12 @@ mod tests {
     fn a_signed_document_is_named_by_stem_and_utc_signing_time() -> TestResult {
         check(
             &named(&["/documents/report.pdf"], Format::Pades)?,
-            &PathBuf::from("/documents/report - signed 2001-02-03T04-05-06Z.pdf"),
+            &PathBuf::from("/documents/report-signed-2001-02-03T04-05-06Z.pdf"),
             "pades",
         )?;
         check(
             &named(&["/documents/report.pdf"], Format::AsicEXades)?,
-            &PathBuf::from("/documents/report - signed 2001-02-03T04-05-06Z.asice"),
+            &PathBuf::from("/documents/report-signed-2001-02-03T04-05-06Z.asice"),
             "asice over a pdf",
         )
     }
@@ -113,7 +117,7 @@ mod tests {
     fn pades_keeps_the_extension_as_written() -> TestResult {
         check(
             &named(&["/documents/Report.PDF"], Format::Pades)?,
-            &PathBuf::from("/documents/Report - signed 2001-02-03T04-05-06Z.PDF"),
+            &PathBuf::from("/documents/Report-signed-2001-02-03T04-05-06Z.PDF"),
             "uppercase kept",
         )
     }
@@ -122,12 +126,12 @@ mod tests {
     fn a_container_takes_the_container_extension() -> TestResult {
         check(
             &named(&["/documents/notes.txt"], Format::AsicEXades)?,
-            &PathBuf::from("/documents/notes - signed 2001-02-03T04-05-06Z.asice"),
+            &PathBuf::from("/documents/notes-signed-2001-02-03T04-05-06Z.asice"),
             "asice-xades",
         )?;
         check(
             &named(&["/documents/notes.txt"], Format::AsicECades)?,
-            &PathBuf::from("/documents/notes - signed 2001-02-03T04-05-06Z.asice"),
+            &PathBuf::from("/documents/notes-signed-2001-02-03T04-05-06Z.asice"),
             "asice-cades",
         )
     }
@@ -139,7 +143,7 @@ mod tests {
                 &["/documents/report.pdf", "/attachments/notes.txt"],
                 Format::AsicEXades,
             )?,
-            &PathBuf::from("/documents/portfolio - signed 2001-02-03T04-05-06Z.asice"),
+            &PathBuf::from("/documents/portfolio-signed-2001-02-03T04-05-06Z.asice"),
             "portfolio",
         )
     }
@@ -148,12 +152,12 @@ mod tests {
     fn cades_takes_its_cms_extensions() -> TestResult {
         check(
             &named(&["/documents/notes.txt"], Format::Cades)?,
-            &PathBuf::from("/documents/notes - signed 2001-02-03T04-05-06Z.p7m"),
+            &PathBuf::from("/documents/notes-signed-2001-02-03T04-05-06Z.p7m"),
             "attached",
         )?;
         check(
             &named(&["/documents/notes.txt"], Format::CadesDetached)?,
-            &PathBuf::from("/documents/notes - signed 2001-02-03T04-05-06Z.p7s"),
+            &PathBuf::from("/documents/notes-signed-2001-02-03T04-05-06Z.p7s"),
             "detached",
         )
     }
@@ -162,7 +166,7 @@ mod tests {
     fn a_relative_input_names_a_relative_output() -> TestResult {
         check(
             &named(&["report.pdf"], Format::Pades)?,
-            &PathBuf::from("report - signed 2001-02-03T04-05-06Z.pdf"),
+            &PathBuf::from("report-signed-2001-02-03T04-05-06Z.pdf"),
             "relative",
         )
     }
