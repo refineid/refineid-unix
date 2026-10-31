@@ -98,7 +98,7 @@ xdotool type --delay 120 "$1"
 EOS
 }
 
-host_pairs() {
+host_phone() {
     host_sh <<'EOS'
 refineid phone 2>/dev/null
 EOS
@@ -133,7 +133,7 @@ wait_for() {
     seconds=$3
     waited=0
     while [ "$waited" -lt "$seconds" ]; do
-        host_pairs > "$work/listing"
+        host_phone > "$work/listing"
         id=$(pair_id < "$work/listing")
         if [ -n "$id" ] && [ "$id" != "$known" ] \
             && entry < "$work/listing" | grep -q "$wanted"; then
@@ -146,7 +146,7 @@ wait_for() {
     return 1
 }
 
-known=$(host_pairs | pair_id)
+known=$(host_phone | pair_id)
 host_forget
 say "asking the phone for a code"
 phone_offer
@@ -157,7 +157,7 @@ host_type_code "$code"
 say "waiting for the pairing on the host"
 if ! new_id=$(wait_for "$known" '^Phone: ' "$pair_wait_seconds"); then
     say "FAIL: no usable pairing within ${pair_wait_seconds} s"
-    host_pairs
+    host_phone
     exit 1
 fi
 say "paired as $new_id; the phone serves again"
@@ -166,9 +166,9 @@ phone_serve
 say "waiting for the certificate read through the phone"
 if ! wait_for "$known" 'Cert cache: Cached' "$read_wait_seconds" > /dev/null; then
     say "FAIL: the certificate was not read within ${read_wait_seconds} s"
-    host_pairs
+    host_phone
     exit 1
 fi
 say "PASS"
-host_pairs || true
+host_phone || true
 exit 0

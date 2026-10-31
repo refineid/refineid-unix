@@ -55,8 +55,9 @@ prompt only, never from the command line.
 Prints nothing on success; -v shows each step.
 ";
 
-/// What `refineid phone help`
-/// prints. The man page refineid(1) carries the same facts.
+/// Bare `phone`'s own help: the first part of what `refineid phone
+/// help` prints, before the group's commands. The man page refineid(1)
+/// carries the same facts.
 pub const PAIRS_HELP: &str = "\
 usage: refineid phone
 
@@ -326,7 +327,7 @@ impl AuthArgs {
             }
         };
         let Some(pair) = reader.phone() else {
-            eprintln!("auth: no phone paired; run `refineid phone pair` first");
+            eprintln!("phone auth: no phone paired; run `refineid phone pair` first");
             return ExitStatus::RuntimeFailure.into();
         };
         let uri = match refineid_lib_core::text::Uri::parse(target.to_string()) {
