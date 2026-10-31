@@ -398,6 +398,15 @@ pub fn verify_token(
     })
 }
 
+/// The `TSTInfo.genTime` a token states, read without authenticating
+/// its signer: the time an unverified token claims, never proof.
+#[must_use]
+pub fn claimed_generation_time(token: &[u8]) -> Option<DateTime> {
+    parse_token(token)
+        .ok()
+        .map(|(_, tst_info)| tst_info.gen_time)
+}
+
 /// Check the token answers this request and no other.
 fn check_binding(
     token: &[u8],

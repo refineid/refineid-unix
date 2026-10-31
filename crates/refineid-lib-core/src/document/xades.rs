@@ -44,14 +44,15 @@
 //! - `ETSI EN 319 162-1` V1.1.1 clause A.4: reference URIs resolve
 //!   against the container root.
 
+use crate::document::TimestampCheck;
 use crate::document::asic::{AsicContainer, Entry, percent_decode};
 use crate::document::xml::{Comments, ElementRef, XmlDocument, XmlError};
 use crate::sign::asic::NAMESPACE_ASIC;
 use crate::sign::cades::DigestAlgorithm;
-use crate::sign::timestamp::{VerifiedTimestampToken, verify_token};
+use crate::sign::timestamp::{claimed_generation_time, verify_token};
 use crate::sign::validation::ValidationMaterial;
 use crate::sign::xades::NAMESPACE_DSIG;
-use crate::x509::{MessageSignatureAlgorithm, OwnedCert};
+use crate::x509::{DateTime, MessageSignatureAlgorithm, OwnedCert};
 
 /// `XAdES` 1.3.2 namespace (`ETSI EN 319 132-1` sec.4.2).
 const NAMESPACE_XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
@@ -287,16 +288,8 @@ pub struct XadesSignature {
     signature_timestamps: Vec<SignatureTimestamp>,
     /// How many `ArchiveTimeStamp` elements are present.
     archive_timestamps: usize,
-}
-
-/// The signature timestamps of one signature.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Timestamps {
-    /// How many `SignatureTimeStamp` tokens the signature carries.
-    pub present: usize,
-    /// The tokens that verified and imprint the signature value, with
-    /// their authenticated generation times and embedded certificates.
-    pub verified: Vec<VerifiedTimestampToken>,
+    /// The `SigningTime` signed property, when present and readable.
+    signing_time: Option<DateTime>,
 }
 
 /// The verdict on one signature.
@@ -313,8 +306,9 @@ pub struct XadesVerdict {
     /// baseline level (`ETSI EN 319 132-1` sec.5.2.2), so a signature
     /// without it is not valid.
     pub signature_valid: bool,
-    /// The `SignatureTimeStamp` tokens.
-    pub signature_timestamps: Timestamps,
+    /// Every `SignatureTimeStamp` token, checked against the canonical
+    /// `ds:SignatureValue`, in document order.
+    pub signature_timestamps: Vec<TimestampCheck>,
     /// How many `ArchiveTimeStamp` elements are present; they are not
     /// verified.
     pub archive_timestamps_present: usize,
@@ -388,8 +382,12 @@ impl XadesSignature {
                 .count();
         }
 
-        let signing_certificate = signed_properties
-            .and_then(|properties| properties.child(NAMESPACE_XADES, "SignedSignatureProperties"))
+        let signed_signature_properties = signed_properties
+            .and_then(|properties| properties.child(NAMESPACE_XADES, "SignedSignatureProperties"));
+        let signing_time = signed_signature_properties
+            .and_then(|properties| properties.child(NAMESPACE_XADES, "SigningTime"))
+            .and_then(|element| xml_date_time(&element.text()));
+        let signing_certificate = signed_signature_properties
             .and_then(|properties| {
                 properties
                     .child(NAMESPACE_XADES, "SigningCertificateV2")
@@ -451,6 +449,7 @@ impl XadesSignature {
             signing_certificate,
             signature_timestamps,
             archive_timestamps,
+            signing_time,
         })
     }
 
@@ -460,6 +459,13 @@ impl XadesSignature {
     #[must_use]
     pub const fn signer_certificate(&self) -> &OwnedCert {
         &self.signer
+    }
+
+    /// The `SigningTime` signed property (`ETSI EN 319 132-1`
+    /// sec.5.2.1), when present and readable.
+    #[must_use]
+    pub const fn signing_time(&self) -> Option<DateTime> {
+        self.signing_time
     }
 
     /// Every `ds:X509Certificate`, then every `CertificateValues`
@@ -548,23 +554,94 @@ impl XadesSignature {
 
     /// Verify each `SignatureTimeStamp` token over the canonical
     /// `ds:SignatureValue`.
-    fn timestamps(&self) -> Timestamps {
-        let verified = self
-            .signature_timestamps
+    fn timestamps(&self) -> Vec<TimestampCheck> {
+        self.signature_timestamps
             .iter()
-            .filter_map(|timestamp| {
-                let imprinted = timestamp.imprinted.as_deref()?;
-                verify_token(&timestamp.token, |algorithm: DigestAlgorithm| {
-                    algorithm.digest(imprinted)
-                })
-                .ok()
+            .map(|timestamp| {
+                timestamp
+                    .imprinted
+                    .as_deref()
+                    .and_then(|imprinted| {
+                        verify_token(&timestamp.token, |algorithm: DigestAlgorithm| {
+                            algorithm.digest(imprinted)
+                        })
+                        .ok()
+                    })
+                    .map_or_else(
+                        || TimestampCheck::Unverified {
+                            claimed_at: claimed_generation_time(&timestamp.token),
+                        },
+                        TimestampCheck::Verified,
+                    )
             })
-            .collect();
-        Timestamps {
-            present: self.signature_timestamps.len(),
-            verified,
-        }
+            .collect()
     }
+}
+
+/// An `xsd:dateTime` (XML Schema Part 2 sec.3.2.7) with a time zone,
+/// as UTC: `YYYY-MM-DDThh:mm:ss`, optional fractional seconds, then
+/// `Z` or an offset `+hh:mm` / `-hh:mm`. Fractional seconds are
+/// dropped; a value without a time zone names no instant and yields
+/// `None`.
+fn xml_date_time(text: &str) -> Option<DateTime> {
+    /// Separator of date and time.
+    const DATE_TIME_SEPARATOR: char = 'T';
+    /// Separator of the date fields.
+    const DATE_SEPARATOR: char = '-';
+    /// Separator of the clock fields and of the offset's.
+    const CLOCK_SEPARATOR: char = ':';
+    /// Start of fractional seconds.
+    const FRACTION_SEPARATOR: char = '.';
+    /// The UTC time zone designator.
+    const UTC_DESIGNATOR: char = 'Z';
+    /// Seconds in a minute.
+    const SECONDS_PER_MINUTE: u64 = 60;
+    /// Minutes in an hour.
+    const MINUTES_PER_HOUR: u64 = 60;
+
+    /// Exactly three fields separated by `separator`.
+    fn three<T: core::str::FromStr>(text: &str, separator: char) -> Option<(T, T, T)> {
+        let mut fields = text.split(separator);
+        let first = fields.next()?.parse().ok()?;
+        let second = fields.next()?.parse().ok()?;
+        let third = fields.next()?.parse().ok()?;
+        fields.next().is_none().then_some((first, second, third))
+    }
+
+    let text = text.trim();
+    let (date, time) = text.split_once(DATE_TIME_SEPARATOR)?;
+    let (year, month, day): (u16, u16, u16) = three(date, DATE_SEPARATOR)?;
+    let (month, day) = (u8::try_from(month).ok()?, u8::try_from(day).ok()?);
+    let (clock, east_of_utc, offset) = if let Some(clock) = time.strip_suffix(UTC_DESIGNATOR) {
+        (clock, true, None)
+    } else {
+        let at = time.rfind(['+', '-'])?;
+        let (clock, zone) = time.split_at(at);
+        let east = zone.starts_with('+');
+        let (hours, minutes) = zone.get(1..)?.split_once(CLOCK_SEPARATOR)?;
+        let hours: u64 = hours.parse().ok()?;
+        let minutes: u64 = minutes.parse().ok()?;
+        let seconds = hours
+            .checked_mul(MINUTES_PER_HOUR)?
+            .checked_add(minutes)?
+            .checked_mul(SECONDS_PER_MINUTE)?;
+        (clock, east, Some(core::time::Duration::from_secs(seconds)))
+    };
+    let whole = clock
+        .split_once(FRACTION_SEPARATOR)
+        .map_or(clock, |(whole, _fraction)| whole);
+    let (hour, minute, second): (u8, u8, u8) = three(whole, CLOCK_SEPARATOR)?;
+    let local = DateTime::new(year, month, day, hour, minute, second).ok()?;
+    let Some(offset) = offset else {
+        return Some(local);
+    };
+    let local = local.unix_duration();
+    let utc = if east_of_utc {
+        local.checked_sub(offset)?
+    } else {
+        local.checked_add(offset)?
+    };
+    DateTime::from_unix_duration(utc).ok()
 }
 
 /// Read `xades:UnsignedSignatureProperties`: the signature timestamps
@@ -791,6 +868,7 @@ mod tests {
     use crate::base64;
     use crate::ber::tlv;
     use crate::document::DocumentFile;
+    use crate::document::TimestampCheck;
     use crate::document::asic::{AsicContainer, Entry};
     use crate::document::trust::testkit::{
         CONTEXT_0, CertificateSpec, Curve, INTEGER, NULL, OBJECT_IDENTIFIER, OCTET_STRING,
@@ -1135,6 +1213,23 @@ mod tests {
     }
 
     #[test]
+    fn an_xml_date_time_reads_as_utc() {
+        /// Noon UTC on [`STAMP_DAY`].
+        const UTC: &str = "2026-06-15T12:00:00Z";
+        /// The same instant two hours east of UTC, with a fraction.
+        const EAST: &str = "2026-06-15T14:00:00.250+02:00";
+        /// The same instant three hours west of UTC.
+        const WEST: &str = "2026-06-15T09:00:00-03:00";
+        /// No time zone: no instant.
+        const FLOATING: &str = "2026-06-15T12:00:00";
+        let noon = day(STAMP_DAY);
+        assert_eq!(super::xml_date_time(UTC), Some(noon));
+        assert_eq!(super::xml_date_time(EAST), Some(noon));
+        assert_eq!(super::xml_date_time(WEST), Some(noon));
+        assert_eq!(super::xml_date_time(FLOATING), None);
+    }
+
+    #[test]
     fn our_rsa_signature_is_intact_and_valid() {
         let signed = Signed::new(&Signer::rsa(), &objects());
         let (container, signature) = container_and_signature(&objects(), &signed.document(&[]));
@@ -1147,7 +1242,7 @@ mod tests {
         let verdict = signature.verify(&container);
         assert!(verdict.document_intact);
         assert!(verdict.signature_valid);
-        assert_eq!(verdict.signature_timestamps.present, 0);
+        assert!(verdict.signature_timestamps.is_empty());
         assert_eq!(verdict.archive_timestamps_present, 0);
     }
 
@@ -1418,10 +1513,14 @@ mod tests {
         let verdict = verdict(&objects(), &with_archive);
         assert!(verdict.document_intact);
         assert!(verdict.signature_valid);
-        assert_eq!(verdict.signature_timestamps.present, 2);
-        let [verified] = verdict.signature_timestamps.verified.as_slice() else {
+        let [
+            TimestampCheck::Verified(verified),
+            TimestampCheck::Unverified { claimed_at },
+        ] = verdict.signature_timestamps.as_slice()
+        else {
             panic!("exactly the good token verifies");
         };
+        assert_eq!(*claimed_at, Some(generated));
         assert_eq!(verified.generated_at, generated);
         assert_eq!(verified.signer_certificate, tsa.certificate);
         assert_eq!(verdict.archive_timestamps_present, 1);

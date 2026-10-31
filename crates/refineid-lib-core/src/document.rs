@@ -45,6 +45,7 @@ pub mod xml;
 
 use crate::crypto::digest::Sha256;
 use crate::identity::Peuin;
+use crate::sign::timestamp::VerifiedTimestampToken;
 use crate::sign::validation::ValidationMaterial;
 use crate::x509::{DateTime, OwnedCert};
 
@@ -107,12 +108,32 @@ impl<'a> TrustAnchors<'a> {
 /// The holder a signer certificate names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerIdentity {
-    /// The given names and surname when the certificate carries them,
-    /// else its common name; empty when it carries neither.
+    /// The subject's common name as the certificate spells it, see
+    /// [`subject_name`].
     pub name: String,
     /// The Finnish electronic identifier, on certificates issued to a
     /// person.
     pub identifier: Option<Peuin>,
+}
+
+/// The name a certificate's subject goes by: its common name as the
+/// certificate spells it, else the whole subject as an RFC 4514
+/// string.
+#[must_use]
+pub fn subject_name(certificate: &OwnedCert) -> String {
+    let subject = certificate.view().subject;
+    subject
+        .common_name()
+        .map_or_else(|| subject.rfc4514(), |name| name.as_str().to_owned())
+}
+
+/// A certificate path, nearest certificate first.
+#[derive(Debug, Clone)]
+pub struct CertificatePath {
+    /// The certificates, each issued by the next.
+    pub certificates: Vec<OwnedCert>,
+    /// Whether the last certificate is a trust anchor.
+    pub anchored: bool,
 }
 
 /// The revocation basis one signature reached.
@@ -125,10 +146,45 @@ pub enum Revocation {
         /// CRL, that answered.
         checked_at: DateTime,
     },
-    /// A verified answer says the signer certificate is revoked.
-    Revoked,
+    /// A verified answer says a certificate on the signer's path is
+    /// revoked.
+    Revoked {
+        /// The revocation time the answer states: OCSP
+        /// `revocationTime` or the CRL entry's `revocationDate`.
+        revoked_at: DateTime,
+    },
     /// No verified answer was available.
     Unavailable,
+}
+
+/// One signature timestamp token, as a format reader checked it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimestampCheck {
+    /// The token verifies under its embedded signer and imprints this
+    /// signature.
+    Verified(VerifiedTimestampToken),
+    /// The token does not verify, or imprints other data.
+    Unverified {
+        /// The `genTime` the token states, when it parses.
+        claimed_at: Option<DateTime>,
+    },
+}
+
+/// One signature timestamp of a report.
+#[derive(Debug, Clone)]
+pub enum SignatureTimestamp {
+    /// A verified token over this signature.
+    Proven {
+        /// The token's authenticated `genTime`.
+        generated_at: DateTime,
+        /// The token signer's path, signer first.
+        chain: CertificatePath,
+    },
+    /// A token that did not verify over this signature.
+    Unproven {
+        /// The `genTime` the token states, when it parses.
+        claimed_at: Option<DateTime>,
+    },
 }
 
 /// One signature's verified facts.
@@ -138,8 +194,9 @@ pub struct SignatureReport {
     pub signer: SignerIdentity,
     /// The signer certificate, for revocation checks above this crate.
     pub signer_certificate: OwnedCert,
-    /// The issuer the chain step was proven against, when one matched.
-    pub issuer_certificate: Option<OwnedCert>,
+    /// The certificates above the signer, issuer first: the anchored
+    /// path when there is one, else as far as it was built.
+    pub chain: CertificatePath,
     /// Whether the digest over the signed spans equals the signed
     /// message digest, and every reference the signature makes was
     /// recomputed and matched.
@@ -150,10 +207,20 @@ pub struct SignatureReport {
     pub signature_valid: bool,
     /// Whether the signer chains to one of the caller's trust anchors.
     pub chain_verified: bool,
+    /// The signing time the signature claims: the `CMS` `signing-time`
+    /// attribute, the `XAdES` `SigningTime` property, or the PDF
+    /// signature dictionary's `/M` entry.
+    pub claimed_signing_time: Option<DateTime>,
     /// The earliest verified proof that the signature existed: a
     /// signature timestamp over the signature value, or a document
     /// timestamp whose byte range covers it.
     pub proof_of_existence: Option<DateTime>,
+    /// Every signature timestamp the signature carries, in encoded
+    /// order.
+    pub signature_timestamps: Vec<SignatureTimestamp>,
+    /// The generation times of the verified document timestamps whose
+    /// byte range covers this signature, in document order.
+    pub document_timestamps: Vec<DateTime>,
     /// Whether every signature timestamp present verified against its
     /// own embedded chain and imprints this signature, and at least one
     /// proof of existence was found.
@@ -177,23 +244,42 @@ impl SignatureReport {
     }
 }
 
+/// A signature of a profile this verifier does not implement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedSignature {
+    /// The holder, when the signer certificate could be read.
+    pub signer: Option<SignerIdentity>,
+    /// The profile feature that was refused.
+    pub profile: &'static str,
+}
+
+/// One signature a document carries.
+#[derive(Debug, Clone)]
+pub enum SignatureEntry {
+    /// A signature this verifier judged.
+    Judged(SignatureReport),
+    /// A signature of a profile this verifier does not implement.
+    Unsupported(UnsupportedSignature),
+}
+
 /// The complete verification of one document.
 #[derive(Debug, Clone)]
 pub struct DocumentReport {
-    /// Every signature's verified facts, in document order.
-    pub signatures: Vec<SignatureReport>,
-    /// The generation times of the verified document timestamps, in
-    /// document order.
-    pub document_timestamps: Vec<DateTime>,
+    /// Every signature, in document order.
+    pub signatures: Vec<SignatureEntry>,
 }
 
 impl DocumentReport {
-    /// Whether every signature is valid and none is revoked.
+    /// Whether every signature is judged valid and none is revoked.
     #[must_use]
     pub fn is_valid(&self) -> bool {
         !self.signatures.is_empty()
-            && self.signatures.iter().all(|signature| {
-                signature.is_valid() && signature.revocation != Revocation::Revoked
+            && self.signatures.iter().all(|entry| match entry {
+                SignatureEntry::Judged(signature) => {
+                    signature.is_valid()
+                        && !matches!(signature.revocation, Revocation::Revoked { .. })
+                }
+                SignatureEntry::Unsupported(_) => false,
             })
     }
 }
@@ -210,7 +296,7 @@ pub enum DocumentFailure {
     Unreadable(&'static str),
     /// The file parses and carries no signature.
     NoSignatures,
-    /// The file carries signatures of a profile this verifier does not
+    /// The file as a whole is of a profile this verifier does not
     /// implement, named so the reader knows what was refused.
     UnsupportedProfile(&'static str),
 }
@@ -319,7 +405,6 @@ fn verify_pdf(
         })
         .collect();
     let mut signatures = Vec::new();
-    let mut unsupported = None;
     for found in document.signatures() {
         let ess = match found.kind {
             pdf::SignatureKind::Signature(pdf::SubFilter::EtsiCadesDetached) => {
@@ -329,7 +414,7 @@ fn verify_pdf(
                 cades::EssBinding::NotRequired
             }
             pdf::SignatureKind::Signature(pdf::SubFilter::EtsiRfc3161 | pdf::SubFilter::Other) => {
-                unsupported = Some("PDF signature subfilter");
+                signatures.push(unsupported(None, "PDF signature subfilter"));
                 continue;
             }
             pdf::SignatureKind::DocumentTimestamp => continue,
@@ -337,7 +422,7 @@ fn verify_pdf(
         let signature = match cades::CadesSignature::parse(found.cms.clone()) {
             Ok(signature) => signature,
             Err(error) => {
-                unsupported = Some(unsupported_cades(error));
+                signatures.push(unsupported(None, unsupported_cades(error)));
                 continue;
             }
         };
@@ -349,15 +434,15 @@ fn verify_pdf(
         let verdict = signature.verify(cades::Content::Detached { digest: &digest }, ess);
         let mut pool = trust::MaterialPool::new();
         pool.add_material(document.validation_store());
-        signatures.push(report(
+        signatures.push(SignatureEntry::Judged(report(
             SignatureFacts {
                 signer: signature.signer_certificate(),
                 embedded_certificates: signature.embedded_certificates(),
                 material: signature.embedded_material(),
                 document_intact: verdict.document_intact,
                 signature_valid: verdict.signature_valid,
-                timestamps_present: verdict.signature_timestamps.present,
-                timestamps_verified: verdict.signature_timestamps.verified,
+                claimed_signing_time: signature.signing_time().or(found.signing_time_entry),
+                timestamps: verdict.signature_timestamps,
                 covering_document_timestamps: document_timestamps
                     .iter()
                     .filter(|stamp| stamp.covers_up_to >= found.byte_range.end())
@@ -368,20 +453,12 @@ fn verify_pdf(
             pool,
             anchors,
             now,
-        ));
+        )));
     }
     if signatures.is_empty() {
-        return Err(unsupported.map_or(DocumentFailure::NoSignatures, |what| {
-            DocumentFailure::UnsupportedProfile(what)
-        }));
+        return Err(DocumentFailure::NoSignatures);
     }
-    Ok(DocumentReport {
-        signatures,
-        document_timestamps: document_timestamps
-            .iter()
-            .map(|stamp| stamp.generated_at)
-            .collect(),
-    })
+    Ok(DocumentReport { signatures })
 }
 
 /// One verified document timestamp and how far into the file its
@@ -409,51 +486,48 @@ fn verify_asic(
         asic::AsicReadError::Unsupported(what) => DocumentFailure::UnsupportedProfile(what),
     })?;
     let mut signatures = Vec::new();
-    let mut unsupported = None;
     for entry in container.xades_signature_files() {
         let Ok(found) = xades::signatures(entry) else {
-            unsupported = Some("XAdES signature file");
+            signatures.push(unsupported(None, "XAdES signature file"));
             continue;
         };
         for signature in found {
             if let Some(what) = signature.unsupported() {
-                unsupported = Some(what);
+                signatures.push(unsupported(Some(signature.signer_certificate()), what));
                 continue;
             }
             let verdict = signature.verify(&container);
-            signatures.push(report(
+            signatures.push(SignatureEntry::Judged(report(
                 SignatureFacts {
                     signer: signature.signer_certificate(),
                     embedded_certificates: signature.embedded_certificates(),
                     material: signature.embedded_material(),
                     document_intact: verdict.document_intact,
                     signature_valid: verdict.signature_valid,
-                    timestamps_present: verdict.signature_timestamps.present,
-                    timestamps_verified: verdict
-                        .signature_timestamps
-                        .verified
-                        .iter()
-                        .map(|token| token.generated_at)
-                        .collect(),
+                    claimed_signing_time: signature.signing_time(),
+                    timestamps: verdict.signature_timestamps,
                     covering_document_timestamps: Vec::new(),
                     covers_whole_document: true,
                 },
                 trust::MaterialPool::new(),
                 anchors,
                 now,
-            ));
+            )));
         }
     }
     for entry in container.cades_signatures() {
         let signature = match cades::CadesSignature::parse(entry.signature.content.clone()) {
             Ok(signature) => signature,
             Err(error) => {
-                unsupported = Some(unsupported_cades(error));
+                signatures.push(unsupported(None, unsupported_cades(error)));
                 continue;
             }
         };
         let Some(manifest) = &entry.manifest else {
-            unsupported = Some("CAdES signature without a manifest");
+            signatures.push(unsupported(
+                Some(signature.signer_certificate()),
+                "CAdES signature without a manifest",
+            ));
             continue;
         };
         let digest =
@@ -462,32 +536,27 @@ fn verify_asic(
             cades::Content::Detached { digest: &digest },
             cades::EssBinding::Required,
         );
-        signatures.push(report(
+        signatures.push(SignatureEntry::Judged(report(
             SignatureFacts {
                 signer: signature.signer_certificate(),
                 embedded_certificates: signature.embedded_certificates(),
                 material: signature.embedded_material(),
                 document_intact: verdict.document_intact && container.manifest_intact(entry),
                 signature_valid: verdict.signature_valid,
-                timestamps_present: verdict.signature_timestamps.present,
-                timestamps_verified: verdict.signature_timestamps.verified,
+                claimed_signing_time: signature.signing_time(),
+                timestamps: verdict.signature_timestamps,
                 covering_document_timestamps: Vec::new(),
                 covers_whole_document: true,
             },
             trust::MaterialPool::new(),
             anchors,
             now,
-        ));
+        )));
     }
     if signatures.is_empty() {
-        return Err(unsupported.map_or(DocumentFailure::NoSignatures, |what| {
-            DocumentFailure::UnsupportedProfile(what)
-        }));
+        return Err(DocumentFailure::NoSignatures);
     }
-    Ok(DocumentReport {
-        signatures,
-        document_timestamps: Vec::new(),
-    })
+    Ok(DocumentReport { signatures })
 }
 
 /// Judge a bare `CMS` structure carrying the document as its
@@ -507,8 +576,8 @@ fn verify_attached_cades(
             material: signature.embedded_material(),
             document_intact: verdict.document_intact,
             signature_valid: verdict.signature_valid,
-            timestamps_present: verdict.signature_timestamps.present,
-            timestamps_verified: verdict.signature_timestamps.verified,
+            claimed_signing_time: signature.signing_time(),
+            timestamps: verdict.signature_timestamps,
             covering_document_timestamps: Vec::new(),
             covers_whole_document: true,
         },
@@ -517,8 +586,16 @@ fn verify_attached_cades(
         now,
     );
     Ok(DocumentReport {
-        signatures: vec![report],
-        document_timestamps: Vec::new(),
+        signatures: vec![SignatureEntry::Judged(report)],
+    })
+}
+
+/// The entry of a signature of a profile this module does not
+/// implement, naming the holder when the signer certificate is known.
+fn unsupported(signer: Option<&OwnedCert>, profile: &'static str) -> SignatureEntry {
+    SignatureEntry::Unsupported(UnsupportedSignature {
+        signer: signer.map(SignerIdentity::of),
+        profile,
     })
 }
 
@@ -547,10 +624,10 @@ struct SignatureFacts<'a> {
     document_intact: bool,
     /// Whether the signature verifies under the signer.
     signature_valid: bool,
-    /// How many signature timestamps are present.
-    timestamps_present: usize,
-    /// The generation times of the signature timestamps that verified.
-    timestamps_verified: Vec<DateTime>,
+    /// The signing time the signature claims.
+    claimed_signing_time: Option<DateTime>,
+    /// Every signature timestamp, in encoded order.
+    timestamps: Vec<TimestampCheck>,
     /// The generation times of verified document timestamps covering
     /// this signature.
     covering_document_timestamps: Vec<DateTime>,
@@ -567,14 +644,6 @@ fn report(
     anchors: TrustAnchors<'_>,
     now: DateTime,
 ) -> SignatureReport {
-    let proof_of_existence = facts
-        .timestamps_verified
-        .iter()
-        .chain(facts.covering_document_timestamps.iter())
-        .copied()
-        .min();
-    let timestamps_valid =
-        proof_of_existence.is_some() && facts.timestamps_verified.len() == facts.timestamps_present;
     pool.add_material(&facts.material);
     pool.add_certificates(facts.embedded_certificates);
     pool.add_certificates(
@@ -584,6 +653,33 @@ fn report(
             .map(|der| der.to_vec())
             .collect::<Vec<_>>(),
     );
+    let signature_timestamps: Vec<SignatureTimestamp> = facts
+        .timestamps
+        .iter()
+        .map(|check| match check {
+            TimestampCheck::Verified(token) => SignatureTimestamp::Proven {
+                generated_at: token.generated_at,
+                chain: trust::token_path(token, &pool, anchors),
+            },
+            TimestampCheck::Unverified { claimed_at } => SignatureTimestamp::Unproven {
+                claimed_at: *claimed_at,
+            },
+        })
+        .collect();
+    let proven: Vec<DateTime> = signature_timestamps
+        .iter()
+        .filter_map(|timestamp| match timestamp {
+            SignatureTimestamp::Proven { generated_at, .. } => Some(*generated_at),
+            SignatureTimestamp::Unproven { .. } => None,
+        })
+        .collect();
+    let proof_of_existence = proven
+        .iter()
+        .chain(facts.covering_document_timestamps.iter())
+        .copied()
+        .min();
+    let timestamps_valid =
+        proof_of_existence.is_some() && proven.len() == signature_timestamps.len();
     let chain = trust::judge(
         facts.signer,
         &pool,
@@ -593,11 +689,14 @@ fn report(
     SignatureReport {
         signer: SignerIdentity::of(facts.signer),
         signer_certificate: facts.signer.clone(),
-        issuer_certificate: chain.issuer,
+        chain: chain.path,
         document_intact: facts.document_intact,
         signature_valid: facts.signature_valid,
         chain_verified: chain.anchored,
+        claimed_signing_time: facts.claimed_signing_time,
         proof_of_existence,
+        signature_timestamps,
+        document_timestamps: facts.covering_document_timestamps,
         timestamps_valid,
         covers_whole_document: facts.covers_whole_document,
         revocation: chain.revocation,
@@ -605,27 +704,13 @@ fn report(
 }
 
 impl SignerIdentity {
-    /// The holder a certificate names: given names and surname when
-    /// present, else the common name; and the electronic identifier.
+    /// The holder a certificate names: its [`subject_name`], and the
+    /// electronic identifier.
     #[must_use]
     pub fn of(certificate: &OwnedCert) -> Self {
-        let subject = certificate.view().subject;
-        let given = subject.given_names();
-        let mut parts: Vec<String> = Vec::new();
-        parts.extend(given.first.map(|name| name.as_str().to_owned()));
-        parts.extend(given.second.map(|name| name.as_str().to_owned()));
-        parts.extend(given.additional.iter().map(|name| name.as_str().to_owned()));
-        parts.extend(subject.surname().map(|name| name.as_str().to_owned()));
-        let name = if parts.is_empty() {
-            subject
-                .common_name()
-                .map_or_else(String::new, |name| name.as_str().to_owned())
-        } else {
-            parts.join(" ")
-        };
         Self {
-            name,
-            identifier: subject.peuin(),
+            name: subject_name(certificate),
+            identifier: certificate.view().subject.peuin(),
         }
     }
 }
@@ -633,8 +718,9 @@ impl SignerIdentity {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentFailure, DocumentFile, DocumentReport, Revocation, SignatureReport, SignerIdentity,
-        TrustAnchors, verify,
+        CertificatePath, DocumentFailure, DocumentFile, DocumentReport, Revocation, SignatureEntry,
+        SignatureReport, SignatureTimestamp, SignerIdentity, TrustAnchors, UnsupportedSignature,
+        subject_name, verify,
     };
     use crate::document::trust::testkit::{
         CertificateSpec, Curve, OcspSpec, PRINTABLE_STRING, TestKey, UTF8_STRING, ca_extensions,
@@ -718,6 +804,12 @@ mod tests {
     const PERSON: &str = "Surname Given 12345678X";
     /// A synthetic electronic identifier of the right shape.
     const IDENTIFIER: &str = "12345678X";
+    /// A country name.
+    const COUNTRY: &str = "FI";
+    /// An organization name with a character RFC 4514 escapes.
+    const ORGANIZATION: &str = "Synthetic, Org";
+    /// [`ORGANIZATION`] as RFC 4514 writes it.
+    const ESCAPED_ORGANIZATION: &str = "Synthetic\\, Org";
 
     /// Which signer signs.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -946,8 +1038,15 @@ mod tests {
 
     /// The one signature of a report.
     fn only(report: &DocumentReport) -> &SignatureReport {
-        assert_eq!(report.signatures.len(), 1, "one signature");
-        report.signatures.first().expect("one signature")
+        let [SignatureEntry::Judged(signature)] = report.signatures.as_slice() else {
+            panic!("one judged signature");
+        };
+        signature
+    }
+
+    /// The subject names along `path`.
+    fn names(path: &CertificatePath) -> Vec<String> {
+        path.certificates.iter().map(subject_name).collect()
     }
 
     /// Change one byte inside the first signed span.
@@ -977,7 +1076,11 @@ mod tests {
         assert!(signature.covers_whole_document);
         assert_eq!(signature.revocation, Revocation::Unavailable);
         assert_eq!(signature.signer.name, DIRECT_SIGNER);
-        assert!(report.document_timestamps.is_empty());
+        assert_eq!(signature.claimed_signing_time, Some(day(STAMPED)));
+        assert!(signature.signature_timestamps.is_empty());
+        assert!(signature.document_timestamps.is_empty());
+        assert_eq!(names(&signature.chain), vec![ROOT.to_owned()]);
+        assert!(signature.chain.anchored);
     }
 
     #[test]
@@ -993,6 +1096,35 @@ mod tests {
         assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
         assert!(signature.timestamps_valid);
         assert!(signature.is_valid());
+        let [
+            SignatureTimestamp::Proven {
+                generated_at,
+                chain,
+            },
+        ] = signature.signature_timestamps.as_slice()
+        else {
+            panic!("one proven timestamp");
+        };
+        assert_eq!(*generated_at, day(STAMPED));
+        assert_eq!(names(chain), vec![TSA.to_owned(), ROOT.to_owned()]);
+        assert!(chain.anchored);
+    }
+
+    #[test]
+    fn a_timestamp_whose_root_is_unknown_ends_unanchored() {
+        let world = World::new();
+        let report = verify_with(
+            world.pdf(Signer::Direct, true, &ValidationMaterial::default()),
+            &[&world.stranger],
+        )
+        .expect("report");
+        let signature = only(&report);
+        let [SignatureTimestamp::Proven { chain, .. }] = signature.signature_timestamps.as_slice()
+        else {
+            panic!("one proven timestamp");
+        };
+        assert_eq!(names(chain), vec![TSA.to_owned()]);
+        assert!(!chain.anchored);
     }
 
     #[test]
@@ -1035,7 +1167,7 @@ mod tests {
         assert_eq!(signature.proof_of_existence, Some(day(STAMPED)));
         assert!(signature.timestamps_valid);
         assert!(!signature.covers_whole_document);
-        assert_eq!(report.document_timestamps, vec![day(STAMPED)]);
+        assert_eq!(signature.document_timestamps, vec![day(STAMPED)]);
     }
 
     #[test]
@@ -1061,9 +1193,10 @@ mod tests {
         assert!(signature.signature_valid);
         assert!(!signature.chain_verified);
         assert_eq!(
-            signature.issuer_certificate.as_ref().map(OwnedCert::as_der),
-            Some(world.intermediate.as_slice())
+            names(&signature.chain),
+            vec![INTERMEDIATE.to_owned(), ROOT.to_owned()]
         );
+        assert!(!signature.chain.anchored);
         assert!(!report.is_valid());
     }
 
@@ -1074,6 +1207,7 @@ mod tests {
             .verify_trusting_root(world.note(Format::AsicEXades))
             .expect("report");
         let signature = only(&report);
+        assert_eq!(signature.claimed_signing_time, Some(day(STAMPED)));
         assert!(signature.document_intact);
         assert!(signature.signature_valid);
         assert!(signature.chain_verified);
@@ -1086,6 +1220,7 @@ mod tests {
             .verify_trusting_root(world.note(Format::AsicECades))
             .expect("report");
         let signature = only(&report);
+        assert_eq!(signature.claimed_signing_time, Some(day(STAMPED)));
         assert!(signature.document_intact);
         assert!(signature.signature_valid);
         assert!(signature.chain_verified);
@@ -1098,6 +1233,7 @@ mod tests {
             .verify_trusting_root(world.note(Format::Cades))
             .expect("report");
         let signature = only(&report);
+        assert_eq!(signature.claimed_signing_time, Some(day(STAMPED)));
         assert!(signature.document_intact);
         assert!(signature.signature_valid);
         assert!(signature.chain_verified);
@@ -1122,13 +1258,29 @@ mod tests {
         let pdf = world.pdf(Signer::Issued, true, &world.lt_material(true, false));
         let report = world.verify_trusting_root(pdf).expect("report");
         let signature = only(&report);
-        assert_eq!(signature.revocation, Revocation::Revoked);
+        assert_eq!(
+            signature.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ISSUED)
+            }
+        );
         assert!(signature.is_valid());
         assert!(!report.is_valid());
     }
 
     #[test]
-    fn the_signer_identity_prefers_given_names_and_surname() {
+    fn an_unsupported_signature_makes_the_document_invalid() {
+        let report = DocumentReport {
+            signatures: vec![SignatureEntry::Unsupported(UnsupportedSignature {
+                signer: None,
+                profile: "PDF signature subfilter",
+            })],
+        };
+        assert!(!report.is_valid());
+    }
+
+    #[test]
+    fn the_signer_identity_is_the_common_name_verbatim() {
         let key = TestKey::generate(Curve::P256);
         let person = certificate_named(
             &spec(PERSON_SERIAL, PERSON, PERSON, Vec::new()),
@@ -1142,7 +1294,7 @@ mod tests {
             &key,
         );
         let identity = SignerIdentity::of(&OwnedCert::from_der(person).expect("parses"));
-        assert_eq!(identity.name, format!("{GIVEN} {SURNAME}"));
+        assert_eq!(identity.name, PERSON);
         assert_eq!(
             identity.identifier.as_ref().map(|peuin| peuin.as_str()),
             Some(IDENTIFIER)
@@ -1156,5 +1308,28 @@ mod tests {
         let identity = SignerIdentity::of(&OwnedCert::from_der(plain).expect("parses"));
         assert_eq!(identity.name, DIRECT_SIGNER);
         assert!(identity.identifier.is_none());
+    }
+
+    #[test]
+    fn without_a_common_name_the_subject_is_named_as_rfc_4514() {
+        let key = TestKey::generate(Curve::P256);
+        let person = certificate_named(
+            &spec(PERSON_SERIAL, PERSON, PERSON, Vec::new()),
+            &name_of(&[
+                (known::COUNTRY_NAME, PRINTABLE_STRING, COUNTRY),
+                (known::ORGANIZATION_NAME, UTF8_STRING, ORGANIZATION),
+                (known::SURNAME, UTF8_STRING, SURNAME),
+            ]),
+            &key,
+            &key,
+        );
+        let identity = SignerIdentity::of(&OwnedCert::from_der(person).expect("parses"));
+        assert_eq!(
+            identity.name,
+            format!(
+                "{}={SURNAME},O={ESCAPED_ORGANIZATION},C={COUNTRY}",
+                known::SURNAME
+            )
+        );
     }
 }

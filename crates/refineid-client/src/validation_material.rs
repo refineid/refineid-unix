@@ -123,7 +123,12 @@ pub enum MaterialError {
     /// Not a failure of the machinery: the answer arrived, was checked,
     /// and says the key should no longer be used. Embedding it would
     /// build a long-term signature whose own evidence refutes it.
-    Revoked(String),
+    Revoked {
+        /// The revocation time the answer states.
+        revoked_at: DateTime,
+        /// Where the answer came from and what it said.
+        detail: String,
+    },
 }
 
 impl core::fmt::Display for MaterialError {
@@ -138,7 +143,7 @@ impl core::fmt::Display for MaterialError {
             Self::ChainTooDeep => f.write_str("certificate chain exceeds the depth limit"),
             Self::Rng(detail) => write!(f, "no random nonce: {detail}"),
             Self::Revocation(detail) => write!(f, "revocation: {detail}"),
-            Self::Revoked(detail) => write!(f, "certificate revoked: {detail}"),
+            Self::Revoked { detail, .. } => write!(f, "certificate revoked: {detail}"),
         }
     }
 }
@@ -928,7 +933,7 @@ fn collect_ocsp_status(
             reference_time,
         ) {
             Ok(()) => return Ok((Some(response), None)),
-            Err(revoked @ MaterialError::Revoked(_)) => return Err(revoked),
+            Err(revoked @ MaterialError::Revoked { .. }) => return Err(revoked),
             Err(why) => failures.push(format!("{url}: {why}")),
         }
     }
@@ -984,9 +989,10 @@ fn collect_crl_status(
         match revocation::check_against_crl(*subject, &verified, reference_time) {
             RevocationStatus::Good => return Ok(Some(der)),
             RevocationStatus::Revoked { at, reason } => {
-                return Err(MaterialError::Revoked(format!(
-                    "{url}: revoked {at} ({reason:?})"
-                )));
+                return Err(MaterialError::Revoked {
+                    revoked_at: at,
+                    detail: format!("{url}: revoked {at} ({reason:?})"),
+                });
             }
             other => failures.push(format!("{url}: list unusable ({other:?})")),
         }
@@ -1128,9 +1134,10 @@ fn check_response(
     // response carried the same serial more than once.
     match answer.status {
         ocsp::CertStatus::Good => Ok(()),
-        ocsp::CertStatus::Revoked { revoked_at, .. } => {
-            Err(MaterialError::Revoked(format!("revoked at {revoked_at}")))
-        }
+        ocsp::CertStatus::Revoked { revoked_at, .. } => Err(MaterialError::Revoked {
+            revoked_at,
+            detail: format!("revoked at {revoked_at}"),
+        }),
         ocsp::CertStatus::Unknown => Err(MaterialError::Revocation(
             "responder does not know this certificate".to_owned(),
         )),

@@ -361,6 +361,82 @@ impl<'a> Name<'a> {
         crate::country::IsoAlpha2::new(self.dn_attribute(OID_COUNTRY_NAME)?.trim()).ok()
     }
 
+    /// The name as an RFC 4514 string: relative distinguished names
+    /// last first, separated by `,`, multi-valued ones joined by `+`.
+    /// Attribute types of RFC 4514 sec.3 appear by their short names,
+    /// others in dotted decimal; a value that is not a directory
+    /// string appears as `#` and the hexadecimal of its DER
+    /// (RFC 4514 sec.2.4). A name that does not decode yields an
+    /// empty string.
+    #[must_use]
+    pub fn rfc4514(&self) -> String {
+        use spki::der::asn1::AnyRef;
+        use spki::der::{Decode as _, Reader as _, SliceReader, Tag, Tagged as _};
+
+        /// Separator between relative distinguished names.
+        const RDN_SEPARATOR: &str = ",";
+        /// Separator between the values of one multi-valued RDN.
+        const MULTI_VALUE_SEPARATOR: &str = "+";
+        /// Marker of a value given as its DER in hexadecimal.
+        const DER_VALUE_MARKER: char = '#';
+
+        let Ok(name) = AnyRef::from_der(self.dn_der) else {
+            return String::new();
+        };
+        if name.tag() != Tag::Sequence {
+            return String::new();
+        }
+        let Ok(mut rdns) = SliceReader::new(name.value()) else {
+            return String::new();
+        };
+        let mut rendered: Vec<String> = Vec::new();
+        while !rdns.is_finished() {
+            let Some(rdn) = rdns
+                .tlv_bytes()
+                .ok()
+                .and_then(|bytes| AnyRef::from_der(bytes).ok())
+            else {
+                return String::new();
+            };
+            let Ok(mut atvs) = SliceReader::new(rdn.value()) else {
+                return String::new();
+            };
+            let mut values: Vec<String> = Vec::new();
+            while !atvs.is_finished() {
+                let Some(atv) = atvs
+                    .tlv_bytes()
+                    .ok()
+                    .and_then(|bytes| AnyRef::from_der(bytes).ok())
+                else {
+                    return String::new();
+                };
+                let Ok(mut fields) = SliceReader::new(atv.value()) else {
+                    return String::new();
+                };
+                let (Some(oid_tlv), Some(value_tlv)) =
+                    (fields.tlv_bytes().ok(), fields.tlv_bytes().ok())
+                else {
+                    return String::new();
+                };
+                let (Ok(oid), Ok(value)) = (AnyRef::from_der(oid_tlv), AnyRef::from_der(value_tlv))
+                else {
+                    return String::new();
+                };
+                let Ok(oid) = Oid::new(oid.value()) else {
+                    return String::new();
+                };
+                let value = X509Helpers::decode_directory_string(value).map_or_else(
+                    || format!("{DER_VALUE_MARKER}{}", crate::hex::Hex::encode(value_tlv)),
+                    |text| escape_rfc4514_value(&text),
+                );
+                values.push(format!("{}={value}", rfc4514_attribute_type(oid)));
+            }
+            rendered.push(values.join(MULTI_VALUE_SEPARATOR));
+        }
+        rendered.reverse();
+        rendered.join(RDN_SEPARATOR)
+    }
+
     /// Return the first DN attribute whose OID body matches `oid_body`.
     fn dn_attribute(&self, oid_body: Oid<'_>) -> Option<String> {
         use spki::der::asn1::AnyRef;
@@ -396,6 +472,48 @@ impl<'a> Name<'a> {
         }
         found
     }
+}
+
+/// The RFC 4514 sec.3 short name of an attribute type, or its dotted
+/// decimal form.
+fn rfc4514_attribute_type(oid: Oid<'_>) -> String {
+    /// The short names RFC 4514 sec.3 lists.
+    const SHORT_NAMES: [(Oid<'static>, &str); 9] = [
+        (known::COMMON_NAME, "CN"),
+        (known::LOCALITY_NAME, "L"),
+        (known::STATE_OR_PROVINCE_NAME, "ST"),
+        (known::ORGANIZATION_NAME, "O"),
+        (known::ORGANIZATIONAL_UNIT_NAME, "OU"),
+        (known::COUNTRY_NAME, "C"),
+        (known::STREET_ADDRESS, "STREET"),
+        (known::DOMAIN_COMPONENT, "DC"),
+        (known::USER_ID, "UID"),
+    ];
+    SHORT_NAMES
+        .iter()
+        .find(|(known, _)| *known == oid)
+        .map_or_else(|| oid.to_string(), |(_, short)| (*short).to_owned())
+}
+
+/// Escape a string value as RFC 4514 sec.2.4 requires: a leading space
+/// or `#`, a trailing space, and every `"`, `+`, `,`, `;`, `<`, `>` and
+/// `\` take a backslash.
+fn escape_rfc4514_value(value: &str) -> String {
+    /// The characters escaped wherever they occur.
+    const SPECIAL: [char; 7] = ['"', '+', ',', ';', '<', '>', '\\'];
+    /// The escape character.
+    const ESCAPE: char = '\\';
+    let last = value.chars().count().saturating_sub(1);
+    let mut out = String::with_capacity(value.len());
+    for (index, character) in value.chars().enumerate() {
+        let leading = index == 0 && (character == ' ' || character == '#');
+        let trailing = index == last && character == ' ';
+        if leading || trailing || SPECIAL.contains(&character) {
+            out.push(ESCAPE);
+        }
+        out.push(character);
+    }
+    out
 }
 
 /// Boundary parser: mint a [`Name`] from raw DN DER, validating it

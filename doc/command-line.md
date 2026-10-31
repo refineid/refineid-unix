@@ -24,6 +24,14 @@ Citations are BibTeX keys in [`references.md`](references.md).
 - **Quiet on success.** An operation prints nothing when it works and
   reports its steps with `-v`. The exit status tells success from
   failure, so `&&` and `||` compose.
+- **Reports are records.** A command that reports facts, such as
+  `refineid document verify`, prints one record per thing judged,
+  records separated by one blank line, each line `key: value` with a
+  lower-case key and nothing else: no indentation, no padding to a
+  column, no tabs. Values are printed as their source spells them; a
+  signer's name is the certificate's common name verbatim, never
+  reordered or joined with other attributes. Times are ISO 8601 in
+  UTC.
 - **Secrets at the terminal only.** A PIN is asked once the card is in
   hand, read from the terminal, never from the command line, and
   nothing is echoed while it is typed.
@@ -112,6 +120,20 @@ say says nothing; the convention is recorded as the Rule of Silence
 ([raymond2003unix](references.md#raymond2003unix)). It is convention,
 not measurement, and we follow it because the shell's composition
 depends on it.
+
+**Records for classic tools.** A line that reads `key: value` is
+found by `grep '^signer: '`, split by `awk -F': '` and `cut -d:`, and a
+blank line ends a record for `awk -v RS=`. Indentation and padding
+make a line's meaning depend on its neighbours and on column widths
+that change with the data; a tab is invisible on the screen and in
+the scrollback, and a value with a space in it breaks a
+whitespace-split reader either way. One key per line keeps every
+line meaningful alone, and the same keys serve the eye and the
+script. A value the program reformats, such as a name reordered from
+the certificate's attributes, is a value the reader can no longer
+match against the certificate, so values are printed as the source
+spells them. This is convention, not measurement; we know of no
+study of it.
 
 **No echo for a PIN.** This is not a research question. An echoed
 mask puts the PIN's length on the screen, in the scrollback and in any
