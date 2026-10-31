@@ -21,6 +21,7 @@
 use core::fmt::Display;
 use std::path::PathBuf;
 
+use refineid_lib_core::crl::CrlReason;
 use refineid_lib_core::document::{
     CertificatePath, DocumentReport, DocumentTimestamp, Revocation, SignatureEntry,
     SignatureReport, SignatureTimestamp, SignerIdentity, SubjectName, UnsupportedSignature,
@@ -43,7 +44,8 @@ record per signature, records separated by a blank line, each line
 
   file: the file as named
   signer: the certificate's common name as it reads
-  signed: the time a timestamp proves, or -
+  signed: the time a timestamp proves, or - when the signature is
+    judged as of now
   verdict: valid, not valid, revoked or unsupported
   reason: one line per cause of not valid or unsupported
   revocation: not checked, when a valid signature's revocation
@@ -238,8 +240,6 @@ enum Reason {
     SignatureInvalid,
     /// The signer does not chain to a trust anchor.
     ChainUnverified,
-    /// No verified timestamp proves the signature's time.
-    NoProvenTime,
     /// The signature's profile is not implemented.
     ProfileNotSupported,
 }
@@ -251,7 +251,6 @@ impl Reason {
             Self::DocumentChanged => "document changed",
             Self::SignatureInvalid => "signature invalid",
             Self::ChainUnverified => "certificate chain unverified",
-            Self::NoProvenTime => "no proven time",
             Self::ProfileNotSupported => "profile not supported",
         }
     }
@@ -374,7 +373,9 @@ fn judged_record(file: &str, signature: &SignatureReport, verbose: bool) -> Reco
         Key::Revocation,
         match signature.revocation {
             Revocation::Good { checked_at } => format!("good {checked_at}"),
-            Revocation::Revoked { revoked_at } => format!("revoked {revoked_at}"),
+            Revocation::Revoked { revoked_at, reason } => {
+                format!("revoked {revoked_at} {}", reason_name(reason))
+            }
             Revocation::Unavailable => "not checked".to_owned(),
         },
     );
@@ -401,7 +402,7 @@ fn signer_name(signer: &SignerIdentity) -> &str {
 
 /// The verdict the facts reach: revoked first, then not valid.
 fn verdict(signature: &SignatureReport) -> Verdict {
-    if matches!(signature.revocation, Revocation::Revoked { .. }) {
+    if signature.is_revoked() {
         Verdict::Revoked
     } else if signature.is_valid() {
         Verdict::Valid
@@ -416,7 +417,6 @@ fn reasons(signature: &SignatureReport) -> Vec<Reason> {
         (signature.document_intact, Reason::DocumentChanged),
         (signature.signature_valid, Reason::SignatureInvalid),
         (signature.chain_verified, Reason::ChainUnverified),
-        (signature.timestamps_valid, Reason::NoProvenTime),
     ]
     .into_iter()
     .filter_map(|(holds, reason)| (!holds).then_some(reason))
@@ -445,6 +445,16 @@ fn chain_name(name: SubjectName) -> String {
     match name {
         SubjectName::CommonName(name) => name.replace('>', r"\>"),
         SubjectName::Distinguished(name) => name,
+    }
+}
+
+/// The revocation reason as RFC 5280 sec.5.3.1 names it. An answer
+/// that states none is `unspecified`: RFC 5280 has the extension left
+/// out in place of that code.
+const fn reason_name(reason: Option<CrlReason>) -> &'static str {
+    match reason {
+        Some(reason) => reason.name(),
+        None => CrlReason::Unspecified.name(),
     }
 }
 
@@ -489,6 +499,8 @@ mod tests {
     const MONTH: u8 = 6;
     /// The hour of every fixture time.
     const HOUR: u8 = 12;
+    /// The day a revoked signer was revoked, before the timestamp.
+    const REVOKED: u8 = 8;
     /// The claimed signing day.
     const CLAIMED: u8 = 9;
     /// The signature timestamp day.
@@ -534,7 +546,6 @@ mod tests {
                 chain: dvv_path(true)?,
             }],
             document_timestamps: Vec::new(),
-            timestamps_valid: true,
             covers_whole_document: true,
             revocation: Revocation::Good {
                 checked_at: at(ANSWERED)?,
@@ -569,8 +580,44 @@ verdict: valid
     fn every_reason_of_a_not_valid_signature_is_a_line() -> TestResult {
         let mut signature = valid()?;
         signature.document_intact = false;
-        signature.timestamps_valid = false;
+        signature.chain_verified = false;
+        check(
+            &rendered(vec![SignatureEntry::Judged(signature)], false).as_str(),
+            &"\
+file: /documents/a.pdf
+signer: SURNAME GIVEN 12345678X
+signed: 2026-06-10T12:00:00Z
+verdict: not valid
+reason: document changed
+reason: certificate chain unverified
+",
+            "record",
+        )
+    }
+
+    #[test]
+    fn an_untimestamped_signature_is_valid_with_no_signed_time() -> TestResult {
+        let mut signature = valid()?;
         signature.proof_of_existence = None;
+        signature.signature_timestamps = Vec::new();
+        check(
+            &rendered(vec![SignatureEntry::Judged(signature)], false).as_str(),
+            &"\
+file: /documents/a.pdf
+signer: SURNAME GIVEN 12345678X
+signed: -
+verdict: valid
+",
+            "record",
+        )
+    }
+
+    #[test]
+    fn an_untimestamped_signature_with_an_unverified_chain_names_the_chain() -> TestResult {
+        let mut signature = valid()?;
+        signature.proof_of_existence = None;
+        signature.signature_timestamps = Vec::new();
+        signature.chain_verified = false;
         check(
             &rendered(vec![SignatureEntry::Judged(signature)], false).as_str(),
             &"\
@@ -578,11 +625,86 @@ file: /documents/a.pdf
 signer: SURNAME GIVEN 12345678X
 signed: -
 verdict: not valid
-reason: document changed
-reason: no proven time
+reason: certificate chain unverified
 ",
             "record",
         )
+    }
+
+    #[test]
+    fn a_revocation_after_the_proven_time_leaves_the_verdict_valid() -> TestResult {
+        let mut signature = valid()?;
+        signature.revocation = Revocation::Revoked {
+            revoked_at: at(ANSWERED)?,
+            reason: None,
+        };
+        let out = rendered(vec![SignatureEntry::Judged(signature)], true);
+        check_true(
+            out.contains("\nverdict: valid\n")
+                && out.contains("\nrevocation: revoked 2026-06-11T12:00:00Z unspecified\n"),
+            "valid, with the later revocation listed",
+        )
+    }
+
+    #[test]
+    fn a_revoked_line_names_the_reason_as_rfc_5280_does() -> TestResult {
+        for (reason, name) in [
+            (Some(CrlReason::KeyCompromise), "keyCompromise"),
+            (Some(CrlReason::CaCompromise), "cACompromise"),
+            (Some(CrlReason::AffiliationChanged), "affiliationChanged"),
+            (Some(CrlReason::Superseded), "superseded"),
+            (
+                Some(CrlReason::CessationOfOperation),
+                "cessationOfOperation",
+            ),
+            (Some(CrlReason::CertificateHold), "certificateHold"),
+            (Some(CrlReason::RemoveFromCrl), "removeFromCRL"),
+            (Some(CrlReason::PrivilegeWithdrawn), "privilegeWithdrawn"),
+            (Some(CrlReason::AaCompromise), "aACompromise"),
+            (Some(CrlReason::Unspecified), "unspecified"),
+            (Some(CrlReason::Unrecognised), "unknown"),
+            (None, "unspecified"),
+        ] {
+            let mut signature = valid()?;
+            signature.revocation = Revocation::Revoked {
+                revoked_at: at(REVOKED)?,
+                reason,
+            };
+            let out = rendered(vec![SignatureEntry::Judged(signature)], true);
+            check_true(
+                out.contains(&format!(
+                    "\nrevocation: revoked 2026-06-08T12:00:00Z {name}\n"
+                )),
+                name,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_compromise_after_the_proven_time_is_revoked() -> TestResult {
+        let mut signature = valid()?;
+        signature.revocation = Revocation::Revoked {
+            revoked_at: at(ANSWERED)?,
+            reason: Some(CrlReason::KeyCompromise),
+        };
+        check(
+            &verdict(&signature),
+            &Verdict::Revoked,
+            "compromise outweighs the proven time",
+        )
+    }
+
+    #[test]
+    fn without_a_proven_time_any_revocation_is_revoked() -> TestResult {
+        let mut signature = valid()?;
+        signature.proof_of_existence = None;
+        signature.signature_timestamps = Vec::new();
+        signature.revocation = Revocation::Revoked {
+            revoked_at: at(ANSWERED)?,
+            reason: None,
+        };
+        check(&verdict(&signature), &Verdict::Revoked, "revoked")
     }
 
     #[test]
@@ -590,7 +712,8 @@ reason: no proven time
         let mut signature = valid()?;
         signature.chain_verified = false;
         signature.revocation = Revocation::Revoked {
-            revoked_at: at(ANSWERED)?,
+            revoked_at: at(REVOKED)?,
+            reason: None,
         };
         check(
             &rendered(vec![SignatureEntry::Judged(signature)], false).as_str(),
@@ -734,7 +857,6 @@ error: not a signed document
                 claimed_at: None,
                 chain: None,
             });
-        signature.timestamps_valid = false;
         signature.document_timestamps = vec![
             DocumentTimestamp::Proven {
                 generated_at: at(ARCHIVED)?,
@@ -749,8 +871,7 @@ error: not a signed document
 file: /documents/a.pdf
 signer: SURNAME GIVEN 12345678X
 signed: 2026-06-10T12:00:00Z
-verdict: not valid
-reason: no proven time
+verdict: valid
 intact: yes
 signature: yes
 chain: DVV Citizen Certificates - G4E > DVV Gov. Root CA - G3 ECC
@@ -804,12 +925,13 @@ revocation: not checked
     fn a_revoked_record_carries_the_revocation_time_with_v() -> TestResult {
         let mut signature = valid()?;
         signature.revocation = Revocation::Revoked {
-            revoked_at: at(ANSWERED)?,
+            revoked_at: at(REVOKED)?,
+            reason: None,
         };
         let out = rendered(vec![SignatureEntry::Judged(signature)], true);
         check_true(
             out.contains("\nverdict: revoked\n")
-                && out.contains("\nrevocation: revoked 2026-06-11T12:00:00Z\n"),
+                && out.contains("\nrevocation: revoked 2026-06-08T12:00:00Z unspecified\n"),
             "revoked with its time",
         )
     }
@@ -821,23 +943,20 @@ revocation: not checked
         for intact in OUTCOMES {
             for signed in OUTCOMES {
                 for chained in OUTCOMES {
-                    for stamped in OUTCOMES {
-                        let mut signature = valid()?;
-                        signature.document_intact = intact;
-                        signature.signature_valid = signed;
-                        signature.chain_verified = chained;
-                        signature.timestamps_valid = stamped;
-                        signature.covers_whole_document = false;
-                        let not_valid = verdict(&signature) == Verdict::NotValid;
-                        check_true(
-                            !not_valid || !reasons(&signature).is_empty(),
-                            "a not valid verdict has a reason",
-                        )?;
-                        check_true(
-                            not_valid != signature.is_valid(),
-                            "covering the whole document is reported, not judged",
-                        )?;
-                    }
+                    let mut signature = valid()?;
+                    signature.document_intact = intact;
+                    signature.signature_valid = signed;
+                    signature.chain_verified = chained;
+                    signature.covers_whole_document = false;
+                    let not_valid = verdict(&signature) == Verdict::NotValid;
+                    check_true(
+                        !not_valid || !reasons(&signature).is_empty(),
+                        "a not valid verdict has a reason",
+                    )?;
+                    check_true(
+                        not_valid != signature.is_valid(),
+                        "covering the whole document is reported, not judged",
+                    )?;
                 }
             }
         }

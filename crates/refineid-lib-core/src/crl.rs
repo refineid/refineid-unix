@@ -68,9 +68,9 @@ const OID_CERTIFICATE_ISSUER: ObjectIdentifier = ObjectIdentifier::new_unwrap("2
 /// Shared by the CRL per-entry `reasonCode` extension and OCSP
 /// `RevokedInfo` (RFC 6960 sec.4.2.1 reuses the same ENUMERATED). A
 /// closed set: an unassigned code (the reserved `7`, or anything out
-/// of range) is treated as "no recognised reason" at the parse
-/// boundary -- the cert is still revoked, the reason is simply
-/// absent. `Display` renders `<name> (<0xNN>)`.
+/// of range) is [`Self::Unrecognised`] at the parse boundary -- the
+/// cert is still revoked, and the code itself is not kept. `Display`
+/// renders `<name> (<0xNN>)`, and `unknown` for an unassigned code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrlReason {
     /// `0` -- no specific reason given.
@@ -94,15 +94,17 @@ pub enum CrlReason {
     PrivilegeWithdrawn,
     /// `10` -- the attribute-authority key is compromised.
     AaCompromise,
+    /// A code RFC 5280 does not assign.
+    Unrecognised,
 }
 
 impl CrlReason {
-    /// Map a `CRLReason` ENUMERATED byte to its variant. `None` for
-    /// the reserved `7` or any out-of-range code (treated as "no
-    /// recognised reason" -- see the type docs).
+    /// Map a `CRLReason` ENUMERATED byte to its variant;
+    /// [`Self::Unrecognised`] for the reserved `7` or any out-of-range
+    /// code.
     #[must_use]
-    pub const fn from_code(code: u8) -> Option<Self> {
-        Some(match code {
+    pub const fn from_code(code: u8) -> Self {
+        match code {
             0 => Self::Unspecified,
             1 => Self::KeyCompromise,
             2 => Self::CaCompromise,
@@ -113,14 +115,15 @@ impl CrlReason {
             8 => Self::RemoveFromCrl,
             9 => Self::PrivilegeWithdrawn,
             10 => Self::AaCompromise,
-            _ => return None,
-        })
+            _ => Self::Unrecognised,
+        }
     }
 
-    /// The on-wire ENUMERATED code for this reason.
+    /// The on-wire ENUMERATED code for this reason; `None` for
+    /// [`Self::Unrecognised`], whose code is not kept.
     #[must_use]
-    pub const fn code(self) -> u8 {
-        match self {
+    pub const fn code(self) -> Option<u8> {
+        Some(match self {
             Self::Unspecified => 0,
             Self::KeyCompromise => 1,
             Self::CaCompromise => 2,
@@ -131,13 +134,26 @@ impl CrlReason {
             Self::RemoveFromCrl => 8,
             Self::PrivilegeWithdrawn => 9,
             Self::AaCompromise => 10,
-        }
+            Self::Unrecognised => return None,
+        })
     }
-}
 
-impl core::fmt::Display for CrlReason {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let name = match *self {
+    /// Whether the reason names a compromised key: the subject's
+    /// (`keyCompromise`), a CA's (`cACompromise`) or an attribute
+    /// authority's (`aACompromise`).
+    #[must_use]
+    pub const fn is_compromise(self) -> bool {
+        matches!(
+            self,
+            Self::KeyCompromise | Self::CaCompromise | Self::AaCompromise
+        )
+    }
+
+    /// The reason as RFC 5280 sec.5.3.1 names it; `unknown` for
+    /// [`Self::Unrecognised`].
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
             Self::Unspecified => "unspecified",
             Self::KeyCompromise => "keyCompromise",
             Self::CaCompromise => "cACompromise",
@@ -148,8 +164,17 @@ impl core::fmt::Display for CrlReason {
             Self::RemoveFromCrl => "removeFromCRL",
             Self::PrivilegeWithdrawn => "privilegeWithdrawn",
             Self::AaCompromise => "aACompromise",
-        };
-        write!(f, "{name} ({:#04x})", self.code())
+            Self::Unrecognised => "unknown",
+        }
+    }
+}
+
+impl core::fmt::Display for CrlReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.code() {
+            Some(code) => write!(f, "{} ({code:#04x})", self.name()),
+            None => f.write_str(self.name()),
+        }
     }
 }
 
@@ -310,9 +335,8 @@ pub struct RevokedEntry {
     /// `revocationDate` per RFC 5280 §5.3.1.
     pub revocation_date: DateTime,
     /// `CRLReason` from the `reasonCode` per-entry extension (OID
-    /// 2.5.29.21) when present and recognised. `None` when the
-    /// issuer didn't include the extension (or used an unassigned
-    /// code).
+    /// 2.5.29.21) when present. `None` when the issuer didn't
+    /// include the extension.
     pub reason: Option<CrlReason>,
 }
 
@@ -769,22 +793,55 @@ impl Iterator for RevokedIter<'_> {
 impl RevokedIter<'_> {
     /// Find the `reasonCode` extension (OID 2.5.29.21) among an
     /// entry's `crlEntryExtensions` and decode its ENUMERATED value
-    /// into a [`CrlReason`]. `None` if absent, unrecognised, or
-    /// malformed.
+    /// into a [`CrlReason`]. `None` if absent; a present extension
+    /// that is not a one-octet ENUMERATED is
+    /// [`CrlReason::Unrecognised`].
     fn find_reason_code(extensions: &[Extension]) -> Option<CrlReason> {
         let reason_ext = extensions
             .iter()
             .find(|ext| ext.extn_id == OID_CRL_REASONS)?;
         // extnValue OCTET STRING wraps the `CRLReason` ENUMERATED.
-        let inner = AnyRef::from_der(reason_ext.extn_value.as_bytes()).ok()?;
-        if inner.tag() != Tag::Enumerated {
-            return None;
-        }
-        let value = inner.value();
-        if value.len() == 1 {
-            value.first().copied().and_then(CrlReason::from_code)
-        } else {
-            None
+        let Ok(inner) = AnyRef::from_der(reason_ext.extn_value.as_bytes()) else {
+            return Some(CrlReason::Unrecognised);
+        };
+        Some(match (inner.tag(), inner.value()) {
+            (Tag::Enumerated, [code]) => CrlReason::from_code(*code),
+            _ => CrlReason::Unrecognised,
+        })
+    }
+}
+
+/// `CRLReason` encodings for the revocation fixtures of this crate's
+/// tests.
+#[cfg(test)]
+pub(crate) mod testkit {
+    use super::CrlReason;
+
+    /// The code RFC 5280 sec.5.3.1 leaves unassigned (value 7 is not
+    /// used).
+    pub(crate) const UNASSIGNED_REASON_CODE: u8 = 7;
+    /// An octet of value zero, put before a code to lengthen it.
+    pub(crate) const ZERO_OCTET: u8 = 0x00;
+
+    /// The content of the `CRLReason` ENUMERATED a fixture writes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ReasonOctets {
+        /// The one-octet code of the reason;
+        /// [`CrlReason::Unrecognised`] is written as
+        /// [`UNASSIGNED_REASON_CODE`].
+        Code(CrlReason),
+        /// The same code after a [`ZERO_OCTET`]: two octets.
+        Padded(CrlReason),
+    }
+
+    impl ReasonOctets {
+        /// The ENUMERATED content octets.
+        pub(crate) fn content(self) -> Vec<u8> {
+            let code = |reason: CrlReason| reason.code().unwrap_or(UNASSIGNED_REASON_CODE);
+            match self {
+                Self::Code(reason) => vec![code(reason)],
+                Self::Padded(reason) => vec![ZERO_OCTET, code(reason)],
+            }
         }
     }
 }
@@ -792,6 +849,7 @@ impl RevokedIter<'_> {
 #[cfg(test)]
 mod tests {
 
+    use super::testkit::ReasonOctets;
     use super::{Crl, CrlReason, CrlVerifyError, RevokedEntry, VerifiedCrl, X509Error};
     use crate::identity::CertSerial;
     use core::str::FromStr as _;
@@ -812,8 +870,8 @@ mod tests {
         serial: CertSerial,
         /// When it was revoked.
         revoked_at: DateTime,
-        /// Optional `CRLReason`.
-        reason: Option<CrlReason>,
+        /// Optional `CRLReason`, as encoded.
+        reason: Option<ReasonOctets>,
     }
 
     /// A distinct cert serial for fixtures. The value is arbitrary
@@ -861,7 +919,7 @@ mod tests {
                     .expect("fixture serial encodes"),
                 revocation_date: as_utc(e.revoked_at),
                 crl_entry_extensions: e.reason.map(|r| {
-                    let enumerated = Any::new(Tag::Enumerated, vec![r.code()])
+                    let enumerated = Any::new(Tag::Enumerated, r.content())
                         .expect("reason code fits an ENUMERATED");
                     vec![Extension {
                         extn_id: super::OID_CRL_REASONS,
@@ -1024,7 +1082,7 @@ mod tests {
             &[RevokedFixture {
                 serial: serial.clone(),
                 revoked_at: DateTime::new(2026, 5, 21, 5, 42, 53).expect("valid"),
-                reason: Some(CrlReason::Superseded),
+                reason: Some(ReasonOctets::Code(CrlReason::Superseded)),
             }],
             true,
         );
@@ -1034,9 +1092,31 @@ mod tests {
     }
 
     #[test]
+    fn a_reason_code_not_one_octet_or_unassigned_is_unrecognised() {
+        for written in [
+            ReasonOctets::Padded(CrlReason::KeyCompromise),
+            ReasonOctets::Code(CrlReason::Unrecognised),
+        ] {
+            let serial = fixture_serial(5);
+            let der = build_crl(
+                &[RevokedFixture {
+                    serial: serial.clone(),
+                    revoked_at: DateTime::new(2026, 5, 21, 5, 42, 53).expect("valid"),
+                    reason: Some(written),
+                }],
+                true,
+            );
+            let crl = Crl::parse(&der).expect("parses");
+            let entry = crl.find_serial(&serial).expect("found");
+            assert_eq!(entry.reason, Some(CrlReason::Unrecognised), "{written:?}");
+        }
+    }
+
+    #[test]
     fn crl_reason_renders_name_and_code() {
         assert_eq!(CrlReason::Superseded.to_string(), "superseded (0x04)");
-        assert_eq!(CrlReason::from_code(7), None);
+        assert_eq!(CrlReason::from_code(7), CrlReason::Unrecognised);
+        assert_eq!(CrlReason::Unrecognised.to_string(), "unknown");
     }
 
     #[test]

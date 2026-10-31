@@ -314,7 +314,8 @@ the signer certificate's common name exactly as the certificate
 spells it, or its whole subject when it has none.
 .It Li signed\&:
 the time a verified timestamp proves the signature existed, or
-.Li - .
+.Li -
+when the signature is judged as of now.
 .It Li verdict\&:
 .Li valid ,
 .Li not valid ,
@@ -329,8 +330,7 @@ or
 verdict:
 .Li document changed ,
 .Li signature invalid ,
-.Li certificate chain unverified ,
-.Li no proven time
+.Li certificate chain unverified
 or
 .Li profile not supported .
 .It Li revocation\&:
@@ -340,10 +340,21 @@ checked.
 .El
 .Pp
 A signature is valid when the document is unchanged since it was
-signed, the signature verifies, the signer chains to a DVV root, and
-a signature timestamp or a document timestamp covering it verifies.
-A signer the document carries no revocation answer for is looked up
-over OCSP or CRL.
+signed, the signature verifies, and the signer chains to a DVV root.
+A timestamp proves the signing time: the chain and revocation are
+judged at the earliest time a proven signature timestamp, or a proven
+document timestamp covering the signature, sets.
+Without one the signature is judged as of now.
+A revocation at or before the proven time makes the verdict
+.Li revoked ;
+one after it does not, unless its reason is
+.Li keyCompromise ,
+.Li cACompromise
+or
+.Li aACompromise .
+Without a proven time any revocation does.
+A signer on a verified chain the document carries no revocation
+answer for is looked up over OCSP or CRL.
 With
 .Fl v
 a record also carries, after the verdict and its reasons:
@@ -382,8 +393,25 @@ when the timestamp did not verify.
 .It Li revocation\&:
 .Li good
 and the time of the answer,
-.Li revoked
-and the revocation time, or
+.Li revoked ,
+the revocation time and the reason as RFC 5280 names it
+.Po
+.Li keyCompromise ,
+.Li cACompromise ,
+.Li affiliationChanged ,
+.Li superseded ,
+.Li cessationOfOperation ,
+.Li certificateHold ,
+.Li removeFromCRL ,
+.Li privilegeWithdrawn ,
+.Li aACompromise
+or
+.Li unspecified ,
+also when the answer states none;
+.Li unknown
+for a code RFC 5280 does not assign
+.Pc ,
+or
 .Li not checked .
 .It Li document-timestamp\&:
 one line per document timestamp covering the signature: its time and

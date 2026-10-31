@@ -30,7 +30,8 @@
 //! without this material becomes uncheckable. Collecting it at signing
 //! time freezes the evidence while it is still there to freeze.
 
-use refineid_lib_core::crl::{OwnedCrl, VerifiedCrl};
+use refineid_lib_core::crl::{CrlReason, OwnedCrl, VerifiedCrl};
+use refineid_lib_core::document::Revocation;
 use refineid_lib_core::ocsp;
 use refineid_lib_core::revocation::{self, RevocationStatus};
 use refineid_lib_core::sign::validation::ValidationMaterial;
@@ -126,6 +127,9 @@ pub enum MaterialError {
     Revoked {
         /// The revocation time the answer states.
         revoked_at: DateTime,
+        /// The `CRLReason` the answer states, when it states one
+        /// (RFC 5280 sec.5.3.1).
+        reason: Option<CrlReason>,
         /// Where the answer came from and what it said.
         detail: String,
     },
@@ -408,11 +412,63 @@ impl WalkGuard {
 }
 
 /// Walk one path to one of its own explicitly approved anchors.
+///
+/// A revoked answer does not end the walk: every certificate on the
+/// path is still asked about, and the gravest revocation found
+/// ([`keep_graver`]) is the result, whatever else the walk met.
 fn walk<P: EvidenceProvider>(
     start: ChainStart<'_>,
     evidence_time: DateTime,
     provider: &P,
     collection: &mut Collection,
+) -> Result<(), MaterialError> {
+    let mut revoked = None;
+    let outcome = walk_path(start, evidence_time, provider, collection, &mut revoked);
+    revoked.map_or(outcome, Err)
+}
+
+/// Keep in `kept` the graver of it and `found`, both
+/// [`MaterialError::Revoked`]: a compromise outranks any other reason,
+/// then the earlier revocation time does ([`Revocation::graver`]).
+fn keep_graver(kept: &mut Option<MaterialError>, found: MaterialError) {
+    /// The revocation a revoked error states.
+    const fn as_revocation(error: &MaterialError) -> Revocation {
+        match *error {
+            MaterialError::Revoked {
+                revoked_at, reason, ..
+            } => Revocation::Revoked { revoked_at, reason },
+            MaterialError::NoChain
+            | MaterialError::NoTrustAnchor
+            | MaterialError::Certificate(_)
+            | MaterialError::InvalidIssuer(_)
+            | MaterialError::NoIssuer(_)
+            | MaterialError::ChainCycle
+            | MaterialError::ChainTooDeep
+            | MaterialError::Rng(_)
+            | MaterialError::Revocation(_) => Revocation::Unavailable,
+        }
+    }
+    match kept.take() {
+        Some(known) => {
+            let graver = as_revocation(&known).graver(as_revocation(&found));
+            *kept = Some(if graver == as_revocation(&known) {
+                known
+            } else {
+                found
+            });
+        }
+        None => *kept = Some(found),
+    }
+}
+
+/// The body of [`walk`]; a revoked answer goes into `revoked` and the
+/// walk goes on.
+fn walk_path<P: EvidenceProvider>(
+    start: ChainStart<'_>,
+    evidence_time: DateTime,
+    provider: &P,
+    collection: &mut Collection,
+    revoked: &mut Option<MaterialError>,
 ) -> Result<(), MaterialError> {
     if start.approved_anchor_ders.is_empty() {
         return Err(MaterialError::NoTrustAnchor);
@@ -470,13 +526,16 @@ fn walk<P: EvidenceProvider>(
             is_approved_anchor(&issuer_der, start.approved_anchor_ders),
         )?;
 
-        let evidence = provider.status(
+        match provider.status(
             start.nonce_policy,
             &current_view,
             &issuer_view,
             evidence_time,
-        )?;
-        push_status(&mut collection.material, evidence);
+        ) {
+            Ok(evidence) => push_status(&mut collection.material, evidence),
+            Err(found @ MaterialError::Revoked { .. }) => keep_graver(revoked, found),
+            Err(other) => return Err(other),
+        }
 
         let issuer_is_anchor = is_approved_anchor(&issuer_der, start.approved_anchor_ders);
         push_candidate(collection, &issuer_der);
@@ -991,6 +1050,7 @@ fn collect_crl_status(
             RevocationStatus::Revoked { at, reason } => {
                 return Err(MaterialError::Revoked {
                     revoked_at: at,
+                    reason,
                     detail: format!("{url}: revoked {at} ({reason:?})"),
                 });
             }
@@ -1134,8 +1194,9 @@ fn check_response(
     // response carried the same serial more than once.
     match answer.status {
         ocsp::CertStatus::Good => Ok(()),
-        ocsp::CertStatus::Revoked { revoked_at, .. } => Err(MaterialError::Revoked {
+        ocsp::CertStatus::Revoked { revoked_at, reason } => Err(MaterialError::Revoked {
             revoked_at,
+            reason,
             detail: format!("revoked at {revoked_at}"),
         }),
         ocsp::CertStatus::Unknown => Err(MaterialError::Revocation(
@@ -1342,6 +1403,94 @@ mod tests {
                 "no authenticated current answer".to_owned(),
             ))
         }
+    }
+
+    /// Answers every status question with one revoked answer.
+    #[derive(Debug)]
+    struct RevokedEvidence {
+        revoked_at: DateTime,
+        reason: Option<CrlReason>,
+        statuses: Cell<usize>,
+    }
+
+    impl EvidenceProvider for RevokedEvidence {
+        fn fetch_issuer(&self, _url: &Uri) -> Result<Vec<u8>, String> {
+            Err("offline fixture has no fetched issuer".to_owned())
+        }
+
+        fn status(
+            &self,
+            _nonce_policy: NoncePolicy,
+            _subject: &Certificate<'_>,
+            _issuer: &Certificate<'_>,
+            _evidence_time: DateTime,
+        ) -> Result<StatusEvidence, MaterialError> {
+            self.statuses.set(self.statuses.get().saturating_add(1));
+            Err(revoked(self.revoked_at, self.reason))
+        }
+    }
+
+    /// A revoked error at `revoked_at` for `reason`.
+    fn revoked(revoked_at: DateTime, reason: Option<CrlReason>) -> MaterialError {
+        MaterialError::Revoked {
+            revoked_at,
+            reason,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_revoked_answer_is_the_walk_result_with_its_reason() -> TestResult {
+        let provider = RevokedEvidence {
+            revoked_at: reference_time()?,
+            reason: Some(CrlReason::Superseded),
+            statuses: Cell::new(0),
+        };
+        let anchors = [DVV_ROOT_ECC_DER];
+        let chain = start(DVV_INTERMEDIATE_DER, &anchors, false)?;
+        let error = collect_chains_with(&[chain], reference_time()?, &provider)
+            .err()
+            .ok_or("a revoked path unexpectedly succeeded")?;
+        check(
+            &error,
+            &revoked(reference_time()?, Some(CrlReason::Superseded)),
+            "revoked with its reason",
+        )?;
+        check(&provider.statuses.get(), &1, "one status asked")
+    }
+
+    #[test]
+    fn the_gravest_revocation_is_kept() -> TestResult {
+        let earlier = DateTime::new(2026, 8, 1, 12, 0, 0)?;
+        let later = reference_time()?;
+        for (first, second, gravest) in [
+            (
+                revoked(later, None),
+                revoked(earlier, None),
+                revoked(earlier, None),
+            ),
+            (
+                revoked(earlier, Some(CrlReason::Superseded)),
+                revoked(later, Some(CrlReason::KeyCompromise)),
+                revoked(later, Some(CrlReason::KeyCompromise)),
+            ),
+            (
+                revoked(later, Some(CrlReason::CaCompromise)),
+                revoked(earlier, Some(CrlReason::Unrecognised)),
+                revoked(later, Some(CrlReason::CaCompromise)),
+            ),
+            (
+                revoked(earlier, Some(CrlReason::AaCompromise)),
+                revoked(later, Some(CrlReason::KeyCompromise)),
+                revoked(earlier, Some(CrlReason::AaCompromise)),
+            ),
+        ] {
+            let mut kept = None;
+            keep_graver(&mut kept, first);
+            keep_graver(&mut kept, second);
+            check(&kept, &Some(gravest), "gravest kept")?;
+        }
+        Ok(())
     }
 
     #[test]

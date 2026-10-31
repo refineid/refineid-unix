@@ -35,14 +35,16 @@
 //!   clause 5.6.2 (past certificate validation): a good answer counts
 //!   when its validity window contains the validation time, or when it
 //!   was issued at or after that time while the signer certificate was
-//!   still valid. A verified revoked answer counts whatever its time.
+//!   still valid. A verified revoked answer counts whatever its time;
+//!   whether it invalidates a signature is judged against the proof of
+//!   existence ([`Revocation::invalidates`]).
 //! - RFC 6960: an OCSP answer counts only when its signer is the
 //!   issuer or a responder the issuer delegated
 //!   ([`VerifiedOcspResponse::verify`]).
 //! - RFC 5280 section 5: a CRL counts only when the issuer signed it
 //!   ([`VerifiedCrl::verify`]).
 
-use crate::crl::{OwnedCrl, VerifiedCrl};
+use crate::crl::{CrlReason, OwnedCrl, VerifiedCrl};
 use crate::crypto::digest::Sha256;
 use crate::document::{CertificatePath, Revocation, TrustAnchors};
 use crate::ocsp::{CertStatus, OcspResponseStatus, OwnedOcspResponse, VerifiedOcspResponse};
@@ -93,8 +95,8 @@ pub struct ChainVerdict {
 enum Answer {
     /// Good, as of this production time.
     Good(DateTime),
-    /// Revoked at this revocation time.
-    Revoked(DateTime),
+    /// Revoked at this revocation time, for this reason when stated.
+    Revoked(DateTime, Option<CrlReason>),
 }
 
 impl MaterialPool {
@@ -225,24 +227,30 @@ impl MaterialPool {
     /// The revocation status of a path, signer first and anchor last:
     /// every certificate below the anchor is checked against its
     /// issuer (RFC 5280 section 6.1.3 (a)(3), `ETSI EN 319 102-1`
-    /// clause 5.2.6). Revoked when any is revoked, else unavailable
-    /// when any is unanswered, else the signer's good answer.
+    /// clause 5.2.6). The gravest revocation ([`Revocation::graver`]) when any is
+    /// revoked, else unavailable when any is unanswered, else the
+    /// signer's good answer.
     fn path_revocation(&self, path: &[Certificate<'_>], at: DateTime) -> Revocation {
         let mut signer = None;
         let mut unanswered = false;
+        let mut revoked: Option<Revocation> = None;
         for step in path.windows(2) {
             let [certificate, issuer] = step else {
                 continue;
             };
             let revocation = self.revocation_of(*certificate, *issuer, at);
             match revocation {
-                revoked @ Revocation::Revoked { .. } => return revoked,
+                Revocation::Revoked { .. } => {
+                    revoked = Some(revoked.map_or(revocation, |known| known.graver(revocation)));
+                }
                 Revocation::Unavailable => unanswered = true,
                 Revocation::Good { .. } => {}
             }
             signer.get_or_insert(revocation);
         }
-        if unanswered {
+        if let Some(revoked) = revoked {
+            revoked
+        } else if unanswered {
             Revocation::Unavailable
         } else {
             signer.unwrap_or(Revocation::Unavailable)
@@ -277,7 +285,9 @@ impl MaterialPool {
                 let verified = VerifiedOcspResponse::verify(basic, candidate, issuer).ok()?;
                 let single = verified.response_for(signer)?;
                 match single.status {
-                    CertStatus::Revoked { revoked_at, .. } => Some(Answer::Revoked(revoked_at)),
+                    CertStatus::Revoked { revoked_at, reason } => {
+                        Some(Answer::Revoked(revoked_at, reason))
+                    }
                     CertStatus::Good => {
                         accepted_window(signer, single.this_update, single.next_update, at)
                             .then_some(Answer::Good(basic.produced_at))
@@ -429,7 +439,7 @@ fn crl_answer(
     match check_against_crl(signer, &verified, view.this_update) {
         RevocationStatus::Good => accepted_window(signer, view.this_update, view.next_update, at)
             .then_some(Answer::Good(view.this_update)),
-        RevocationStatus::Revoked { at, .. } => Some(Answer::Revoked(at)),
+        RevocationStatus::Revoked { at, reason } => Some(Answer::Revoked(at, reason)),
         RevocationStatus::Inapplicable(_) | RevocationStatus::Stale | RevocationStatus::Unknown => {
             None
         }
@@ -456,19 +466,24 @@ fn accepted_window(
     contains_at || issued_after_at
 }
 
-/// A revoked answer outweighs any good one; among good answers the
-/// latest production time is reported.
+/// A revoked answer outweighs any good one, and among revoked answers
+/// the gravest ([`Revocation::graver`]) is reported; among good answers the latest
+/// production time is.
 fn strongest(answers: impl Iterator<Item = Answer>) -> Option<Revocation> {
     let mut good: Option<DateTime> = None;
+    let mut revoked: Option<Revocation> = None;
     for answer in answers {
         match answer {
-            Answer::Revoked(revoked_at) => return Some(Revocation::Revoked { revoked_at }),
+            Answer::Revoked(revoked_at, reason) => {
+                let revocation = Revocation::Revoked { revoked_at, reason };
+                revoked = Some(revoked.map_or(revocation, |known| known.graver(revocation)));
+            }
             Answer::Good(checked_at) => {
                 good = Some(good.map_or(checked_at, |known| known.max(checked_at)));
             }
         }
     }
-    good.map(|checked_at| Revocation::Good { checked_at })
+    revoked.or_else(|| good.map(|checked_at| Revocation::Good { checked_at }))
 }
 
 /// Whether `at` lies inside the certificate's validity window
@@ -511,6 +526,8 @@ fn may_issue(certificate: Certificate<'_>, intermediates_below: usize) -> bool {
 #[cfg(test)]
 pub(crate) mod testkit {
     use crate::ber::tlv;
+    use crate::crl::CrlReason;
+    use crate::crl::testkit::ReasonOctets;
     use crate::crypto::digest::Sha256;
     use crate::ocsp::{IssuerKeyHash, IssuerNameHash};
     use crate::oid::{Oid, known};
@@ -900,6 +917,30 @@ pub(crate) mod testkit {
         signed(&tlv(SEQUENCE, tbs), issuer_key)
     }
 
+    /// A revoked OCSP answer's `RevokedInfo` (RFC 6960 sec.4.2.1).
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct RevokedSpec {
+        /// `revocationTime`.
+        pub(crate) at: DateTime,
+        /// `revocationReason` as encoded, when stated.
+        pub(crate) reason: Option<ReasonOctets>,
+    }
+
+    impl RevokedSpec {
+        /// Revoked at `at`, no reason stated.
+        pub(crate) const fn at(at: DateTime) -> Self {
+            Self { at, reason: None }
+        }
+
+        /// Revoked at `at` for `reason`, written as its one-octet code.
+        pub(crate) const fn for_reason(at: DateTime, reason: CrlReason) -> Self {
+            Self {
+                at,
+                reason: Some(ReasonOctets::Code(reason)),
+            }
+        }
+    }
+
     /// What one OCSP response says.
     pub(crate) struct OcspSpec<'a> {
         /// The key that signs the response.
@@ -910,8 +951,8 @@ pub(crate) mod testkit {
         pub(crate) issuer: &'a OwnedCert,
         /// Serial of the certificate asked about.
         pub(crate) serial: u8,
-        /// `Some(revocation time)` for a revoked answer, `None` for good.
-        pub(crate) revoked: Option<DateTime>,
+        /// `Some` for a revoked answer, `None` for good.
+        pub(crate) revoked: Option<RevokedSpec>,
         /// `producedAt`.
         pub(crate) produced_at: DateTime,
         /// `thisUpdate`.
@@ -941,7 +982,13 @@ pub(crate) mod testkit {
         let mut single = tlv(SEQUENCE, cert_id);
         match spec.revoked {
             None => single.extend_from_slice(&tlv(CONTEXT_0_PRIMITIVE, [])),
-            Some(at) => single.extend_from_slice(&tlv(CONTEXT_1, generalized_time(at))),
+            Some(revoked) => {
+                let mut info = generalized_time(revoked.at);
+                if let Some(reason) = revoked.reason {
+                    info.extend_from_slice(&tlv(CONTEXT_0, tlv(ENUMERATED, reason.content())));
+                }
+                single.extend_from_slice(&tlv(CONTEXT_1, info));
+            }
         }
         single.extend_from_slice(&generalized_time(spec.this_update));
         if let Some(next_update) = spec.next_update {
@@ -1098,10 +1145,11 @@ pub(crate) mod testkit {
 #[cfg(test)]
 mod tests {
     use super::testkit::{
-        CertificateSpec, Curve, OcspSpec, TestKey, ca_extensions, certificate, crl, day,
-        ocsp_response,
+        CertificateSpec, Curve, OcspSpec, RevokedSpec, TestKey, ca_extensions, certificate, crl,
+        day, ocsp_response,
     };
     use super::{MaterialPool, judge, token_path};
+    use crate::crl::CrlReason;
     use crate::document::{CertificatePath, Revocation, TrustAnchors};
     use crate::sign::timestamp::VerifiedTimestampToken;
     use crate::sign::validation::ValidationMaterial;
@@ -1237,7 +1285,7 @@ mod tests {
                 responder: ROOT,
                 issuer: &issuer,
                 serial: INTERMEDIATE_SERIAL,
-                revoked: revoked.then(|| day(ISSUED)),
+                revoked: revoked.then(|| RevokedSpec::at(day(ISSUED))),
                 produced_at: day(ANSWERED),
                 this_update: day(ANSWERED),
                 next_update: Some(day(ENDS)),
@@ -1254,7 +1302,7 @@ mod tests {
                 responder: INTERMEDIATE,
                 issuer: &issuer,
                 serial: SIGNER_SERIAL,
-                revoked: revoked.then(|| day(ISSUED)),
+                revoked: revoked.then(|| RevokedSpec::at(day(ISSUED))),
                 produced_at: day(answered),
                 this_update: day(answered),
                 next_update: next_update.map(day),
@@ -1433,7 +1481,8 @@ mod tests {
         assert_eq!(
             verdict.revocation,
             Revocation::Revoked {
-                revoked_at: day(ISSUED)
+                revoked_at: day(ISSUED),
+                reason: None,
             }
         );
     }
@@ -1491,7 +1540,8 @@ mod tests {
         assert_eq!(
             verdict.revocation,
             Revocation::Revoked {
-                revoked_at: day(ISSUED)
+                revoked_at: day(ISSUED),
+                reason: None,
             }
         );
     }
@@ -1542,7 +1592,8 @@ mod tests {
         assert_eq!(
             verdict.revocation,
             Revocation::Revoked {
-                revoked_at: day(ISSUED)
+                revoked_at: day(ISSUED),
+                reason: None,
             }
         );
 
@@ -1607,7 +1658,8 @@ mod tests {
         assert_eq!(
             verdict.revocation,
             Revocation::Revoked {
-                revoked_at: day(ISSUED)
+                revoked_at: day(ISSUED),
+                reason: None,
             }
         );
     }
@@ -1630,7 +1682,78 @@ mod tests {
         assert_eq!(
             verdict.revocation,
             Revocation::Revoked {
-                revoked_at: day(ISSUED)
+                revoked_at: day(ISSUED),
+                reason: None,
+            }
+        );
+    }
+
+    /// An OCSP answer about the signer, signed by the intermediate,
+    /// revoked as `revoked` states.
+    fn revoked_signer_ocsp(chain: &Chain, revoked: RevokedSpec) -> Vec<u8> {
+        let issuer = OwnedCert::from_der(&chain.intermediate).expect("intermediate parses");
+        ocsp_response(&OcspSpec {
+            responder_key: &chain.intermediate_key,
+            responder: INTERMEDIATE,
+            issuer: &issuer,
+            serial: SIGNER_SERIAL,
+            revoked: Some(revoked),
+            produced_at: day(ANSWERED),
+            this_update: day(ANSWERED),
+            next_update: Some(day(ENDS)),
+            embedded: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn the_earliest_revocation_on_the_path_is_reported() {
+        let chain = chain(ENDS);
+        let pool = pool_with(
+            &chain,
+            vec![
+                revoked_signer_ocsp(&chain, RevokedSpec::at(day(ANSWERED))),
+                chain.intermediate_ocsp(true),
+            ],
+            Vec::new(),
+        );
+        let anchors = [chain.root.as_slice()];
+        let verdict = judge(
+            &chain.signer,
+            &pool,
+            TrustAnchors::new(&anchors),
+            day(VALIDATED),
+        );
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ISSUED),
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_compromise_outranks_an_earlier_revocation() {
+        let chain = chain(ENDS);
+        let listing = crl(
+            INTERMEDIATE,
+            &chain.intermediate_key,
+            day(ANSWERED),
+            Some(day(ENDS)),
+            &[SIGNER_SERIAL],
+            day(ISSUED),
+        );
+        let compromised = revoked_signer_ocsp(
+            &chain,
+            RevokedSpec::for_reason(day(ANSWERED), CrlReason::KeyCompromise),
+        );
+        let pool = pool_with(&chain, vec![compromised], vec![listing]);
+        let verdict = judge(&chain.signer, &pool, TrustAnchors::new(&[]), day(VALIDATED));
+        assert_eq!(
+            verdict.revocation,
+            Revocation::Revoked {
+                revoked_at: day(ANSWERED),
+                reason: Some(CrlReason::KeyCompromise),
             }
         );
     }
