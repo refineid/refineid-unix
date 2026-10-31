@@ -36,8 +36,9 @@
 //! - `ETSI EN 319 122-1` clause 5.3: each `signature-time-stamp`
 //!   token's `messageImprint` is computed over the octets of
 //!   `SignerInfo.signature`.
-//! - `ETSI EN 319 122-1` clause 5.5.3: `archive-time-stamp-v3`
-//!   attributes are counted, not verified.
+//! - `ETSI EN 319 122-1` clause 5.5.3 and RFC 5126 sec.6.4.1:
+//!   `archive-time-stamp-v3` and `archive-time-stamp` (v2) attributes
+//!   are counted, not verified.
 //! - `ETSI EN 319 122-2` level LT: the validation material travels in
 //!   `SignedData.certificates` and `SignedData.crls`, OCSP responses
 //!   as `id-ri-ocsp-response` (RFC 5940); that is what
@@ -182,8 +183,8 @@ pub struct CadesVerdict {
     pub signature_valid: bool,
     /// The `signature-time-stamp` tokens.
     pub signature_timestamps: Timestamps,
-    /// How many `archive-time-stamp-v3` tokens are present; they are
-    /// not verified.
+    /// How many `archive-time-stamp-v3` and `archive-time-stamp` (v2)
+    /// tokens are present; they are not verified.
     pub archive_timestamps_present: usize,
 }
 
@@ -324,11 +325,13 @@ impl CadesSignature {
             document_intact,
             signature_valid,
             signature_timestamps: signature_timestamps(&signed),
-            archive_timestamps_present: attribute_values(
-                &signed.signer.unsigned_attributes,
+            archive_timestamps_present: [
+                known::ARCHIVE_TIME_STAMP_V2,
                 known::ARCHIVE_TIME_STAMP_V3,
-            )
-            .len(),
+            ]
+            .into_iter()
+            .map(|oid| attribute_values(&signed.signer.unsigned_attributes, oid).len())
+            .sum(),
         }
     }
 }
@@ -652,6 +655,15 @@ mod tests {
     /// A `CAdES` structure over `DOCUMENT` signed by the world's signer,
     /// with only `content-type` and `message-digest` signed.
     fn without_ess(world: &World, digest_algorithm: Vec<u8>) -> Vec<u8> {
+        without_ess_with_unsigned(world, digest_algorithm, Vec::new())
+    }
+
+    /// [`without_ess`] carrying `unsigned_attributes`.
+    fn without_ess_with_unsigned(
+        world: &World,
+        digest_algorithm: Vec<u8>,
+        unsigned_attributes: Vec<Vec<u8>>,
+    ) -> Vec<u8> {
         let attributes = attribute_set(&[
             attribute(
                 known::CONTENT_TYPE,
@@ -670,6 +682,7 @@ mod tests {
             key: &world.signer_key,
             signer: &world.signer,
             certificates: vec![world.signer.clone()],
+            unsigned_attributes,
         })
     }
 
@@ -797,6 +810,7 @@ mod tests {
             key: &world.signer_key,
             signer: &world.signer,
             certificates: vec![world.root.clone()],
+            unsigned_attributes: Vec::new(),
         });
         assert_eq!(
             CadesSignature::parse(bare).map(|_parsed| ()),
@@ -888,5 +902,34 @@ mod tests {
             embedded_material(&signed, &certificates, &world.signer),
             ValidationMaterial::default()
         );
+    }
+
+    #[test]
+    fn archive_timestamps_of_both_versions_are_counted() {
+        let world = World::new(Curve::P256);
+        let token = world.timestamp_token(Sha256::of(DOCUMENT).as_bytes());
+        let other_token = world.timestamp_token(Sha256::of(OTHER_DOCUMENT).as_bytes());
+        let archive = |unsigned: Vec<Vec<u8>>| {
+            CadesSignature::parse(without_ess_with_unsigned(
+                &world,
+                DigestAlgorithm::Sha256.algorithm_identifier(),
+                unsigned,
+            ))
+            .expect("parses")
+            .verify(Content::Attached, EssBinding::NotRequired)
+            .archive_timestamps_present
+        };
+        let v2 = attribute(known::ARCHIVE_TIME_STAMP_V2, &token);
+        let v3 = attribute(known::ARCHIVE_TIME_STAMP_V3, &token);
+        let v3_twice = attribute(
+            known::ARCHIVE_TIME_STAMP_V3,
+            &[token.clone(), token].concat(),
+        );
+        assert_eq!(archive(Vec::new()), 0);
+        assert_eq!(archive(vec![v2.clone()]), 1);
+        assert_eq!(archive(vec![v3]), 1);
+        assert_eq!(archive(vec![v2.clone(), v3_twice]), 3);
+        let v2_again = attribute(known::ARCHIVE_TIME_STAMP_V2, &other_token);
+        assert_eq!(archive(vec![v2, v2_again]), 2);
     }
 }
