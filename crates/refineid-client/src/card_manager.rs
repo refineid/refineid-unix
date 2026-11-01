@@ -380,13 +380,13 @@ fn pdf_document_request(
     }
 }
 
-/// Establish the trust-gated context needed by a card-activation screen.
+/// Establish the card context needed by a card-activation screen.
 ///
 /// The returned context identifies the card, reports the expected activation
 /// code length, and binds later activation to the same reader and card serial.
 ///
 /// # Errors
-/// Reader/card access failure or failure of the FINEID root trust gate.
+/// Reader/card access failure, or a card whose activation scheme is undecided.
 pub fn prepare_activation(
     reader_filter: Option<&ReaderFilter>,
 ) -> Result<ActivationCardContext, CardPinError> {
@@ -404,19 +404,19 @@ pub fn activate(
     crate::card_pin::activate_first(PcscBackend, context, options)
 }
 
-/// Change PIN1 or PIN2 on the displayed card after a fresh trust-gated session.
+/// Change PIN1 or PIN2 on the displayed card after opening a fresh card session.
 ///
 /// `expected_serial` must be the full serial captured when the caller displayed
 /// the card to the operator. A mismatch is refused before the modify APDU.
 ///
 /// # Errors
-/// Reader/card access, trust-gate, card-swap, PIN-policy, or transport failure.
+/// Reader/card access, card-swap, PIN-policy, or transport failure.
 pub fn change_pin(
     expected_serial: &TokenSerial,
     options: ChangePinOptions,
 ) -> Result<ChangePinReport, CardPinError> {
     let reader_filter = options.reader_filter.as_deref().map(ReaderFilter::new);
-    let session = crate::card_pin::establish_trusted_session(PcscBackend, reader_filter.as_ref())?;
+    let session = crate::card_pin::establish_card_session(PcscBackend, reader_filter.as_ref())?;
     ensure_displayed_serial(expected_serial, &session.bound_serial)?;
     crate::card_pin::change_pin_first(PcscBackend, session.into_pin_management_context(), options)
 }
@@ -426,13 +426,13 @@ pub fn change_pin(
 /// `expected_serial` is checked before the PUK-bearing modify APDU.
 ///
 /// # Errors
-/// Reader/card access, trust-gate, card-swap, PIN-policy, or transport failure.
+/// Reader/card access, card-swap, PIN-policy, or transport failure.
 pub fn unblock_pin(
     expected_serial: &TokenSerial,
     options: UnblockPinOptions,
 ) -> Result<UnblockPinReport, CardPinError> {
     let reader_filter = options.reader_filter.as_deref().map(ReaderFilter::new);
-    let session = crate::card_pin::establish_trusted_session(PcscBackend, reader_filter.as_ref())?;
+    let session = crate::card_pin::establish_card_session(PcscBackend, reader_filter.as_ref())?;
     ensure_displayed_serial(expected_serial, &session.bound_serial)?;
     crate::card_pin::unblock_pin_first(PcscBackend, session.into_pin_management_context(), options)
 }

@@ -26,8 +26,7 @@ use refineid_lib_core::pin::{ActivationCode, ActivationPinEight, ActivationPinSe
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::{
-    ActivateReport, ActivationCardContext, ActivationTarget, CardPinError, CardTrustAttestation,
-    PinManageSlot,
+    ActivateReport, ActivationCardContext, ActivationTarget, CardPinError, PinManageSlot,
 };
 use crate::exit_status::ExitStatus;
 
@@ -280,28 +279,19 @@ impl ActivateArgs {
     }
 }
 
-/// Emit the JSONL pre-flight event with trust-state + card-model
-/// metadata. The operator's `pin activate` invocation flushes
+/// Emit the JSONL pre-flight event with card-model metadata. The operator's `pin activate` invocation flushes
 /// this *before* the activation-PIN prompt so log scrapers can
 /// pair the prompt with the targeted card.
 impl PinActivateHelpers {
     /// Emit the `card.activate.preflight.ready` JSONL event.
     ///
-    /// Captures the trust state, card-model facts, and the
+    /// Captures the card-model facts and the
     /// declared activation-PIN length *before* the operator
     /// is prompted for the PIN, so a downstream scraper can
     /// pair the JSONL line with the human prompt. Required by
     /// `doc/observability.md` -- the pre-flight event is part
     /// of the audit baseline.
     fn emit_preflight_event(ctx: &ActivationCardContext) {
-        let (trust_root_label, trust_root_sha256_hex) = match &ctx.trust {
-            CardTrustAttestation::PinnedRootMatched {
-                root_label,
-                root_sha256,
-            } => (*root_label, format!("{root_sha256}")),
-            CardTrustAttestation::PinnedRootMismatch { .. }
-            | CardTrustAttestation::RootCertUnavailable { .. } => ("", String::new()),
-        };
         let card_issued = ctx.validity_start.map_or_else(String::new, |start| {
             format!(
                 "{:04}-{:02}-{:02}",
@@ -313,9 +303,6 @@ impl PinActivateHelpers {
         let activation_pin_length_str = format!("{}", ctx.activation_entry_digit_count());
         let model = ctx.model;
         crate::events::CardActivatePreflightReady {
-            trust_state: "pinned_root_matched",
-            trust_root_label,
-            trust_root_sha256: &trust_root_sha256_hex,
             card_issued: &card_issued,
             card_type: model.map_or("", |m| m.card_type().as_dvv_label()),
             card_vendor: model.map_or("", |m| m.vendor().as_dvv_label()),

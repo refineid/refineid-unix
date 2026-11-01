@@ -124,8 +124,8 @@ impl EventRecord for CardTarget<'_> {
 // ===========================================================
 
 /// `card.activate.preflight.ready` -- emitted once after the
-/// activation trust gate passes and the card's activation scheme
-/// is decided, just before the operator is prompted for the
+/// card session is open and the card's activation scheme is
+/// decided, just before the operator is prompted for the
 /// activation PIN.
 ///
 /// The structured form of "here's what we know about the card
@@ -139,19 +139,6 @@ impl EventRecord for CardTarget<'_> {
 /// [dvv]: ../../../../doc/dvv-terminology.md
 #[derive(Debug)]
 pub struct CardActivatePreflightReady<'a> {
-    /// `pinned_root_matched`. The activate flow refuses to
-    /// reach `preflight.ready` on any other trust state -- the
-    /// alternatives (`pinned_root_mismatch`,
-    /// `root_cert_unavailable`) bail earlier with
-    /// `CardDataUntrusted`. Carried explicitly so a SOC parser
-    /// doesn't have to assume.
-    pub trust_state: &'a str,
-    /// Human label of the pinned root that matched, e.g.
-    /// `"DVV Gov. Root CA"`.
-    pub trust_root_label: &'a str,
-    /// Lowercase hex SHA-256 (64 chars) of the on-card root
-    /// cert that the pin matched.
-    pub trust_root_sha256: &'a str,
     /// Auth cert `notBefore` as `YYYY-MM-DD`; `""` when it was
     /// not readable.
     pub card_issued: &'a str,
@@ -199,15 +186,6 @@ impl CardActivatePreflightReady<'_> {
     /// `CardActivatePin2Set`; the preflight context is
     /// background not worth the disk artifact on its own).
     pub const PERSISTENCE: Persistence = Persistence::Ephemeral;
-    /// Trust-state classifier verdict; not PII.
-    pub const F_TRUST_STATE: FieldDescriptor =
-        FieldDescriptor::new(FieldName::new("trust_state"), FieldPrivacy::Public);
-    /// Pinned-root human label; not PII.
-    pub const F_TRUST_ROOT_LABEL: FieldDescriptor =
-        FieldDescriptor::new(FieldName::new("trust_root_label"), FieldPrivacy::Public);
-    /// Pinned-root SHA-256; not PII (public certificate hash).
-    pub const F_TRUST_ROOT_SHA256: FieldDescriptor =
-        FieldDescriptor::new(FieldName::new("trust_root_sha256"), FieldPrivacy::Public);
     /// Card issuance date; not PII on its own.
     pub const F_CARD_ISSUED: FieldDescriptor =
         FieldDescriptor::new(FieldName::new("card_issued"), FieldPrivacy::Public);
@@ -267,9 +245,6 @@ impl EventRecord for CardActivatePreflightReady<'_> {
     }
 
     fn for_each_field(&self, f: &mut dyn FnMut(FieldDescriptor, &dyn fmt::Display)) {
-        f(Self::F_TRUST_STATE, &self.trust_state);
-        f(Self::F_TRUST_ROOT_LABEL, &self.trust_root_label);
-        f(Self::F_TRUST_ROOT_SHA256, &self.trust_root_sha256);
         f(Self::F_CARD_ISSUED, &self.card_issued);
         f(Self::F_CARD_TYPE, &self.card_type);
         f(Self::F_CARD_VENDOR, &self.card_vendor);
