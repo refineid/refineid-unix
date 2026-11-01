@@ -170,10 +170,10 @@ pub struct CardCheckReport {
     /// PIN1 "PIN changed" flag probe outcome per FINEID S1 v4.2
     /// §3.15.2 Table 19 (`DF 2F`). `Some(true)` if PIN1 has been
     /// changed since manufacture (factory-set value rewritten),
-    /// `Some(false)` if still at the factory value (fresh new-
-    /// scheme card), `None` if the card declined the probe
-    /// (older firmware without the GET DATA PIN-container
-    /// implementation, or the optional flag parameter is off).
+    /// `Some(false)` if still at the factory value (the PIN
+    /// awaits activation), `None` if the card did not return the
+    /// flag (no PIN container for the reference, or the "Return
+    /// PIN changed flag" parameter was not set at personalization).
     /// Counter-safe; no try-counter mutation.
     pub pin1_changed: Option<bool>,
     /// Same as [`pin1_changed`](Self::pin1_changed) for PIN2.
@@ -623,9 +623,9 @@ fn read_pkcs15_section<T: refineid_lib_core::transport::CardTransport>(
         .then(|| transport.puk_policy_counters().ok().flatten())
         .flatten();
     // PIN-changed flag probes (S1 v4.2 §3.15.2; counter-safe GET
-    // DATA on the PIN container). Best-effort like pin_status:
-    // older firmware that doesn't implement the PIN-info GET DATA
-    // surfaces as `None`. `Ok(None)` vs `Err(_)` both collapse to
+    // DATA on the PIN container). Best-effort like pin_status: a
+    // card that does not return the flag surfaces as `None`.
+    // `Ok(None)` vs `Err(_)` both collapse to
     // `None` -- we treat the call site as flag-indeterminate.
     let pin1_changed = transport.pin_changed_flag(PinSlot::Pin1).ok().flatten();
     let pin2_changed = (!secure_channel)
@@ -1910,9 +1910,9 @@ impl CardCheckHelpers {
     /// FINEID S1 v4.2 §3.15.2 specifies a card-resident
     /// boolean reflecting whether the cardholder has ever
     /// changed the slot's PIN from its factory value. `None`
-    /// covers older firmware that does not implement the
-    /// GET DATA at `DF2F` -- the indeterminate result is
-    /// surfaced explicitly, not silently treated as "no".
+    /// covers a card that does not return `DF2F` -- the
+    /// indeterminate result is surfaced explicitly, not silently
+    /// treated as "no".
     const fn render_pin_changed(flag: Option<bool>) -> &'static str {
         match flag {
             Some(true) => "yes",

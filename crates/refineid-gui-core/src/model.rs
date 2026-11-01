@@ -19,11 +19,12 @@ use std::path::PathBuf;
 use refineid_client::card_check::CardCheckReport;
 use refineid_client::card_pin::{ActivationCardContext, PinManageSlot};
 use refineid_doc_sign::document::Format;
-use refineid_lib_core::auth::{PinSlot, PinStatus, PukStatus, check_retry_floor};
+use refineid_lib_core::auth::{
+    PinReadiness, PinReferenceScheme, PinSlot, PinStatus, PukStatus, check_retry_floor,
+};
 use refineid_lib_core::can::Can;
 use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
-use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::profiles::ProfileName;
 use refineid_rapp_core::remote::PairSummary;
@@ -91,21 +92,32 @@ impl ManagedCard {
         status.is_some_and(|&status| check_retry_floor(slot, status).is_ok())
     }
 
-    /// Check if legacy factory activation is required.
-    pub fn legacy_activation_required(&self) -> bool {
-        let pin1_locked = matches!(self.report.pin1, Some(PinStatus::Locked));
-        let unchanged = self.report.pin1_changed == Some(false);
-        pin1_locked && unchanged
+    /// Each PIN's readiness ([`PinReadiness::judge`]), PIN 1 then
+    /// PIN 2, under the card's activation scheme; without a scheme
+    /// only the PIN changed flag decides.
+    pub fn pin_readiness(&self) -> [PinReadiness; 2] {
+        let scheme = self.activation_context.as_ref().map(|ctx| ctx.scheme);
+        let report = &self.report;
+        [
+            PinReadiness::judge(scheme, report.pin1_changed, report.pin1),
+            PinReadiness::judge(scheme, report.pin2_changed, report.pin2),
+        ]
     }
 
-    /// Check if factory activation is available.
+    /// Whether factory activation is available: the activation sets
+    /// both PINs, so both must await it.
     pub fn activation_available(&self) -> bool {
-        if let Some(ctx) = &self.activation_context {
-            (ctx.generation == CardGeneration::Newer && self.report.pin1_changed == Some(false))
-                || (ctx.generation == CardGeneration::Older && self.legacy_activation_required())
-        } else {
-            false
-        }
+        self.activation_context.is_some()
+            && self
+                .pin_readiness()
+                .iter()
+                .all(|&readiness| readiness == PinReadiness::AwaitsActivation)
+    }
+
+    /// Whether the card answers the organization reference numbering
+    /// (FINEID S4-2 v4.0 §4.2).
+    pub fn is_organization_card(&self) -> bool {
+        self.report.pin_reference_scheme == PinReferenceScheme::Organizational
     }
 
     /// Check if PIN unblocking is available for PIN1 and PIN2.
@@ -282,14 +294,15 @@ pub struct UiState {
     pub pin2_change_available: bool,
     /// Whether factory activation is available.
     pub activation_available: bool,
-    /// Whether legacy card activation rules apply.
-    pub legacy_activation: bool,
     /// Whether unblocking PIN1 is available.
     pub pin1_unblock_available: bool,
     /// Whether unblocking PIN2 is available.
     pub pin2_unblock_available: bool,
     /// Whether unblocking uses an activation code.
     pub unblock_uses_activation_code: bool,
+    /// Whether the selected card is an organization card (FINEID S4-2
+    /// v4.0 §4.2 reference numbering).
+    pub organization_card: bool,
     /// Whether the card model supports digital signatures.
     pub signature_supported: bool,
 
@@ -345,10 +358,10 @@ impl Default for UiState {
             pin1_change_available: false,
             pin2_change_available: false,
             activation_available: false,
-            legacy_activation: false,
             pin1_unblock_available: false,
             pin2_unblock_available: false,
             unblock_uses_activation_code: false,
+            organization_card: false,
             signature_supported: false,
             has_local_card: false,
             selected_card_is_local: false,

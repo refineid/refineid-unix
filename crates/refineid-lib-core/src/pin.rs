@@ -228,16 +228,13 @@ impl PinBytes {
 /// 1|2`).
 ///
 /// 8 to 12 ASCII digits (FINEID S4-1 v4.2 section 8.1.5, EF.AOD:
-/// minLength 8, storedLength 12), independent of card generation.
+/// minLength 8, storedLength 12), under either activation scheme.
 ///
-/// The separately-ordered PUK and the older card's reusable
-/// 8-digit activation PIN are valid here; the newer card's
-/// 7-digit activation code is single-use and cannot unblock, so
-/// it is a distinct type ([`ActivationPinSeven`]), not a PUK.
-///
-/// Distinct from `ActivationPin` in the type system, even
-/// though the card-side mechanism may be the same slot
-/// (`0x83`). See `doc/dvv-terminology.md`.
+/// Under FINEID S4-1 v4.2 §4.6.1 the 8-digit activation code from
+/// the letter is the PUK ([`ActivationPinEight`] carries it for the
+/// activation itself). Under §4.6.2 the 7-digit preset activation
+/// PIN is the factory value of PIN 1 and PIN 2, not a PUK
+/// ([`ActivationPinSeven`]). See `doc/dvv-terminology.md`.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Puk(PinBytes);
 
@@ -282,19 +279,15 @@ impl core::fmt::Debug for Puk {
     }
 }
 
-/// Activation PIN for FINEID cards issued **on or after
-/// 13 January 2026**. 7 ASCII digits exactly.
-///
-/// **Single-use**: consumed by card activation; cannot
-/// subsequently unblock PIN1 / PIN2. After activation it has
-/// no further role. If lost / locked, the citizen must order a
-/// separate [`Puk`] from the Police (subject to a fee).
+/// The preset activation PIN of FINEID S4-1 v4.2 §4.6.2: the
+/// factory value of PIN 1 and PIN 2, 7 ASCII digits exactly.
+/// Activation presents it as the current PIN in `CHANGE REFERENCE
+/// DATA` for each PIN; it is not a PUK.
 ///
 /// Source: <https://dvv.fi/en/activation-of-the-citizen-certificate>.
 ///
-/// Distinct type from [`ActivationPinEight`] (older-card form)
-/// and [`Puk`] (unblock code) so the compiler enforces "this
-/// activation PIN is for the new-card single-use flow".
+/// Distinct type from [`ActivationPinEight`] (the §4.6.1 activation
+/// code) and [`Puk`] (unblock code).
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct ActivationPinSeven(PinBytes);
 
@@ -302,7 +295,7 @@ impl ActivationPinSeven {
     /// 7 ASCII digits exactly.
     pub const LENGTH: usize = 7;
 
-    /// Parse `bytes` as a new-card activation PIN.
+    /// Parse `bytes` as a §4.6.2 preset activation PIN.
     ///
     /// # Errors
     /// Empty, wrong length (not exactly 7), or any non-digit
@@ -332,25 +325,16 @@ impl core::fmt::Debug for ActivationPinSeven {
     }
 }
 
-/// Activation PIN for FINEID cards issued **before
-/// 13 January 2026**. 8 ASCII digits exactly.
-///
-/// **Reusable**: the same 8-digit code from the activation
-/// letter doubles as the card's PUK -- it can unblock PIN1 /
-/// PIN2 after they get locked, in addition to its primary
-/// activation role. On these cards, exhausting this code via 5
-/// wrong activation attempts permanently locks the chip for
-/// e-services (the card still works as an ID document and
-/// travel document, but no online services). Recovery requires
-/// a new card from the Police.
+/// The activation code of FINEID S4-1 v4.2 §4.6.1, 8 ASCII digits
+/// exactly: the code is the PUK, and activation presents it in
+/// `RESET RETRY COUNTER` for each PIN, under the PUK's counter.
 ///
 /// Source: <https://dvv.fi/en/activation-of-the-citizen-certificate>.
 ///
-/// Distinct type from [`ActivationPinSeven`] (new-card form).
-/// Wire-shape identical to [`Puk`] (both are 8 ASCII digits)
-/// but the operator-intent distinction is preserved at the
-/// type level -- this is "the code from the activation letter",
-/// while `Puk` is "the code separately ordered for unblock".
+/// Distinct type from [`ActivationPinSeven`] (the §4.6.2 preset
+/// activation PIN). [`Puk`] accepts the same code for `pin unblock`;
+/// this type is the code as the activation entry, exactly the length
+/// the scheme names.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct ActivationPinEight(PinBytes);
 
@@ -358,7 +342,7 @@ impl ActivationPinEight {
     /// 8 ASCII digits exactly.
     pub const LENGTH: usize = 8;
 
-    /// Parse `bytes` as an old-card activation PIN.
+    /// Parse `bytes` as a §4.6.1 activation code.
     ///
     /// # Errors
     /// Empty, wrong length (not exactly 8), or any non-digit
@@ -388,22 +372,18 @@ impl core::fmt::Debug for ActivationPinEight {
     }
 }
 
-/// API sum-type for "either activation PIN form".
+/// API sum-type for "either activation entry".
 ///
-/// Consumers like `card_pin::activate_first` take this and
-/// dispatch based on which variant the operator constructed at
-/// the input-parsing boundary (the variant choice corresponds
-/// to the card's issuance date per DVV's 2026-01-13 cutoff).
-///
-/// The variants carry the two distinct types from this module;
-/// the enum exists only to give callers a single function
-/// parameter that can be either. Inside that function the
-/// match arms operate on the typed inner value.
+/// The variant follows the activation scheme read from the card
+/// (`PinReferenceScheme::activation_scheme`): [`Self::Seven`] for
+/// §4.6.2, [`Self::Eight`] for §4.6.1. Consumers like
+/// `card_pin::activate_first` refuse a variant that does not match
+/// the card's scheme before any command is sent.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub enum ActivationCode {
-    /// 7 ASCII digits; new-card single-use flow.
+    /// 7 ASCII digits: the §4.6.2 preset activation PIN.
     Seven(ActivationPinSeven),
-    /// 8 ASCII digits; old-card reusable flow.
+    /// 8 ASCII digits: the §4.6.1 activation code, which is the PUK.
     Eight(ActivationPinEight),
 }
 
@@ -427,9 +407,7 @@ impl ActivationCode {
         }
     }
 
-    /// Human label for the variant. Useful in error messages
-    /// like "card-side generation mismatch: card is older but
-    /// you supplied an `ActivationPinSeven`."
+    /// Human label for the variant, for `Debug`.
     #[must_use]
     pub const fn variant_label(&self) -> &'static str {
         match self {
@@ -519,8 +497,8 @@ mod tests {
 
     #[test]
     fn puk_rejects_lengths_below_eight() {
-        // Seven digits is the new-card single-use activation code, not a
-        // PUK; the PUK is eight to twelve digits.
+        // Seven digits is the §4.6.2 preset activation PIN, not a PUK;
+        // the PUK is eight to twelve digits.
         assert!(matches!(
             Puk::new(pin(b"1234567")),
             Err(PinRoleError::WrongLength {

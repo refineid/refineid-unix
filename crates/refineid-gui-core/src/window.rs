@@ -40,8 +40,9 @@ pub fn puk_digits() -> RangeInclusive<usize> {
     Puk::MIN_LENGTH..=Puk::MAX_LENGTH
 }
 
-/// How many digits an activation PIN may have: seven on the newer
-/// card, eight on the older.
+/// How many digits an activation PIN may have: seven for the preset
+/// activation PIN (FINEID S4-1 v4.2 §4.6.2), eight for the activation
+/// code that is the PUK (§4.6.1).
 #[must_use]
 pub fn activation_digits() -> RangeInclusive<usize> {
     ActivationPinSeven::LENGTH..=ActivationPinEight::LENGTH
@@ -142,8 +143,20 @@ pub const PIN_2: &str = "PIN 2";
 pub const SIGN: &str = "Sign\u{2026}";
 /// The accessible name of the progress shown while signing.
 pub const SIGNING_DOCUMENT: &str = "Signing document\u{2026}";
-/// The activation form's heading.
-pub const CARD_ACTIVATION: &str = "Card activation";
+/// The activation form's heading for an identity card.
+pub const IDENTITY_CARD_ACTIVATION: &str = "Identity card activation";
+/// The activation form's heading for an organization card.
+pub const ORGANISATION_CARD_ACTIVATION: &str = "Organisation card activation";
+
+/// The activation form's heading for the selected card.
+#[must_use]
+pub const fn activation_heading(state: &UiState) -> &'static str {
+    if state.organization_card {
+        ORGANISATION_CARD_ACTIVATION
+    } else {
+        IDENTITY_CARD_ACTIVATION
+    }
+}
 /// The activation form's first field.
 pub const ACTIVATION_PIN: &str = "Activation PIN";
 /// The activation form's new PIN 1.
@@ -759,6 +772,14 @@ mod tests {
             ..UiState::default()
         };
         assert_eq!(WindowContent::derive(&state), WindowContent::Documents);
+    }
+
+    #[test]
+    fn an_organization_card_has_its_own_activation_heading() {
+        let mut state = UiState::default();
+        assert_eq!(activation_heading(&state), IDENTITY_CARD_ACTIVATION);
+        state.organization_card = true;
+        assert_eq!(activation_heading(&state), ORGANISATION_CARD_ACTIVATION);
     }
 
     #[test]

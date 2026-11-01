@@ -269,6 +269,7 @@ impl CodeBoxes {
 /// The activation form.
 struct ActivationWidgets {
     container: gtk4::Box,
+    heading: gtk4::Label,
     code: gtk4::PasswordEntry,
 }
 
@@ -899,6 +900,11 @@ impl Ui {
         self.activation
             .container
             .set_visible(content == WindowContent::Activation);
+        if content == WindowContent::Activation {
+            self.activation
+                .heading
+                .set_label(window::activation_heading(state));
+        }
         if entered && content == WindowContent::Activation {
             self.activation.code.grab_focus();
         }
@@ -1063,7 +1069,7 @@ impl Ui {
 
 fn build_activation(controller: &Arc<RefineIdController>) -> ActivationWidgets {
     let container = column();
-    let heading = text_label(window::CARD_ACTIVATION);
+    let heading = text_label(window::IDENTITY_CARD_ACTIVATION);
     heading.add_css_class("heading");
     container.append(&heading);
     let code = pin_field(window::ACTIVATION_PIN);
@@ -1131,7 +1137,11 @@ fn build_activation(controller: &Arc<RefineIdController>) -> ActivationWidgets {
             });
         }
     });
-    ActivationWidgets { container, code }
+    ActivationWidgets {
+        container,
+        heading,
+        code,
+    }
 }
 
 fn build_pin_codes(parent: &gtk4::Window) -> PinCodesWidgets {

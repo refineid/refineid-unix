@@ -1,8 +1,8 @@
 # FINEID card models
 
 The set of FINEID card models refineid recognises, the
-engineering identifiers used for them, and why some models
-are explicitly out of scope.
+engineering identifiers used for them, how organization cards
+are recognised, and which models are out of scope.
 
 This is the canonical taxonomy. Code that classifies cards by
 ATR/ATS, names a card model in an event payload, or branches
@@ -26,11 +26,13 @@ doc, the type lattice in
 [`doc/typing-discipline.md`](typing-discipline.md), and the
 classifier in `refineid-lib-core` in the same change.
 
-## Scope: in-production citizen eID cards only
+## Scope: citizen eID cards in the field, and organization cards
 
-refineid's `pin activate` and related flows target **citizen
-eID cards still in the field**. As of 2026-05-24 that is two
-models:
+refineid's `pin activate` and related flows target the
+**citizen eID cards still in the field** and the **organization
+cards** (see [Social welfare / organizational
+cards](#social-welfare--organizational-cards)). The ATR
+classifier knows two citizen models:
 
 | Card type   | Vendor  | Vendor product | Vendor product version | FINEID specification | FINEID specification version | Production window     | Newest card expires |
 |-------------|---------|----------------|------------------------|----------------------|------------------------------|-----------------------|---------------------|
@@ -85,10 +87,12 @@ gives SOC operators independent axes to filter on:
 Allowed `card_type` values (the literals DVV uses, minus the
 trailing "card"/"cards" plural):
 
-- `"Citizen eID"` -- the in-scope category.
-- `"Social welfare and organizational"` -- out of scope for
-  now; deferred (see below).
-- `"Health care and organizational"` -- out of scope; legacy.
+- `"Citizen eID"` -- the citizen models the ATR classifier
+  knows.
+- `"Social welfare and organizational"` -- organization cards;
+  recognised by their PIN reference numbering, so the model
+  fields are empty for them (see below).
+- `"Health care and organizational"` -- no model in the field.
 
 ### FINEID specification numbering
 
@@ -107,9 +111,10 @@ documents. The codes that appear in the
 | `S4-2`   | Implementation Profile for Organizational Usage      | Organizational usage profile.                                       |
 | `S5`     | Directory Specification                              | Directory structure on the card.                                   |
 
-`S4-1` is the in-scope specification for refineid's `card
-activate` flow: the implementation profile a Finnish citizen
-eID card follows.
+`S4-1` is the implementation profile a Finnish citizen eID card
+follows, and its §4.6 defines both activation schemes. `S4-2`
+is the organization card's profile; its §4.2 reference
+numbering is what identifies an organization card.
 
 The codes are DVV's canonical identifiers and are used
 verbatim in their own materials -- the dashed form (`S4-1`)
@@ -161,9 +166,9 @@ forged card could in principle reproduce an ATR; only the
 pinned root anchors trust.
 
 That said, ATR matching is a useful weak counterfeit-card
-detector: a card whose ATR doesn't match any in-scope model
-gets rejected before any further reads, regardless of trust
-gate state.
+detector: a card whose ATR matches no known citizen model is
+rejected unless it answers the organization reference
+numbering, regardless of trust gate state.
 
 ## Out of scope, but recorded for context
 
@@ -200,12 +205,14 @@ card), and the credential references resolve at runtime via
 credentials by security-data-object identifier (PIN AUTH `03`,
 PIN SIG `04`, PIN PUK `12`, per section 4.2) where the citizen
 line uses S1 v4.2 section 3.5.2 references (`11`/`82`/`83`).
-PIN management (`card pin`) still gates on ATR model
-classification, which does not yet name the Cosmo X.
+The ATR classifier does not name the Cosmo X; PIN management
+and activation admit a card the classifier does not know when
+it answers the organization numbering, and send every PIN
+command under those references.
 
 | Card type                              | Card vendor and product            | FINEID specification | Production window         | Status                            |
 |----------------------------------------|------------------------------------|----------------------|---------------------------|-----------------------------------|
-| Social welfare and organizational      | Idemia Cosmo X                     | S1 v5.0 / S4-2 v4.0  | ~2025 ->                  | Readout + sign; pin gated on ATR  |
+| Social welfare and organizational      | Idemia Cosmo X                     | S1 v5.0 / S4-2 v4.0  | ~2025 ->                  | Readout, sign, PIN management, activation |
 | Social welfare and organizational      | Idemia ID.me IDeal Citiz 2.17-i    | S1 v4.0              | 2019-12-17 ->             | Not in scope                      |
 | Social welfare and organizational      | Oberthur Cosmo v7 IAS-ECC          | (no FINEID spec id)  | ~2010 - 2019-12-16        | All expired                       |
 
@@ -217,41 +224,59 @@ classification, which does not yet name the Cosmo X.
 
 ## Detecting unactivated vs activated cards
 
-Refineid cannot reliably distinguish an activated from an
-unactivated FINEID card via card-side query alone on the
-in-scope OSes. Live-tested 2026-05-24:
+[Card activation](https://github.com/refineid/refineid-core/blob/main/doc/reference/card-activation.md)
+in refineid-core is the reference; this is how refineid applies
+it.
 
-| Card model | `pin_status(PIN1)` on UNACTIVATED card |
-|------------|----------------------------------------|
-| Thales MultiApp v5.0 (FINEID S4-1 v4.0) | `Remaining(5)` -- indistinguishable from an activated card with 5 retries left. |
-| Gemalto MultiApp v4.2 (FINEID S4-1 v3.1) | (not tested unactivated; the maintainer's old card has been activated since 2022.) |
+**The scheme.** FINEID S4-1 v4.2 §4.6 defines two procedures:
 
-Implications for the PIN-management commands:
+| Scheme | Cards | Factory state | Activation |
+| --- | --- | --- | --- |
+| §4.6.1, activation code is the PUK | citizen cards issued before 13 January 2026; every organization card | PIN 1 and PIN 2 blocked | RESET RETRY COUNTER with the 8-digit code (the PUK) for each PIN |
+| §4.6.2, preset activation PIN | citizen cards issued from 13 January 2026 | PIN 1 and PIN 2 set to one 7-digit activation PIN | CHANGE REFERENCE DATA from the activation PIN for each PIN |
 
-- `pin change` / `pin unblock` run a `pin_status`
-  preflight that refuses on `NoInfo` / `Other` / no-probe
-  states. This catches *some* unactivated cards but NOT
-  Thales MultiApp v5.0.
-- The type system enforces a strict command/path split via
-  `PinManagementCardContext` vs `ActivationCardContext` (see
-  the code in `crates/refineid-client/src/card_pin.rs`) --
-  a refactor that mis-routes a context fails to compile.
-- The runtime burn-protection ultimately comes down to the
-  card's own try counter. Operator error (inserting an
-  unactivated card and running `pin change 1`) costs one PIN
-  try and one PUK / activation-PIN try.
+The organization reference numbering decides §4.6.1 whatever the
+certificate date. Under the citizen numbering the authentication
+certificate's validity start decides; when it cannot be read
+there is no scheme and no activation decision. The ATR, the
+chip generation, the issuer's key-family suffix and the issuer
+name decide nothing: Thales MultiApp v5.0 cards issued before
+and from 13 January 2026 share an ATR, the ones issued before
+carry ECC certificates from an "...E" issuer and still use
+§4.6.1, and the test organization cards are issued by
+"DVV TEST Certificates - G5R".
 
-Open follow-up: probe the activation-PIN slot (`0x83`) for
-its retry-counter state. On an unactivated card that slot
-should report `Remaining(5)` (activation PIN never used);
-on an activated card it should report the post-consumption
-state which is OS-specific (`Locked` on Thales v5.0,
-`Remaining(N)` on Gemalto v4.2 since the slot doubles as
-PUK). This would close the detection gap on Thales v5.0 but
-requires extending the `PinSlot` enum in
-`refineid-lib-core::auth` to expose slot 0x83, plus live
-validation on both card models with a known-state card. Not
-yet implemented.
+**Each PIN's readiness** (`PinReadiness::judge` in
+`refineid-lib-core::auth`):
+
+- The PIN changed flag (GET DATA PIN container, FINEID S1 v4.2
+  §3.15.3) decides under both schemes: unchanged awaits
+  activation, changed is activated.
+- Without the flag, §4.6.1 reads the counter-safe VERIFY status:
+  blocked (`6983`), invalidated (`6984`) or exhausted (`63C0`,
+  0 tries left) awaits activation; a usable counter or a verified
+  PIN is activated.
+- Without the flag, §4.6.2 makes no activation decision, and
+  neither scheme decides from any other reading (`6300`, an
+  unexpected status word, no answer). refineid treats such an
+  undecided PIN as activated.
+
+An Idemia Cosmo X organization card ships both PINs answering
+`63C0`, its PUK with 5 tries, and returns no PIN changed flag, so
+the §4.6.1 counter fallback applies.
+
+**What the commands do with it.**
+
+- `pin activate` proceeds when every targeted PIN awaits
+  activation, and otherwise refuses as already activated unless
+  `--allow-reactivate` is given.
+- `pin change` and `pin unblock` refuse a PIN that awaits
+  activation and point to `pin activate`; an activated or
+  undecided PIN meets only the retry floor.
+- The type system keeps the paths apart through
+  `PinManagementCardContext` and `ActivationCardContext` (see
+  `crates/refineid-client/src/card_pin.rs`): a refactor that
+  mis-routes a context fails to compile.
 
 ## Orthogonal classifications
 
@@ -260,26 +285,21 @@ and is identified by ATR/ATS. It does **not** answer the
 following independent questions, which have their own
 classifiers:
 
-### Activation PIN length
+### Activation scheme
 
-DVV cut the activation-PIN mechanism over from 8 digits
-(reusable, doubles as PUK) to 7 digits (single-use,
-separately ordered PUK) on **2026-01-13**. That cutoff falls
-**inside** Thales MultiApp v5.0's production window, so the
-same physical card model has both pre-cutoff (8-digit) and
-post-cutoff (7-digit) instances in the field.
-
-| Card_issued (auth-cert notBefore) | Activation PIN length |
-|-----------------------------------|-----------------------|
-| < 2026-01-13                      | 8 digits (reusable / PUK-equivalent on old card) |
-| >= 2026-01-13                     | 7 digits (single-use) |
-
-The classifier is `classify_card_generation_by_issuance` in
-`refineid-lib-core::pkcs15`. See
+The activation scheme is not a card-model property: the
+13 January 2026 cutover falls inside Thales MultiApp v5.0's
+production window, so one model has cards of both schemes. See
+[Detecting unactivated vs activated cards](#detecting-unactivated-vs-activated-cards)
+for what decides it, and
 [`doc/dvv-terminology.md`](dvv-terminology.md) for the
-activation-PIN-vs-PUK terminology, the citation, and the
-typed `ActivationPinSeven` / `ActivationPinEight` /
-`ActivationCode` lattice.
+terminology and the typed `ActivationPinSeven` /
+`ActivationPinEight` / `ActivationCode` lattice.
+
+| Scheme | Activation entry |
+|--------|------------------|
+| §4.6.1, activation code is the PUK | 8 digits |
+| §4.6.2, preset activation PIN | 7 digits |
 
 Engineering canonical for this dimension on the wire:
 
@@ -294,24 +314,23 @@ table.)
 ### Key algorithm family
 
 Citizen FINEID cards have used both RSA and ECC keys in
-their lifetime; the issuer DN suffix (G3R / G4R for RSA, G3E
-/ G4E for ECC) is a heuristic signal. Not every card model
-maps cleanly onto a single algorithm family. Where
-operations branch on algorithm family, do it via the parsed
-public key, not via the card-model enum.
+their lifetime. Not every card model maps cleanly onto a
+single algorithm family, and the issuer DN suffix is not a
+reliable signal. Where operations branch on algorithm family,
+do it via the parsed public key, not via the card-model enum.
 
-## Type lattice (planned)
+## Type lattice
 
 Following [`doc/typing-discipline.md`](typing-discipline.md),
-the in-scope classification will be encoded as typed values
-in `refineid-lib-core`:
+the classification is encoded as typed values in
+`refineid-lib-core::fineid_card`, in this shape:
 
 ```rust
 pub struct Atr(/* bounded byte array */);
 pub struct Ats(/* bounded byte array */);
 
-/// DVV's category label. Three known values; only `CitizenEid`
-/// is currently in scope. Each variant's `as_dvv_label()`
+/// DVV's category label. Three known values. Each variant's
+/// `as_dvv_label()`
 /// returns the canonical literal used on the wire
 /// ("Citizen eID", "Social welfare and organizational",
 /// "Health care and organizational").
@@ -351,15 +370,10 @@ pub enum CardClassificationError {
 
 The classifier reads the reader's ATR (or ATS, contactless)
 at session-open and returns either `FineidCardModel` or an
-explicit reject. The activation flow takes the typed model
-through its `ActivationCardContext` (next to the existing
-`bound_serial`, `issuance_date`, `trust` fields).
-
-`CardGeneration` (the current `{ Older, Newer, Unknown }`
-enum) is downgraded from a card-identity concept to a pure
-projection of the activation-PIN dimension. Code that uses
-it to decide PIN length keeps working; code that uses it to
-infer card model migrates to `FineidCardModel`.
+explicit reject. The activation flow carries the model, when
+there is one, in its `ActivationCardContext` next to the
+reference numbering, the activation scheme, `bound_serial`,
+`validity_start` and `trust`.
 
 ## What this doc is not
 
@@ -370,10 +384,6 @@ infer card model migrates to `FineidCardModel`.
 - **Not an exhaustive ATR catalogue.** Only the FINEID cards
   DVV ships appear here. A FIDO key or a PIV smartcard's ATR
   is none of refineid's business.
-- **Not a guarantee that out-of-scope models will stay out
-  of scope.** S1 v5.0 (Idemia Cosmo X) social welfare /
-  organizational cards may be added when that use case
-  becomes a refineid surface.
 
 ## References
 

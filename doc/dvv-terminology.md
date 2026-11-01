@@ -6,88 +6,61 @@ use the DVV vocabulary.
 
 ## Codes that protect the card
 
-The Finnish citizen ID card (FINEID) protects key operations with
-up to **four** distinct codes. The first two are user-set during
-activation; the second two are issued by DVV.
+A FINEID card protects key operations with PIN 1 and PIN 2,
+which the holder sets during activation, and the PUK, which
+unblocks them. The activation letter carries the activation
+PIN.
 
-| Code identifier in repo | English (DVV)        | suomi                  | svenska         | Length         | Set by   |
-|-------------------------|----------------------|------------------------|-----------------|----------------|----------|
-| `Pin1`                  | basic PIN code       | perustunnusluku        | baskod          | 4-12 digits    | citizen  |
-| `Pin2`                  | signature PIN code   | allekirjoitustunnusluku | signaturkod    | 6-12 digits    | citizen  |
-| (n/a in code)           | activation PIN       | aktivointitunnusluku   | aktiveringskod  | 7 digits (new card) / 8 digits (old card) | DVV (in the activation letter) |
-| `Puk`                   | PUK code             | PUK-tunnusluku         | PUK-kod         | 7 or 8 digits  | DVV (separately ordered) |
+| Code identifier in repo | English              | suomi                   | svenska         | Length         | Set by   |
+|-------------------------|----------------------|-------------------------|-----------------|----------------|----------|
+| `Pin1`                  | basic PIN            | perustunnusluku         | grundkod        | 4-12 digits    | holder   |
+| `Pin2`                  | signature PIN        | allekirjoitustunnusluku | signaturkod     | 6-12 digits    | holder   |
+| `ActivationCode`        | activation PIN       | aktivointitunnusluku    | aktiveringskod  | 8 digits (§4.6.1) / 7 digits (§4.6.2) | DVV (in the activation letter) |
+| `Puk`                   | PUK code             | PUK-tunnusluku          | PUK-kod         | 8-12 digits    | DVV      |
 
-> ⚠ **The 2026-01-13 cutoff is normative.** Per DVV
-> (<https://dvv.fi/en/activation-of-the-citizen-certificate>):
->
-> - **Cards issued on or after 2026-01-13**: 7-digit activation
->   PIN, **single-use** -- consumed by the activation step,
->   cannot subsequently unblock PIN1 / PIN2. Recovery from
->   lockout requires a separately-ordered PUK (paid).
-> - **Cards issued before 2026-01-13**: 8-digit activation PIN,
->   **reusable** -- doubles as the card's PUK, can unblock
->   PIN1 / PIN2 after they lock. Exhausting it via 5 wrong
->   tries permanently locks the chip for e-services (the card
->   still works as ID document and travel document; a new card
->   from the Police is the only recovery).
->
-> The card's issuance date is printed on its surface.
->
-> In refineid the two activation flows are *two distinct
-> types*:
->
-> - `ActivationPinSeven` -- new-card single-use code, paired
->   with `CardGeneration::Newer`.
-> - `ActivationPinEight` -- old-card reusable code, paired
->   with `CardGeneration::Older`.
-> - `Puk` -- generation-independent unblock code accepting exactly
->   7 or 8 digits. An 8-digit PUK is also issued separately for
->   current ECC cards; length does not identify card generation.
->   The older-card 8-digit form is identical in wire shape to the
->   reusable activation PIN, but distinguished from it by type to
->   reflect operator intent.
->
-> The CLI parses the operator's input length at the prompt
-> boundary into the matching typed variant; `activate_first`
-> then matches the variant against the detected card
-> generation and refuses on mismatch before any modify APDU
-> goes out.
->
-> **Engineering-wise** the activation PIN and PUK may still be
-> the same card-side password slot (`0x83`) on either card --
-> see below.
+UI text writes "PIN 1" and "PIN 2" with a space.
 
-> ⚠ **DVV uses two names for what may be a single card-side
-> mechanism.** Current-generation activation letters ship a
-> 7-digit *activation PIN* (aktivointitunnusluku); the *PUK
-> code* (PUK-tunnusluku) is separately orderable for a fee.
-> Engineering-wise these are plausibly the same password
-> reference inside the card (`0x83` per FINEID S4-1 v3.1) --
-> the activation letter ships an initial value, DVV writes a
-> new value into the same slot when the citizen orders a PUK,
-> and the card sees one mechanism with one try counter. The
-> previous-generation card spelled this out by calling the
-> single 8-digit code "aktivointitunnusluku" for both roles.
->
-> Treat the two names as distinct in **user-facing strings,
-> audit logs, and prose** -- that is how DVV communicates and
-> what citizens see on the letter and on dvv.fi. Don't assert
-> they're separate hardware mechanisms in committed prose.
-> FINEID S4-2 v4.0 (the organizational profile) settles the
-> question for that line only: one PIN PUK security data object
-> (`12`) whose EF.AOD label is "aktivointitunnusluku", with
-> change reference data and reset retry counter both Never
-> (sections 4.2-4.3) -- one mechanism, one counter, never
-> replaceable. The citizen line's S4-1 stays silent, so the
-> caution stands there.
->
-> refineid uses the activation PIN only for factory activation and
-> uses the PUK for `pin unblock 1` / `pin unblock 2`.
-> FINEID S4-1 v4.2 section 4.6 requires both PINs to be initialized,
-> but there is no combined two-PIN card command. Middleware sends one
-> per-slot command for PIN1 and then one for PIN2: `RESET RETRY COUNTER`
-> on the old scheme and `CHANGE REFERENCE DATA` on the new scheme.
-> Later recovery targets only the selected blocked PIN.
+### The two activation schemes
+
+FINEID S4-1 v4.2 §4.6 defines two activation procedures, and the
+card decides which one applies:
+
+- **§4.6.1, the activation code is the PUK.** Citizen cards
+  issued before 13 January 2026, and every organization card.
+  PIN 1 and PIN 2 ship blocked; activation sends RESET RETRY
+  COUNTER with the 8-digit code from the letter for each PIN.
+  The code stays the card's PUK afterwards.
+- **§4.6.2, preset activation PIN.** Citizen cards issued from
+  13 January 2026. PIN 1 and PIN 2 ship set to one 7-digit
+  activation PIN; activation sends CHANGE REFERENCE DATA from
+  that PIN for each PIN. The PUK is a separate code.
+
+The organization reference numbering (FINEID S4-2 v4.0 §4.2)
+decides §4.6.1; under the citizen numbering the authentication
+certificate's validity start decides. Neither the ATR nor the
+issuer name does. The card's issuance date is also printed on
+its surface.
+
+In refineid the two activation entries are *two distinct
+types*:
+
+- `ActivationPinEight` -- the §4.6.1 activation code
+  (`ActivationScheme::ActivationCodeIsPuk`).
+- `ActivationPinSeven` -- the §4.6.2 preset activation PIN
+  (`ActivationScheme::PresetActivationPin`).
+- `Puk` -- the unblock code, 8 to 12 digits under either scheme.
+
+The CLI and the GUI read the scheme from the card before
+prompting and build the matching type; `activate_first` refuses
+a variant that does not match the card's scheme before any
+modify APDU goes out.
+
+refineid uses the activation PIN only for activation and the PUK
+for `pin unblock 1` / `pin unblock 2`. FINEID S4-1 v4.2 §4.6
+requires both PINs to be initialized, but there is no combined
+two-PIN card command: refineid sends one per-PIN command for
+PIN 1 and then one for PIN 2. Later recovery targets only the
+selected blocked PIN.
 
 The terms above are DVV's own -- see the activation letter that
 ships with every new card and the public DVV pages.
@@ -110,32 +83,29 @@ Canonical DVV sources:
 
 ### Activation PIN (`aktivointitunnusluku` / `aktiveringskod`)
 
-- 7 digits on cards issued from ~2025; 8 digits on older cards.
-- Single-use. Used once during card activation to set the
-  initial `Pin1` and `Pin2`.
-- 5 wrong tries during activation **locks the activation PIN
-  itself**. After that the card can only be activated via the
-  PUK (next row).
+- §4.6.1: the 8-digit activation code, which is the PUK; each
+  wrong try spends one of the PUK's tries.
+- §4.6.2: the 7-digit preset activation PIN, the factory value
+  of PIN 1 and PIN 2; each wrong try spends one of that PIN's
+  tries.
+- Used during activation to set the initial `Pin1` and `Pin2`.
 - Distributed inside the DVV activation letter that ships with
   the card. The letter explicitly warns to keep it separate
   from the card.
 
 ### PUK (`PUK-tunnusluku` / `PUK-kod`)
 
-- Exactly 7 or 8 digits, independent of card generation. Field
-  evidence includes an 8-digit separately ordered PUK for a current
-  ECC card; therefore generation must not select the accepted length.
-- Separately ordered from DVV, *paid service*.
-- Used to (a) unblock `Pin1` / `Pin2` after lockout, and
-  (b) activate the card if the activation PIN got locked.
+- 8 to 12 digits (FINEID S4-1 v4.2 §8.1.5, EF.AOD: minLength 8,
+  storedLength 12).
+- Under §4.6.1 the activation letter's code is the PUK; under
+  §4.6.2 the PUK is separately ordered from DVV, a *paid
+  service*.
+- Used to unblock `Pin1` / `Pin2` after lockout.
 - PUK has its own try counter. Exhausting it permanently
   bricks the card -- DVV reissue is the only recovery.
 - FINEID S4-1 v4.2 section 4.1 sets the PUK try limit to 5,
   its usage counter to `No limit`, and both PIN unblocking counters
   to `No limit`. A successful unblock resets the PUK retry counter.
-  Production ECC-card validation confirmed two successive PIN2
-  recoveries with the same PUK; after each recovery both PIN2 and
-  PUK reported 5 retries remaining.
 - refineid's `pin unblock 1 / pin unblock 2` drive
   this code via the PKCS#15 `RESET RETRY COUNTER` APDU.
 
@@ -167,22 +137,11 @@ PIC.
 
 ### Activation PIN vs PUK -- code-side discipline
 
-Old refineid prose treated *aktivointitunnusluku* as a synonym
-for PUK because the previous-generation card conflated them.
-On the current-generation card they are distinct. Code review
-should flag any new occurrence of either pattern:
-
-- "PUK (aktivointitunnusluku)" -- wrong, those are different
-  codes now. Use either "PUK" or "activation PIN" depending on
-  which code is meant.
-- "8-digit activation PIN" -- wrong, the new card's activation
-  PIN is 7 digits. Eight digits is one accepted PUK length and the
-  old-generation activation-code length.
-
-The PUK-related code in `refineid-lib-core::auth` and
-`refineid-client::card_pin` operates on the PUK proper -- the
-naming is correct, only the surrounding doc comments needed
-the conflation removed.
+Name the code by the scheme it belongs to. Under §4.6.1 the
+activation code *is* the PUK; under §4.6.2 the preset activation
+PIN is not a PUK. Prose that equates the two without naming the
+scheme, or that gives the activation PIN one length for every
+card, is wrong.
 
 ### Project name forms
 
