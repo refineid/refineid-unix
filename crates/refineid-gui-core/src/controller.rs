@@ -304,7 +304,9 @@ impl RefineIdController {
 
     /// Replaces the listed cards and selects the card in use: a card in a
     /// reader attached to this computer before the phone's card, the
-    /// first of either.
+    /// first of either. The cards and the selected card's state change in
+    /// one update, so no window shows one card's list with another card's
+    /// activation or organization state.
     fn replace_cards(&self, cards: Vec<ManagedCard>) {
         let index = cards
             .iter()
@@ -315,70 +317,70 @@ impl RefineIdController {
         self.update_state(|state| {
             state.has_local_card = has_local_card;
             state.cards = cards;
+            Self::select_card(state, index);
         });
-        self.select_card(index);
     }
 
-    fn select_card(&self, index: usize) {
-        self.update_state(|state| {
-            if index < state.cards.len() {
-                state.selected_card = Some(index);
-                let card = &state.cards[index];
-                let is_local = card.source == CardSource::Local;
-                state.selected_card_is_local = is_local;
-                state.card_serial = card.report.token_info.serial_number_hex.clone();
-                state.pin1_changed = card.report.pin1_changed;
-                state.pin2_changed = card.report.pin2_changed;
-                state.pin1_status = card.report.pin1;
-                state.pin2_status = card.report.pin2;
-                state.puk_status = card.report.puk;
-                state.pin1_change_available =
-                    is_local && card.pin_change_available(PinSlot::Pin1, card.report.pin1.as_ref());
-                state.pin2_change_available =
-                    is_local && card.pin_change_available(PinSlot::Pin2, card.report.pin2.as_ref());
-                state.activation_available = is_local && card.activation_available();
-                let (p1_rec, p2_rec) = if is_local {
-                    card.recovery_availability()
-                } else {
-                    (false, false)
-                };
-                state.pin1_unblock_available = p1_rec;
-                state.pin2_unblock_available = p2_rec;
-                state.unblock_uses_activation_code = is_local
-                    && card
-                        .activation_context
-                        .as_ref()
-                        .is_some_and(|ctx| ctx.scheme == ActivationScheme::ActivationCodeIsPuk);
-                state.organization_card = card.is_organization_card();
-                // A card here signs whatever its activation scheme; the
-                // phone's card signs when the pairing grants it.
-                state.signature_supported = if is_local {
-                    true
-                } else {
-                    state
-                        .phone
-                        .as_ref()
-                        .is_some_and(|phone| phone.signs_documents)
-                };
+    /// Sets the selected card's state from the card at `index`, or clears
+    /// it when there is none.
+    fn select_card(state: &mut UiState, index: usize) {
+        if index < state.cards.len() {
+            state.selected_card = Some(index);
+            let card = &state.cards[index];
+            let is_local = card.source == CardSource::Local;
+            state.selected_card_is_local = is_local;
+            state.card_serial = card.report.token_info.serial_number_hex.clone();
+            state.pin1_changed = card.report.pin1_changed;
+            state.pin2_changed = card.report.pin2_changed;
+            state.pin1_status = card.report.pin1;
+            state.pin2_status = card.report.pin2;
+            state.puk_status = card.report.puk;
+            state.pin1_change_available =
+                is_local && card.pin_change_available(PinSlot::Pin1, card.report.pin1.as_ref());
+            state.pin2_change_available =
+                is_local && card.pin_change_available(PinSlot::Pin2, card.report.pin2.as_ref());
+            state.activation_available = is_local && card.activation_available();
+            let (p1_rec, p2_rec) = if is_local {
+                card.recovery_availability()
             } else {
-                state.selected_card = None;
-                state.selected_card_is_local = false;
-                state.card_serial = None;
-                state.pin1_changed = None;
-                state.pin2_changed = None;
-                state.pin1_status = None;
-                state.pin2_status = None;
-                state.puk_status = None;
-                state.pin1_change_available = false;
-                state.pin2_change_available = false;
-                state.activation_available = false;
-                state.organization_card = false;
-                state.pin1_unblock_available = false;
-                state.pin2_unblock_available = false;
-                state.unblock_uses_activation_code = false;
-                state.signature_supported = false;
-            }
-        });
+                (false, false)
+            };
+            state.pin1_unblock_available = p1_rec;
+            state.pin2_unblock_available = p2_rec;
+            state.unblock_uses_activation_code = is_local
+                && card
+                    .activation_context
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.scheme == ActivationScheme::ActivationCodeIsPuk);
+            state.organization_card = card.is_organization_card();
+            // A card here signs whatever its activation scheme; the
+            // phone's card signs when the pairing grants it.
+            state.signature_supported = if is_local {
+                true
+            } else {
+                state
+                    .phone
+                    .as_ref()
+                    .is_some_and(|phone| phone.signs_documents)
+            };
+        } else {
+            state.selected_card = None;
+            state.selected_card_is_local = false;
+            state.card_serial = None;
+            state.pin1_changed = None;
+            state.pin2_changed = None;
+            state.pin1_status = None;
+            state.pin2_status = None;
+            state.puk_status = None;
+            state.pin1_change_available = false;
+            state.pin2_change_available = false;
+            state.activation_available = false;
+            state.organization_card = false;
+            state.pin1_unblock_available = false;
+            state.pin2_unblock_available = false;
+            state.unblock_uses_activation_code = false;
+            state.signature_supported = false;
+        }
     }
 
     /// Refresh and inspect all available cards.
@@ -1400,6 +1402,26 @@ mod tests {
         assert!(!state.pin1_unblock_available);
         assert!(!state.pin2_unblock_available);
         assert!(!state.unblock_uses_activation_code);
+    }
+
+    /// The window sees the new cards and the selected card's state in
+    /// one change, never the list beside the previous card's state.
+    #[test]
+    fn replacing_the_cards_is_one_state_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let changes = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&changes);
+        let controller = RefineIdController::new(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let before = changes.load(Ordering::SeqCst);
+        controller.replace_cards(vec![phone_card(
+            "custodian-1",
+            TokenSerial::new("1".to_owned()),
+            CredentialIdentity::new(),
+        )]);
+        assert_eq!(changes.load(Ordering::SeqCst) - before, 1);
+        assert_eq!(controller.state().selected_card, Some(0));
     }
 
     /// Signing does not depend on the activation scheme: a card here
