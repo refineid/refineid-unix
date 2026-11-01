@@ -369,7 +369,7 @@ Section: utils
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: Petri Koistinen <petri.koistinen@refineid.fi>
-Depends: ${GUI_SHLIBS}, refineid-cli (= ${VERSION})
+Depends: ${GUI_SHLIBS}, refineid-cli (= ${VERSION}), xdg-desktop-portal-gtk
 Recommends: refineid-pkcs11 (= ${VERSION})
 Homepage: https://github.com/refineid/refineid-unix
 Description: Graphical user interface for Finnish identity cards

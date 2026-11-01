@@ -653,9 +653,7 @@ impl RefineIdController {
         if !is_local {
             self.update_state(|s| {
                 s.can_text.clear();
-                s.status_message =
-                    "CAN cannot be sent over RAPP. Manage credentials directly on your phone."
-                        .into();
+                s.status_message = "The photo cannot be loaded through the phone".into();
             });
             return;
         }

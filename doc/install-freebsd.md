@@ -17,11 +17,13 @@ pkg install pcsc-lite acsccid libccid pcsc-tools \
     p11-kit nss firefox chromium
 ```
 
-For a desktop: `pkg install xfce xorg lightdm lightdm-gtk-greeter dbus`
-and the `drm-*-kmod` package for the GPU; enable `dbus` and `lightdm` in
+For a desktop: `pkg install xfce xorg lightdm lightdm-gtk-greeter dbus
+xdg-desktop-portal-gtk` and the `drm-*-kmod` package for the GPU; enable `dbus` and `lightdm` in
 `/etc/rc.conf`, set `greeter-session=lightdm-gtk-greeter` and
 `user-session=xfce` under `[Seat:*]` in `/usr/local/etc/lightdm/lightdm.conf`,
-and add the user to the `video` group.
+and add the user to the `video` group. Without `xdg-desktop-portal-gtk`
+the desktop portal has no file chooser and the GUI's file dialogs do not
+open.
 
 ## 2. Smart-card daemon
 
@@ -76,22 +78,16 @@ laptops or workstations, see [freebsd-network-failover.md](freebsd-network-failo
 
 ## 4. Build
 
-The sources need no change. The FLTK crate builds FLTK with its Wayland
-backend on FreeBSD but links the Wayland and GTK libraries only under
-its `use-wayland` feature, and its CMake has to find `linux/input.h`
-from `evdev-proto`, so the build takes the environment below. As the
-user:
+The sources need no change. FLTK's CMake has to find `linux/input.h`
+from `evdev-proto`, so the build takes the environment below; the
+libraries FLTK links on FreeBSD come from `crates/refineid-gui-fltk/build.rs`
+and reach only binaries that link FLTK. As the user:
 
 ```sh
 git clone https://github.com/refineid/refineid-unix.git
 cd refineid-unix
 export CFLAGS=-I/usr/local/include CXXFLAGS=-I/usr/local/include \
     CMAKE_INCLUDE_PATH=/usr/local/include
-export RUSTFLAGS="-L native=/usr/local/lib \
-    -l dylib=wayland-client -l dylib=wayland-cursor -l dylib=wayland-egl \
-    -l dylib=xkbcommon -l dylib=dbus-1 -l dylib=EGL -l dylib=GL \
-    -l dylib=gtk-3 -l dylib=gdk-3 -l dylib=gobject-2.0 -l dylib=glib-2.0 \
-    -l dylib=gio-2.0 -l dylib=pango-1.0 -l dylib=pangocairo-1.0 -l dylib=cairo"
 cargo build --release --workspace
 cargo test --release --workspace
 ```

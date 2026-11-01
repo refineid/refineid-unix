@@ -214,66 +214,77 @@ impl CodeBoxes {
     }
 }
 
-/// Human-readable retry count formatting for status pills.
+/// The fewest tries left at which a PIN or the PUK is still served.
+const SERVED_TRIES_FLOOR: usize = 3;
+
+/// A PIN's status pill: empty at the try limit, the tries left below it,
+/// red below the floor and when blocked.
 fn format_pin_status(status: Option<&PinStatus>, changed: Option<bool>) -> (String, &'static str) {
     let limit = PIN_TRY_LIMIT as usize;
-    match status {
+    let (count, class) = match status {
         Some(PinStatus::Remaining(retries)) => {
             let count = retries.get() as usize;
-            let note = if changed == Some(false) {
-                " • Factory"
+            let class = if count < SERVED_TRIES_FLOOR {
+                "status-pill-red"
             } else {
-                ""
+                "status-pill-gray"
             };
-            if count >= limit {
-                (format!("{count} / {limit}{note}"), "status-pill-green")
-            } else if count >= 3 {
-                (format!("{count} / {limit}{note}"), "status-pill-orange")
+            if count == 0 {
+                ("Blocked".to_string(), class)
+            } else if count < limit {
+                (format!("{count} / {limit}"), class)
             } else {
-                (format!("{count} / {limit}{note}"), "status-pill-red")
+                (String::new(), class)
             }
         }
         Some(PinStatus::Locked) => ("Blocked".to_string(), "status-pill-red"),
-        Some(PinStatus::Verified) => ("Verified".to_string(), "status-pill-green"),
         Some(PinStatus::NoInfo) => ("No retry count".to_string(), "status-pill-gray"),
         Some(PinStatus::Other(sw)) => (format!("Status {sw:04X}"), "status-pill-gray"),
-        None => ("No card".to_string(), "status-pill-gray"),
-    }
+        Some(PinStatus::Verified) | None => (String::new(), "status-pill-gray"),
+    };
+    let text = match (changed, count.is_empty()) {
+        (Some(false), true) => "Factory value".to_string(),
+        (Some(false), false) => format!("{count} • Factory value"),
+        (Some(true) | None, _) => count,
+    };
+    (text, class)
 }
 
-/// Human-readable PUK status formatting.
+/// The PUK's status pill, by the same rule as [`format_pin_status`].
 fn format_puk_status(status: Option<&PukStatus>) -> (String, &'static str) {
     match status {
         Some(PukStatus::Remaining(retries)) => {
             let count = retries.get() as usize;
-            if count >= 5 {
-                (format!("{count} remaining"), "status-pill-green")
-            } else if count >= 3 {
-                (format!("{count} remaining"), "status-pill-orange")
+            let class = if count < SERVED_TRIES_FLOOR {
+                "status-pill-red"
             } else {
-                (format!("{count} remaining"), "status-pill-red")
+                "status-pill-gray"
+            };
+            if count == 0 {
+                ("Blocked".to_string(), class)
+            } else if count < PIN_TRY_LIMIT as usize {
+                (format!("{count} remaining"), class)
+            } else {
+                (String::new(), class)
             }
         }
         Some(PukStatus::Locked) => ("Blocked".to_string(), "status-pill-red"),
         Some(PukStatus::Invalidated) => ("Invalidated".to_string(), "status-pill-red"),
         Some(PukStatus::NoInfo) => ("No count".to_string(), "status-pill-gray"),
         Some(PukStatus::Other(sw)) => (format!("Status {sw:04X}"), "status-pill-gray"),
-        None => ("No card".to_string(), "status-pill-gray"),
+        None => (String::new(), "status-pill-gray"),
     }
 }
 
 /// Visual widgets associated with the Identity tab.
 struct IdentityWidgets {
     holder_name_label: gtk4::Label,
-    status_pill_label: gtk4::Label,
     can_entry: gtk4::Entry,
     load_photo_button: gtk4::Button,
     portrait_picture: gtk4::Picture,
-    portrait_placeholder: gtk4::Label,
     copy_portrait_button: gtk4::Button,
     save_portrait_button: gtk4::Button,
     signature_picture: gtk4::Picture,
-    signature_placeholder: gtk4::Label,
     copy_signature_button: gtk4::Button,
     save_signature_button: gtk4::Button,
 }
@@ -285,9 +296,7 @@ struct IdentityWidgets {
 )]
 struct PinsWidgets {
     pin1_pill: gtk4::Label,
-    pin1_note: gtk4::Label,
     pin2_pill: gtk4::Label,
-    pin2_note: gtk4::Label,
     puk_pill: gtk4::Label,
     task_stack: gtk4::Stack,
     btn_task_p1: gtk4::ToggleButton,
@@ -329,7 +338,6 @@ struct PinsWidgets {
     reason = "Widget handles retained for GTK UI hierarchy lifetime"
 )]
 struct SignWidgets {
-    doc_count_label: gtk4::Label,
     doc_list: gtk4::ListBox,
     add_doc_button: gtk4::Button,
     remove_doc_button: gtk4::Button,
@@ -361,7 +369,6 @@ struct PhoneWidgets {
 
 /// Bottom status bar widgets.
 struct StatusBarWidgets {
-    attempts_label: gtk4::Label,
     status_label: gtk4::Label,
     spinner: gtk4::Spinner,
 }
@@ -494,6 +501,7 @@ impl Gtk4Driver {
 
             /* Primary Action Button (macOS Blue) */
             .apple-primary-button {
+                background-image: none;
                 background-color: #007aff;
                 color: #ffffff;
                 border: none;
@@ -505,14 +513,17 @@ impl Gtk4Driver {
             }
 
             .apple-primary-button:hover {
+                background-image: none;
                 background-color: #0069d9;
             }
 
             .apple-primary-button:active {
+                background-image: none;
                 background-color: #0056b3;
             }
 
             .apple-primary-button:disabled {
+                background-image: none;
                 background-color: #e5e5ea;
                 color: #8e8e93;
                 box-shadow: none;
@@ -520,6 +531,7 @@ impl Gtk4Driver {
 
             /* Secondary Action Button (macOS White Button) */
             .apple-secondary-button {
+                background-image: none;
                 background-color: #ffffff;
                 color: #1d1d1f;
                 border: 1px solid #d1d1d6;
@@ -566,24 +578,9 @@ impl Gtk4Driver {
                 font-weight: 600;
             }
 
-            .status-pill-green {
-                background-color: rgba(52, 199, 89, 0.15);
-                color: #248a3d;
-            }
-
-            .status-pill-orange {
-                background-color: rgba(255, 149, 0, 0.15);
-                color: #c97000;
-            }
-
             .status-pill-red {
                 background-color: rgba(255, 59, 48, 0.15);
                 color: #d70015;
-            }
-
-            .status-pill-blue {
-                background-color: rgba(0, 122, 255, 0.15);
-                color: #007aff;
             }
 
             .status-pill-gray {
@@ -899,50 +896,15 @@ impl Gtk4Widgets {
             .selected_card
             .and_then(|idx| state.cards.get(idx))
             .map(|c| c.display_name())
-            .unwrap_or_else(|| "No card inserted".to_string());
+            .unwrap_or_else(|| "No card".to_string());
         self.identity.holder_name_label.set_label(&holder);
 
         if state.selected_card_is_local {
-            self.identity
-                .status_pill_label
-                .set_label("● Local Smart Card");
-            self.identity
-                .status_pill_label
-                .remove_css_class("status-pill-blue");
-            self.identity
-                .status_pill_label
-                .remove_css_class("status-pill-gray");
-            self.identity
-                .status_pill_label
-                .add_css_class("status-pill-green");
             self.identity.can_entry.set_sensitive(true);
             self.identity
                 .load_photo_button
                 .set_sensitive(!state.busy && state.selected_card.is_some());
-        } else if state.selected_card.is_some() {
-            self.identity.status_pill_label.set_label("● Paired Phone");
-            self.identity
-                .status_pill_label
-                .remove_css_class("status-pill-green");
-            self.identity
-                .status_pill_label
-                .remove_css_class("status-pill-gray");
-            self.identity
-                .status_pill_label
-                .add_css_class("status-pill-blue");
-            self.identity.can_entry.set_sensitive(false);
-            self.identity.load_photo_button.set_sensitive(false);
         } else {
-            self.identity.status_pill_label.set_label("No Card");
-            self.identity
-                .status_pill_label
-                .remove_css_class("status-pill-green");
-            self.identity
-                .status_pill_label
-                .remove_css_class("status-pill-blue");
-            self.identity
-                .status_pill_label
-                .add_css_class("status-pill-gray");
             self.identity.can_entry.set_sensitive(false);
             self.identity.load_photo_button.set_sensitive(false);
         }
@@ -959,7 +921,6 @@ impl Gtk4Widgets {
             if let Some(ref buf) = state.portrait {
                 if let Some(texture) = texture_from_rgba(buf) {
                     self.identity.portrait_picture.set_paintable(Some(&texture));
-                    self.identity.portrait_placeholder.set_visible(false);
                     self.identity.portrait_picture.set_visible(true);
                     self.identity.copy_portrait_button.set_sensitive(true);
                     self.identity.save_portrait_button.set_sensitive(true);
@@ -969,7 +930,6 @@ impl Gtk4Widgets {
                     .portrait_picture
                     .set_paintable(None::<&gdk::Texture>);
                 self.identity.portrait_picture.set_visible(false);
-                self.identity.portrait_placeholder.set_visible(true);
                 self.identity.copy_portrait_button.set_sensitive(false);
                 self.identity.save_portrait_button.set_sensitive(false);
             }
@@ -983,7 +943,6 @@ impl Gtk4Widgets {
                     self.identity
                         .signature_picture
                         .set_paintable(Some(&texture));
-                    self.identity.signature_placeholder.set_visible(false);
                     self.identity.signature_picture.set_visible(true);
                     self.identity.copy_signature_button.set_sensitive(true);
                     self.identity.save_signature_button.set_sensitive(true);
@@ -993,7 +952,6 @@ impl Gtk4Widgets {
                     .signature_picture
                     .set_paintable(None::<&gdk::Texture>);
                 self.identity.signature_picture.set_visible(false);
-                self.identity.signature_placeholder.set_visible(true);
                 self.identity.copy_signature_button.set_sensitive(false);
                 self.identity.save_signature_button.set_sensitive(false);
             }
@@ -1002,26 +960,21 @@ impl Gtk4Widgets {
         // 2. PINs Tab
         let (p1_text, p1_cls) = format_pin_status(state.pin1_status.as_ref(), state.pin1_changed);
         self.pins.pin1_pill.set_label(&p1_text);
+        self.pins.pin1_pill.set_visible(!p1_text.is_empty());
         self.pins
             .pin1_pill
             .set_css_classes(&["status-pill", p1_cls]);
-        self.pins.pin1_note.set_label(match state.pin1_changed {
-            Some(false) => "Factory value",
-            _ => "Authentication",
-        });
 
         let (p2_text, p2_cls) = format_pin_status(state.pin2_status.as_ref(), state.pin2_changed);
         self.pins.pin2_pill.set_label(&p2_text);
+        self.pins.pin2_pill.set_visible(!p2_text.is_empty());
         self.pins
             .pin2_pill
             .set_css_classes(&["status-pill", p2_cls]);
-        self.pins.pin2_note.set_label(match state.pin2_changed {
-            Some(false) => "Factory value",
-            _ => "Qualified Signature",
-        });
 
         let (puk_text, puk_cls) = format_puk_status(state.puk_status.as_ref());
         self.pins.puk_pill.set_label(&puk_text);
+        self.pins.puk_pill.set_visible(!puk_text.is_empty());
         self.pins
             .puk_pill
             .set_css_classes(&["status-pill", puk_cls]);
@@ -1045,13 +998,6 @@ impl Gtk4Widgets {
             .set_sensitive(state.activation_available && !state.busy);
 
         // 3. Sign Tab
-        let count = state.pdf_documents.len();
-        self.sign.doc_count_label.set_label(&format!(
-            "{} document{}",
-            count,
-            if count == 1 { "" } else { "s" }
-        ));
-
         let mut cached_docs = self.sign.last_pdf_documents.borrow_mut();
         if *cached_docs != state.pdf_documents {
             *cached_docs = state.pdf_documents.clone();
@@ -1171,9 +1117,6 @@ impl Gtk4Widgets {
         }
 
         // 5. Bottom Status Bar
-        self.status_bar.attempts_label.set_label(&format!(
-            "PIN 1: {p1_text}  •  PIN 2: {p2_text}  •  PUK: {puk_text}"
-        ));
         self.status_bar
             .status_label
             .set_label(&state.status_message);
@@ -1193,28 +1136,6 @@ fn show_alert(parent: &gtk4::Window, message: &str) {
         .buttons(gtk4::ButtonsType::Ok)
         .build();
     dialog.connect_response(|d, _| {
-        d.close();
-    });
-    dialog.present();
-}
-
-/// Helper confirmation modal dialog.
-fn show_confirm(parent: &gtk4::Window, message: &str, on_confirm: impl FnOnce() + 'static) {
-    let dialog = gtk4::MessageDialog::builder()
-        .transient_for(parent)
-        .modal(true)
-        .title("RefineID")
-        .text(message)
-        .message_type(gtk4::MessageType::Question)
-        .buttons(gtk4::ButtonsType::OkCancel)
-        .build();
-    let cb = RefCell::new(Some(on_confirm));
-    dialog.connect_response(move |d, resp| {
-        if resp == gtk4::ResponseType::Ok
-            && let Some(action) = cb.borrow_mut().take()
-        {
-            action();
-        }
         d.close();
     });
     dialog.present();
@@ -1257,19 +1178,14 @@ fn build_identity_page(
     id_icon.set_pixel_size(24);
 
     let holder_name_label = gtk4::Label::builder()
-        .label("No card detected")
+        .label("No card")
         .halign(gtk4::Align::Start)
         .hexpand(true)
         .build();
     holder_name_label.add_css_class("apple-card-title");
 
-    let status_pill_label = gtk4::Label::builder().label("No Card").build();
-    status_pill_label.add_css_class("status-pill");
-    status_pill_label.add_css_class("status-pill-gray");
-
     holder_row.append(&id_icon);
     holder_row.append(&holder_name_label);
-    holder_row.append(&status_pill_label);
     card1.append(&holder_row);
 
     let sep = gtk4::Separator::builder()
@@ -1282,12 +1198,11 @@ fn build_identity_page(
         .spacing(12)
         .build();
     let can_label = gtk4::Label::builder()
-        .label("Card Access Number (CAN):")
+        .label("CAN")
         .halign(gtk4::Align::Start)
         .build();
 
     let can_entry = gtk4::Entry::builder()
-        .placeholder_text("6 digits on card")
         .max_length(CAN_DIGITS as i32)
         .width_chars(16)
         .build();
@@ -1301,7 +1216,7 @@ fn build_identity_page(
         }
     });
 
-    let load_photo_button = gtk4::Button::builder().label("Load Photo").build();
+    let load_photo_button = gtk4::Button::builder().label("Load photo").build();
     load_photo_button.add_css_class("apple-primary-button");
 
     can_row.append(&can_label);
@@ -1352,7 +1267,7 @@ fn build_identity_page(
         .hexpand(true)
         .build();
     let photo_title = gtk4::Label::builder()
-        .label("Official Photo")
+        .label("Photo")
         .halign(gtk4::Align::Start)
         .build();
     photo_title.add_css_class("apple-card-title");
@@ -1363,14 +1278,6 @@ fn build_identity_page(
         .build();
     photo_frame.add_css_class("media-preview-frame");
 
-    let portrait_overlay = gtk4::Overlay::builder().build();
-    let portrait_placeholder = gtk4::Label::builder()
-        .label("Enter CAN above to load photo")
-        .halign(gtk4::Align::Center)
-        .valign(gtk4::Align::Center)
-        .build();
-    portrait_placeholder.add_css_class("apple-card-subtitle");
-
     let portrait_picture = gtk4::Picture::builder()
         .can_shrink(true)
         .halign(gtk4::Align::Center)
@@ -1378,17 +1285,15 @@ fn build_identity_page(
         .build();
     portrait_picture.set_visible(false);
 
-    portrait_overlay.set_child(Some(&portrait_placeholder));
-    portrait_overlay.add_overlay(&portrait_picture);
-    photo_frame.set_child(Some(&portrait_overlay));
+    photo_frame.set_child(Some(&portrait_picture));
 
     let photo_actions = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(8)
         .build();
-    let copy_portrait_button = gtk4::Button::builder().label("Copy Photo").build();
+    let copy_portrait_button = gtk4::Button::builder().label("Copy photo").build();
     copy_portrait_button.add_css_class("apple-secondary-button");
-    let save_portrait_button = gtk4::Button::builder().label("Save As…").build();
+    let save_portrait_button = gtk4::Button::builder().label("Save as…").build();
     save_portrait_button.add_css_class("apple-secondary-button");
     photo_actions.append(&copy_portrait_button);
     photo_actions.append(&save_portrait_button);
@@ -1404,7 +1309,7 @@ fn build_identity_page(
         .hexpand(true)
         .build();
     let sig_title = gtk4::Label::builder()
-        .label("Cardholder Signature")
+        .label("Signature")
         .halign(gtk4::Align::Start)
         .build();
     sig_title.add_css_class("apple-card-title");
@@ -1415,14 +1320,6 @@ fn build_identity_page(
         .build();
     sig_frame.add_css_class("media-preview-frame");
 
-    let sig_overlay = gtk4::Overlay::builder().build();
-    let signature_placeholder = gtk4::Label::builder()
-        .label("(Signature not loaded)")
-        .halign(gtk4::Align::Center)
-        .valign(gtk4::Align::Center)
-        .build();
-    signature_placeholder.add_css_class("apple-card-subtitle");
-
     let signature_picture = gtk4::Picture::builder()
         .can_shrink(true)
         .halign(gtk4::Align::Center)
@@ -1430,17 +1327,15 @@ fn build_identity_page(
         .build();
     signature_picture.set_visible(false);
 
-    sig_overlay.set_child(Some(&signature_placeholder));
-    sig_overlay.add_overlay(&signature_picture);
-    sig_frame.set_child(Some(&sig_overlay));
+    sig_frame.set_child(Some(&signature_picture));
 
     let sig_actions = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(8)
         .build();
-    let copy_signature_button = gtk4::Button::builder().label("Copy Signature").build();
+    let copy_signature_button = gtk4::Button::builder().label("Copy signature").build();
     copy_signature_button.add_css_class("apple-secondary-button");
-    let save_signature_button = gtk4::Button::builder().label("Save As…").build();
+    let save_signature_button = gtk4::Button::builder().label("Save as…").build();
     save_signature_button.add_css_class("apple-secondary-button");
     sig_actions.append(&copy_signature_button);
     sig_actions.append(&save_signature_button);
@@ -1540,15 +1435,12 @@ fn build_identity_page(
         scrolled,
         IdentityWidgets {
             holder_name_label,
-            status_pill_label,
             can_entry,
             load_photo_button,
             portrait_picture,
-            portrait_placeholder,
             copy_portrait_button,
             save_portrait_button,
             signature_picture,
-            signature_placeholder,
             copy_signature_button,
             save_signature_button,
         },
@@ -1577,13 +1469,6 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .build();
     card1.add_css_class("apple-card");
 
-    let card1_title = gtk4::Label::builder()
-        .label("Credential Status")
-        .halign(gtk4::Align::Start)
-        .build();
-    card1_title.add_css_class("apple-card-title");
-    card1.append(&card1_title);
-
     let tiles_row = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(16)
@@ -1605,18 +1490,13 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .hexpand(true)
         .build();
     l1.add_css_class("apple-card-title");
-    let pin1_pill = gtk4::Label::builder().label("5 / 5").build();
+    let pin1_pill = gtk4::Label::builder().build();
     pin1_pill.add_css_class("status-pill");
-    pin1_pill.add_css_class("status-pill-green");
+    pin1_pill.add_css_class("status-pill-gray");
+    pin1_pill.set_visible(false);
     t1_head.append(&l1);
     t1_head.append(&pin1_pill);
-    let pin1_note = gtk4::Label::builder()
-        .label("Authentication")
-        .halign(gtk4::Align::Start)
-        .build();
-    pin1_note.add_css_class("apple-card-subtitle");
     t1.append(&t1_head);
-    t1.append(&pin1_note);
 
     // Tile 2: PIN 2
     let t2 = gtk4::Box::builder()
@@ -1633,18 +1513,13 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .hexpand(true)
         .build();
     l2.add_css_class("apple-card-title");
-    let pin2_pill = gtk4::Label::builder().label("5 / 5").build();
+    let pin2_pill = gtk4::Label::builder().build();
     pin2_pill.add_css_class("status-pill");
-    pin2_pill.add_css_class("status-pill-green");
+    pin2_pill.add_css_class("status-pill-gray");
+    pin2_pill.set_visible(false);
     t2_head.append(&l2);
     t2_head.append(&pin2_pill);
-    let pin2_note = gtk4::Label::builder()
-        .label("Qualified Signature")
-        .halign(gtk4::Align::Start)
-        .build();
-    pin2_note.add_css_class("apple-card-subtitle");
     t2.append(&t2_head);
-    t2.append(&pin2_note);
 
     // Tile 3: PUK
     let t3 = gtk4::Box::builder()
@@ -1661,18 +1536,13 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .hexpand(true)
         .build();
     l3.add_css_class("apple-card-title");
-    let puk_pill = gtk4::Label::builder().label("5 remaining").build();
+    let puk_pill = gtk4::Label::builder().build();
     puk_pill.add_css_class("status-pill");
-    puk_pill.add_css_class("status-pill-green");
+    puk_pill.add_css_class("status-pill-gray");
+    puk_pill.set_visible(false);
     t3_head.append(&l3);
     t3_head.append(&puk_pill);
-    let puk_note = gtk4::Label::builder()
-        .label("Unblocking Code")
-        .halign(gtk4::Align::Start)
-        .build();
-    puk_note.add_css_class("apple-card-subtitle");
     t3.append(&t3_head);
-    t3.append(&puk_note);
 
     tiles_row.append(&t1);
     tiles_row.append(&t2);
@@ -1724,7 +1594,7 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .margin_top(8)
         .build();
     let p1_current_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Current PIN 1 (4-12 digits)")
+        .placeholder_text("Current PIN 1")
         .show_peek_icon(true)
         .build();
     let p1_new_entry = gtk4::PasswordEntry::builder()
@@ -1732,7 +1602,7 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .show_peek_icon(true)
         .build();
     let p1_confirm_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Confirm New PIN 1")
+        .placeholder_text("Confirm new PIN 1")
         .show_peek_icon(true)
         .build();
     let change_pin1_button = gtk4::Button::builder().label("Change PIN 1").build();
@@ -1751,7 +1621,7 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .margin_top(8)
         .build();
     let p2_current_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Current PIN 2 (6-12 digits)")
+        .placeholder_text("Current PIN 2")
         .show_peek_icon(true)
         .build();
     let p2_new_entry = gtk4::PasswordEntry::builder()
@@ -1759,7 +1629,7 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .show_peek_icon(true)
         .build();
     let p2_confirm_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Confirm New PIN 2")
+        .placeholder_text("Confirm new PIN 2")
         .show_peek_icon(true)
         .build();
     let change_pin2_button = gtk4::Button::builder().label("Change PIN 2").build();
@@ -1777,8 +1647,7 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .spacing(12)
         .margin_top(8)
         .build();
-    let unblock_slot_combo =
-        gtk4::DropDown::from_strings(&["PIN 1 (Authentication)", "PIN 2 (Signature)"]);
+    let unblock_slot_combo = gtk4::DropDown::from_strings(&["PIN 1", "PIN 2"]);
     let puk_entry = gtk4::PasswordEntry::builder()
         .placeholder_text("PUK Code")
         .show_peek_icon(true)
@@ -1788,7 +1657,7 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .show_peek_icon(true)
         .build();
     let unblock_confirm_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Confirm New PIN")
+        .placeholder_text("Confirm new PIN")
         .show_peek_icon(true)
         .build();
     let unblock_button = gtk4::Button::builder().label("Unblock PIN").build();
@@ -1808,11 +1677,11 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .margin_top(8)
         .build();
     let act_code_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("8-digit Activation Code from Letter")
+        .placeholder_text("Activation code")
         .show_peek_icon(true)
         .build();
     let act_p1_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Initial PIN 1 (4-12 digits)")
+        .placeholder_text("Initial PIN 1")
         .show_peek_icon(true)
         .build();
     let act_p1_confirm_entry = gtk4::PasswordEntry::builder()
@@ -1820,7 +1689,7 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         .show_peek_icon(true)
         .build();
     let act_p2_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Initial PIN 2 (6-12 digits)")
+        .placeholder_text("Initial PIN 2")
         .show_peek_icon(true)
         .build();
     let act_p2_confirm_entry = gtk4::PasswordEntry::builder()
@@ -2152,9 +2021,7 @@ fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindo
         scrolled,
         PinsWidgets {
             pin1_pill,
-            pin1_note,
             pin2_pill,
-            pin2_note,
             puk_pill,
             task_stack,
             btn_task_p1,
@@ -2214,17 +2081,12 @@ fn build_sign_page(
         .spacing(8)
         .build();
     let card1_title = gtk4::Label::builder()
-        .label("Documents to Sign")
+        .label("Documents")
         .halign(gtk4::Align::Start)
         .hexpand(true)
         .build();
     card1_title.add_css_class("apple-card-title");
-    let doc_count_label = gtk4::Label::builder().label("0 documents").build();
-    doc_count_label.add_css_class("status-pill");
-    doc_count_label.add_css_class("status-pill-gray");
-
     card1_head.append(&card1_title);
-    card1_head.append(&doc_count_label);
     card1.append(&card1_head);
 
     let doc_scroller = gtk4::ScrolledWindow::builder()
@@ -2243,11 +2105,11 @@ fn build_sign_page(
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(8)
         .build();
-    let add_doc_button = gtk4::Button::builder().label("Add Documents…").build();
+    let add_doc_button = gtk4::Button::builder().label("Add documents…").build();
     add_doc_button.add_css_class("apple-primary-button");
     let remove_doc_button = gtk4::Button::builder().label("Remove").build();
     remove_doc_button.add_css_class("apple-secondary-button");
-    let clear_doc_button = gtk4::Button::builder().label("Clear All").build();
+    let clear_doc_button = gtk4::Button::builder().label("Clear all").build();
     clear_doc_button.add_css_class("apple-secondary-button");
 
     doc_actions.append(&add_doc_button);
@@ -2263,7 +2125,7 @@ fn build_sign_page(
     card2.add_css_class("apple-card");
 
     let card2_title = gtk4::Label::builder()
-        .label("Signature Format")
+        .label("Signing method")
         .halign(gtk4::Align::Start)
         .build();
     card2_title.add_css_class("apple-card-title");
@@ -2277,13 +2139,11 @@ fn build_sign_page(
     format_bar.add_css_class("apple-segmented-bar");
 
     let btn_format_pades = gtk4::ToggleButton::builder()
-        .label("PAdES (PDF Embedded)")
+        .label("Separately (PDF)")
         .build();
     btn_format_pades.add_css_class("apple-segmented-button");
 
-    let btn_format_asice = gtk4::ToggleButton::builder()
-        .label("ASiC-E Container")
-        .build();
+    let btn_format_asice = gtk4::ToggleButton::builder().label("As a package").build();
     btn_format_asice.add_css_class("apple-segmented-button");
     btn_format_asice.set_group(Some(&btn_format_pades));
 
@@ -2291,48 +2151,23 @@ fn build_sign_page(
     format_bar.append(&btn_format_asice);
     card2.append(&format_bar);
 
-    let format_hint = gtk4::Label::builder()
-        .label(
-            "PAdES (ETSI EN 319 142) embeds qualified digital signatures directly within standard PDF files.",
-        )
-        .halign(gtk4::Align::Start)
-        .build();
-    format_hint.add_css_class("apple-card-subtitle");
-    card2.append(&format_hint);
-
-    // Card 3: Qualified Authorization & Sign Action
+    // Card 3: PIN 2 and the sign action
     let card3 = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(12)
         .build();
     card3.add_css_class("apple-card");
 
-    let card3_title = gtk4::Label::builder()
-        .label("Qualified Signature Authorization")
-        .halign(gtk4::Align::Start)
-        .build();
-    card3_title.add_css_class("apple-card-title");
-    let card3_subtitle = gtk4::Label::builder()
-        .label(
-            "Enter PIN 2 to execute a Qualified Electronic Signature (QES) pursuant to EU eIDAS Regulation (EU) No 910/2014.",
-        )
-        .halign(gtk4::Align::Start)
-        .build();
-    card3_subtitle.add_css_class("apple-card-subtitle");
-
-    card3.append(&card3_title);
-    card3.append(&card3_subtitle);
-
     let sign_row = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(12)
         .build();
     let sign_pin2_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("PIN 2 (Signature)")
+        .placeholder_text("Signature PIN 2")
         .show_peek_icon(true)
         .hexpand(true)
         .build();
-    let sign_button = gtk4::Button::builder().label("Sign Documents").build();
+    let sign_button = gtk4::Button::builder().label("Sign documents").build();
     sign_button.add_css_class("apple-primary-button");
 
     sign_row.append(&sign_pin2_entry);
@@ -2364,7 +2199,7 @@ fn build_sign_page(
         let win_clone = window.clone();
         add_doc_button.connect_clicked(move |_| {
             let chooser = gtk4::FileChooserNative::new(
-                Some("Select PDF Documents to Sign"),
+                Some("Choose documents"),
                 Some(&win_clone),
                 gtk4::FileChooserAction::Open,
                 Some("Add"),
@@ -2425,23 +2260,15 @@ fn build_sign_page(
     }
     {
         let c = Arc::clone(controller);
-        let hint = format_hint.clone();
         btn_format_pades.connect_toggled(move |btn| {
             if btn.is_active() {
-                hint.set_label(
-                    "PAdES (ETSI EN 319 142) embeds qualified digital signatures directly within standard PDF files.",
-                );
                 c.handle_intent(UserIntent::SetSignFormat(SignFormat::Pades));
             }
         });
 
         let c = Arc::clone(controller);
-        let hint = format_hint.clone();
         btn_format_asice.connect_toggled(move |btn| {
             if btn.is_active() {
-                hint.set_label(
-                    "ASiC-E (ETSI EN 319 162) packages arbitrary documents and signatures into a standardized container.",
-                );
                 c.handle_intent(UserIntent::SetSignFormat(SignFormat::AsicE));
             }
         });
@@ -2479,7 +2306,6 @@ fn build_sign_page(
     (
         scrolled,
         SignWidgets {
-            doc_count_label,
             doc_list,
             add_doc_button,
             remove_doc_button,
@@ -2525,18 +2351,11 @@ fn build_phone_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWind
     reader_card.append(&phone_icon);
 
     let pair_title = gtk4::Label::builder()
-        .label("Use Phone as Smart Card Reader")
+        .label("Pairing code")
         .halign(gtk4::Align::Center)
         .build();
     pair_title.add_css_class("apple-card-title");
     reader_card.append(&pair_title);
-
-    let pair_subtitle = gtk4::Label::builder()
-        .label("Type the 6-character code displayed in the RefineID app on your phone:")
-        .halign(gtk4::Align::Center)
-        .build();
-    pair_subtitle.add_css_class("apple-card-subtitle");
-    reader_card.append(&pair_subtitle);
 
     let code_boxes = CodeBoxes::new();
     reader_card.append(code_boxes.container());
@@ -2570,9 +2389,9 @@ fn build_phone_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWind
         .halign(gtk4::Align::Start)
         .build();
     phone_name_label.add_css_class("apple-card-title");
-    let phone_state_pill = gtk4::Label::builder().label("Ready").build();
+    let phone_state_pill = gtk4::Label::builder().build();
     phone_state_pill.add_css_class("status-pill");
-    phone_state_pill.add_css_class("status-pill-blue");
+    phone_state_pill.add_css_class("status-pill-gray");
     phone_state_pill.set_halign(gtk4::Align::Start);
     phone_info.append(&phone_name_label);
     phone_info.append(&phone_state_pill);
@@ -2616,19 +2435,8 @@ fn build_phone_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWind
     // Wiring forget phone
     {
         let c = Arc::clone(controller);
-        forget_phone_button.connect_clicked(move |btn| {
-            if let Some(root) = btn.root()
-                && let Ok(win) = root.downcast::<gtk4::Window>()
-            {
-                let c_action = Arc::clone(&c);
-                show_confirm(
-                    &win,
-                    "Forget this paired phone? It will no longer serve smart card sessions.",
-                    move || {
-                        c_action.handle_intent(UserIntent::ForgetPhone);
-                    },
-                );
-            }
+        forget_phone_button.connect_clicked(move |_| {
+            c.handle_intent(UserIntent::ForgetPhone);
         });
     }
 
@@ -2653,12 +2461,6 @@ fn build_status_bar() -> (gtk4::Box, StatusBarWidgets) {
         .build();
     bar.add_css_class("bottom-bar");
 
-    let attempts_label = gtk4::Label::builder()
-        .label("PIN 1: No card  •  PIN 2: No card  •  PUK: No card")
-        .halign(gtk4::Align::Start)
-        .build();
-    attempts_label.add_css_class("apple-card-subtitle");
-
     let spacer = gtk4::Box::builder().hexpand(true).build();
 
     let status_label = gtk4::Label::builder()
@@ -2670,7 +2472,6 @@ fn build_status_bar() -> (gtk4::Box, StatusBarWidgets) {
     let spinner = gtk4::Spinner::builder().build();
     spinner.set_visible(false);
 
-    bar.append(&attempts_label);
     bar.append(&spacer);
     bar.append(&status_label);
     bar.append(&spinner);
@@ -2678,11 +2479,20 @@ fn build_status_bar() -> (gtk4::Box, StatusBarWidgets) {
     (
         bar,
         StatusBarWidgets {
-            attempts_label,
             status_label,
             spinner,
         },
     )
+}
+
+/// Holds `chooser` until it answers. GTK keeps no reference to a native
+/// dialog of its own; the last reference dropping destroys it, and
+/// without a desktop portal it is gone before it is shown.
+fn keep_until_response(chooser: &gtk4::FileChooserNative) {
+    let held = Rc::new(RefCell::new(Some(chooser.clone())));
+    chooser.connect_response(move |_, _| {
+        let _released = held.borrow_mut().take();
+    });
 }
 
 #[cfg(test)]
@@ -2719,19 +2529,19 @@ mod tests {
 
         assert_eq!(
             format_pin_status(Some(&PinStatus::Remaining(retries5)), None),
-            ("5 / 5".to_string(), "status-pill-green")
+            (String::new(), "status-pill-gray")
         );
         assert_eq!(
             format_pin_status(Some(&PinStatus::Remaining(retries5)), Some(false)),
-            ("5 / 5 • Factory".to_string(), "status-pill-green")
+            ("Factory value".to_string(), "status-pill-gray")
         );
         assert_eq!(
-            format_pin_status(Some(&PinStatus::Remaining(retries4)), None),
-            ("4 / 5".to_string(), "status-pill-orange")
+            format_pin_status(Some(&PinStatus::Remaining(retries4)), Some(false)),
+            ("4 / 5 • Factory value".to_string(), "status-pill-gray")
         );
         assert_eq!(
             format_pin_status(Some(&PinStatus::Remaining(retries3)), None),
-            ("3 / 5".to_string(), "status-pill-orange")
+            ("3 / 5".to_string(), "status-pill-gray")
         );
         assert_eq!(
             format_pin_status(Some(&PinStatus::Remaining(retries2)), None),
@@ -2747,7 +2557,7 @@ mod tests {
         );
         assert_eq!(
             format_pin_status(Some(&PinStatus::Verified), None),
-            ("Verified".to_string(), "status-pill-green")
+            (String::new(), "status-pill-gray")
         );
         assert_eq!(
             format_pin_status(Some(&PinStatus::NoInfo), None),
@@ -2759,37 +2569,27 @@ mod tests {
         );
         assert_eq!(
             format_pin_status(None, None),
-            ("No card".to_string(), "status-pill-gray")
+            (String::new(), "status-pill-gray")
         );
     }
 
     #[test]
     fn test_format_puk_status() {
         let retries5 = PinRetries::from_nibble(5).expect("valid nibble");
-        let retries4 = PinRetries::from_nibble(4).expect("valid nibble");
         let retries3 = PinRetries::from_nibble(3).expect("valid nibble");
         let retries2 = PinRetries::from_nibble(2).expect("valid nibble");
-        let retries1 = PinRetries::from_nibble(1).expect("valid nibble");
 
         assert_eq!(
             format_puk_status(Some(&PukStatus::Remaining(retries5))),
-            ("5 remaining".to_string(), "status-pill-green")
-        );
-        assert_eq!(
-            format_puk_status(Some(&PukStatus::Remaining(retries4))),
-            ("4 remaining".to_string(), "status-pill-orange")
+            (String::new(), "status-pill-gray")
         );
         assert_eq!(
             format_puk_status(Some(&PukStatus::Remaining(retries3))),
-            ("3 remaining".to_string(), "status-pill-orange")
+            ("3 remaining".to_string(), "status-pill-gray")
         );
         assert_eq!(
             format_puk_status(Some(&PukStatus::Remaining(retries2))),
             ("2 remaining".to_string(), "status-pill-red")
-        );
-        assert_eq!(
-            format_puk_status(Some(&PukStatus::Remaining(retries1))),
-            ("1 remaining".to_string(), "status-pill-red")
         );
         assert_eq!(
             format_puk_status(Some(&PukStatus::Locked)),
@@ -2807,10 +2607,7 @@ mod tests {
             format_puk_status(Some(&PukStatus::Other(0x6a80))),
             ("Status 6A80".to_string(), "status-pill-gray")
         );
-        assert_eq!(
-            format_puk_status(None),
-            ("No card".to_string(), "status-pill-gray")
-        );
+        assert_eq!(format_puk_status(None), (String::new(), "status-pill-gray"));
     }
 
     #[test]
@@ -2824,14 +2621,4 @@ mod tests {
             assert!(texture_from_rgba(&valid).is_some());
         }
     }
-}
-
-/// Holds `chooser` until it answers. GTK keeps no reference to a native
-/// dialog of its own; the last reference dropping destroys it, and
-/// without a desktop portal it is gone before it is shown.
-fn keep_until_response(chooser: &gtk4::FileChooserNative) {
-    let held = std::rc::Rc::new(std::cell::RefCell::new(Some(chooser.clone())));
-    chooser.connect_response(move |_, _| {
-        let _released = held.borrow_mut().take();
-    });
 }

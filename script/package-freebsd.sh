@@ -17,9 +17,10 @@
 # and its manual page, the GUI, the PKCS#11 module with its p11-kit
 # registration, the Firefox policy and the autostart entry that gives
 # Chromium the module. The
-# dependencies are pcsc-lite, libccid, p11-kit, nss and every package that
-# provides a shared library the binaries link, at the versions installed
-# on the build host. packaging/freebsd/+POST_INSTALL enables pcscd.
+# dependencies are pcsc-lite, libccid, p11-kit, nss, xdg-desktop-portal-gtk
+# (the file chooser on a desktop whose portal has no FileChooser backend)
+# and every package that provides a shared library the binaries link, at
+# the versions installed on the build host. packaging/freebsd/+POST_INSTALL enables pcscd.
 #
 # Usage:
 #   script/package-freebsd.sh [--skip-build]
@@ -44,31 +45,18 @@ fi
 VERSION="$(script/version.sh)"
 
 PREFIX="/usr/local"
-RUNTIME_DEPS="pcsc-lite libccid p11-kit nss"
+RUNTIME_DEPS="pcsc-lite libccid p11-kit nss xdg-desktop-portal-gtk"
 for name in $RUNTIME_DEPS; do
     pkg info -e "$name" || { echo "error: $name is not installed" >&2; exit 1; }
 done
 
-# The FLTK crate builds FLTK with its Wayland backend on FreeBSD but links
-# the Wayland and GTK libraries only under its use-wayland feature, and its
-# CMake finds linux/input.h from evdev-proto under /usr/local/include.
-# FLTK uses the system libdecor when one is installed and its bundled copy
-# otherwise; the system one is linked here.
+# FLTK's CMake finds linux/input.h from evdev-proto under /usr/local/include;
+# crates/refineid-gui-fltk/build.rs links the libraries FLTK needs.
 if [ "$DO_BUILD" -eq 1 ]; then
     CFLAGS="-I$PREFIX/include"
     CXXFLAGS="-I$PREFIX/include"
     CMAKE_INCLUDE_PATH="$PREFIX/include"
-    RUSTFLAGS="-L native=$PREFIX/lib"
-    libs="wayland-client wayland-cursor wayland-egl xkbcommon dbus-1 EGL GL"
-    libs="$libs gtk-3 gdk-3 gobject-2.0 glib-2.0 gio-2.0 pango-1.0"
-    libs="$libs pangocairo-1.0 cairo"
-    if pkg-config --exists libdecor-0; then
-        libs="$libs decor-0"
-    fi
-    for lib in $libs; do
-        RUSTFLAGS="$RUSTFLAGS -l dylib=$lib"
-    done
-    export CFLAGS CXXFLAGS CMAKE_INCLUDE_PATH RUSTFLAGS
+    export CFLAGS CXXFLAGS CMAKE_INCLUDE_PATH
     cargo build --release --workspace
 fi
 

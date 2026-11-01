@@ -20,7 +20,7 @@ use std::sync::Arc;
 use fltk::app::{self, Receiver, Scheme};
 use fltk::browser::HoldBrowser;
 use fltk::button::{Button, RadioRoundButton};
-use fltk::dialog::{FileDialogType, NativeFileChooser, alert, choice2_default};
+use fltk::dialog::{FileDialogType, NativeFileChooser, alert};
 use fltk::draw;
 use fltk::enums::{Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType, Key};
 use fltk::frame::Frame;
@@ -179,12 +179,12 @@ impl FltkDriver {
         can_bar.set_frame(FrameType::RFlatBox);
         can_bar.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut can_label = Frame::new(50, 153, 210, 30, "Card Access Number (CAN):");
+        let mut can_label = Frame::new(50, 153, 210, 30, "CAN:");
         can_label.set_align(Align::Left | Align::Inside);
         let mut can_input = Input::new(265, 153, 90, 30, "");
         can_input.set_maximum_size(6);
 
-        let mut read_images_btn = Button::new(370, 153, 140, 30, "Load Photo");
+        let mut read_images_btn = Button::new(370, 153, 140, 30, "Load photo");
         read_images_btn.set_color(Color::from_rgb(0, 122, 255));
         read_images_btn.set_label_color(Color::from_rgb(255, 255, 255));
         read_images_btn.set_label_font(Font::HelveticaBold);
@@ -195,7 +195,7 @@ impl FltkDriver {
         photo_card.set_frame(FrameType::RFlatBox);
         photo_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut p_title = Frame::new(50, 208, 340, 24, "Official Photo");
+        let mut p_title = Frame::new(50, 208, 340, 24, "Photo");
         p_title.set_label_font(Font::HelveticaBold);
         p_title.set_label_size(14);
         p_title.set_align(Align::Left | Align::Inside);
@@ -203,8 +203,8 @@ impl FltkDriver {
         let mut portrait_frame = Frame::new(60, 240, 320, 330, "");
         portrait_frame.set_frame(FrameType::ThinDownBox);
 
-        let copy_portrait_btn = Button::new(85, 580, 120, 32, "Copy Photo");
-        let save_portrait_btn = Button::new(225, 580, 120, 32, "Save As...");
+        let copy_portrait_btn = Button::new(85, 580, 120, 32, "Copy photo");
+        let save_portrait_btn = Button::new(225, 580, 120, 32, "Save as…");
         photo_card.end();
 
         // Signature Card
@@ -212,7 +212,7 @@ impl FltkDriver {
         sig_card.set_frame(FrameType::RFlatBox);
         sig_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut s_title = Frame::new(435, 208, 435, 24, "Cardholder Signature");
+        let mut s_title = Frame::new(435, 208, 435, 24, "Signature");
         s_title.set_label_font(Font::HelveticaBold);
         s_title.set_label_size(14);
         s_title.set_align(Align::Left | Align::Inside);
@@ -220,8 +220,8 @@ impl FltkDriver {
         let mut signature_frame = Frame::new(435, 240, 435, 165, "");
         signature_frame.set_frame(FrameType::ThinDownBox);
 
-        let copy_sig_btn = Button::new(490, 420, 140, 32, "Copy Signature");
-        let save_sig_btn = Button::new(650, 420, 140, 32, "Save As...");
+        let copy_sig_btn = Button::new(490, 420, 140, 32, "Copy signature");
+        let save_sig_btn = Button::new(650, 420, 140, 32, "Save as…");
         sig_card.end();
 
         pace_tab.end();
@@ -294,7 +294,7 @@ impl FltkDriver {
         let mut l_slot = Frame::new(120, 154, 150, 32, "PIN to Unblock:");
         l_slot.set_align(Align::Right | Align::Inside);
         let mut react_slot_choice = Choice::new(285, 154, 260, 32, "");
-        react_slot_choice.add_choice("PIN 1 (Authentication)|PIN 2 (Signing)");
+        react_slot_choice.add_choice("PIN 1|PIN 2");
         react_slot_choice.set_value(0);
 
         let mut l_puk = Frame::new(120, 194, 150, 32, "PUK Code:");
@@ -308,7 +308,7 @@ impl FltkDriver {
         l_rnew.set_align(Align::Right | Align::Inside);
         let react_new_pin = SecretInput::new(285, 234, 260, 32, "");
 
-        let mut l_rconf = Frame::new(120, 274, 150, 32, "Confirm New PIN:");
+        let mut l_rconf = Frame::new(120, 274, 150, 32, "Confirm new PIN:");
         l_rconf.set_align(Align::Right | Align::Inside);
         let react_conf_pin = SecretInput::new(285, 274, 260, 32, "");
 
@@ -362,14 +362,14 @@ impl FltkDriver {
         doc_card.set_frame(FrameType::RFlatBox);
         doc_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut queue_label = Frame::new(50, 108, 465, 24, "Documents to Sign");
+        let mut queue_label = Frame::new(50, 108, 465, 24, "Documents");
         queue_label.set_label_font(Font::HelveticaBold);
         queue_label.set_label_size(14);
         queue_label.set_align(Align::Left | Align::Inside);
 
         let doc_browser = HoldBrowser::new(50, 138, 465, 335, "");
 
-        let mut add_doc_btn = Button::new(50, 485, 130, 32, "Add Files...");
+        let mut add_doc_btn = Button::new(50, 485, 130, 32, "Add documents…");
         let mut remove_doc_btn = Button::new(190, 485, 140, 32, "Remove Selected");
         let mut clear_docs_btn = Button::new(340, 485, 100, 32, "Clear List");
 
@@ -383,23 +383,20 @@ impl FltkDriver {
         sign_settings.set_frame(FrameType::RFlatBox);
         sign_settings.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut opt_title = Frame::new(560, 108, 310, 24, "Signature Options");
+        let mut opt_title = Frame::new(560, 108, 310, 24, "Signing method");
         opt_title.set_label_font(Font::HelveticaBold);
         opt_title.set_label_size(14);
         opt_title.set_align(Align::Left | Align::Inside);
 
-        let mut fmt_label = Frame::new(560, 145, 310, 20, "Format:");
-        fmt_label.set_align(Align::Left | Align::Inside);
-
-        let mut format_pades = RadioRoundButton::new(560, 170, 290, 25, "PDF Document (PAdES)");
+        let mut format_pades = RadioRoundButton::new(560, 170, 290, 25, "Separately (PDF)");
         format_pades.set_value(true);
-        let format_asice = RadioRoundButton::new(560, 200, 290, 25, "BDOC Container (ASiC-E)");
+        let format_asice = RadioRoundButton::new(560, 200, 290, 25, "As a package");
 
-        let mut p2_label = Frame::new(560, 240, 310, 20, "Signing PIN (PIN 2):");
+        let mut p2_label = Frame::new(560, 240, 310, 20, "Signature PIN 2:");
         p2_label.set_align(Align::Left | Align::Inside);
         let sign_pin2_input = SecretInput::new(560, 265, 310, 32, "");
 
-        let mut sign_btn = Button::new(560, 320, 310, 42, "Sign Documents");
+        let mut sign_btn = Button::new(560, 320, 310, 42, "Sign documents");
         sign_btn.set_color(Color::from_rgb(0, 122, 255));
         sign_btn.set_label_color(Color::from_rgb(255, 255, 255));
         sign_btn.set_label_font(Font::HelveticaBold);
@@ -418,7 +415,7 @@ impl FltkDriver {
         reader_card.set_frame(FrameType::RFlatBox);
         reader_card.set_color(Color::from_rgb(255, 255, 255));
 
-        let mut code_label = Frame::new(50, 110, 170, 32, "Code on the phone:");
+        let mut code_label = Frame::new(50, 110, 170, 32, "Pairing code:");
         code_label.set_align(Align::Left | Align::Inside);
         // The input reads the keyboard and pastes and draws itself as the
         // boxes; its cursor stays at the end, so the next character always
@@ -767,13 +764,7 @@ impl FltkDriver {
         {
             let c = Arc::clone(controller);
             forget_phone_btn.set_callback(move |_| {
-                let Some(phone) = c.state().phone else {
-                    return;
-                };
-                let question = format!("Forget {}?", phone.name);
-                if choice2_default(&question, "Cancel", "Forget", "") == Some(FORGET_CHOICE) {
-                    c.handle_intent(UserIntent::ForgetPhone);
-                }
+                c.handle_intent(UserIntent::ForgetPhone);
             });
         }
 
@@ -1307,9 +1298,6 @@ fn draw_code_boxes(input: &Input) {
         }
     }
 }
-
-/// The index of the "Forget" button in the forget confirmation.
-const FORGET_CHOICE: i32 = 1;
 
 /// The credential labels of the status lines.
 const PIN1_LABEL: &str = "PIN 1";

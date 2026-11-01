@@ -31,8 +31,9 @@ deb [signed-by=/etc/apt/keyrings/refineid.asc] https://pkg.refineid.fi/ubuntu re
 ```
 
 `curl` is `sudo apt install curl` where it is missing. `refineid` installs
-the CLI, the desktop application and the PKCS#11 module, with pcscd and
-the CCID driver.
+the CLI, the desktop application and the PKCS#11 module, with pcscd, the
+CCID driver and `xdg-desktop-portal-gtk`, which gives the desktop portal
+the file chooser the application's file dialogs use.
 
 #### Firefox
 
