@@ -22,8 +22,9 @@
 //! - `sign-auth`: VERIFY PIN1, sign with the **auth key** (key
 //!   ref `0x01`), verify against the EF.4331 cert.
 //! - `sign-qualified`: VERIFY PIN2, sign with the **qualified-
-//!   signature key** (key ref `0x02`), verify against the
-//!   EF.4332 cert. PIN2 has a 6-digit floor (FINEID S1 v4.2 §3.5).
+//!   signature key** (key ref `0x02`; `0x82` in DF.ESIGN on an
+//!   organization card), verify against the EF.4332 cert. PIN2 has
+//!   a 6-digit floor (FINEID S1 v4.2 §3.5).
 //!
 //! Both paths share the same option / report / error types and a
 //! shared internal driver (`sign_with_slot`) so the wire
@@ -74,16 +75,18 @@ pub enum SignSlot {
 }
 
 impl SignSlot {
-    /// PKCS#15 key reference for this signing slot.
+    /// PKCS#15 key reference for this signing slot under the
+    /// card's numbering.
     ///
     /// FINEID S1 v4.2 §3.5 -- auth key uses `KeyRef::Auth`
     /// (ref `0x01`), qualified-signature key uses
-    /// `KeyRef::Sign` (ref `0x02`). Used as the `MSE:SET DST`
-    /// data byte.
-    const fn key_ref(self) -> KeyRef {
+    /// `KeyRef::Sign` (ref `0x02`, or the DF.ESIGN-local
+    /// reference on an organization card). Used as the
+    /// `MSE:SET DST` data byte.
+    const fn key_ref(self, scheme: PinReferenceScheme) -> KeyRef {
         match self {
             Self::Auth => KeyRef::Auth,
-            Self::Qualified => KeyRef::Sign,
+            Self::Qualified => KeyRef::Sign(scheme),
         }
     }
     /// PIN slot that gates use of this signing key.
@@ -172,6 +175,8 @@ pub struct SignReport {
     /// Which sign slot the operation targeted (auth key /
     /// non-repudiation key).
     pub slot: SignSlot,
+    /// The key reference the card signed under.
+    pub key_ref: KeyRef,
     /// Length of the input file in bytes.
     pub input_len: u64,
     /// SHA-256 of the input.
@@ -507,10 +512,10 @@ fn sign_dispatch_by_alg<T: CardTransport>(
             // §6.6.2.3).
             let signature = match scheme {
                 PinReferenceScheme::Citizen => transport
-                    .sign_pre_hashed_sha256_rsa(slot.key_ref(), input_sha256)
+                    .sign_pre_hashed_sha256_rsa(slot.key_ref(scheme), input_sha256)
                     .map_err(sign_err_to_kind)?,
                 PinReferenceScheme::Organizational => transport
-                    .sign_pre_hashed_sha256_rsa_hash_in_command(slot.key_ref(), input_sha256)
+                    .sign_pre_hashed_sha256_rsa_hash_in_command(slot.key_ref(scheme), input_sha256)
                     .map_err(sign_err_to_kind)?,
             };
             let verify = match pubkey.verify_pkcs1v15_sha256(input_bytes, &signature) {
@@ -524,7 +529,7 @@ fn sign_dispatch_by_alg<T: CardTransport>(
         PublicKeyAlgorithm::Ec(EcCurve::Secp384r1) => {
             let hash_sha384 = Sha384::of(input_bytes);
             let signature = transport
-                .sign_pre_hashed_sha384_ecdsa_p384(slot.key_ref(), hash_sha384)
+                .sign_pre_hashed_sha384_ecdsa_p384(slot.key_ref(scheme), hash_sha384)
                 .map_err(sign_err_to_kind)?;
             let pubkey =
                 cert.spki
@@ -687,6 +692,7 @@ where
     Ok(SignReport {
         reader: reader_id.as_str().to_owned(),
         slot,
+        key_ref: chain.key_ref,
         input_len,
         input_sha256,
         signature_path: options.output,
@@ -705,6 +711,8 @@ struct SignChainOutput {
     cert_der: CertDer,
     /// Subject CN for the report.
     cert_subject_cn: Option<CommonName>,
+    /// The key reference the card signed under.
+    key_ref: KeyRef,
     /// Retry count surfaced by a non-Ok VERIFY status word; see
     /// [`SignReport::pin_retries_after`].
     pin_retries_after: Option<u8>,
@@ -812,6 +820,7 @@ fn sign_chain<T: CardTransport>(
     Ok(SignChainOutput {
         cert_der,
         cert_subject_cn,
+        key_ref: slot.key_ref(scheme),
         pin_retries_after,
         signature_bytes,
         local_verify,
@@ -895,7 +904,7 @@ impl fmt::Display for SignReport {
             f,
             "slot: {} (key ref {:#04X})",
             self.slot.slot_label(),
-            self.slot.key_ref().as_u8()
+            self.key_ref.as_u8()
         )?;
         if let Some(cn) = &self.cert_subject_cn {
             writeln!(f, "cert subject CN: {cn}")?;
@@ -930,6 +939,7 @@ mod tests {
     use super::*;
     use crate::test_util::{TestResult, check, check_true};
     use refineid_lib_core::apdu::status_word::PinRetries;
+    use refineid_lib_core::sign::{KEY_REF_AUTH, KEY_REF_SIGN, ORG_QUALIFIED_KEY_REF};
 
     // ---- SignSlot: the FINEID slot -> {key ref, PIN, cert}
     // mapping (S1 v4.2 §3.5). Getting any of these wrong signs
@@ -939,7 +949,12 @@ mod tests {
     #[test]
     fn auth_slot_maps_to_pin1_keyref01_ef4331() -> TestResult {
         let s = SignSlot::Auth;
-        check(&s.key_ref().as_u8(), &0x01_u8, "auth key ref")?;
+        for scheme in [
+            PinReferenceScheme::Citizen,
+            PinReferenceScheme::Organizational,
+        ] {
+            check(&s.key_ref(scheme).as_u8(), &KEY_REF_AUTH, "auth key ref")?;
+        }
         check_true(matches!(s.pin_slot(), PinSlot::Pin1), "auth pin slot")?;
         check_true(
             matches!(s.cert_slot(), CertSlot::Authentication),
@@ -952,7 +967,16 @@ mod tests {
     #[test]
     fn qualified_slot_maps_to_pin2_keyref02_ef4332() -> TestResult {
         let s = SignSlot::Qualified;
-        check(&s.key_ref().as_u8(), &0x02_u8, "qualified key ref")?;
+        check(
+            &s.key_ref(PinReferenceScheme::Citizen).as_u8(),
+            &KEY_REF_SIGN,
+            "citizen qualified key ref",
+        )?;
+        check(
+            &s.key_ref(PinReferenceScheme::Organizational).as_u8(),
+            &ORG_QUALIFIED_KEY_REF,
+            "organizational qualified key ref",
+        )?;
         check_true(matches!(s.pin_slot(), PinSlot::Pin2), "qualified pin slot")?;
         check_true(
             matches!(s.cert_slot(), CertSlot::Signature),
@@ -1149,6 +1173,7 @@ mod tests {
         SignReport {
             reader: "OMNIKEY 5422".to_owned(),
             slot: SignSlot::Auth,
+            key_ref: KeyRef::Auth,
             input_len: 11,
             input_sha256: Sha256::of(b"hello world"),
             signature_path: PathBuf::from("/tmp/out.sig"),
