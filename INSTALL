@@ -126,7 +126,7 @@ sudo install -m 644 -T <(cat << 'DESKTOPEOF'
 Type=Application
 Name=RefineID
 GenericName=Identity card tool
-Comment=Finnish identity card: PIN management, portrait and signature, document signing
+Comment=Finnish identity card: document signing, PIN management, phone pairing
 Exec=/usr/local/bin/refineid-gui
 Icon=refineid
 Terminal=false

@@ -16,6 +16,7 @@
 //!
 //! Follows the dialogue specification architecture:
 //! - [`RefineIdController`]: Manages PC/SC presence, ceremonies, RAPP CPace pairing, and signing.
+//! - [`window`]: What the one window shows for a state, shared by every driver.
 //! - [`UiDriver`]: Toolkit-independent trait implemented by presentation frontends (FLTK, GTK 4, etc.).
 //! - [`UiState`]: Immutable snapshot of all presentation state.
 //! - [`UserIntent`]: Typed user actions dispatched to the controller.
@@ -23,12 +24,14 @@
 pub mod controller;
 pub mod driver;
 pub mod error;
-pub mod image;
 pub mod model;
+pub mod window;
 
 pub use controller::RefineIdController;
 pub use driver::UiDriver;
 pub use error::GuiCoreError;
-pub use image::{RgbaImageBuffer, decode_document_image};
-pub use model::{CardSource, ManagedCard, RappPairingState, SignFormat, UiState, UserIntent};
+pub use model::{
+    CanRequest, CardSource, ManagedCard, PairedPhone, RappPairingState, ReaderPresence, SignFormat,
+    UiState, UserIntent,
+};
 pub use refineid_client::card_pin::PinManageSlot;

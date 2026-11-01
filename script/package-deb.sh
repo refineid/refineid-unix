@@ -373,8 +373,8 @@ Depends: ${GUI_SHLIBS}, refineid-cli (= ${VERSION}), xdg-desktop-portal-gtk
 Recommends: refineid-pkcs11 (= ${VERSION})
 Homepage: https://github.com/refineid/refineid-unix
 Description: Graphical user interface for Finnish identity cards
- RefineID graphical desktop application for PIN management, card portrait and
- signature inspection, document signing, and pairing management.
+ RefineID graphical desktop application for document signing, PIN
+ management, and pairing a phone.
 CONTROLEOF
 chmod 644 "$STAGING_GUI/DEBIAN/control"
 

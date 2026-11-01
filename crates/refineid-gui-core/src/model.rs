@@ -15,20 +15,18 @@
 //! Typed data models for GUI state and user intentions.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use refineid_client::card_check::CardCheckReport;
 use refineid_client::card_pin::{ActivationCardContext, PinManageSlot};
 use refineid_doc_sign::document::Format;
 use refineid_lib_core::auth::{PinSlot, PinStatus, PukStatus, check_retry_floor};
+use refineid_lib_core::can::Can;
 use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::profiles::ProfileName;
 use refineid_rapp_core::remote::PairSummary;
-
-use crate::image::RgbaImageBuffer;
 
 /// Where a managed card is read: a reader attached to this computer, or
 /// a paired phone over RAPP.
@@ -87,24 +85,6 @@ impl ManagedCard {
         )
     }
 
-    /// Card key for cache lookup.
-    pub fn key(&self) -> String {
-        self.report
-            .token_info
-            .serial_number_hex
-            .as_ref()
-            .map_or_else(
-                || {
-                    format!(
-                        "fallback:{}\u{1f}{}",
-                        self.report.identity.person_string(),
-                        self.report.atr_hex
-                    )
-                },
-                |serial| format!("serial:{serial}"),
-            )
-    }
-
     /// Whether a change with the current PIN passes the retry floor for
     /// `slot`: five, four or three tries left, or already verified.
     pub fn pin_change_available(&self, slot: PinSlot, status: Option<&PinStatus>) -> bool {
@@ -154,11 +134,35 @@ impl UiState {
 /// Supported signing output formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignFormat {
-    /// PAdES signature embedded directly into the PDF.
+    /// PAdES signature embedded in each PDF.
     Pades,
-    /// ASiC-E container alongside the document.
+    /// One ASiC-E container over every document.
     AsicE,
 }
+
+impl SignFormat {
+    /// Whether `document` can carry its own signature: a PDF.
+    #[must_use]
+    pub fn is_pdf(document: &std::path::Path) -> bool {
+        document
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(PDF_EXTENSION))
+    }
+
+    /// The format every one of `documents` can take: each PDF signed in
+    /// itself when all are PDFs, one container otherwise.
+    #[must_use]
+    pub fn shared(documents: &[PathBuf]) -> Self {
+        if documents.iter().all(|document| Self::is_pdf(document)) {
+            Self::Pades
+        } else {
+            Self::AsicE
+        }
+    }
+}
+
+/// The file extension of a PDF.
+const PDF_EXTENSION: &str = "pdf";
 
 impl From<SignFormat> for Format {
     fn from(f: SignFormat) -> Self {
@@ -169,13 +173,48 @@ impl From<SignFormat> for Format {
     }
 }
 
-/// Active RAPP phone pairing state.
+/// A pairing ceremony under way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RappPairingState {
     /// The typed pairing code, in two-character clusters ("7K X4 M9").
     pub code: String,
-    /// Human-readable status line.
-    pub status: String,
+}
+
+/// What the card readers attached to this computer report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReaderPresence {
+    /// No reader is attached.
+    #[default]
+    NoReader,
+    /// Readers are attached and none holds a card.
+    Empty,
+    /// A reader holds a card.
+    Card,
+}
+
+impl ReaderPresence {
+    /// The presence a PC/SC presence signature reports: each reader's
+    /// name and whether it holds a card.
+    #[must_use]
+    pub fn from_signature(signature: &[(String, bool)]) -> Self {
+        if signature.iter().any(|(_, present)| *present) {
+            Self::Card
+        } else if signature.is_empty() {
+            Self::NoReader
+        } else {
+            Self::Empty
+        }
+    }
+}
+
+/// A contactless card whose application opens only with its card
+/// access number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanRequest {
+    /// No number has been tried for the card yet.
+    Needed,
+    /// The card refused the number last typed.
+    Refused,
 }
 
 /// The paired phone, as its stored pairing describes it.
@@ -254,20 +293,19 @@ pub struct UiState {
     /// Whether the card model supports digital signatures.
     pub signature_supported: bool,
 
-    /// Whether at least one physical smart card is present in an attached card reader.
-    /// When true, the physical card reader overrides RAPP, and the Phone page/tab is suppressed.
+    /// Whether a card in a reader attached to this computer was read.
+    /// A local card overrides the paired phone.
     pub has_local_card: bool,
     /// Whether the currently selected card is hosted on a local PC/SC reader.
-    /// When false (e.g. remote phone over RAPP), photo loading via local CAN is unavailable
-    /// and credentials must be handled directly on the phone.
+    /// When false (a phone over RAPP), its PINs are handled on the phone.
     pub selected_card_is_local: bool,
-
-    /// Entered 6-digit Card Access Number.
-    pub can_text: String,
-    /// Decoded card portrait image.
-    pub portrait: Option<Arc<RgbaImageBuffer>>,
-    /// Decoded card signature image.
-    pub signature: Option<Arc<RgbaImageBuffer>>,
+    /// What the attached readers report, before any card is read.
+    pub reader: ReaderPresence,
+    /// A contactless card in a reader asks for its card access number.
+    pub can_request: Option<CanRequest>,
+    /// A reader holds a card that the inspection, repeated while the
+    /// card settled, did not read.
+    pub card_unread: bool,
 
     /// PDF documents queued for signature.
     pub pdf_documents: Vec<PathBuf>,
@@ -280,6 +318,14 @@ pub struct UiState {
     pub pairing: Option<RappPairingState>,
     /// The paired phone, while one is paired.
     pub phone: Option<PairedPhone>,
+    /// Whether remote use is on: a phone is paired, or the user turned
+    /// it on to pair one.
+    pub remote_use: bool,
+    /// The paired phone reports no card in the card reader attached to it.
+    pub phone_reader_empty: bool,
+    /// The name of the phone that said it forgot this computer, until a
+    /// phone is paired again.
+    pub phone_that_forgot: Option<String>,
 }
 
 impl Default for UiState {
@@ -306,14 +352,17 @@ impl Default for UiState {
             signature_supported: false,
             has_local_card: false,
             selected_card_is_local: false,
-            can_text: String::new(),
-            portrait: None,
-            signature: None,
+            reader: ReaderPresence::NoReader,
+            can_request: None,
+            card_unread: false,
             pdf_documents: Vec::new(),
             sign_format: SignFormat::Pades,
             sign_result: None,
             pairing: None,
             phone: None,
+            remote_use: false,
+            phone_reader_empty: false,
+            phone_that_forgot: None,
         }
     }
 }
@@ -348,13 +397,12 @@ pub enum UserIntent {
         /// New PIN bytes.
         new_pin: PinBytes,
     },
-    /// Request reading portrait and signature images with the given CAN.
-    LoadImages {
-        /// 6-digit CAN bytes.
-        can: PinBytes,
-    },
+    /// Open the contactless card in the reader with its card access number.
+    EnterCan(Can),
     /// Add documents to the signing queue.
     AddDocuments(Vec<PathBuf>),
+    /// Take one document out of the signing queue.
+    RemoveDocument(PathBuf),
     /// Clear the signing queue.
     ClearDocuments,
     /// Set signing format (PAdES or ASiC-E).
@@ -371,8 +419,8 @@ pub enum UserIntent {
         /// The code as the user typed it.
         code: String,
     },
-    /// Forget the paired phone.
-    ForgetPhone,
+    /// Turn remote use on or off. Off forgets the paired phone.
+    SetRemoteUse(bool),
 }
 
 #[cfg(test)]
@@ -410,6 +458,39 @@ mod tests {
             "Tormanen Paivi"
         );
         assert_eq!(holder_name("12345678N", Some("12345678N")), "12345678N");
+    }
+
+    #[test]
+    fn the_readers_report_no_reader_an_empty_reader_or_a_card() {
+        assert_eq!(
+            ReaderPresence::from_signature(&[]),
+            ReaderPresence::NoReader
+        );
+        let empty = vec![("Synthetic Card Reader".to_owned(), false)];
+        assert_eq!(
+            ReaderPresence::from_signature(&empty),
+            ReaderPresence::Empty
+        );
+        let card = vec![
+            ("Synthetic Card Reader".to_owned(), false),
+            ("Second Synthetic Card Reader".to_owned(), true),
+        ];
+        assert_eq!(ReaderPresence::from_signature(&card), ReaderPresence::Card);
+    }
+
+    #[test]
+    fn a_pile_with_anything_but_pdfs_is_a_package() {
+        let pdfs = vec![
+            PathBuf::from("/documents/a.pdf"),
+            PathBuf::from("/documents/B.PDF"),
+        ];
+        assert_eq!(SignFormat::shared(&pdfs), SignFormat::Pades);
+        let mixed = vec![
+            PathBuf::from("/documents/a.pdf"),
+            PathBuf::from("/documents/notes.txt"),
+        ];
+        assert_eq!(SignFormat::shared(&mixed), SignFormat::AsicE);
+        assert_eq!(SignFormat::shared(&[]), SignFormat::Pades);
     }
 
     #[test]

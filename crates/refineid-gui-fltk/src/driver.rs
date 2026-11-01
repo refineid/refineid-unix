@@ -12,35 +12,95 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! FLTK implementation of the presentation driver for RefineID.
+//! FLTK presentation driver for RefineID: the one window of
+//! `doc/gui-architecture.md` in FLTK's own widgets.
+//!
+//! The window is a column of sections that show and hide by state; the
+//! remote-use switch, or the button that opens the PIN codes window, sits
+//! at the right of the top row.
 
-use std::borrow::Cow;
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use fltk::app::{self, Receiver, Scheme};
-use fltk::browser::HoldBrowser;
-use fltk::button::{Button, RadioRoundButton};
-use fltk::dialog::{FileDialogType, NativeFileChooser, alert};
+use fltk::button::{Button, RadioButton, RadioRoundButton, ToggleButton};
+use fltk::dialog::{FileDialogType, NativeFileChooser};
 use fltk::draw;
-use fltk::enums::{Align, CallbackTrigger, Color, ColorDepth, Event, Font, FrameType, Key};
+use fltk::enums::{Align, CallbackTrigger, Color, Event, Font, FrameType, Key};
 use fltk::frame::Frame;
-use fltk::group::{Group, Tabs};
-use fltk::image::RgbImage;
+use fltk::group::{Flex, Group, Pack, PackType, Scroll, ScrollType};
 use fltk::input::{Input, SecretInput};
-use fltk::menu::Choice;
 use fltk::prelude::*;
 use fltk::window::Window;
 
-use refineid_gui_core::PinManageSlot;
 use refineid_gui_core::controller::RefineIdController;
 use refineid_gui_core::driver::UiDriver;
 use refineid_gui_core::error::GuiCoreError;
-use refineid_gui_core::image::RgbaImageBuffer;
-use refineid_gui_core::model::{SignFormat, UiState, UserIntent};
-use refineid_lib_core::apdu::status_word::PinRetries;
-use refineid_lib_core::auth::{PIN_TRY_LIMIT, PinStatus, PukStatus};
+use refineid_gui_core::model::{CanRequest, SignFormat, UiState, UserIntent};
+use refineid_gui_core::window::{
+    self, IdentityLine, PinTask, Recovery, WindowContent, activation_complete, digits_only,
+};
+use refineid_lib_core::can::{CAN_DIGITS, Can};
 use refineid_lib_core::pin::PinBytes;
-use refineid_rapp_core::offer::{PAIRING_CODE_LENGTH, pairing_code_character};
+use refineid_rapp_core::offer::{
+    PAIRING_CODE_GROUP_SIZE, PAIRING_CODE_LENGTH, pairing_code_character,
+};
+
+/// The window's width and height, in pixels.
+const WINDOW_WIDTH: i32 = 560;
+const WINDOW_HEIGHT: i32 = 520;
+/// The margin around the content and the gap between its sections.
+const MARGIN: i32 = 20;
+const GAP: i32 = 10;
+/// The width of the content between the margins.
+const CONTENT_WIDTH: i32 = WINDOW_WIDTH - 2 * MARGIN;
+/// The height of one line of text, of a field and of a button.
+const LINE: i32 = 26;
+const FIELD: i32 = 30;
+/// The width of a form row's name.
+const LABEL_WIDTH: i32 = 170;
+/// The width of the field beside it.
+const FIELD_WIDTH: i32 = CONTENT_WIDTH - LABEL_WIDTH - GAP;
+/// The width of a button.
+const BUTTON_WIDTH: i32 = 130;
+/// The side of the top row's one control.
+const TOOL_SIZE: i32 = 30;
+/// The drop area's height while empty, and the pile's height.
+const DROP_HEIGHT: i32 = 96;
+const PILE_HEIGHT: i32 = 132;
+/// The height of one row of the pile.
+const PILE_ROW: i32 = 24;
+/// The side of one code box, the gap between boxes and between clusters.
+const CODE_BOX_SIZE: i32 = 36;
+const CODE_BOX_SPACING: i32 = 6;
+const CODE_GROUP_GAP: i32 = 14;
+/// The colours: the secondary text, errors, the accent, the boxes.
+const SECONDARY: Color = Color::from_rgb(108, 117, 125);
+const ERROR: Color = Color::from_rgb(200, 30, 30);
+/// The colour of a warning line: orange.
+const WARNING: Color = Color::from_rgb(230, 120, 0);
+const ACCENT: Color = Color::from_rgb(0, 122, 255);
+const BOX_BORDER: Color = Color::from_rgb(190, 190, 190);
+const BACKGROUND: Color = Color::from_rgb(245, 246, 248);
+/// The keys that would move a code input's cursor off the end.
+const CURSOR_KEYS: [Key; 8] = [
+    Key::Left,
+    Key::Right,
+    Key::Up,
+    Key::Down,
+    Key::Home,
+    Key::End,
+    Key::PageUp,
+    Key::PageDown,
+];
+/// How a dropped file is named on the clipboard: a `file:` URI.
+const FILE_URI_PREFIX: &str = "file://";
+/// The radix of a percent-encoded byte.
+const HEX_RADIX: u32 = 16;
+/// The FLTK symbol drawn beside a counter below the retry floor.
+const BELOW_FLOOR_SYMBOL: &str = "@circle";
 
 fn to_pin_bytes(s: &str) -> Option<PinBytes> {
     PinBytes::new(s.as_bytes().to_vec()).ok()
@@ -54,65 +114,292 @@ fn set_active<W: WidgetExt>(w: &mut W, active: bool) {
     }
 }
 
-/// Set of GUI widget handles maintained by the FLTK driver.
-#[derive(Clone, Debug)]
-struct FltkWidgets {
+fn set_shown<W: WidgetExt>(w: &mut W, shown: bool) {
+    if shown {
+        w.show();
+    } else {
+        w.hide();
+    }
+}
+
+/// Keeps the code characters of `typed`, up to the pairing code's length.
+fn pairing_code(typed: &str) -> String {
+    typed
+        .chars()
+        .filter_map(pairing_code_character)
+        .take(PAIRING_CODE_LENGTH)
+        .collect()
+}
+
+/// Keeps the digits of `typed`, up to the access number's length.
+fn access_number(typed: &str) -> String {
+    digits_only(typed, CAN_DIGITS)
+}
+
+/// The files a drop names: one `file:` URI or path per line.
+fn dropped_paths(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.strip_prefix(FILE_URI_PREFIX)
+                .map_or_else(|| line.to_owned(), percent_decoded)
+        })
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// `text` with each `%XX` replaced by the byte it encodes.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        let encoded = (byte == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|pair| std::str::from_utf8(pair).ok())
+            .and_then(|pair| u8::from_str_radix(pair, HEX_RADIX).ok());
+        if let Some(decoded) = encoded {
+            out.push(decoded);
+            index += 3;
+        } else {
+            out.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A text line aligned to the left of its section.
+fn line_frame(x: i32, y: i32, w: i32, h: i32, text: &str) -> Frame {
+    let mut frame = Frame::new(x, y, w, h, None);
+    frame.set_label(text);
+    frame.set_align(Align::Left | Align::Inside | Align::Wrap);
+    frame
+}
+
+/// A section of the column, `height` tall, its children placed from its
+/// top left.
+fn section(height: i32) -> Group {
+    let mut group = Group::new(0, 0, CONTENT_WIDTH, height, None);
+    group.set_frame(FrameType::NoBox);
+    group
+}
+
+/// A form row: the name, then a masked PIN entry that keeps digits only.
+fn pin_row(y: i32, label: &str) -> (Frame, SecretInput) {
+    let frame = line_frame(0, y, LABEL_WIDTH, FIELD, label);
+    let mut input = SecretInput::new(LABEL_WIDTH + GAP, y, FIELD_WIDTH, FIELD, None);
+    input.set_maximum_size(i32::try_from(PinBytes::MAX_LENGTH).unwrap_or(i32::MAX));
+    input.set_trigger(CallbackTrigger::Changed);
+    (frame, input)
+}
+
+/// Keeps the digits a PIN input was given.
+fn keep_pin_digits(input: &mut SecretInput) {
+    let kept = digits_only(&input.value(), PinBytes::MAX_LENGTH);
+    if kept != input.value() {
+        input.set_value(&kept);
+    }
+}
+
+/// A primary button.
+fn primary_button(x: i32, y: i32, label: &str) -> Button {
+    let mut button = Button::new(x, y, BUTTON_WIDTH, FIELD, None);
+    button.set_label(label);
+    button.set_color(ACCENT);
+    button.set_label_color(Color::White);
+    button.set_label_font(Font::HelveticaBold);
+    button
+}
+
+/// The width of a row of `length` boxes in clusters of `group`.
+fn code_boxes_width(length: usize, group: usize) -> i32 {
+    code_box_offset(length - 1, group) + CODE_BOX_SIZE
+}
+
+/// The left edge of box `index` relative to the row.
+fn code_box_offset(index: usize, group: usize) -> i32 {
+    let position = i32::try_from(index).unwrap_or(i32::MAX);
+    let cluster = i32::try_from(index / group).unwrap_or(i32::MAX);
+    position * (CODE_BOX_SIZE + CODE_BOX_SPACING) + cluster * (CODE_GROUP_GAP - CODE_BOX_SPACING)
+}
+
+/// An input drawn as one box per character, its cursor kept at the end;
+/// `refused` marks every box until the next character.
+fn code_input(x: i32, y: i32, length: usize, group: usize, refused: &Rc<RefCell<bool>>) -> Input {
+    let mut input = Input::new(x, y, code_boxes_width(length, group), CODE_BOX_SIZE, None);
+    input.set_frame(FrameType::NoBox);
+    input.set_trigger(CallbackTrigger::Changed);
+    input.set_maximum_size(i32::try_from(length).unwrap_or(i32::MAX));
+    let marked = Rc::clone(refused);
+    input.draw(move |input| {
+        let end = input.value().len().try_into().unwrap_or(i32::MAX);
+        if input.position() != end {
+            let _ = input.set_position(end);
+        }
+        draw_code_boxes(input, length, group, *marked.borrow());
+    });
+    input.handle(|input, event| match event {
+        Event::Focus | Event::Unfocus => {
+            input.redraw();
+            false
+        }
+        Event::Push => {
+            let _ = input.take_focus();
+            true
+        }
+        Event::Drag | Event::Released => true,
+        Event::KeyDown => CURSOR_KEYS.contains(&app::event_key()),
+        _ => false,
+    });
+    input
+}
+
+/// Draws `input` as `length` boxes; the box the next character lands in
+/// carries the accent while the input has focus.
+fn draw_code_boxes(input: &Input, length: usize, group: usize, refused: bool) {
+    let code: Vec<char> = input.value().chars().collect();
+    let active = input.active();
+    let focused = input.has_focus();
+    draw::draw_rect_fill(input.x(), input.y(), input.w(), input.h(), BACKGROUND);
+    draw::set_font(Font::CourierBold, 20);
+    for index in 0..length {
+        let x = input.x() + code_box_offset(index, group);
+        let y = input.y();
+        let next = focused && active && index == code.len();
+        let border = if refused {
+            ERROR
+        } else if next {
+            ACCENT
+        } else {
+            BOX_BORDER
+        };
+        draw::draw_rect_with_color(x, y, CODE_BOX_SIZE, CODE_BOX_SIZE, border);
+        if next || refused {
+            draw::draw_rect_with_color(x + 1, y + 1, CODE_BOX_SIZE - 2, CODE_BOX_SIZE - 2, border);
+        }
+        if let Some(character) = code.get(index) {
+            draw::set_draw_color(if active { Color::Black } else { SECONDARY });
+            draw::draw_text2(
+                &character.to_string(),
+                x,
+                y,
+                CODE_BOX_SIZE,
+                CODE_BOX_SIZE,
+                Align::Center,
+            );
+        }
+    }
+}
+
+/// Draws the remote-use switch: a phone, struck through while off.
+fn draw_phone(button: &mut ToggleButton) {
+    let (x, y, w, h) = (button.x(), button.y(), button.w(), button.h());
+    let color = if button.value() {
+        Color::Black
+    } else {
+        SECONDARY
+    };
+    draw::set_draw_color(color);
+    draw::set_line_style(draw::LineStyle::Solid, 2);
+    let (px, py) = (x + w / 2 - 6, y + h / 2 - 10);
+    draw::draw_rect(px, py, 12, 20);
+    draw::draw_line(px + 4, py + 16, px + 8, py + 16);
+    if !button.value() {
+        draw::draw_line(x + 6, y + h - 6, x + w - 6, y + 6);
+    }
+    draw::set_line_style(draw::LineStyle::Solid, 0);
+}
+
+/// Draws the PIN codes button: two keys, red while a code needs a reset.
+fn draw_keys(button: &mut Button) {
+    let (x, y) = (button.x(), button.y());
+    draw::set_draw_color(button.label_color());
+    draw::set_line_style(draw::LineStyle::Solid, 2);
+    for (dx, dy) in [(5, 7), (13, 13)] {
+        draw::draw_circle(f64::from(x + dx + 4), f64::from(y + dy + 4), 4.0);
+        draw::draw_line(x + dx + 8, y + dy + 4, x + dx + 15, y + dy + 4);
+        draw::draw_line(x + dx + 13, y + dy + 4, x + dx + 13, y + dy + 7);
+    }
+    draw::set_line_style(draw::LineStyle::Solid, 0);
+}
+
+/// The activation form's fields.
+#[derive(Clone)]
+struct ActivationFields {
+    section: Group,
+    inputs: [SecretInput; 5],
+    button: Button,
+}
+
+/// The PIN codes window.
+#[derive(Clone)]
+struct PinCodes {
     window: Window,
-    tabs: Tabs,
-    pace_tab: Group,
-    can_bar: Group,
-    rapp_tab: Group,
-    holder_name_frame: Frame,
-    pin1_status_frame: Frame,
-    pin2_status_frame: Frame,
-    puk_status_frame: Frame,
-    change_pin1_btn: Button,
-    change_pin2_btn: Button,
-    reactivate_btn: Button,
-    activate_btn: Button,
-    pin_subtabs: Tabs,
-    tab_change_pin1: Group,
-    tab_activate: Group,
+    column: Flex,
+    recovery: [Frame; 2],
+    tasks: Group,
+    task_buttons: Vec<(PinTask, RadioButton)>,
+    form: Group,
+    labels: [Frame; 3],
+    inputs: [SecretInput; 3],
+    action: Button,
+    error: Frame,
+    attempts: Group,
+    attempts_text: Pack,
+    task: Rc<RefCell<PinTask>>,
+}
+
+/// Every widget the driver updates.
+#[derive(Clone)]
+struct Widgets {
+    window: Window,
+    column: Flex,
+    remote_switch: ToggleButton,
+    pin_codes_button: Button,
+    identity: Frame,
+    prompt: Group,
+    pairing_input: Input,
+    pairing_refused: Rc<RefCell<bool>>,
+    can: Group,
     can_input: Input,
-    read_images_btn: Button,
-    portrait_frame: Frame,
-    copy_portrait_btn: Button,
-    save_portrait_btn: Button,
-    signature_frame: Frame,
-    copy_sig_btn: Button,
-    save_sig_btn: Button,
-    doc_browser: HoldBrowser,
-    format_pades: RadioRoundButton,
-    format_asice: RadioRoundButton,
-    sign_btn: Button,
-    /// The settings column the PIN 2 field sits in.
-    sign_settings: Group,
-    sign_pin2_label: Frame,
-    sign_pin2_input: SecretInput,
-    sign_result_frame: Frame,
-    pair_code_input: Input,
-    /// Whether the last rendered state had a pairing ceremony running.
+    can_refused: Rc<RefCell<bool>>,
+    activation: ActivationFields,
+    drop_area: Group,
+    invitation: Group,
+    pile: Group,
+    pile_rows: Pack,
+    method: Group,
+    separately: RadioRoundButton,
+    package: RadioRoundButton,
+    pin2: Group,
+    pin2_input: SecretInput,
+    action: Group,
+    sign: Button,
+    result: Frame,
+    error: Frame,
+    pin_codes: PinCodes,
+}
+
+/// What the driver remembers between snapshots.
+#[derive(Default)]
+struct Memory {
+    last: UiState,
+    shown_pile: Vec<PathBuf>,
+    content: Option<WindowContent>,
     pairing_running: bool,
-    pair_status_frame: Frame,
-    /// The code boxes, shown while no phone is paired.
-    reader_card: Group,
-    /// The paired phone's row, shown while one is paired.
-    phone_card: Group,
-    phone_name_frame: Frame,
-    phone_state_frame: Frame,
-    status_frame: Frame,
+    opened_for_card: bool,
 }
 
 /// Presentation driver using the Fast Light Toolkit (FLTK).
 pub struct FltkDriver {
     app: app::App,
     state_rx: Receiver<UiState>,
-    /// Whether the window opens on the Phone tab with the code boxes
-    /// focused, for a pairing driven from the keyboard alone.
-    opens_on_phone_tab: bool,
-    widgets: Option<FltkWidgets>,
-    cached_portrait: Option<Arc<RgbaImageBuffer>>,
-    cached_signature: Option<Arc<RgbaImageBuffer>>,
+    widgets: Option<Widgets>,
+    controller: Option<Arc<RefineIdController>>,
+    memory: Rc<RefCell<Memory>>,
 }
 
 impl std::fmt::Debug for FltkDriver {
@@ -127,567 +414,270 @@ impl std::fmt::Debug for FltkDriver {
 pub type StateChangeCallback = Box<dyn Fn(&UiState) + Send + Sync + 'static>;
 
 impl FltkDriver {
-    /// Opens the window on the Phone tab with the code boxes focused.
-    pub fn open_on_phone_tab(&mut self) {
-        self.opens_on_phone_tab = true;
-    }
-
     /// Create a new FLTK driver and its state notification callback.
     pub fn create() -> (Self, StateChangeCallback) {
         let app = app::App::default().with_scheme(Scheme::Gtk);
         app::set_background_color(245, 246, 248);
         app::set_foreground_color(33, 37, 41);
         let (state_tx, state_rx) = app::channel::<UiState>();
-
         let on_state_change = Box::new(move |state: &UiState| {
             state_tx.send(state.clone());
         });
-
         let driver = Self {
             app,
             state_rx,
-            opens_on_phone_tab: false,
             widgets: None,
-            cached_portrait: None,
-            cached_signature: None,
+            controller: None,
+            memory: Rc::new(RefCell::new(Memory::default())),
         };
-
         (driver, on_state_change)
     }
 
-    /// Build all UI controls and attach callbacks dispatching to `controller`.
+    /// Builds the window and attaches callbacks dispatching to `controller`.
     fn init_ui(&mut self, controller: &Arc<RefineIdController>) {
-        let window = Window::default().with_size(920, 642).with_label("RefineID");
+        let mut window = Window::default()
+            .with_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+            .with_label("RefineID");
+        let mut column = Flex::default_fill().column();
+        column.set_margin(MARGIN);
+        column.set_pad(GAP);
 
-        // Main Tabs
-        let mut tabs = Tabs::new(20, 58, 880, 580, "");
+        // The top row: the one control at its right.
+        let top = section(TOOL_SIZE);
+        let mut remote_switch =
+            ToggleButton::new(CONTENT_WIDTH - TOOL_SIZE, 0, TOOL_SIZE, TOOL_SIZE, None);
+        remote_switch.set_frame(FrameType::FlatBox);
+        remote_switch.set_tooltip(window::REMOTE_ACCESS);
+        remote_switch.clear_visible_focus();
+        remote_switch.draw(draw_phone);
+        let mut pin_codes_button =
+            Button::new(CONTENT_WIDTH - TOOL_SIZE, 0, TOOL_SIZE, TOOL_SIZE, None);
+        pin_codes_button.set_frame(FrameType::FlatBox);
+        pin_codes_button.set_tooltip(window::PIN_CODES);
+        pin_codes_button.clear_visible_focus();
+        pin_codes_button.draw(draw_keys);
+        pin_codes_button.hide();
+        top.end();
+        column.fixed(&top, TOOL_SIZE);
 
-        // ---------------------------------------------------------------------
-        // TAB 1: Identity (Portrait & Signature)
-        // ---------------------------------------------------------------------
-        let pace_tab = Group::new(20, 88, 880, 550, "Identity   ");
+        let mut identity = Frame::new(0, 0, CONTENT_WIDTH, LINE, None);
+        identity.set_align(Align::Left | Align::Inside | Align::Wrap);
+        identity.set_label_size(16);
+        column.fixed(&identity, LINE);
 
-        // The holder's name from the certificate
-        let mut name_card = Group::new(35, 98, 850, 40, "");
-        name_card.set_frame(FrameType::RFlatBox);
-        name_card.set_color(Color::from_rgb(255, 255, 255));
+        // The pairing prompt.
+        let prompt = section(LINE * 2 + GAP + CODE_BOX_SIZE);
+        line_frame(0, 0, CONTENT_WIDTH, LINE * 2, window::PAIRING_PROMPT);
+        let pairing_refused = Rc::new(RefCell::new(false));
+        let pairing_input = code_input(
+            0,
+            LINE * 2 + GAP,
+            PAIRING_CODE_LENGTH,
+            PAIRING_CODE_GROUP_SIZE,
+            &pairing_refused,
+        );
+        prompt.end();
+        column.fixed(&prompt, prompt.h());
 
-        let mut holder_name_frame = Frame::new(50, 104, 820, 28, "");
-        holder_name_frame.set_label_font(Font::HelveticaBold);
-        holder_name_frame.set_label_size(18);
-        holder_name_frame.set_align(Align::Left | Align::Inside);
-        name_card.end();
+        // The card access number.
+        let can = section(CODE_BOX_SIZE);
+        let mut caption = line_frame(0, 0, 40, CODE_BOX_SIZE, window::CAN_CAPTION);
+        caption.set_label_color(SECONDARY);
+        let can_refused = Rc::new(RefCell::new(false));
+        let can_input = code_input(50, 0, CAN_DIGITS, CAN_DIGITS, &can_refused);
+        can.end();
+        column.fixed(&can, can.h());
 
-        // CAN Bar
-        let mut can_bar = Group::new(35, 146, 850, 44, "");
-        can_bar.set_frame(FrameType::RFlatBox);
-        can_bar.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut can_label = Frame::new(50, 153, 210, 30, "CAN:");
-        can_label.set_align(Align::Left | Align::Inside);
-        let mut can_input = Input::new(265, 153, 90, 30, "");
-        can_input.set_maximum_size(6);
-
-        let mut read_images_btn = Button::new(370, 153, 140, 30, "Load photo");
-        read_images_btn.set_color(Color::from_rgb(0, 122, 255));
-        read_images_btn.set_label_color(Color::from_rgb(255, 255, 255));
-        read_images_btn.set_label_font(Font::HelveticaBold);
-        can_bar.end();
-
-        // Photo Card
-        let mut photo_card = Group::new(35, 200, 370, 422, "");
-        photo_card.set_frame(FrameType::RFlatBox);
-        photo_card.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut p_title = Frame::new(50, 208, 340, 24, "Photo");
-        p_title.set_label_font(Font::HelveticaBold);
-        p_title.set_label_size(14);
-        p_title.set_align(Align::Left | Align::Inside);
-
-        let mut portrait_frame = Frame::new(60, 240, 320, 330, "");
-        portrait_frame.set_frame(FrameType::ThinDownBox);
-
-        let copy_portrait_btn = Button::new(85, 580, 120, 32, "Copy photo");
-        let save_portrait_btn = Button::new(225, 580, 120, 32, "Save as…");
-        photo_card.end();
-
-        // Signature Card
-        let mut sig_card = Group::new(420, 200, 465, 265, "");
-        sig_card.set_frame(FrameType::RFlatBox);
-        sig_card.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut s_title = Frame::new(435, 208, 435, 24, "Signature");
-        s_title.set_label_font(Font::HelveticaBold);
-        s_title.set_label_size(14);
-        s_title.set_align(Align::Left | Align::Inside);
-
-        let mut signature_frame = Frame::new(435, 240, 435, 165, "");
-        signature_frame.set_frame(FrameType::ThinDownBox);
-
-        let copy_sig_btn = Button::new(490, 420, 140, 32, "Copy signature");
-        let save_sig_btn = Button::new(650, 420, 140, 32, "Save as…");
-        sig_card.end();
-
-        pace_tab.end();
-
-        // ---------------------------------------------------------------------
-        // TAB 2: PIN Management
-        // ---------------------------------------------------------------------
-        let pin_tab = Group::new(20, 88, 880, 550, "PINs   ");
-
-        // Subtabs for PIN operations
-        let pin_subtabs = Tabs::new(35, 98, 850, 526, "");
-
-        // Subtab 1: Change PIN 1
-        let mut tab_change_pin1 = Group::new(35, 128, 850, 496, "Change PIN 1   ");
-        tab_change_pin1.set_frame(FrameType::RFlatBox);
-        tab_change_pin1.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut l1 = Frame::new(120, 159, 150, 32, "Current PIN 1:");
-        l1.set_align(Align::Right | Align::Inside);
-        let cur_p1_in = SecretInput::new(285, 159, 260, 32, "");
-        let mut pin1_status_frame = Frame::new(560, 159, 310, 32, "");
-        pin1_status_frame.set_label_size(12);
-        pin1_status_frame.set_align(Align::Left | Align::Inside);
-
-        let mut l2 = Frame::new(120, 204, 150, 32, "New PIN 1:");
-        l2.set_align(Align::Right | Align::Inside);
-        let new_p1_in = SecretInput::new(285, 204, 260, 32, "");
-
-        let mut l3 = Frame::new(120, 249, 150, 32, "Confirm PIN 1:");
-        l3.set_align(Align::Right | Align::Inside);
-        let conf_p1_in = SecretInput::new(285, 249, 260, 32, "");
-
-        let mut change_pin1_btn = Button::new(285, 299, 180, 36, "Change PIN 1");
-        change_pin1_btn.set_color(Color::from_rgb(0, 122, 255));
-        change_pin1_btn.set_label_color(Color::from_rgb(255, 255, 255));
-        change_pin1_btn.set_label_font(Font::HelveticaBold);
-        tab_change_pin1.end();
-
-        // Subtab 2: Change PIN 2
-        let mut tab_change_pin2 = Group::new(35, 128, 850, 496, "Change PIN 2   ");
-        tab_change_pin2.set_frame(FrameType::RFlatBox);
-        tab_change_pin2.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut l1_p2 = Frame::new(120, 159, 150, 32, "Current PIN 2:");
-        l1_p2.set_align(Align::Right | Align::Inside);
-        let cur_p2_in = SecretInput::new(285, 159, 260, 32, "");
-        let mut pin2_status_frame = Frame::new(560, 159, 310, 32, "");
-        pin2_status_frame.set_label_size(12);
-        pin2_status_frame.set_align(Align::Left | Align::Inside);
-
-        let mut l2_p2 = Frame::new(120, 204, 150, 32, "New PIN 2:");
-        l2_p2.set_align(Align::Right | Align::Inside);
-        let new_p2_in = SecretInput::new(285, 204, 260, 32, "");
-
-        let mut l3_p2 = Frame::new(120, 249, 150, 32, "Confirm PIN 2:");
-        l3_p2.set_align(Align::Right | Align::Inside);
-        let conf_p2_in = SecretInput::new(285, 249, 260, 32, "");
-
-        let mut change_pin2_btn = Button::new(285, 299, 180, 36, "Change PIN 2");
-        change_pin2_btn.set_color(Color::from_rgb(0, 122, 255));
-        change_pin2_btn.set_label_color(Color::from_rgb(255, 255, 255));
-        change_pin2_btn.set_label_font(Font::HelveticaBold);
-        tab_change_pin2.end();
-
-        // Subtab 3: Unblock PIN
-        let mut tab_reactivate = Group::new(35, 128, 850, 496, "Unblock PIN   ");
-        tab_reactivate.set_frame(FrameType::RFlatBox);
-        tab_reactivate.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut l_slot = Frame::new(120, 154, 150, 32, "PIN to Unblock:");
-        l_slot.set_align(Align::Right | Align::Inside);
-        let mut react_slot_choice = Choice::new(285, 154, 260, 32, "");
-        react_slot_choice.add_choice("PIN 1|PIN 2");
-        react_slot_choice.set_value(0);
-
-        let mut l_puk = Frame::new(120, 194, 150, 32, "PUK Code:");
-        l_puk.set_align(Align::Right | Align::Inside);
-        let puk_in = SecretInput::new(285, 194, 260, 32, "");
-        let mut puk_status_frame = Frame::new(560, 194, 310, 32, "");
-        puk_status_frame.set_label_size(12);
-        puk_status_frame.set_align(Align::Left | Align::Inside);
-
-        let mut l_rnew = Frame::new(120, 234, 150, 32, "New PIN:");
-        l_rnew.set_align(Align::Right | Align::Inside);
-        let react_new_pin = SecretInput::new(285, 234, 260, 32, "");
-
-        let mut l_rconf = Frame::new(120, 274, 150, 32, "Confirm new PIN:");
-        l_rconf.set_align(Align::Right | Align::Inside);
-        let react_conf_pin = SecretInput::new(285, 274, 260, 32, "");
-
-        let mut reactivate_btn = Button::new(285, 322, 180, 36, "Unblock PIN");
-        reactivate_btn.set_color(Color::from_rgb(0, 122, 255));
-        reactivate_btn.set_label_color(Color::from_rgb(255, 255, 255));
-        reactivate_btn.set_label_font(Font::HelveticaBold);
-        tab_reactivate.end();
-
-        // Subtab 4: First-Time Setup
-        let mut tab_activate = Group::new(35, 128, 850, 496, "First-Time Setup   ");
-        tab_activate.set_frame(FrameType::RFlatBox);
-        tab_activate.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut l_acode = Frame::new(120, 144, 150, 30, "Activation Code:");
-        l_acode.set_align(Align::Right | Align::Inside);
-        let act_code_in = SecretInput::new(285, 144, 260, 30, "");
-
-        let mut l_ap1 = Frame::new(120, 184, 150, 30, "New PIN 1:");
-        l_ap1.set_align(Align::Right | Align::Inside);
-        let act_p1_in = SecretInput::new(285, 184, 260, 30, "");
-
-        let mut l_ap1c = Frame::new(120, 224, 150, 30, "Confirm PIN 1:");
-        l_ap1c.set_align(Align::Right | Align::Inside);
-        let act_p1_conf = SecretInput::new(285, 224, 260, 30, "");
-
-        let mut l_ap2 = Frame::new(120, 264, 150, 30, "New PIN 2:");
-        l_ap2.set_align(Align::Right | Align::Inside);
-        let act_p2_in = SecretInput::new(285, 264, 260, 30, "");
-
-        let mut l_ap2c = Frame::new(120, 304, 150, 30, "Confirm PIN 2:");
-        l_ap2c.set_align(Align::Right | Align::Inside);
-        let act_p2_conf = SecretInput::new(285, 304, 260, 30, "");
-
-        let mut activate_btn = Button::new(285, 349, 180, 36, "Activate Card");
-        activate_btn.set_color(Color::from_rgb(0, 122, 255));
-        activate_btn.set_label_color(Color::from_rgb(255, 255, 255));
-        activate_btn.set_label_font(Font::HelveticaBold);
-        tab_activate.end();
-
-        pin_subtabs.end();
-        pin_tab.end();
-
-        // ---------------------------------------------------------------------
-        // TAB 3: Sign Documents
-        // ---------------------------------------------------------------------
-        let sign_tab = Group::new(20, 88, 880, 550, "Sign   ");
-
-        // Document Queue Card
-        let mut doc_card = Group::new(35, 98, 495, 525, "");
-        doc_card.set_frame(FrameType::RFlatBox);
-        doc_card.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut queue_label = Frame::new(50, 108, 465, 24, "Documents");
-        queue_label.set_label_font(Font::HelveticaBold);
-        queue_label.set_label_size(14);
-        queue_label.set_align(Align::Left | Align::Inside);
-
-        let doc_browser = HoldBrowser::new(50, 138, 465, 335, "");
-
-        let mut add_doc_btn = Button::new(50, 485, 130, 32, "Add documents…");
-        let mut remove_doc_btn = Button::new(190, 485, 140, 32, "Remove Selected");
-        let mut clear_docs_btn = Button::new(340, 485, 100, 32, "Clear List");
-
-        let mut sign_result_frame = Frame::new(50, 530, 465, 80, "");
-        sign_result_frame.set_frame(FrameType::ThinDownBox);
-        sign_result_frame.set_align(Align::Left | Align::Inside);
-        doc_card.end();
-
-        // Signing Options Card
-        let mut sign_settings = Group::new(545, 98, 340, 525, "");
-        sign_settings.set_frame(FrameType::RFlatBox);
-        sign_settings.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut opt_title = Frame::new(560, 108, 310, 24, "Signing method");
-        opt_title.set_label_font(Font::HelveticaBold);
-        opt_title.set_label_size(14);
-        opt_title.set_align(Align::Left | Align::Inside);
-
-        let mut format_pades = RadioRoundButton::new(560, 170, 290, 25, "Separately (PDF)");
-        format_pades.set_value(true);
-        let format_asice = RadioRoundButton::new(560, 200, 290, 25, "As a package");
-
-        let mut p2_label = Frame::new(560, 240, 310, 20, "Signature PIN 2:");
-        p2_label.set_align(Align::Left | Align::Inside);
-        let sign_pin2_input = SecretInput::new(560, 265, 310, 32, "");
-
-        let mut sign_btn = Button::new(560, 320, 310, 42, "Sign documents");
-        sign_btn.set_color(Color::from_rgb(0, 122, 255));
-        sign_btn.set_label_color(Color::from_rgb(255, 255, 255));
-        sign_btn.set_label_font(Font::HelveticaBold);
-        sign_btn.set_label_size(14);
-        sign_settings.end();
-
-        sign_tab.end();
-
-        // ---------------------------------------------------------------------
-        // TAB 4: Phone (RAPP)
-        // ---------------------------------------------------------------------
-        let rapp_tab = Group::new(20, 88, 880, 550, "Phone   ");
-
-        // Reader card: the opt-in and the code the phone shows
-        let mut reader_card = Group::new(35, 98, 850, 110, "");
-        reader_card.set_frame(FrameType::RFlatBox);
-        reader_card.set_color(Color::from_rgb(255, 255, 255));
-
-        let mut code_label = Frame::new(50, 110, 170, 32, "Pairing code:");
-        code_label.set_align(Align::Left | Align::Inside);
-        // The input reads the keyboard and pastes and draws itself as the
-        // boxes; its cursor stays at the end, so the next character always
-        // lands in the box after the last one.
-        let mut pair_code_input = Input::new(225, 108, code_boxes_width(), CODE_BOX_SIZE, "");
-        pair_code_input.set_frame(FrameType::NoBox);
-        pair_code_input.set_trigger(CallbackTrigger::Changed);
-        pair_code_input.draw(|input| {
-            // Whatever moved the cursor between two draws, the next
-            // character lands after the last one; the position changes
-            // only when something moved it, so this settles at once.
-            let end = input.value().len().try_into().unwrap_or(i32::MAX);
-            if input.position() != end {
-                let _ = input.set_position(end);
-            }
-            draw_code_boxes(input);
+        // The activation form.
+        let activation_height = LINE + 5 * (FIELD + GAP) + FIELD;
+        let activation_section = section(activation_height);
+        let mut heading = line_frame(0, 0, CONTENT_WIDTH, LINE, window::CARD_ACTIVATION);
+        heading.set_label_font(Font::HelveticaBold);
+        let names = [
+            window::ACTIVATION_PIN,
+            window::NEW_PIN_1,
+            window::NEW_PIN_1_AGAIN,
+            window::NEW_PIN_2,
+            window::NEW_PIN_2_AGAIN,
+        ];
+        let rows = names.map(|name| name.to_owned());
+        let mut y = LINE + GAP;
+        let inputs = rows.map(|name| {
+            let (_, input) = pin_row(y, &name);
+            y += FIELD + GAP;
+            input
         });
-        pair_code_input.handle(|input, event| match event {
-            Event::Focus | Event::Unfocus => {
-                input.redraw();
-                false
-            }
-            Event::Push => {
-                let _ = input.take_focus();
-                true
-            }
-            Event::Drag | Event::Released => true,
-            Event::KeyDown => CURSOR_KEYS.contains(&app::event_key()),
-            _ => false,
-        });
+        let activate = primary_button(CONTENT_WIDTH - BUTTON_WIDTH, y, window::ACTIVATE_CARD);
+        activation_section.end();
+        column.fixed(&activation_section, activation_height);
+        let activation = ActivationFields {
+            section: activation_section,
+            inputs,
+            button: activate,
+        };
 
-        let mut pair_status_frame = Frame::new(50, 155, 820, 36, "");
-        pair_status_frame.set_align(Align::Left | Align::Inside);
-        pair_status_frame.set_label_size(12);
-        reader_card.end();
+        // The drop area: the invitation, or the pile and its footer.
+        let mut drop_area = section(PILE_HEIGHT + FIELD);
+        drop_area.set_frame(FrameType::BorderBox);
+        let invitation = Group::new(0, 0, CONTENT_WIDTH, DROP_HEIGHT, None);
+        let mut invitation_text = Frame::new(0, 16, CONTENT_WIDTH, LINE, None);
+        invitation_text.set_label(window::DROP_INVITATION);
+        invitation_text.set_label_color(SECONDARY);
+        let mut choose = Button::new(
+            (CONTENT_WIDTH - BUTTON_WIDTH) / 2,
+            16 + LINE + 4,
+            BUTTON_WIDTH,
+            LINE,
+            None,
+        );
+        choose.set_label(window::CHOOSE);
+        choose.set_frame(FrameType::FlatBox);
+        choose.set_label_color(ACCENT);
+        invitation.end();
+        let pile = Group::new(0, 0, CONTENT_WIDTH, PILE_HEIGHT + FIELD, None);
+        let mut scroll = Scroll::new(2, 2, CONTENT_WIDTH - 4, PILE_HEIGHT - 4, None);
+        scroll.set_type(ScrollType::Vertical);
+        let mut pile_rows = Pack::new(2, 2, CONTENT_WIDTH - 24, PILE_HEIGHT - 4, None);
+        pile_rows.set_type(PackType::Vertical);
+        pile_rows.end();
+        scroll.end();
+        let mut add = Button::new(CONTENT_WIDTH - 180, PILE_HEIGHT, 80, LINE, None);
+        add.set_label(window::ADD);
+        add.set_frame(FrameType::FlatBox);
+        add.set_label_color(ACCENT);
+        let mut clear = Button::new(CONTENT_WIDTH - 90, PILE_HEIGHT, 80, LINE, None);
+        clear.set_label(window::CLEAR);
+        clear.set_frame(FrameType::FlatBox);
+        clear.set_label_color(ACCENT);
+        pile.end();
+        drop_area.end();
+        column.fixed(&drop_area, DROP_HEIGHT);
 
-        // The paired phone's row, in the place of the code boxes
-        let mut phone_card = Group::new(35, 98, 850, 56, "");
-        phone_card.set_frame(FrameType::RFlatBox);
-        phone_card.set_color(CARD_BACKGROUND);
+        // The signing controls.
+        let method = section(FIELD);
+        line_frame(0, 0, LABEL_WIDTH, FIELD, window::SIGNING_METHOD);
+        let mut separately = RadioRoundButton::new(LABEL_WIDTH + GAP, 0, 160, FIELD, None);
+        separately.set_label(window::SEPARATELY);
+        let mut package = RadioRoundButton::new(LABEL_WIDTH + GAP + 170, 0, 160, FIELD, None);
+        package.set_label(window::AS_A_PACKAGE);
+        method.end();
+        column.fixed(&method, FIELD);
+        let pin2 = section(FIELD);
+        let (_, mut pin2_input) = pin_row(0, window::PIN_2);
+        pin2.end();
+        column.fixed(&pin2, FIELD);
+        let action = section(FIELD);
+        let mut sign = primary_button(CONTENT_WIDTH - BUTTON_WIDTH, 0, window::SIGN);
+        action.end();
+        column.fixed(&action, FIELD);
 
-        let mut phone_name_frame = Frame::new(50, 110, 560, 32, "");
-        phone_name_frame.set_label_font(Font::HelveticaBold);
-        phone_name_frame.set_label_size(16);
-        phone_name_frame.set_align(Align::Left | Align::Inside);
-
-        let mut phone_state_frame = Frame::new(610, 110, 210, 32, "");
-        phone_state_frame.set_label_size(12);
-        phone_state_frame.set_label_color(Color::from_rgb(108, 117, 125));
-        phone_state_frame.set_align(Align::Right | Align::Inside);
-
-        let mut forget_phone_btn = Button::new(830, 110, 32, 32, "");
-        forget_phone_btn.set_frame(FrameType::NoBox);
-        forget_phone_btn.clear_visible_focus();
-        forget_phone_btn.set_tooltip("Forget this phone");
-        forget_phone_btn.draw(draw_trash_icon);
-        phone_card.end();
-        phone_card.hide();
-
-        rapp_tab.end();
-        tabs.end();
-        tabs.resize(20, 20, 880, 580);
-        if self.opens_on_phone_tab {
-            let _ = tabs.set_value(&rapp_tab);
-            let _ = pair_code_input.take_focus();
-        }
-
-        // Bottom status bar
-        let mut status_frame = Frame::new(20, 604, 880, 24, "");
-        status_frame.set_align(Align::Left | Align::Inside);
-        status_frame.set_label_size(12);
-        status_frame.set_label_color(Color::from_rgb(108, 117, 125));
-
+        let mut result = Frame::new(0, 0, CONTENT_WIDTH, LINE * 2, None);
+        result.set_align(Align::Left | Align::Inside | Align::Wrap | Align::Top);
+        column.fixed(&result, LINE * 2);
+        let mut error = Frame::new(0, 0, CONTENT_WIDTH, LINE * 2, None);
+        error.set_align(Align::Left | Align::Inside | Align::Wrap | Align::Top);
+        error.set_label_color(ERROR);
+        column.fixed(&error, LINE * 2);
+        // The rest of the window stays empty below the content.
+        Frame::default();
+        column.end();
         window.end();
+        window.make_resizable(true);
 
-        // ---------------------------------------------------------------------
-        // Set up Callbacks
-        // ---------------------------------------------------------------------
+        let pin_codes = build_pin_codes();
+
+        // Callbacks.
         {
             let c = Arc::clone(controller);
-            let mut cur = cur_p1_in.clone();
-            let mut new = new_p1_in.clone();
-            let mut conf = conf_p1_in.clone();
-            change_pin1_btn.set_callback(move |_| {
-                let cur_val = cur.value();
-                let new_val = new.value();
-                let conf_val = conf.value();
-
-                if new_val != conf_val {
-                    alert(200, 200, "New PIN1 entries do not match.");
-                    return;
+            remote_switch.set_callback(move |switch| {
+                c.handle_intent(UserIntent::SetRemoteUse(switch.value()));
+            });
+        }
+        {
+            let mut pin_window = pin_codes.window.clone();
+            pin_codes_button.set_callback(move |_| pin_window.show());
+        }
+        {
+            let c = Arc::clone(controller);
+            let refused = Rc::clone(&pairing_refused);
+            let mut input = pairing_input.clone();
+            input.set_callback(move |input| {
+                let kept = pairing_code(&input.value());
+                if kept != input.value() {
+                    input.set_value(&kept);
                 }
-                if new_val.len() < 4 || new_val.len() > 12 {
-                    alert(200, 200, "PIN1 must be between 4 and 12 digits.");
-                    return;
+                *refused.borrow_mut() = false;
+                input.redraw();
+                if kept.len() == PAIRING_CODE_LENGTH {
+                    c.handle_intent(UserIntent::StartPairing { code: kept });
                 }
-                let (Some(cur_pin), Some(new_pin)) =
-                    (to_pin_bytes(&cur_val), to_pin_bytes(&new_val))
-                else {
-                    alert(200, 200, "PIN contains invalid characters.");
-                    return;
-                };
-                c.handle_intent(UserIntent::ChangePin {
-                    slot: PinManageSlot::Pin1,
-                    current_pin: cur_pin,
-                    new_pin,
-                });
-                cur.set_value("");
-                new.set_value("");
-                conf.set_value("");
             });
         }
         {
             let c = Arc::clone(controller);
-            let mut cur = cur_p2_in.clone();
-            let mut new = new_p2_in.clone();
-            let mut conf = conf_p2_in.clone();
-            change_pin2_btn.set_callback(move |_| {
-                let cur_val = cur.value();
-                let new_val = new.value();
-                let conf_val = conf.value();
-
-                if new_val != conf_val {
-                    alert(200, 200, "New PIN2 entries do not match.");
-                    return;
+            let refused = Rc::clone(&can_refused);
+            let mut input = can_input.clone();
+            input.set_callback(move |input| {
+                let kept = access_number(&input.value());
+                if kept != input.value() {
+                    input.set_value(&kept);
                 }
-                if new_val.len() < 6 || new_val.len() > 12 {
-                    alert(200, 200, "PIN2 must be between 6 and 12 digits.");
-                    return;
+                *refused.borrow_mut() = false;
+                input.redraw();
+                if kept.len() == CAN_DIGITS
+                    && let Ok(number) = Can::new(&kept)
+                {
+                    input.set_value("");
+                    c.handle_intent(UserIntent::EnterCan(number));
                 }
-                let (Some(cur_pin), Some(new_pin)) =
-                    (to_pin_bytes(&cur_val), to_pin_bytes(&new_val))
-                else {
-                    alert(200, 200, "PIN contains invalid characters.");
-                    return;
-                };
-                c.handle_intent(UserIntent::ChangePin {
-                    slot: PinManageSlot::Pin2,
-                    current_pin: cur_pin,
-                    new_pin,
-                });
-                cur.set_value("");
-                new.set_value("");
-                conf.set_value("");
             });
         }
         {
-            let c = Arc::clone(controller);
-            let slot_choice = react_slot_choice.clone();
-            let mut puk = puk_in.clone();
-            let mut new = react_new_pin.clone();
-            let mut conf = react_conf_pin.clone();
-            reactivate_btn.set_callback(move |_| {
-                let slot = match slot_choice.value() {
-                    1 => PinManageSlot::Pin2,
-                    _ => PinManageSlot::Pin1,
-                };
-                let puk_val = puk.value();
-                let new_val = new.value();
-                let conf_val = conf.value();
-
-                if new_val != conf_val {
-                    alert(200, 200, "New PIN entries do not match.");
-                    return;
-                }
-                let min_len = match slot {
-                    PinManageSlot::Pin1 => 4,
-                    PinManageSlot::Pin2 => 6,
-                };
-                if new_val.len() < min_len || new_val.len() > 12 {
-                    alert(
-                        200,
-                        200,
-                        &format!("PIN must be between {min_len} and 12 digits."),
+            let fields = activation.inputs.clone();
+            let mut button = activation.button.clone();
+            set_active(&mut button, false);
+            for mut input in activation.inputs.clone() {
+                let fields = fields.clone();
+                let mut button = button.clone();
+                input.set_callback(move |input| {
+                    keep_pin_digits(input);
+                    let text = fields.each_ref().map(SecretInput::value);
+                    set_active(
+                        &mut button,
+                        activation_complete(&text[0], [&text[1], &text[2]], [&text[3], &text[4]]),
                     );
-                    return;
-                }
-                let (Some(puk_pin), Some(new_pin)) =
-                    (to_pin_bytes(&puk_val), to_pin_bytes(&new_val))
-                else {
-                    alert(200, 200, "PUK or PIN contains invalid characters.");
-                    return;
-                };
-                c.handle_intent(UserIntent::ReactivatePin {
-                    slot,
-                    puk: puk_pin,
-                    new_pin,
                 });
-                puk.set_value("");
-                new.set_value("");
-                conf.set_value("");
+            }
+            let c = Arc::clone(controller);
+            button.set_callback(move |_| {
+                if c.state().busy {
+                    return;
+                }
+                let mut fields = fields.clone();
+                let text = fields.each_ref().map(SecretInput::value);
+                for field in &mut fields {
+                    field.set_value("");
+                }
+                if !activation_complete(&text[0], [&text[1], &text[2]], [&text[3], &text[4]]) {
+                    return;
+                }
+                if let (Some(activation_code), Some(new_pin1), Some(new_pin2)) = (
+                    to_pin_bytes(&text[0]),
+                    to_pin_bytes(&text[1]),
+                    to_pin_bytes(&text[3]),
+                ) {
+                    c.handle_intent(UserIntent::ActivateCard {
+                        activation_code,
+                        new_pin1,
+                        new_pin2,
+                    });
+                }
             });
         }
-        {
+        for button in [&mut choose, &mut add] {
             let c = Arc::clone(controller);
-            let mut act = act_code_in.clone();
-            let mut p1 = act_p1_in.clone();
-            let mut p1c = act_p1_conf.clone();
-            let mut p2 = act_p2_in.clone();
-            let mut p2c = act_p2_conf.clone();
-            activate_btn.set_callback(move |_| {
-                let act_val = act.value();
-                let p1_val = p1.value();
-                let p1c_val = p1c.value();
-                let p2_val = p2.value();
-                let p2c_val = p2c.value();
-
-                if p1_val != p1c_val {
-                    alert(200, 200, "PIN1 entries do not match.");
-                    return;
-                }
-                if p2_val != p2c_val {
-                    alert(200, 200, "PIN2 entries do not match.");
-                    return;
-                }
-                if p1_val.len() < 4 || p1_val.len() > 12 {
-                    alert(200, 200, "PIN1 must be between 4 and 12 digits.");
-                    return;
-                }
-                if p2_val.len() < 6 || p2_val.len() > 12 {
-                    alert(200, 200, "PIN2 must be between 6 and 12 digits.");
-                    return;
-                }
-                let (Some(act_code), Some(new_p1), Some(new_p2)) = (
-                    to_pin_bytes(&act_val),
-                    to_pin_bytes(&p1_val),
-                    to_pin_bytes(&p2_val),
-                ) else {
-                    alert(
-                        200,
-                        200,
-                        "Activation code or PINs contain invalid characters.",
-                    );
-                    return;
-                };
-                c.handle_intent(UserIntent::ActivateCard {
-                    activation_code: act_code,
-                    new_pin1: new_p1,
-                    new_pin2: new_p2,
-                });
-                act.set_value("");
-                p1.set_value("");
-                p1c.set_value("");
-                p2.set_value("");
-                p2c.set_value("");
-            });
-        }
-        {
-            let c = Arc::clone(controller);
-            let can = can_input.clone();
-            read_images_btn.set_callback(move |_| {
-                let can_val = can.value();
-                if can_val.len() != 6 || !can_val.chars().all(|ch| ch.is_ascii_digit()) {
-                    alert(200, 200, "CAN must be exactly 6 numeric digits.");
-                    return;
-                }
-                let Some(can_pin) = to_pin_bytes(&can_val) else {
-                    alert(200, 200, "CAN contains invalid characters.");
-                    return;
-                };
-                c.handle_intent(UserIntent::LoadImages { can: can_pin });
-            });
-        }
-        {
-            let c = Arc::clone(controller);
-            add_doc_btn.set_callback(move |_| {
+            button.set_callback(move |_| {
                 let mut chooser = NativeFileChooser::new(FileDialogType::BrowseMultiFile);
-                chooser.set_filter("PDF Documents\t*.{pdf,PDF}\nAll Files\t*.*");
                 chooser.show();
                 let paths = chooser.filenames();
                 if !paths.is_empty() {
@@ -697,275 +687,282 @@ impl FltkDriver {
         }
         {
             let c = Arc::clone(controller);
-            let browser = doc_browser.clone();
-            remove_doc_btn.set_callback(move |_| {
-                let val = browser.value();
-                if val > 0 {
-                    let idx = (val - 1) as usize;
-                    let current = c.state().pdf_documents;
-                    if idx < current.len() {
-                        let mut updated = current;
-                        updated.remove(idx);
-                        c.handle_intent(UserIntent::ClearDocuments);
-                        if !updated.is_empty() {
-                            c.handle_intent(UserIntent::AddDocuments(updated));
-                        }
+            clear.set_callback(move |_| c.handle_intent(UserIntent::ClearDocuments));
+        }
+        {
+            let c = Arc::clone(controller);
+            drop_area.handle(move |_, event| match event {
+                Event::DndEnter | Event::DndDrag | Event::DndLeave | Event::DndRelease => true,
+                Event::Paste => {
+                    let paths = dropped_paths(&app::event_text());
+                    if !paths.is_empty() {
+                        c.handle_intent(UserIntent::AddDocuments(paths));
                     }
+                    true
                 }
+                _ => false,
+            });
+        }
+        for (button, format) in [
+            (&mut separately, SignFormat::Pades),
+            (&mut package, SignFormat::AsicE),
+        ] {
+            let c = Arc::clone(controller);
+            button.set_callback(move |_| c.handle_intent(UserIntent::SetSignFormat(format)));
+        }
+        {
+            let memory = Rc::clone(&self.memory);
+            let mut button = sign.clone();
+            pin2_input.set_callback(move |input| {
+                keep_pin_digits(input);
+                set_active(
+                    &mut button,
+                    window::can_sign(&memory.borrow().last, &input.value()),
+                );
             });
         }
         {
+            let memory = Rc::clone(&self.memory);
+            let mut pin = pin2_input.clone();
             let c = Arc::clone(controller);
-            clear_docs_btn.set_callback(move |_| {
-                c.handle_intent(UserIntent::ClearDocuments);
-            });
-        }
-        {
-            let c = Arc::clone(controller);
-            let mut pades = format_pades.clone();
-            pades.set_callback(move |_| {
-                c.handle_intent(UserIntent::SetSignFormat(SignFormat::Pades));
-            });
-        }
-        {
-            let c = Arc::clone(controller);
-            let mut asice = format_asice.clone();
-            asice.set_callback(move |_| {
-                c.handle_intent(UserIntent::SetSignFormat(SignFormat::AsicE));
-            });
-        }
-        {
-            let c = Arc::clone(controller);
-            let mut p2 = sign_pin2_input.clone();
-            sign_btn.set_callback(move |_| {
-                if c.state().phone_signs() {
+            sign.set_callback(move |_| {
+                let typed = pin.value();
+                pin.set_value("");
+                let state = memory.borrow().last.clone();
+                if !window::can_sign(&state, &typed) {
+                    return;
+                }
+                if state.phone_signs() {
+                    // PIN 2 for the phone's card is typed on the phone.
                     c.handle_intent(UserIntent::SignDocuments { pin2: None });
-                    return;
-                }
-                let pin2_val = p2.value();
-                if pin2_val.len() < 6 {
-                    alert(200, 200, "PIN2 must be at least 6 digits.");
-                    return;
-                }
-                let Some(pin2) = to_pin_bytes(&pin2_val) else {
-                    alert(200, 200, "PIN2 contains invalid characters.");
-                    return;
-                };
-                c.handle_intent(UserIntent::SignDocuments { pin2: Some(pin2) });
-                p2.set_value("");
-            });
-        }
-        {
-            let c = Arc::clone(controller);
-            pair_code_input.set_callback(move |input| {
-                let kept = kept_code(&input.value());
-                if kept != input.value() {
-                    input.set_value(&kept);
-                }
-                let _ = input.set_position(kept.len().try_into().unwrap_or(i32::MAX));
-                input.redraw();
-                if kept.len() == PAIRING_CODE_LENGTH {
-                    c.handle_intent(UserIntent::StartPairing { code: kept });
+                } else if let Some(pin2) = to_pin_bytes(&typed) {
+                    c.handle_intent(UserIntent::SignDocuments { pin2: Some(pin2) });
                 }
             });
         }
-        {
-            let c = Arc::clone(controller);
-            forget_phone_btn.set_callback(move |_| {
-                c.handle_intent(UserIntent::ForgetPhone);
-            });
-        }
+        wire_pin_codes(&pin_codes, controller, &self.memory);
 
-        self.widgets = Some(FltkWidgets {
+        self.widgets = Some(Widgets {
             window,
-            tabs,
-            pace_tab,
-            can_bar,
-            rapp_tab,
-            holder_name_frame,
-            pin1_status_frame,
-            pin2_status_frame,
-            puk_status_frame,
-            change_pin1_btn,
-            change_pin2_btn,
-            reactivate_btn,
-            activate_btn,
-            pin_subtabs,
-            tab_change_pin1,
-            tab_activate,
+            column,
+            remote_switch,
+            pin_codes_button,
+            identity,
+            prompt,
+            pairing_input,
+            pairing_refused,
+            can,
             can_input,
-            read_images_btn,
-            portrait_frame,
-            copy_portrait_btn,
-            save_portrait_btn,
-            signature_frame,
-            copy_sig_btn,
-            save_sig_btn,
-            doc_browser,
-            format_pades,
-            format_asice,
-            sign_btn,
-            sign_settings,
-            sign_pin2_label: p2_label,
-            sign_pin2_input,
-            sign_result_frame,
-            pair_code_input,
-            pairing_running: false,
-            pair_status_frame,
-            reader_card,
-            phone_card,
-            phone_name_frame,
-            phone_state_frame,
-            status_frame,
+            can_refused,
+            activation,
+            drop_area,
+            invitation,
+            pile,
+            pile_rows,
+            method,
+            separately,
+            package,
+            pin2,
+            pin2_input,
+            action,
+            sign,
+            result,
+            error,
+            pin_codes,
         });
-
-        self.wire_image_actions();
     }
 
-    /// Wire up image clipboard copying and save file actions.
-    fn wire_image_actions(&mut self) {
-        if let Some(ref widgets) = self.widgets {
-            let mut copy_p = widgets.copy_portrait_btn.clone();
-            copy_p.set_callback(|_| {
-                copy_image_to_clipboard();
-            });
-
-            let mut save_p = widgets.save_portrait_btn.clone();
-            save_p.set_callback(|_| {
-                save_image_to_file();
-            });
-
-            let mut copy_s = widgets.copy_sig_btn.clone();
-            copy_s.set_callback(|_| {
-                copy_sig_to_clipboard();
-            });
-
-            let mut save_s = widgets.save_sig_btn.clone();
-            save_s.set_callback(|_| {
-                save_sig_to_file();
-            });
+    /// Lists the pile, each document with its removal.
+    fn rebuild_pile(widgets: &mut Widgets, controller: &Arc<RefineIdController>, pile: &[PathBuf]) {
+        widgets.pile_rows.clear();
+        widgets.pile_rows.begin();
+        for document in pile {
+            let file_name = document.file_name().map_or_else(
+                || document.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let row = Group::new(0, 0, CONTENT_WIDTH - 24, PILE_ROW, None);
+            let mut name = Frame::new(4, 0, CONTENT_WIDTH - 24 - PILE_ROW - 8, PILE_ROW, None);
+            name.set_label(&file_name);
+            name.set_align(Align::Left | Align::Inside | Align::Clip);
+            name.set_tooltip(&document.display().to_string());
+            let mut remove =
+                Button::new(CONTENT_WIDTH - 24 - PILE_ROW, 0, PILE_ROW, PILE_ROW, None);
+            remove.set_label("@1+");
+            remove.set_frame(FrameType::FlatBox);
+            remove.set_label_color(SECONDARY);
+            remove.set_tooltip(&window::remove_document(&file_name));
+            let c = Arc::clone(controller);
+            let path = document.clone();
+            remove.set_callback(move |_| c.handle_intent(UserIntent::RemoveDocument(path.clone())));
+            row.end();
         }
+        widgets.pile_rows.end();
+        Group::set_current(None::<&Group>);
+        widgets.pile_rows.redraw();
     }
 }
 
-// Global cached image slots for the clipboard/save dialogs
-static CURRENT_PORTRAIT: std::sync::RwLock<Option<Arc<RgbaImageBuffer>>> =
-    std::sync::RwLock::new(None);
-static CURRENT_SIGNATURE: std::sync::RwLock<Option<Arc<RgbaImageBuffer>>> =
-    std::sync::RwLock::new(None);
+fn build_pin_codes() -> PinCodes {
+    let window = Window::default()
+        .with_size(WINDOW_WIDTH, 360)
+        .with_label(window::PIN_CODES);
+    let mut column = Flex::default_fill().column();
+    column.set_margin(MARGIN);
+    column.set_pad(GAP);
+    let recovery = [0, 1].map(|_| {
+        let frame = Frame::new(0, 0, CONTENT_WIDTH, LINE, None);
+        column.fixed(&frame, LINE);
+        frame
+    });
+    for mut frame in recovery.clone() {
+        frame.set_align(Align::Left | Align::Inside | Align::Wrap);
+    }
+    let tasks = section(FIELD);
+    let task_width = CONTENT_WIDTH / 4;
+    let mut x = 0;
+    let task_buttons: Vec<(PinTask, RadioButton)> = PinTask::ALL
+        .iter()
+        .map(|task| {
+            let mut button = RadioButton::new(x, 0, task_width, FIELD, None);
+            button.set_label(task.name());
+            x += task_width;
+            (*task, button)
+        })
+        .collect();
+    tasks.end();
+    column.fixed(&tasks, FIELD);
+    let form_height = 3 * (FIELD + GAP) + FIELD;
+    let form = section(form_height);
+    let fields = PinTask::ChangePin1.fields();
+    let mut y = 0;
+    let rows = fields.map(|name| {
+        let row = pin_row(y, name);
+        y += FIELD + GAP;
+        row
+    });
+    let labels = rows.clone().map(|(label, _)| label);
+    let inputs = rows.map(|(_, input)| input);
+    let action = primary_button(
+        CONTENT_WIDTH - 2 * BUTTON_WIDTH,
+        y,
+        PinTask::ChangePin1.action(),
+    );
+    form.end();
+    column.fixed(&form, form_height);
+    let mut error = Frame::new(0, 0, CONTENT_WIDTH, LINE * 2, None);
+    error.set_align(Align::Left | Align::Inside | Align::Wrap);
+    error.set_label_color(ERROR);
+    column.fixed(&error, LINE * 2);
+    Frame::default();
+    let attempts = section(LINE);
+    let mut attempts_label = line_frame(0, 0, 110, LINE, window::ATTEMPTS_LEFT);
+    attempts_label.set_label_color(SECONDARY);
+    let mut attempts_text = Pack::new(120, 0, CONTENT_WIDTH - 120, LINE, None);
+    attempts_text.set_type(PackType::Horizontal);
+    attempts_text.set_spacing(GAP);
+    attempts_text.end();
+    attempts.end();
+    column.fixed(&attempts, LINE);
+    column.end();
+    window.end();
+    PinCodes {
+        window,
+        column,
+        recovery,
+        tasks,
+        task_buttons,
+        form,
+        labels,
+        inputs,
+        action,
+        error,
+        attempts,
+        attempts_text,
+        task: Rc::new(RefCell::new(PinTask::ChangePin1)),
+    }
+}
 
-fn copy_image_to_clipboard() {
-    let guard = CURRENT_PORTRAIT.read().expect("current portrait lock");
-    if let Some(ref portrait) = *guard
-        && let Ok(mut cb) = arboard::Clipboard::new()
+/// Shows `task`'s fields and action in the PIN codes window.
+fn show_pin_task(pin: &mut PinCodes, task: PinTask, state: &UiState) {
+    *pin.task.borrow_mut() = task;
+    for (button_task, button) in &mut pin.task_buttons {
+        button.set_value(*button_task == task);
+    }
+    for ((label, input), name) in pin
+        .labels
+        .iter_mut()
+        .zip(&mut pin.inputs)
+        .zip(task.fields())
     {
-        let img_data = arboard::ImageData {
-            width: portrait.width() as usize,
-            height: portrait.height() as usize,
-            bytes: Cow::Borrowed(portrait.rgba_bytes()),
-        };
-        if cb.set_image(img_data).is_ok() {
+        label.set_label(name);
+        input.set_value("");
+    }
+    pin.action.set_label(task.action());
+    update_pin_action(pin, state);
+}
+
+/// Activates the PIN codes action while its entries are filled in and the
+/// card lets it run.
+fn update_pin_action(pin: &mut PinCodes, state: &UiState) {
+    let task = *pin.task.borrow();
+    let text = pin.inputs.each_ref().map(SecretInput::value);
+    let ready = task.complete(text.each_ref().map(String::as_str)) && task.available(state);
+    set_active(&mut pin.action, ready);
+}
+
+fn wire_pin_codes(
+    pin: &PinCodes,
+    controller: &Arc<RefineIdController>,
+    memory: &Rc<RefCell<Memory>>,
+) {
+    for (task, button) in &pin.task_buttons {
+        let mut shown = pin.clone();
+        let memory = Rc::clone(memory);
+        let task = *task;
+        let mut button = button.clone();
+        button.set_callback(move |_| show_pin_task(&mut shown, task, &memory.borrow().last));
+    }
+    for input in &pin.inputs {
+        let mut shown = pin.clone();
+        let memory = Rc::clone(memory);
+        let mut input = input.clone();
+        input.set_callback(move |input| {
+            keep_pin_digits(input);
+            update_pin_action(&mut shown, &memory.borrow().last);
+        });
+    }
+    let mut shown = pin.clone();
+    let c = Arc::clone(controller);
+    let mut action = pin.action.clone();
+    action.set_callback(move |_| {
+        let task = *shown.task.borrow();
+        let text = shown.inputs.each_ref().map(SecretInput::value);
+        for input in &mut shown.inputs {
+            input.set_value("");
+        }
+        if !task.complete(text.each_ref().map(String::as_str)) {
             return;
         }
-    }
-    alert(200, 200, "Failed to copy image to clipboard.");
-}
-
-fn save_image_to_file() {
-    let guard = CURRENT_PORTRAIT.read().expect("current portrait lock");
-    if let Some(ref portrait) = *guard {
-        let mut chooser = NativeFileChooser::new(FileDialogType::BrowseSaveFile);
-        chooser.set_filter("PNG Images\t*.png");
-        chooser.show();
-        let path = chooser.filename();
-        if !path.as_os_str().is_empty() {
-            let mut save_path = path;
-            if save_path.extension().is_none() {
-                save_path.set_extension("png");
-            }
-            if image::save_buffer(
-                &save_path,
-                portrait.rgba_bytes(),
-                portrait.width(),
-                portrait.height(),
-                image::ExtendedColorType::Rgba8,
-            )
-            .is_ok()
-            {
-                return;
-            }
-        }
-    }
-    alert(200, 200, "Failed to save portrait image.");
-}
-
-fn copy_sig_to_clipboard() {
-    let guard = CURRENT_SIGNATURE.read().expect("current signature lock");
-    if let Some(ref sig) = *guard
-        && let Ok(mut cb) = arboard::Clipboard::new()
-    {
-        let img_data = arboard::ImageData {
-            width: sig.width() as usize,
-            height: sig.height() as usize,
-            bytes: Cow::Borrowed(sig.rgba_bytes()),
-        };
-        if cb.set_image(img_data).is_ok() {
+        let (Some(presented), Some(new_pin)) = (to_pin_bytes(&text[0]), to_pin_bytes(&text[1]))
+        else {
             return;
-        }
-    }
-    alert(200, 200, "Failed to copy signature to clipboard.");
-}
-
-fn save_sig_to_file() {
-    let guard = CURRENT_SIGNATURE.read().expect("current signature lock");
-    if let Some(ref sig) = *guard {
-        let mut chooser = NativeFileChooser::new(FileDialogType::BrowseSaveFile);
-        chooser.set_filter("PNG Images\t*.png");
-        chooser.show();
-        let path = chooser.filename();
-        if !path.as_os_str().is_empty() {
-            let mut save_path = path;
-            if save_path.extension().is_none() {
-                save_path.set_extension("png");
+        };
+        let slot = task.manage_slot();
+        c.handle_intent(if task.uses_puk() {
+            UserIntent::ReactivatePin {
+                slot,
+                puk: presented,
+                new_pin,
             }
-            if image::save_buffer(
-                &save_path,
-                sig.rgba_bytes(),
-                sig.width(),
-                sig.height(),
-                image::ExtendedColorType::Rgba8,
-            )
-            .is_ok()
-            {
-                return;
+        } else {
+            UserIntent::ChangePin {
+                slot,
+                current_pin: presented,
+                new_pin,
             }
-        }
-    }
-    alert(200, 200, "Failed to save signature image.");
-}
-
-/// Create a fitted FLTK `RgbImage` preserving aspect ratio.
-fn create_fitted_image(buf: &RgbaImageBuffer, max_w: i32, max_h: i32) -> Option<RgbImage> {
-    if buf.width() == 0 || buf.height() == 0 || buf.rgba_bytes().is_empty() {
-        return None;
-    }
-    let mut fltk_img = RgbImage::new(
-        buf.rgba_bytes(),
-        buf.width() as i32,
-        buf.height() as i32,
-        ColorDepth::Rgba8,
-    )
-    .ok()?;
-
-    let aspect = buf.width() as f64 / buf.height() as f64;
-    let (target_w, target_h) = if (max_w as f64 / max_h as f64) > aspect {
-        ((max_h as f64 * aspect) as i32, max_h)
-    } else {
-        (max_w, (max_w as f64 / aspect) as i32)
-    };
-
-    fltk_img.scale(target_w, target_h, true, true);
-    Some(fltk_img)
+        });
+    });
 }
 
 impl UiDriver for FltkDriver {
@@ -974,234 +971,205 @@ impl UiDriver for FltkDriver {
     }
 
     fn render(&mut self, state: &UiState) {
-        let Some(widgets) = self.widgets.as_mut() else {
+        let (Some(widgets), Some(controller)) = (self.widgets.as_mut(), self.controller.as_ref())
+        else {
             return;
         };
-
-        // Window Title & Status
+        let mut memory = self.memory.borrow_mut();
+        memory.last = state.clone();
         widgets.window.set_label(&state.window_title);
-        widgets.status_frame.set_label(&state.status_message);
 
-        // The holder of the card in use
-        let holder = state
-            .selected_card
-            .and_then(|index| state.cards.get(index))
-            .map(|card| card.display_name())
-            .unwrap_or_default();
-        widgets.holder_name_frame.set_label(&holder);
+        let line = IdentityLine::derive(state);
+        let content = WindowContent::derive(state);
+        let entered = memory.content.replace(content) != Some(content);
 
-        // Tab 2: PIN Status
-        widgets.pin1_status_frame.set_label(&credential_line(
-            PIN1_LABEL,
-            with_factory_flag(pin_value(state.pin1_status), state.pin1_changed),
+        // The top row's one control.
+        let opens_pin_codes = window::toolbar_opens_pin_codes(state);
+        set_shown(&mut widgets.pin_codes_button, opens_pin_codes);
+        set_shown(&mut widgets.remote_switch, !opens_pin_codes);
+        widgets.remote_switch.set_value(state.remote_use);
+        widgets.remote_switch.set_tooltip(&format!(
+            "{}: {}",
+            window::REMOTE_ACCESS,
+            if state.remote_use {
+                window::REMOTE_ON
+            } else {
+                window::REMOTE_OFF
+            }
         ));
-        widgets.pin2_status_frame.set_label(&credential_line(
-            PIN2_LABEL,
-            with_factory_flag(pin_value(state.pin2_status), state.pin2_changed),
-        ));
+        let recovery = Recovery::derive(state);
         widgets
-            .puk_status_frame
-            .set_label(&credential_line(PUK_LABEL, puk_value(state.puk_status)));
-
-        // The activation sub-tab exists only for a card that still needs it.
-        let setup_listed =
-            widgets.pin_subtabs.find(&widgets.tab_activate) < widgets.pin_subtabs.children();
-        if state.activation_available && !setup_listed {
-            widgets.pin_subtabs.add(&widgets.tab_activate);
-            widgets.pin_subtabs.redraw();
-        } else if !state.activation_available && setup_listed {
-            let showing_setup = widgets
-                .pin_subtabs
-                .value()
-                .is_some_and(|tab| tab.is_same(&widgets.tab_activate));
-            widgets.pin_subtabs.remove(&widgets.tab_activate);
-            if showing_setup {
-                let _ = widgets.pin_subtabs.set_value(&widgets.tab_change_pin1);
-            }
-            widgets.pin_subtabs.redraw();
-        }
-
-        set_active(
-            &mut widgets.change_pin1_btn,
-            state.pin1_change_available && !state.busy,
-        );
-        set_active(
-            &mut widgets.change_pin2_btn,
-            state.pin2_change_available && !state.busy,
-        );
-        set_active(
-            &mut widgets.reactivate_btn,
-            (state.pin1_unblock_available || state.pin2_unblock_available) && !state.busy,
-        );
-        set_active(
-            &mut widgets.activate_btn,
-            state.activation_available && !state.busy,
-        );
-
-        // Tab 1: Identity & PACE
-        if !state.selected_card_is_local {
-            if widgets.can_bar.visible() {
-                widgets.can_bar.hide();
-                widgets.pace_tab.redraw();
-            }
+            .pin_codes_button
+            .set_label_color(if recovery.is_some() { ERROR } else { SECONDARY });
+        widgets.pin_codes_button.set_tooltip(if recovery.is_some() {
+            window::PIN_NEEDS_RESET
         } else {
-            if !widgets.can_bar.visible() {
-                widgets.can_bar.show();
-                widgets.pace_tab.redraw();
-            }
-            set_active(
-                &mut widgets.read_images_btn,
-                !state.busy && state.selected_card.is_some(),
-            );
+            window::PIN_CODES
+        });
+
+        // The identity line.
+        let replaced = matches!(
+            content,
+            WindowContent::CardAccessNumber(_) | WindowContent::Activation
+        );
+        let text = line.text();
+        widgets.identity.set_label(&text);
+        widgets.identity.set_label_color(if line.is_warning() {
+            WARNING
+        } else if line.is_holder() {
+            Color::Black
+        } else {
+            SECONDARY
+        });
+        set_shown(&mut widgets.identity, !replaced && !text.is_empty());
+
+        // The pairing prompt.
+        set_shown(&mut widgets.prompt, content == WindowContent::PairingPrompt);
+        let running = state.pairing.is_some();
+        set_active(&mut widgets.pairing_input, !running);
+        if memory.pairing_running && !running {
+            widgets.pairing_input.set_value("");
+            *widgets.pairing_refused.borrow_mut() = !state.status_message.is_empty();
         }
-        if state.can_text.is_empty() && !state.busy && !widgets.can_input.value().is_empty() {
+        memory.pairing_running = running;
+        if entered && content == WindowContent::PairingPrompt {
+            widgets.pairing_input.set_value("");
+            let _ = widgets.pairing_input.take_focus();
+        }
+
+        // The card access number.
+        let can_request = match content {
+            WindowContent::CardAccessNumber(request) => Some(request),
+            _ => None,
+        };
+        set_shown(&mut widgets.can, can_request.is_some());
+        if entered && can_request.is_some() {
             widgets.can_input.set_value("");
-        } else if !state.can_text.is_empty() && widgets.can_input.value().is_empty() {
-            widgets.can_input.set_value(&state.can_text);
+            *widgets.can_refused.borrow_mut() = can_request == Some(CanRequest::Refused);
+            let _ = widgets.can_input.take_focus();
         }
 
-        // Update portrait frame
-        if state.portrait.as_ref() != self.cached_portrait.as_ref() {
-            self.cached_portrait = state.portrait.clone();
-            *CURRENT_PORTRAIT
-                .write()
-                .expect("current portrait write lock") = state.portrait.clone();
+        // The activation form.
+        set_shown(
+            &mut widgets.activation.section,
+            content == WindowContent::Activation,
+        );
+        if entered && content == WindowContent::Activation {
+            let _ = widgets.activation.inputs[0].take_focus();
+        }
 
-            if let Some(ref buf) = state.portrait {
-                if let Some(img) = create_fitted_image(buf, 310, 320) {
-                    widgets.portrait_frame.set_label("");
-                    widgets.portrait_frame.set_image(Some(img));
-                }
-                set_active(&mut widgets.copy_portrait_btn, true);
-                set_active(&mut widgets.save_portrait_btn, true);
+        // The documents.
+        let documents = content == WindowContent::Documents;
+        let pile = !state.pdf_documents.is_empty();
+        set_shown(&mut widgets.drop_area, documents);
+        set_shown(&mut widgets.invitation, !pile);
+        set_shown(&mut widgets.pile, pile);
+        widgets.column.fixed(
+            &widgets.drop_area,
+            if pile {
+                PILE_HEIGHT + FIELD
             } else {
-                widgets.portrait_frame.set_image(None::<RgbImage>);
-                widgets.portrait_frame.set_label("");
-                set_active(&mut widgets.copy_portrait_btn, false);
-                set_active(&mut widgets.save_portrait_btn, false);
-            }
-            widgets.portrait_frame.redraw();
+                DROP_HEIGHT
+            },
+        );
+        if memory.shown_pile != state.pdf_documents {
+            memory.shown_pile.clone_from(&state.pdf_documents);
+            Self::rebuild_pile(widgets, controller, &state.pdf_documents);
         }
+        let signing = documents && pile;
+        set_shown(&mut widgets.method, signing);
+        let every_one_a_pdf = SignFormat::shared(&state.pdf_documents) == SignFormat::Pades;
+        set_active(&mut widgets.separately, every_one_a_pdf);
+        set_active(&mut widgets.package, every_one_a_pdf);
+        widgets
+            .separately
+            .set_value(state.sign_format == SignFormat::Pades);
+        widgets
+            .package
+            .set_value(state.sign_format == SignFormat::AsicE);
+        set_shown(&mut widgets.pin2, signing && window::asks_pin2_here(state));
+        set_shown(&mut widgets.action, signing);
+        set_active(
+            &mut widgets.sign,
+            window::can_sign(state, &widgets.pin2_input.value()),
+        );
 
-        // Update signature frame
-        if state.signature.as_ref() != self.cached_signature.as_ref() {
-            self.cached_signature = state.signature.clone();
-            *CURRENT_SIGNATURE
-                .write()
-                .expect("current signature write lock") = state.signature.clone();
+        // The outcome of the last action.
+        let result = state.sign_result.clone().unwrap_or_default();
+        widgets.result.set_label(&result);
+        set_shown(&mut widgets.result, documents && !result.is_empty());
+        widgets.error.set_label(&state.status_message);
+        set_shown(&mut widgets.error, !state.status_message.is_empty());
 
-            if let Some(ref buf) = state.signature {
-                if let Some(img) = create_fitted_image(buf, 420, 150) {
-                    widgets.signature_frame.set_label("");
-                    widgets.signature_frame.set_image(Some(img));
-                }
-                set_active(&mut widgets.copy_sig_btn, true);
-                set_active(&mut widgets.save_sig_btn, true);
-            } else {
-                widgets.signature_frame.set_image(None::<RgbImage>);
-                widgets.signature_frame.set_label("");
-                set_active(&mut widgets.copy_sig_btn, false);
-                set_active(&mut widgets.save_sig_btn, false);
-            }
-            widgets.signature_frame.redraw();
-        }
-
-        // Tab 3: Sign Documents
-        widgets.doc_browser.clear();
-        for p in &state.pdf_documents {
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                widgets.doc_browser.add(name);
-            } else {
-                widgets.doc_browser.add(&p.display().to_string());
-            }
-        }
-
-        match state.sign_format {
-            SignFormat::Pades => widgets.format_pades.set_value(true),
-            SignFormat::AsicE => widgets.format_asice.set_value(true),
-        }
-
-        let can_sign = !state.pdf_documents.is_empty()
-            && !state.busy
-            && state.selected_card.is_some()
-            && state.signature_supported;
-        set_active(&mut widgets.sign_btn, can_sign);
-        // PIN 2 for the phone's card is typed on the phone.
-        let pin2_shown = !state.phone_signs();
-        if widgets.sign_pin2_input.visible() != pin2_shown {
-            if pin2_shown {
-                widgets.sign_pin2_label.show();
-                widgets.sign_pin2_input.show();
-            } else {
-                widgets.sign_pin2_label.hide();
-                widgets.sign_pin2_input.hide();
-            }
-            widgets.sign_settings.redraw();
-        }
-
-        if let Some(ref result) = state.sign_result {
-            widgets.sign_result_frame.set_label(result);
-        } else {
-            widgets.sign_result_frame.set_label("");
-        }
-
-        // Tab 4: Phone (RAPP)
-        if state.has_local_card {
-            if widgets.rapp_tab.visible() {
-                let showing_phone = widgets
-                    .tabs
-                    .value()
-                    .is_some_and(|tab| tab.is_same(&widgets.rapp_tab));
-                widgets.rapp_tab.hide();
-                if showing_phone {
-                    let _ = widgets.tabs.set_value(&widgets.pace_tab);
-                }
-                widgets.tabs.redraw();
-            }
-        } else {
-            if !widgets.rapp_tab.visible() {
-                widgets.rapp_tab.show();
-                widgets.tabs.redraw();
-            }
-
-            if let Some(ref pairing) = state.pairing {
-                widgets.pair_status_frame.set_label(&pairing.status);
-                set_active(&mut widgets.pair_code_input, false);
-            } else {
-                widgets.pair_status_frame.set_label("");
-                set_active(&mut widgets.pair_code_input, true);
-                if widgets.pairing_running {
-                    widgets.pair_code_input.set_value("");
-                    let _ = widgets.pair_code_input.take_focus();
-                }
-            }
-            widgets.pairing_running = state.pairing.is_some();
-            widgets.pair_code_input.redraw();
-
-            if let Some(ref phone) = state.phone {
-                widgets.phone_name_frame.set_label(&phone.name);
-                widgets
-                    .phone_state_frame
-                    .set_label(if phone.certificate_cached {
-                        &phone.platform
+        // The PIN codes window.
+        let pin = &mut widgets.pin_codes;
+        if opens_pin_codes {
+            let sentences = recovery.map(Recovery::sentences);
+            for (index, frame) in pin.recovery.iter_mut().enumerate() {
+                let text = sentences.map(|pair| pair[index]).unwrap_or_default();
+                frame.set_label(text);
+                frame.set_label_color(
+                    if matches!(
+                        recovery,
+                        Some(Recovery::UseOtherSoftware | Recovery::Unrecoverable)
+                    ) {
+                        ERROR
                     } else {
-                        "Reading the card"
-                    });
-                if !widgets.phone_card.visible() {
-                    widgets.reader_card.hide();
-                    widgets.phone_card.show();
-                }
-            } else if !widgets.reader_card.visible() {
-                widgets.phone_card.hide();
-                widgets.reader_card.show();
+                        Color::Black
+                    },
+                );
+                set_shown(frame, !text.is_empty());
             }
+            let tasks = Recovery::tasks(recovery);
+            for (task, button) in &mut pin.task_buttons {
+                set_shown(button, tasks.contains(task));
+            }
+            set_shown(&mut pin.tasks, !tasks.is_empty());
+            set_shown(&mut pin.form, !tasks.is_empty());
+            if !tasks.contains(&pin.task.borrow()) {
+                show_pin_task(pin, Recovery::initial_task(recovery), state);
+            }
+            update_pin_action(pin, state);
+            let entries = window::attempts_below_full(state);
+            pin.attempts_text.clear();
+            pin.attempts_text.begin();
+            for entry in &entries {
+                if entry.below_floor {
+                    let mut mark = Frame::new(0, 0, LINE / 2, LINE, None);
+                    mark.set_label(BELOW_FLOOR_SYMBOL);
+                    mark.set_label_color(ERROR);
+                }
+                let width = i32::try_from(entry.text.len()).unwrap_or(0) * 8;
+                let mut text = Frame::new(0, 0, width, LINE, None);
+                text.set_label(&entry.text);
+                text.set_label_color(if entry.below_floor {
+                    ERROR
+                } else {
+                    Color::Black
+                });
+            }
+            pin.attempts_text.end();
+            Group::set_current(None::<&Group>);
+            set_shown(&mut pin.attempts, !entries.is_empty());
+            pin.error.set_label(&state.status_message);
+            pin.column.layout();
+            pin.window.redraw();
+            if recovery.is_some() && !memory.opened_for_card {
+                memory.opened_for_card = true;
+                pin.window.show();
+            }
+        } else {
+            memory.opened_for_card = false;
+            pin.window.hide();
         }
+
+        widgets.column.layout();
+        widgets.window.redraw();
     }
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
         self.init_ui(&controller);
-
-        // Apply initial state
+        self.controller = Some(Arc::clone(&controller));
         self.render(&controller.state());
 
         if let Some(ref mut widgets) = self.widgets {
@@ -1218,18 +1186,17 @@ impl UiDriver for FltkDriver {
                 self.render(&state);
             }
             #[cfg(debug_assertions)]
+            while let Some(entry) = follower.next() {
+                errors.add(entry);
+            }
+            // Neither the PIN codes window nor the Errors window keeps the
+            // application open.
+            if self
+                .widgets
+                .as_ref()
+                .is_some_and(|widgets| !widgets.window.shown())
             {
-                while let Some(entry) = follower.next() {
-                    errors.add(entry);
-                }
-                // The Errors window does not keep the application open.
-                if self
-                    .widgets
-                    .as_ref()
-                    .is_some_and(|widgets| !widgets.window.shown())
-                {
-                    break;
-                }
+                break;
             }
         }
 
@@ -1238,243 +1205,45 @@ impl UiDriver for FltkDriver {
     }
 }
 
-/// The side of one pairing-code box, in pixels.
-const CODE_BOX_SIZE: i32 = 36;
-/// The gap between boxes of one cluster.
-const CODE_BOX_SPACING: i32 = 6;
-/// The gap between the two-character clusters.
-const CODE_GROUP_GAP: i32 = 14;
-/// The characters of one cluster, as the phone shows the code.
-const CODE_GROUP_SIZE: usize = 2;
-/// The background of the cards, drawn behind the boxes.
-const CARD_BACKGROUND: Color = Color::from_rgb(255, 255, 255);
-/// The keys that would move the input's cursor off the end; every other
-/// key reaches the input, and a change puts the cursor back at the end.
-const CURSOR_KEYS: [Key; 8] = [
-    Key::Left,
-    Key::Right,
-    Key::Up,
-    Key::Down,
-    Key::Home,
-    Key::End,
-    Key::PageUp,
-    Key::PageDown,
-];
-
-/// The width of the row of boxes.
-fn code_boxes_width() -> i32 {
-    let boxes = i32::try_from(PAIRING_CODE_LENGTH).unwrap_or(i32::MAX);
-    let groups = i32::try_from(PAIRING_CODE_LENGTH / CODE_GROUP_SIZE).unwrap_or(i32::MAX);
-    boxes * CODE_BOX_SIZE + (boxes - groups) * CODE_BOX_SPACING + (groups - 1) * CODE_GROUP_GAP
-}
-
-/// The left edge of box `index` relative to the row.
-fn code_box_offset(index: usize) -> i32 {
-    let position = i32::try_from(index).unwrap_or(i32::MAX);
-    let group = i32::try_from(index / CODE_GROUP_SIZE).unwrap_or(i32::MAX);
-    position * (CODE_BOX_SIZE + CODE_BOX_SPACING) + group * (CODE_GROUP_GAP - CODE_BOX_SPACING)
-}
-
-/// What a typed value keeps: its code characters, up to the code's
-/// length.
-fn kept_code(typed: &str) -> String {
-    typed
-        .chars()
-        .filter_map(pairing_code_character)
-        .take(PAIRING_CODE_LENGTH)
-        .collect()
-}
-
-/// Draws `input` as one box per code character; the box the next
-/// character lands in carries the accent while the input has focus.
-fn draw_code_boxes(input: &Input) {
-    let code: Vec<char> = input.value().chars().collect();
-    let active = input.active();
-    let focused = input.has_focus();
-    draw::draw_rect_fill(input.x(), input.y(), input.w(), input.h(), CARD_BACKGROUND);
-    let text_color = if active {
-        Color::from_rgb(20, 20, 20)
-    } else {
-        Color::from_rgb(140, 140, 140)
-    };
-    draw::set_font(Font::CourierBold, 20);
-    for index in 0..PAIRING_CODE_LENGTH {
-        let x = input.x() + code_box_offset(index);
-        let y = input.y();
-        let border = if focused && active && index == code.len() {
-            Color::from_rgb(0, 122, 255)
-        } else {
-            Color::from_rgb(190, 190, 190)
-        };
-        draw::draw_rect_with_color(x, y, CODE_BOX_SIZE, CODE_BOX_SIZE, border);
-        if focused && active && index == code.len() {
-            draw::draw_rect_with_color(x + 1, y + 1, CODE_BOX_SIZE - 2, CODE_BOX_SIZE - 2, border);
-        }
-        if let Some(character) = code.get(index) {
-            draw::set_draw_color(text_color);
-            draw::draw_text2(
-                &character.to_string(),
-                x,
-                y,
-                CODE_BOX_SIZE,
-                CODE_BOX_SIZE,
-                Align::Center,
-            );
-        }
-    }
-}
-
-/// The credential labels of the status lines.
-const PIN1_LABEL: &str = "PIN 1";
-const PIN2_LABEL: &str = "PIN 2";
-const PUK_LABEL: &str = "PUK";
-
-/// A credential line: nothing while the value is in its normal state,
-/// otherwise the label and the value.
-fn credential_line(label: &str, value: String) -> String {
-    if value.is_empty() {
-        String::new()
-    } else {
-        format!("{label}: {value}")
-    }
-}
-
-/// What a PIN's counter says: nothing at the try limit, the tries left
-/// below it, and the blocked or unknown state otherwise.
-fn pin_value(status: Option<PinStatus>) -> String {
-    match status {
-        Some(PinStatus::Remaining(retries)) => tries_left(retries),
-        Some(PinStatus::Locked) => "blocked".to_owned(),
-        Some(PinStatus::NoInfo) => "no retry count".to_owned(),
-        Some(PinStatus::Other(sw)) => format!("status {sw:04X}"),
-        Some(PinStatus::Verified) | None => String::new(),
-    }
-}
-
-/// What the PUK's counter says, by the same rule as [`pin_value`].
-fn puk_value(status: Option<PukStatus>) -> String {
-    match status {
-        Some(PukStatus::Remaining(retries)) => tries_left(retries),
-        Some(PukStatus::Locked) => "blocked".to_owned(),
-        Some(PukStatus::Invalidated) => "invalidated".to_owned(),
-        Some(PukStatus::NoInfo) => "no retry count".to_owned(),
-        Some(PukStatus::Other(sw)) => format!("status {sw:04X}"),
-        None => String::new(),
-    }
-}
-
-fn tries_left(retries: PinRetries) -> String {
-    let count = retries.get();
-    if retries.is_exhausted() {
-        "blocked".to_owned()
-    } else if count < PIN_TRY_LIMIT {
-        format!("{count} of {PIN_TRY_LIMIT} tries left")
-    } else {
-        String::new()
-    }
-}
-
-/// Appends the factory-value flag to a credential value.
-fn with_factory_flag(value: String, changed: Option<bool>) -> String {
-    match (changed, value.is_empty()) {
-        (Some(false), true) => "factory value".to_owned(),
-        (Some(false), false) => format!("{value}; factory value"),
-        (Some(true) | None, _) => value,
-    }
-}
-
-/// Draws `button` as a trash can: the lid with its handle, the body
-/// and three ribs, in the accent while the button is active.
-fn draw_trash_icon(button: &mut Button) {
-    let (x, y) = (button.x(), button.y());
-    let color = if button.active() {
-        TRASH_COLOR
-    } else {
-        Color::from_rgb(170, 170, 170)
-    };
-    draw::set_draw_color(color);
-    draw::set_line_style(draw::LineStyle::Solid, 2);
-    draw::draw_line(x + 7, y + 9, x + 25, y + 9);
-    draw::draw_line(x + 13, y + 9, x + 13, y + 5);
-    draw::draw_line(x + 13, y + 5, x + 19, y + 5);
-    draw::draw_line(x + 19, y + 5, x + 19, y + 9);
-    draw::draw_line(x + 9, y + 12, x + 10, y + 27);
-    draw::draw_line(x + 10, y + 27, x + 22, y + 27);
-    draw::draw_line(x + 22, y + 27, x + 23, y + 12);
-    draw::draw_line(x + 13, y + 15, x + 13, y + 24);
-    draw::draw_line(x + 16, y + 15, x + 16, y + 24);
-    draw::draw_line(x + 19, y + 15, x + 19, y + 24);
-    draw::set_line_style(draw::LineStyle::Solid, 0);
-}
-
-/// The trash can's colour.
-const TRASH_COLOR: Color = Color::from_rgb(200, 60, 50);
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn factory_flag_follows_the_card() {
-        assert_eq!(
-            with_factory_flag(String::new(), Some(false)),
-            "factory value"
-        );
-        assert_eq!(
-            with_factory_flag("blocked".to_owned(), Some(false)),
-            "blocked; factory value"
-        );
-        assert_eq!(with_factory_flag(String::new(), Some(true)), "");
-        assert_eq!(with_factory_flag(String::new(), None), "");
-    }
-
-    #[test]
-    fn a_credential_line_is_silent_in_its_normal_state() {
-        let full = PinRetries::from_nibble(PIN_TRY_LIMIT).expect("retry nibble");
-        let spent = PinRetries::from_nibble(PIN_TRY_LIMIT - 1).expect("retry nibble");
-        let none = PinRetries::from_nibble(0).expect("retry nibble");
-        assert_eq!(
-            credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(full)))),
-            ""
-        );
-        assert_eq!(
-            credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(spent)))),
-            "PIN 1: 4 of 5 tries left"
-        );
-        assert_eq!(
-            credential_line("PIN 1", pin_value(Some(PinStatus::Remaining(none)))),
-            "PIN 1: blocked"
-        );
-        assert_eq!(
-            credential_line("PIN 1", pin_value(Some(PinStatus::Verified))),
-            ""
-        );
-        assert_eq!(credential_line("PUK", puk_value(None)), "");
-        assert_eq!(
-            credential_line("PUK", puk_value(Some(PukStatus::Locked))),
-            "PUK: blocked"
-        );
-    }
-
-    #[test]
     fn a_typed_code_keeps_its_code_characters_up_to_the_length() {
-        assert_eq!(kept_code("7k x4-m9"), "7KX4M9");
-        assert_eq!(kept_code("7K X4 M9 extra"), "7KX4M9");
-        assert_eq!(kept_code("7k"), "7K");
-        assert_eq!(kept_code("ü"), "");
+        assert_eq!(pairing_code("7k x4-m9"), "7KX4M9");
+        assert_eq!(pairing_code("7K X4 M9 extra"), "7KX4M9");
+        assert_eq!(pairing_code("7k"), "7K");
+        assert_eq!(access_number("12a34b567"), "123456");
     }
 
     #[test]
-    fn the_boxes_sit_in_two_character_clusters() {
-        assert_eq!(code_box_offset(0), 0);
-        assert_eq!(code_box_offset(1), CODE_BOX_SIZE + CODE_BOX_SPACING);
+    fn the_boxes_sit_in_clusters() {
+        assert_eq!(code_box_offset(0, 2), 0);
+        assert_eq!(code_box_offset(1, 2), CODE_BOX_SIZE + CODE_BOX_SPACING);
         assert_eq!(
-            code_box_offset(2),
+            code_box_offset(2, 2),
             2 * CODE_BOX_SIZE + CODE_BOX_SPACING + CODE_GROUP_GAP
         );
         assert_eq!(
-            code_boxes_width(),
-            code_box_offset(PAIRING_CODE_LENGTH - 1) + CODE_BOX_SIZE
+            code_boxes_width(PAIRING_CODE_LENGTH, PAIRING_CODE_GROUP_SIZE),
+            code_box_offset(PAIRING_CODE_LENGTH - 1, PAIRING_CODE_GROUP_SIZE) + CODE_BOX_SIZE
         );
+        assert_eq!(
+            code_boxes_width(CAN_DIGITS, CAN_DIGITS),
+            CAN_DIGITS as i32 * CODE_BOX_SIZE + (CAN_DIGITS as i32 - 1) * CODE_BOX_SPACING
+        );
+    }
+
+    #[test]
+    fn a_drop_names_its_files() {
+        assert_eq!(
+            dropped_paths("file:///documents/my%20report.pdf\r\n/documents/notes.txt\n"),
+            vec![
+                PathBuf::from("/documents/my report.pdf"),
+                PathBuf::from("/documents/notes.txt")
+            ]
+        );
+        assert_eq!(percent_decoded("100%"), "100%");
     }
 }

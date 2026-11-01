@@ -3,7 +3,7 @@
 //! Portable desktop application for FINEID card management.
 //!
 //! Presentation drivers:
-//! - GTK 4 (`--driver gtk4`): Tier 1 modern desktop driver with Apple HIG styling.
+//! - GTK 4 (`--driver gtk4`): Tier 1 modern desktop driver.
 //! - FLTK (`--driver fltk`): Tier 2 lightweight/minimalist driver.
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
@@ -18,49 +18,44 @@ compile_error!(
     "At least one presentation driver feature ('gtk4' or 'fltk') must be enabled for refineid-gui."
 );
 
-#[cfg(feature = "fltk")]
-fn run_fltk(initial_tab: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut driver, on_state_change) = refineid_gui_fltk::FltkDriver::create();
-    if initial_tab == Some("phone") {
-        driver.open_on_phone_tab();
-    }
+/// Starts the controller; `--pair` turns remote use on, which shows the
+/// pairing prompt while no phone is paired.
+#[cfg(any(feature = "gtk4", feature = "fltk"))]
+fn start_controller(
+    on_state_change: impl Fn(&refineid_gui_core::model::UiState) + Send + Sync + 'static,
+    pair: bool,
+) -> std::sync::Arc<RefineIdController> {
     let controller = RefineIdController::new(on_state_change);
     controller.start();
-    driver.run(controller)?;
+    if pair {
+        controller.handle_intent(refineid_gui_core::model::UserIntent::SetRemoteUse(true));
+    }
+    controller
+}
+
+#[cfg(feature = "fltk")]
+fn run_fltk(pair: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (driver, on_state_change) = refineid_gui_fltk::FltkDriver::create();
+    driver.run(start_controller(on_state_change, pair))?;
     Ok(())
 }
 
 #[cfg(feature = "gtk4")]
-fn run_gtk4(initial_tab: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut driver, on_state_change) = refineid_gui_gtk4::Gtk4Driver::create();
-    if let Some(tab) = initial_tab {
-        driver.set_initial_tab(tab);
-    }
-    let controller = RefineIdController::new(on_state_change);
-    controller.start();
-    driver.run(controller)?;
+fn run_gtk4(pair: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (driver, on_state_change) = refineid_gui_gtk4::Gtk4Driver::create();
+    driver.run(start_controller(on_state_change, pair))?;
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut explicit_driver = None;
-    let mut initial_tab = None;
+    let mut pair = false;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
         if arg == "--pair" {
-            initial_tab = Some("phone");
-            continue;
-        }
-        if arg == "--tab" {
-            if let Some(val) = iter.next() {
-                initial_tab = Some(val.as_str());
-            }
-            continue;
-        }
-        if let Some(val) = arg.strip_prefix("--tab=") {
-            initial_tab = Some(val);
+            pair = true;
             continue;
         }
         if arg == "--driver" {
@@ -99,9 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ran = match chosen {
         #[cfg(feature = "gtk4")]
-        "gtk4" => run_gtk4(initial_tab),
+        "gtk4" => run_gtk4(pair),
         #[cfg(feature = "fltk")]
-        "fltk" => run_fltk(initial_tab),
+        "fltk" => run_fltk(pair),
         other => {
             eprintln!(
                 "Unknown or unsupported presentation driver: '{other}' (available: {available_str})"

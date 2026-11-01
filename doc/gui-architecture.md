@@ -2,9 +2,9 @@
 
 - **Document Version**: `26.9.28.1`
 - **Protocol Wire Version**: `26.10.29`
-- **Status**: Implemented (Tier 2: FLTK; Tier 1: GTK4 planned)
+- **Status**: Implemented (Tier 1: GTK 4; Tier 2: FLTK)
 - **Date**: 2026-09-28
-- **Implemented**: 2026-10-22 — FLTK driver (`refineid-gui-fltk`) is the Tier 2 backend; GTK4 driver (`refineid-gui-gtk4`) is planned for Tier 1.
+- **Implemented**: the GTK 4 driver (`refineid-gui-gtk4`, GTK 4.6 or later) is the Tier 1 backend and the FLTK driver (`refineid-gui-fltk`) the Tier 2 backend; both lay out the one window of section 4.4.
 - **Applies To**: `RefineID-Unix` (Linux, NetBSD, FreeBSD, OpenBSD)
 
 ---
@@ -165,39 +165,57 @@ pub trait UiDriver: Send + 'static {
 ### 4.2 State & Intent Data Contracts
 
 #### State Pushed to Driver (`UiState`)
-- `cards: Vec<CardSummary>` and `selected_card: Option<usize>`
-- `pin_status: BTreeMap<PinManageSlot, PinStatus>` (retry counters, blocked flags)
-- `portrait: Option<Arc<DocumentImage>>` and `signature: Option<Arc<DocumentImage>>`
-- `signing_queue: Vec<PathBuf>`
-- `phone: Option<PairedPhone>` (the paired phone: its name, platform and whether its certificate is cached)
-- `pin1_changed`, `pin2_changed` (whether a PIN still holds its factory value)
-- `pairing: Option<RappPairingState>` (the typed code and the status line while the ceremony runs)
-- `busy_message: Option<String>`
-- `status_banner: Option<StatusBanner>`
+- `cards: Vec<ManagedCard>` and `selected_card: Option<usize>`: the card in use, a card in a reader here before the phone's card
+- `reader: ReaderPresence` (no reader, empty readers, a card in a reader) and `has_local_card`
+- `can_request: Option<CanRequest>`: a contactless card waits for its card access number, or refused the one typed
+- `pin1_status`, `pin2_status`, `puk_status` and what they allow (`pin1_change_available`, `activation_available`, ...)
+- `pdf_documents: Vec<PathBuf>`, `sign_format`, `sign_result`: the pile, the signing method, the outcome
+- `remote_use`, `phone: Option<PairedPhone>`, `pairing: Option<RappPairingState>`, `phone_reader_empty`, `phone_that_forgot`
+- `busy`, `status_message`: an operation runs; the last failure
+
+`refineid_gui_core::window` derives what the window shows from a state, so both drivers show the same states with the same words: `IdentityLine`, `WindowContent`, `Recovery`, `PinTask` and `attempts_below_full`. Its texts are the Apple app's English source strings for the same states.
 
 #### Intent Emitted by Driver (`UserIntent`)
-- `ChangePin { slot: PinManageSlot, old_pin: PinBytes, new_pin: PinBytes }`
-- `ReactivatePin { puk: PukBytes, new_pin1: PinBytes, new_pin2: PinBytes }`
-- `LoadPortrait { can: PinBytes }`
-- `QueueDocuments(Vec<PathBuf>)` and `ClearDocuments`
-- `ExecuteSign { pin2: PinBytes, format: SignFormat }`
-- `StartPairing { code }`
-- `ForgetPhone`
+- `ActivateCard { activation_code, new_pin1, new_pin2 }`
+- `ChangePin { slot, current_pin, new_pin }` and `ReactivatePin { slot, puk, new_pin }`
+- `EnterCan(Can)`
+- `AddDocuments(Vec<PathBuf>)`, `RemoveDocument(PathBuf)`, `ClearDocuments`, `SetSignFormat(SignFormat)`
+- `SignDocuments { pin2 }`
+- `StartPairing { code }` and `SetRemoteUse(bool)`
 
 ### 4.3 Workstation UX Hygiene Contract
 
 In accordance with [RAPP Transport and Discovery Hierarchy Specification](https://github.com/refineid/refineid-core/blob/main/doc/protocols/rapp-transport-and-discovery-hierarchy.md):
 1. **Local Card Reader Default**: Out of the box, the controller interfaces exclusively with local smart cards via `pcscd`. No background radio polling, mDNS queries, or network sockets are active.
-2. **Pairing Is the Decision**: Typing the code a phone shows is the decision to use that phone as a card reader; forgetting the last pairing is the decision to stop. There is no separate switch.
+2. **The Switch Is the Pairing**: The header bar's remote-use switch is on while a phone is paired. Turning it off forgets the phone at once, with no question; turning it on with no phone paired shows the pairing prompt. When the phone forgets this computer, the switch turns off. `--pair` opens the window with the switch on.
 3. **Outbound Discovery**: The workstation browses for phones only while a pairing ceremony runs, and dials the paired phone only while the pairing is usable. The card served by the phone is listed only then.
-4. **Values and Controls Only**: The window shows labels, values, button titles, and the text a failed action needs. A value in its normal state carries no text: a PIN at its try limit shows no count, an activated card shows no activation tab, and an idle window has an empty status line. There is no card selector, no refresh button and no card presence badge: the holder's name on the Identity tab is the card.
-5. **One Phone per Computer**: The requester keeps one usable pairing. Pairing a phone forgets every earlier pairing: a forgotten pairing serves nothing, tells its phone on the session that holds it or as the first message of the next session, and then loses its key (RAPP v26.10.29 section 4.6). Forgotten pairings are not shown. The Phone tab shows the paired phone's row with a trash icon that forgets it, or the code boxes while no phone is paired.
+4. **Values and Controls Only**: The window shows the identity line, controls, and the text a failed action needs. There is no card selector, no refresh button and no card presence badge: the identity line is the card.
+5. **One Phone per Computer**: The requester keeps one usable pairing. Pairing a phone forgets every earlier pairing: a forgotten pairing serves nothing, tells its phone on the session that holds it or as the first message of the next session, and then loses its key (RAPP v26.10.29 section 4.6). Forgotten pairings are not shown.
 6. **The Local Card Wins**: With a card in a local reader and a phone paired, the local card is the card in use; the phone's card is used while no local card is present.
-7. **Tab Order**: Identity, PINs, Sign, Phone; the window opens on Identity, or on Phone with the code boxes focused when launched with `--pair`.
-8. **No Explaining Text**: No caption, subtitle or placeholder explains or restates what the window shows.
-9. **No Standards Names**: No control or label names a standard, regulation or acronym for one (ETSI, eIDAS, QES, PAdES, ASiC-E, CAdES, XAdES, ISO); the signing methods are "Separately (PDF)" and "As a package".
-10. **Result and Errors Only**: The happy path shows the result and nothing else; a value outside its normal state says so in words ("None", "Blocked", "Factory value"), never a blank or a colour alone.
-11. **Red for Errors Only**: Red and orange mark errors and a credential below its served floor; every other state is neutral grey.
+7. **No Explaining Text**: No caption, subtitle or placeholder explains or restates what the window shows.
+8. **No Standards Names**: No control or label names a standard, regulation or acronym for one (ETSI, eIDAS, QES, PAdES, ASiC-E, CAdES, XAdES, ISO); the signing methods are "Separately (PDF)" and "As a package".
+9. **Result and Errors Only**: The happy path shows the result and nothing else. A counter at its try limit is not listed.
+10. **Red for Errors Only**: Red marks errors and a credential below the retry floor, beside a mark; every other state is neutral grey.
+11. **No Confirmation Dialogs**: A chosen action happens.
+
+### 4.4 The One Window
+
+The window follows the Mac app's (`refineid-apple`, `Documentation/design/macos.md`). From the top:
+
+1. **The identity line**, the first that holds:
+   - a card in a reader here: its holder's name, "Reading information…" until it is read, or "Remove the card from the reader for a moment." in orange when the reads repeated while the card settled did not read it;
+   - remote use off: "Connect a card reader." with no reader, "Insert the card into the reader." with empty readers;
+   - remote use on, no phone paired: "*phone* forgot this computer" when the phone said so, then the pairing prompt;
+   - a paired phone: "Insert the card into the phone's card reader." when it reports no card there, "*HOLDER NAME* (via phone)" while it serves a card, "Connecting to the phone…" otherwise.
+
+   Only the holder's name is in the primary text colour.
+2. **The document drop area**, while an identity is available or documents wait: files are dragged in or picked with "Choose…"; the pile lists every document with its own removal ("Remove *name*"), "Add…" and "Clear".
+3. **The signing controls**, while documents wait: "Signing method" with "Separately (PDF)" and "As a package" (locked to the package while anything but PDFs waits), "PIN 2" unless the paired phone signs, and "Sign…". The phone signs when its card is in use and the pairing grants document signing; PIN 2 is then typed on the phone. A package is one container over every document.
+4. **The outcome of the last action**: "*name* signed" for each signed document, and the failure in red.
+
+Three states replace the line and the content: a contactless card asking for its access number shows the six-box entry ("CAN"); a card waiting to be taken into use shows the activation form ("Card activation": "Activation PIN", "New PIN 1", "New PIN 1 again", "New PIN 2", "New PIN 2 again", "Activate Card"); remote use on with no phone paired and nothing waiting shows "Open RefineID remote access on your phone and enter the pairing code:" above the six-box pairing code entry. A pairing code and an access number are always typed into six boxes, never a plain field.
+
+The header bar holds one control at its right: the remote-use switch ("Remote Access"), or, while a card is in a reader here, the button that opens the "PIN Codes" window. That window holds the tasks "Change PIN 1", "Change PIN 2", "Reset PIN 1" and "Reset PIN 2", and along its foot "Attempts left:" with only the counters below full; the row is hidden while all are full. It opens by itself once per insertion when a counter is below the retry floor, with the Mac's two sentences for that case, offering only the resets, or no task while only other software can help; then the button is red. It closes when the card leaves.
 
 ### Phase 1: Unify with Core & Bring in RAPP with CPace PAKE
 - Update `Cargo.toml` to depend on modular `refineid-core` components (`refineid-rapp`, `refineid-sign`, `refineid-emrtd`, `refineid-pcsc`).
@@ -215,10 +233,7 @@ In accordance with [RAPP Transport and Discovery Hierarchy Specification](https:
 
 ### Phase 3: Implement `refineid-gui-fltk` (Tier 2 / Purist)
 - Create `crates/refineid-gui-fltk` using `fltk` 1.5.
-- Implement tab navigation via `fltk::group::Wizard`.
 - Implement masked PIN input via `fltk::input::SecretInput` with numeric filtering callbacks.
-- Render eMRTD JPEG2000 portraits using `fltk::image::RgbImage`.
-- Render RAPP pairing QR codes directly with `qrcodegen` onto an FLTK drawing canvas.
 - Replace `rfd` with `fltk::dialog::NativeFileChooser`.
 - Run `cargo audit` to confirm complete elimination of `bincode`, `ttf-parser`, and Slint transitives.
 
