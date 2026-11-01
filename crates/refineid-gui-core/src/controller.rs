@@ -353,6 +353,11 @@ impl RefineIdController {
                     .as_ref()
                     .is_some_and(|ctx| ctx.scheme == ActivationScheme::ActivationCodeIsPuk);
             state.organization_card = card.is_organization_card();
+            state.pin_lengths = card
+                .activation_context
+                .as_ref()
+                .filter(|_| is_local)
+                .map(|ctx| ctx.lengths);
             // A card here signs whatever its activation scheme; the
             // phone's card signs when the pairing grants it.
             state.signature_supported = if is_local {
@@ -380,6 +385,7 @@ impl RefineIdController {
             state.pin2_unblock_available = false;
             state.unblock_uses_activation_code = false;
             state.signature_supported = false;
+            state.pin_lengths = None;
         }
     }
 
@@ -612,11 +618,7 @@ impl RefineIdController {
             return;
         };
 
-        if let Err(e) = validate_gui_pin(
-            &new_pin,
-            slot.label(),
-            if slot == PinManageSlot::Pin1 { 4 } else { 6 },
-        ) {
+        if let Err(e) = validate_gui_pin(&new_pin, slot.label()) {
             self.update_state(|s| s.status_message = format!("Invalid new PIN: {e}"));
             return;
         }
@@ -675,8 +677,7 @@ impl RefineIdController {
             return;
         };
 
-        let min_len = if slot == PinManageSlot::Pin1 { 4 } else { 6 };
-        if let Err(e) = validate_gui_pin(&new_pin, slot.label(), min_len) {
+        if let Err(e) = validate_gui_pin(&new_pin, slot.label()) {
             self.update_state(|s| s.status_message = format!("Invalid new PIN: {e}"));
             return;
         }
@@ -1087,11 +1088,11 @@ fn inspection_settled(signature: &[(String, bool)], readers: &[&str]) -> bool {
 /// the phone's display name.
 const PHONE_READER_PREFIX: &str = "Phone: ";
 
-fn validate_gui_pin(pin: &PinBytes, label: &str, minimum_length: usize) -> Result<(), String> {
+/// Refuses a new PIN that is not digits or is too easy to guess. Its
+/// length is checked against the card's own range in the card session
+/// that sets it.
+fn validate_gui_pin(pin: &PinBytes, label: &str) -> Result<(), String> {
     let bytes = pin.as_bytes();
-    if bytes.len() < minimum_length {
-        return Err(format!("{label} must be at least {minimum_length} digits"));
-    }
     if !bytes.iter().all(u8::is_ascii_digit) {
         return Err(format!("{label} must contain digits only"));
     }

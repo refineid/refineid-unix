@@ -325,7 +325,7 @@ pub struct PhoneSignFailure {
     /// What the signing flow refused.
     pub kind: SignErrorKind,
     /// The reader's failure behind a refusal.
-    pub cause: Option<RemoteError>,
+    pub cause: Option<Box<RemoteError>>,
 }
 
 impl PhoneSignFailure {
@@ -343,7 +343,7 @@ impl PhoneSignFailure {
 impl fmt::Display for PhoneSignFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            SignErrorKind::Phone(refusal) => match self.cause.as_ref() {
+            SignErrorKind::Phone(refusal) => match self.cause.as_deref() {
                 Some(cause) if reader_tells(cause) => write!(f, "{cause}"),
                 Some(RemoteError::Session(_)) => {
                     f.write_str("the connection to the paired phone was lost")
@@ -409,7 +409,7 @@ pub fn sign(
     crate::doc_sign_http::install();
     let link = PairedPhoneLink::open(pair_id).map_err(|error| PhoneSignFailure {
         kind: SignErrorKind::Phone(refusal_of(&error)),
-        cause: Some(error),
+        cause: Some(Box::new(error)),
     })?;
     sign_over(link, documents)
 }
@@ -422,7 +422,7 @@ fn sign_over<Link: PhoneLink>(
     let mut signer = PhoneSigner::new(link);
     sign_on_phone(&mut signer, documents).map_err(|kind| PhoneSignFailure {
         kind,
-        cause: signer.cause.take(),
+        cause: signer.cause.take().map(Box::new),
     })
 }
 

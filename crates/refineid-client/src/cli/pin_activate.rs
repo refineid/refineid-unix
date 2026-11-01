@@ -21,7 +21,7 @@ use std::process::ExitCode;
 /// `doc/typing-discipline.md`).
 struct PinActivateHelpers;
 
-use refineid_lib_core::auth::{ActivationScheme, UnblockOutcome};
+use refineid_lib_core::auth::{ActivationScheme, CardPinLengths, UnblockOutcome};
 use refineid_lib_core::pin::{ActivationCode, ActivationPinEight, ActivationPinSeven};
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
@@ -73,11 +73,17 @@ const fn cmd(slot: Option<PinManageSlot>) -> &'static str {
     }
 }
 
-/// The length hint of a new PIN's first prompt.
-const fn digit_hint(slot: PinManageSlot) -> &'static str {
-    match slot {
-        PinManageSlot::Pin1 => "basic, 4-12 digits",
-        PinManageSlot::Pin2 => "signature, 6-12 digits",
+/// The length hint of a new PIN's first prompt: the PIN's kind and the
+/// lengths the card accepts for it.
+fn digit_hint(slot: PinManageSlot, lengths: &CardPinLengths) -> String {
+    let kind = match slot {
+        PinManageSlot::Pin1 => "basic",
+        PinManageSlot::Pin2 => "signature",
+    };
+    match lengths.slot(slot.as_pin_slot().into()).accepted() {
+        Some(range) if range.min() == range.max() => format!("{kind}, {} digits", range.min()),
+        Some(range) => format!("{kind}, {}-{} digits", range.min(), range.max()),
+        None => kind.to_owned(),
     }
 }
 
@@ -172,7 +178,7 @@ impl ActivateArgs {
                 cmd,
                 env_new_pin(slot),
                 super::util::pin_name(slot),
-                Some(digit_hint(slot)),
+                Some(&digit_hint(slot, &ctx.lengths)),
             )
         };
         let result = match slot {
@@ -425,6 +431,22 @@ mod tests {
     use super::*;
     use crate::cli::argv::fixtures::remaining_argv as argv;
     use crate::test_util::{TestResult, check, check_true};
+
+    #[test]
+    fn a_card_listing_no_lengths_hints_the_fineid_bounds() -> TestResult {
+        let lengths =
+            CardPinLengths::not_listed(refineid_lib_core::auth::PinReferenceScheme::Citizen.into());
+        check(
+            digit_hint(PinManageSlot::Pin1, &lengths).as_str(),
+            "basic, 4-12 digits",
+            "PIN 1 hint",
+        )?;
+        check(
+            digit_hint(PinManageSlot::Pin2, &lengths).as_str(),
+            "signature, 6-12 digits",
+            "PIN 2 hint",
+        )
+    }
 
     #[test]
     fn defaults() -> TestResult {
