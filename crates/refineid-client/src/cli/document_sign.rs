@@ -20,20 +20,23 @@
 //! form: a signed PDF, a container, a `CMS` structure -- something a
 //! counterparty can open.
 
+use core::cell::Cell;
 use std::path::PathBuf;
 
+use refineid_doc_sign::cades::SigningTime;
+use refineid_doc_sign::document::Format;
+use refineid_doc_sign::pades::{SignatureMetadata, StampLanguage, VisibleSignature};
+use refineid_doc_sign::pin::{PinEntryError, PinRole, PromptedPin};
+use refineid_doc_sign::service::{
+    DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES,
+    SignErrorKind, SignOptions, SignOutput, SignReport, SignSlot,
+};
+use refineid_doc_sign::signed_name::PendingSignedName;
+use refineid_doc_sign::x509::DateTime;
 use refineid_lib_core::can::Can;
-use refineid_lib_core::sign::cades::SigningTime;
-use refineid_lib_core::sign::document::Format;
-use refineid_lib_core::sign::pades::SignatureMetadata;
-use refineid_lib_core::x509::DateTime;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
-use crate::card_sign::{
-    DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES, SignOutput,
-    SignSlot, process_visible_signature,
-};
-use crate::signed_name::PendingSignedName;
+use crate::exit_status::ExitStatus;
 
 /// What `refineid document sign help`
 /// prints. The man page refineid(1) carries the same facts.
@@ -100,7 +103,7 @@ pub struct DocumentSignArgs {
     /// makes one document.
     ///
     /// `None` names each with
-    /// [`crate::signed_name::PendingSignedName`] once it is signed,
+    /// [`PendingSignedName`] once it is signed,
     /// since the name carries the signature timestamp's time.
     pub output: Option<PathBuf>,
     /// Which key signs.
@@ -169,75 +172,80 @@ impl DocumentSignArgs {
             stamp,
         } = self;
         let cmd = CMD.label();
-        let env_var = match slot {
-            SignSlot::Auth => "REFINEID_PIN1",
-            SignSlot::Qualified => "REFINEID_PIN2",
-        };
         // Every input is checked before the card is touched or a PIN
         // is asked: a run that will fail on its third file fails before
         // the first signature.
         if let Err(message) = check_inputs(&inputs) {
             eprintln!("{cmd}: {message}");
-            return crate::exit_status::ExitStatus::RuntimeFailure.into();
+            return ExitStatus::RuntimeFailure.into();
         }
-        let now = crate::card_check::now_date_time();
+        crate::doc_sign_http::install();
+        let now = refineid_doc_sign::now_date_time();
         let jobs = jobs_for(format, inputs, output, now);
         let several = jobs.len() > 1;
         let metadata = SignatureMetadata {
             reason,
             location,
+            visible_signature: (stamp && format == Format::Pades)
+                .then(|| VisibleSignature::verification(StampLanguage::for_process_locale())),
             ..SignatureMetadata::default()
         };
         let signing_time = signing_time_at(now);
         // One PIN for the run: the first document asks for it at its
         // point of use, once the card is in hand; the rest repeat it.
-        let pin = crate::pin_source::SharedPin::new(Box::new(move || {
-            super::util::pin_env_or_prompt(cmd, env_var, super::util::sign_pin_prompt(slot))
-                .map_err(|status| crate::pin_source::PinEntryError { status })
-        }));
+        // A prompt that ends without a PIN has already told the
+        // operator why; the status it maps to is kept here.
+        let entry_status = Cell::new(None);
+        let mut pin = PromptedPin::new(|role| {
+            let (env_var, prompt) = match role {
+                PinRole::Pin1 => ("REFINEID_PIN1", super::util::PROMPT_PIN1),
+                PinRole::Pin2 => ("REFINEID_PIN2", super::util::PROMPT_PIN2),
+            };
+            let entered =
+                super::util::pin_env_or_prompt(cmd, env_var, prompt).map_err(|status| {
+                    entry_status.set(Some(status));
+                    PinEntryError::Cancelled
+                })?;
+            crate::doc_sign_bridge::pin(&entered).map_err(PinEntryError::NotAPin)
+        });
 
-        let backend = refineid_lib_pcsc::PcscBackend;
+        let backend = refineid_pcsc::PcscBackend;
         let mut can = can;
-        let mut worst = crate::exit_status::ExitStatus::Ok;
+        let mut worst = ExitStatus::Ok;
         for job in jobs {
             let mut inputs = job.inputs;
             let primary = inputs.remove(0);
-            let run_once = |can: Option<Can>| {
-                let options = crate::card_sign::SignOptions {
-                    input: primary.clone(),
-                    output: job.output.clone(),
-                    pin: pin.source(),
-                    save_cert: None,
-                    reader_filter: reader_filter.clone(),
-                    can,
-                    document: Some(DocumentRequest {
-                        format,
-                        additional_inputs: inputs.clone(),
-                        signing_time,
-                        metadata: metadata.clone(),
-                        // The CLI signs whichever card is present; there
-                        // is no prior inspection view to bind to.
-                        expected_serial: None,
-                        visible_signature: (stamp && format == Format::Pades)
-                            .then(process_visible_signature),
-                        timestamp_authorities: timestamp_authorities.clone(),
-                        timestamp_credentials: None,
-                        long_term,
-                        archive,
-                    }),
-                };
-                crate::card_sign::sign_with_slot(backend, slot, options)
+            let options = |can: Option<Can>| SignOptions {
+                input: primary.clone(),
+                output: job.output.clone(),
+                slot,
+                save_cert: None,
+                reader_filter: reader_filter.clone(),
+                can: can.as_ref().and_then(crate::doc_sign_bridge::can),
+                document: Some(DocumentRequest {
+                    format,
+                    additional_inputs: inputs.clone(),
+                    signing_time,
+                    metadata: metadata.clone(),
+                    // The CLI signs whichever card is present; there
+                    // is no prior inspection view to bind to.
+                    expected_serial: None,
+                    timestamp_authorities: timestamp_authorities.clone(),
+                    timestamp_credentials: None,
+                    long_term,
+                    archive,
+                }),
             };
 
-            let mut result = run_once(can);
+            let mut result = refineid_doc_sign::service::sign(&backend, options(can), &mut pin);
             // Same contactless retry as the bare sign verbs: the PACE
             // seal is reported by the first SELECT, before any PIN
             // counter has been touched.
-            if matches!(result, Err(crate::card_sign::SignErrorKind::NeedCan))
+            if matches!(result, Err(SignErrorKind::NeedCan))
                 && let Some(prompted) = super::util::prompt_can_if_tty()
             {
                 can = Some(prompted);
-                result = run_once(Some(prompted));
+                result = refineid_doc_sign::service::sign(&backend, options(can), &mut pin);
             }
             let stop = stops_the_run(&result);
             let name = several.then(|| primary.display().to_string());
@@ -245,17 +253,17 @@ impl DocumentSignArgs {
                 cmd,
                 verbose,
                 result,
-                format,
-                long_term,
-                archive,
+                &Level {
+                    format,
+                    long_term,
+                    archive,
+                },
+                entry_status.get(),
                 name.as_deref(),
             );
             // The run's status is its first failure's, unless a later
             // one ended the run: that is the one to act on.
-            if stop
-                || (status != crate::exit_status::ExitStatus::Ok
-                    && worst == crate::exit_status::ExitStatus::Ok)
-            {
+            if stop || (status != ExitStatus::Ok && worst == ExitStatus::Ok) {
                 worst = status;
             }
             if stop {
@@ -390,7 +398,7 @@ impl DocumentSignArgs {
         }
         let slot = match slot_raw {
             None | Some("qualified") => SignSlot::Qualified,
-            Some("auth") => SignSlot::Auth,
+            Some("auth") => SignSlot::Authentication,
             Some(other) => {
                 return Err(ArgParseError::BadValue {
                     cmd: CMD,
@@ -452,11 +460,9 @@ fn describe_level(timestamp_tokens: usize, long_term: bool, archive: bool) -> St
     }
 }
 
-/// The step report of a signed document: the signing steps, the
-/// format and the level reached.
-struct DocumentReport<'a> {
-    /// What the card and the timestamp authorities did.
-    sign: &'a crate::card_sign::SignReport,
+/// The format and level a run signs at.
+#[derive(Debug, Clone, Copy)]
+struct Level {
     /// The format produced.
     format: Format,
     /// Whether the evidence was embedded.
@@ -465,32 +471,88 @@ struct DocumentReport<'a> {
     archive: bool,
 }
 
+/// The step report of a signed document: the signing steps, the
+/// format and the level reached.
+struct DocumentReport<'a> {
+    /// What the card and the timestamp authorities did.
+    sign: &'a SignReport,
+    /// The format and level asked for.
+    level: &'a Level,
+}
+
+/// The slot as the step report names it.
+const fn slot_label(slot: SignSlot) -> &'static str {
+    match slot {
+        SignSlot::Authentication => "auth",
+        SignSlot::Qualified => "qualified-signature",
+    }
+}
+
 impl core::fmt::Display for DocumentReport<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.sign)?;
-        writeln!(f, "format:           {}", format_label(self.format))?;
+        let sign = self.sign;
+        writeln!(f, "reader: {}", sign.reader)?;
+        writeln!(
+            f,
+            "slot: {} (key ref {:#04X})",
+            slot_label(sign.slot),
+            sign.slot.key_ref().as_byte()
+        )?;
+        if let Some(cn) = &sign.cert_subject_cn {
+            writeln!(f, "cert subject CN: {cn}")?;
+        }
+        writeln!(f, "input length: {} bytes", sign.input_len)?;
+        writeln!(f, "input sha256: {}", sign.input_sha256)?;
+        writeln!(
+            f,
+            "output: {} ({} bytes)",
+            sign.signature_path.display(),
+            sign.output_len
+        )?;
+        // Named separately from the file size, which for a document
+        // format is the whole document rather than the signature.
+        writeln!(f, "card signature: {} bytes", sign.signature_len)?;
+        // How many tokens were obtained, including the outer archive
+        // timestamp; not an authority count, since one authority may
+        // issue both kinds of token.
+        if sign.timestamps > 0 {
+            writeln!(f, "timestamp tokens obtained: {}", sign.timestamps)?;
+        }
+        if let Some(retries) = sign.pin_retries_after {
+            writeln!(
+                f,
+                "{} retries after verify: {retries}",
+                sign.slot.pin_label()
+            )?;
+        }
+        writeln!(
+            f,
+            "local verify (against on-card {} cert pubkey): {}",
+            slot_label(sign.slot),
+            sign.local_verify,
+        )?;
+        writeln!(f, "format:           {}", format_label(self.level.format))?;
         writeln!(
             f,
             "signature level:  {}",
-            describe_level(self.sign.timestamps, self.long_term, self.archive)
+            describe_level(sign.timestamps, self.level.long_term, self.level.archive)
         )
     }
 }
 
-/// Turn the signing outcome into a report and an exit code.
 /// One document's outcome: nothing on success unless `verbose`, the
 /// error on stderr otherwise, prefixed with `name` when the run has
-/// several documents. Returns the status the document earns.
+/// several documents. `entry_status` is what a PIN prompt that ended
+/// without a PIN maps to; it has already said why. Returns the status
+/// the document earns.
 fn report_outcome(
     cmd: &str,
     verbose: bool,
-    result: Result<crate::card_sign::SignReport, crate::card_sign::SignErrorKind>,
-    format: Format,
-    long_term: bool,
-    archive: bool,
+    result: Result<SignReport, SignErrorKind>,
+    level: &Level,
+    entry_status: Option<ExitStatus>,
     name: Option<&str>,
-) -> crate::exit_status::ExitStatus {
-    use crate::exit_status::ExitStatus;
+) -> ExitStatus {
     let whose = name.map(|name| format!("{name}: ")).unwrap_or_default();
     match result {
         Ok(report) => {
@@ -500,9 +562,7 @@ fn report_outcome(
                 verified,
                 &DocumentReport {
                     sign: &report,
-                    format,
-                    long_term,
-                    archive,
+                    level,
                 },
             );
             if verified {
@@ -512,17 +572,20 @@ fn report_outcome(
                 ExitStatus::RuntimeFailure
             }
         }
-        Err(crate::card_sign::SignErrorKind::ReaderPick(pe)) => {
+        Err(SignErrorKind::ReaderPick(pe)) => {
             eprintln!("{cmd}: {whose}{pe}");
-            super::util::reader_pick_status(&pe)
+            super::util::core_reader_pick_status(&pe)
         }
-        Err(crate::card_sign::SignErrorKind::PinEntry(entry)) => entry.status,
+        Err(SignErrorKind::PinEntry(entry)) => entry_status.unwrap_or_else(|| {
+            eprintln!("{cmd}: {whose}{entry}");
+            ExitStatus::BadInvocation
+        }),
         Err(e)
             if matches!(
                 &e,
-                crate::card_sign::SignErrorKind::PinRejected { .. }
-                    | crate::card_sign::SignErrorKind::RetryFloor(_)
-                    | crate::card_sign::SignErrorKind::PinPolicy { .. }
+                SignErrorKind::PinRejected { .. }
+                    | SignErrorKind::RetryFloor(_)
+                    | SignErrorKind::PinPolicy { .. }
             ) =>
         {
             refineid_dev_errors::report!(Cli, "document not signed", e);
@@ -542,17 +605,15 @@ fn report_outcome(
 /// not given. The next document would fail the same way or ask again
 /// for a code already refused. A document that fails on its own
 /// account, a format or an authority, lets the rest be signed.
-fn stops_the_run(
-    result: &Result<crate::card_sign::SignReport, crate::card_sign::SignErrorKind>,
-) -> bool {
+fn stops_the_run(result: &Result<SignReport, SignErrorKind>) -> bool {
     matches!(
         result,
-        Err(crate::card_sign::SignErrorKind::ReaderPick(_)
-            | crate::card_sign::SignErrorKind::NeedCan
-            | crate::card_sign::SignErrorKind::PinEntry(_)
-            | crate::card_sign::SignErrorKind::PinRejected { .. }
-            | crate::card_sign::SignErrorKind::RetryFloor(_)
-            | crate::card_sign::SignErrorKind::PinPolicy { .. })
+        Err(SignErrorKind::ReaderPick(_)
+            | SignErrorKind::NeedCan
+            | SignErrorKind::PinEntry(_)
+            | SignErrorKind::PinRejected { .. }
+            | SignErrorKind::RetryFloor(_)
+            | SignErrorKind::PinPolicy { .. })
     )
 }
 
@@ -735,13 +796,13 @@ fn expand_authority(value: &str) -> Result<Vec<String>, ArgParseError> {
 mod tests {
     use std::path::PathBuf;
 
-    use refineid_lib_core::crypto::digest::Sha256;
+    use refineid_doc_sign::digest::Sha256;
+    use refineid_doc_sign::service::LocalVerifyOutcome;
 
     use super::{
-        DEFAULT_TIMESTAMP_AUTHORITY, DateTime, DocumentReport, DocumentSignArgs, Format, SignSlot,
-        check_inputs, describe_level, jobs_for, parse_format, stops_the_run,
+        DEFAULT_TIMESTAMP_AUTHORITY, DateTime, DocumentReport, DocumentSignArgs, Format, Level,
+        SignReport, SignSlot, check_inputs, describe_level, jobs_for, parse_format, stops_the_run,
     };
-    use crate::card_sign::{LocalVerifyOutcome, SignReport};
     use crate::cli::ArgParseError;
     use crate::cli::argv::fixtures::remaining_argv as argv;
     use crate::cli::util::write_report;
@@ -759,6 +820,13 @@ mod tests {
     /// Timestamp tokens a level-T signature carries.
     const ONE_TOKEN: usize = 1;
 
+    /// A level-T `PAdES` signature.
+    const PADES_T: Level = Level {
+        format: Format::Pades,
+        long_term: false,
+        archive: false,
+    };
+
     /// The report of a synthetic level-T `PAdES` signature.
     fn signed_report() -> SignReport {
         SignReport {
@@ -770,6 +838,7 @@ mod tests {
             cert_path: None,
             signature_len: SIGNATURE_LEN,
             timestamps: ONE_TOKEN,
+            best_signature_time: None,
             output_len: SIGNED_LEN,
             cert_subject_cn: None,
             pin_retries_after: None,
@@ -782,9 +851,7 @@ mod tests {
         let sign = signed_report();
         let report = DocumentReport {
             sign: &sign,
-            format: Format::Pades,
-            long_term: false,
-            archive: false,
+            level: &PADES_T,
         };
         let mut out = Vec::new();
         write_report(&mut out, verbose, &report)?;
@@ -814,9 +881,7 @@ mod tests {
         sign.signature_path = PathBuf::from(WRITTEN);
         let report = DocumentReport {
             sign: &sign,
-            format: Format::Pades,
-            long_term: false,
-            archive: false,
+            level: &PADES_T,
         };
         let mut out = Vec::new();
         write_report(&mut out, true, &report)?;
@@ -891,13 +956,13 @@ mod tests {
 
     #[test]
     fn a_card_or_code_failure_ends_the_run_and_a_document_failure_does_not() -> TestResult {
-        use crate::card_sign::SignErrorKind;
+        use refineid_doc_sign::service::SignErrorKind;
         check_true(
             stops_the_run(&Err(SignErrorKind::NeedCan)),
             "a CAN still missing stops",
         )?;
         check_true(
-            !stops_the_run(&Err(SignErrorKind::VisibleSignature(String::new()))),
+            !stops_the_run(&Err(SignErrorKind::VisibleSignatureFormat)),
             "a document's own failure lets the rest be signed",
         )
     }
@@ -1085,7 +1150,7 @@ mod tests {
     #[test]
     fn slot_can_be_chosen() -> TestResult {
         let a = DocumentSignArgs::parse(argv(&[PDF, "--slot", "auth"]))?;
-        check(&a.slot, &SignSlot::Auth, "slot")?;
+        check(&a.slot, &SignSlot::Authentication, "slot")?;
         check_true(
             matches!(
                 DocumentSignArgs::parse(argv(&[PDF, "--slot", "signature"])),

@@ -576,12 +576,12 @@ mod tests {
     #[ignore = "needs the network and a live timestamp authority"]
     #[cfg(feature = "tls-rustls")]
     fn rustls_reaches_a_live_timestamp_authority() {
-        use refineid_lib_core::sign::cades::DigestAlgorithm;
+        use refineid_doc_sign::cades::DigestAlgorithm;
         use refineid_lib_core::text::Uri;
 
         let algorithm = DigestAlgorithm::Sha256;
         let digest = algorithm.digest(b"refineid rustls backend probe");
-        let request = refineid_lib_core::sign::timestamp::request(&digest, algorithm, None, true);
+        let request = refineid_doc_sign::timestamp::request(&digest, algorithm, None, true);
         let url = Uri::parse("https://timestamp.sectigo.com/qualified".to_owned())
             .expect("the probe URL parses");
 
@@ -598,7 +598,7 @@ mod tests {
         // rejection: proof the handshake completed and the framing held.
         assert_eq!(response.first(), Some(&0x30), "a DER SEQUENCE came back");
         assert!(response.len() > 1000, "got {} bytes", response.len());
-        let token = refineid_lib_core::sign::timestamp::token(&response, &digest, algorithm, None)
+        let token = refineid_doc_sign::timestamp::token(&response, &digest, algorithm, None)
             .expect("the token binds to the digest we asked about");
         assert!(!token.is_empty(), "a token came back");
     }

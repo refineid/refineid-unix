@@ -21,12 +21,13 @@
 use core::fmt::Display;
 use std::path::PathBuf;
 
-use refineid_lib_core::crl::CrlReason;
-use refineid_lib_core::document::{
-    CertificatePath, DocumentReport, DocumentTimestamp, Revocation, SignatureEntry,
-    SignatureReport, SignatureTimestamp, SignerIdentity, SubjectName, UnsupportedSignature,
+use refineid_doc_sign::NameExt as _;
+use refineid_doc_sign::crl::CrlReason;
+use refineid_doc_sign::verification::{
+    CertificationPath, DocumentReport, Revocation, SignatureOutcome, SignatureReport, SignatureRow,
+    TimestampReport,
 };
-use refineid_lib_core::x509::DateTime;
+use refineid_doc_sign::x509::{DateTime, OwnedCert};
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::document_verify::DocumentVerifyError;
@@ -44,6 +45,9 @@ record per signature, records separated by a blank line, each line
 
   file: the file as named
   signer: the certificate's common name as it reads
+  countersigns: on an XAdES counter-signature only, the common name
+    of the signer it counter-signs; its verdict leaves the exit
+    status as it is
   signed: the time a timestamp proves, or - when the signature is
     judged as of now
   verdict: valid, not valid, revoked or unsupported
@@ -82,14 +86,18 @@ impl DocumentVerifyArgs {
     /// aggregate verdict.
     #[must_use]
     pub fn run(self, verbose: bool) -> std::process::ExitCode {
-        let now = crate::card_check::now_date_time();
+        let now = refineid_doc_sign::now_date_time();
         let mut outcomes = Vec::new();
         let mut records = Vec::new();
         for path in &self.inputs {
             let file = path.display().to_string();
             match crate::document_verify::verify_file(path, now) {
                 Ok(report) => {
-                    records.extend(report_records(&file, &report, verbose));
+                    records.extend(
+                        views(&report)
+                            .iter()
+                            .map(|view| view.record(&file, verbose)),
+                    );
                     outcomes.push(if report.is_valid() {
                         FileOutcome::Valid
                     } else {
@@ -160,6 +168,8 @@ enum Key {
     Error,
     /// The signer certificate's subject name.
     Signer,
+    /// The signer an `XAdES` counter-signature counter-signs.
+    Countersigns,
     /// The proven time of the signature.
     Signed,
     /// The verdict.
@@ -191,6 +201,7 @@ impl Key {
             Self::File => "file",
             Self::Error => "error",
             Self::Signer => "signer",
+            Self::Countersigns => "countersigns",
             Self::Signed => "signed",
             Self::Verdict => "verdict",
             Self::Reason => "reason",
@@ -298,111 +309,216 @@ fn error_record(file: &str, error: &DocumentVerifyError) -> Record {
     record
 }
 
-/// One record per signature of `report`.
-fn report_records(file: &str, report: &DocumentReport, verbose: bool) -> Vec<Record> {
-    report
-        .signatures
+/// What one signature row comes to, ready to print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignatureView {
+    /// The signer's name, or `-`.
+    signer: String,
+    /// For a counter-signature, the name of the signer it
+    /// counter-signs, or `-`.
+    countersigns: Option<String>,
+    /// The judgement, or why there is none.
+    judgement: Judgement,
+}
+
+/// A row judged, or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Judgement {
+    /// The signature's profile is not implemented.
+    Unsupported,
+    /// The facts behind the verdict.
+    Judged(Box<Facts>),
+}
+
+/// Every fact a judged record prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Facts {
+    /// The proven time.
+    signed: Option<DateTime>,
+    /// The verdict.
+    verdict: Verdict,
+    /// Whether the signed content is unchanged.
+    intact: bool,
+    /// Whether the signature verifies.
+    signature: bool,
+    /// Whether the signer chains to a trust anchor.
+    chained: bool,
+    /// The signer's path line.
+    chain: String,
+    /// The signing time the signature claims.
+    claimed: Option<DateTime>,
+    /// One `timestamp` and `timestamp-chain` line pair per signature
+    /// or archive timestamp.
+    timestamps: Vec<(String, String)>,
+    /// The revocation status.
+    revocation: Revocation,
+    /// One line per document timestamp covering the signature.
+    document_timestamps: Vec<String>,
+}
+
+/// The view of every row of `report`, in document order.
+fn views(report: &DocumentReport) -> Vec<SignatureView> {
+    let rows = report.rows();
+    rows.iter().map(|row| view(rows, row)).collect()
+}
+
+/// The view of `row`, one of `rows`.
+fn view(rows: &[SignatureRow], row: &SignatureRow) -> SignatureView {
+    let countersigns = row.counter_signs().map(|index| {
+        rows.get(index)
+            .and_then(SignatureRow::signer)
+            .map_or_else(|| NONE.to_owned(), |signer| name_or_none(signer.name()))
+    });
+    let signer = row
+        .signer()
+        .map_or_else(|| NONE.to_owned(), |signer| name_or_none(signer.name()));
+    let judgement = match row.outcome() {
+        SignatureOutcome::Judged(report) => Judgement::Judged(Box::new(facts(report))),
+        SignatureOutcome::Unsupported { .. } => Judgement::Unsupported,
+    };
+    SignatureView {
+        signer,
+        countersigns,
+        judgement,
+    }
+}
+
+/// The facts of a judged signature.
+fn facts(report: &SignatureReport) -> Facts {
+    let timestamps = report
+        .timestamps()
         .iter()
-        .map(|entry| match entry {
-            SignatureEntry::Judged(signature) => judged_record(file, signature, verbose),
-            SignatureEntry::Unsupported(signature) => unsupported_record(file, signature),
-        })
-        .collect()
+        .chain(
+            report
+                .archive_timestamps()
+                .iter()
+                .map(|archive| archive.timestamp()),
+        )
+        .map(timestamp_lines)
+        .collect();
+    Facts {
+        signed: report.proof_of_existence(),
+        verdict: verdict(report),
+        intact: report.document_intact(),
+        signature: report.signature_valid(),
+        chained: report.chain_verified(),
+        chain: path(&[], report.chain()),
+        claimed: report.claimed_signing_time(),
+        timestamps,
+        revocation: report.revocation(),
+        document_timestamps: report
+            .covering_document_timestamps()
+            .iter()
+            .map(|stamped| proven_or_not(stamped.timestamp()))
+            .collect(),
+    }
 }
 
-/// The record of a signature of an unsupported profile.
-fn unsupported_record(file: &str, signature: &UnsupportedSignature) -> Record {
-    let mut record = Record::default();
-    record.line(Key::File, file);
-    record.line(
-        Key::Signer,
-        signature.signer.as_ref().map_or(NONE, signer_name),
+/// The `timestamp` and `timestamp-chain` values of one token: its time
+/// and whether it is proven, and its signer's path, signer first.
+fn timestamp_lines(timestamp: &TimestampReport) -> (String, String) {
+    let chain = timestamp.authority().map_or_else(
+        || NONE.to_owned(),
+        |authority| path(core::slice::from_ref(authority.signer()), authority.chain()),
     );
-    record.line(Key::Signed, NONE);
-    record.line(Key::Verdict, Verdict::Unsupported.as_str());
-    record.line(Key::Reason, Reason::ProfileNotSupported.as_str());
-    record
+    (proven_or_not(timestamp), chain)
 }
 
-/// The record of a judged signature; `verbose` adds every fact
-/// behind the verdict.
-fn judged_record(file: &str, signature: &SignatureReport, verbose: bool) -> Record {
-    let mut record = Record::default();
-    record.line(Key::File, file);
-    record.line(Key::Signer, signer_name(&signature.signer));
-    record.line(Key::Signed, time_or_none(signature.proof_of_existence));
-    let verdict = verdict(signature);
-    record.line(Key::Verdict, verdict.as_str());
-    if verdict == Verdict::NotValid {
-        for reason in reasons(signature) {
-            record.line(Key::Reason, reason.as_str());
+/// A token's time with `proven` when it is anchored, else the time it
+/// claims, or `-`, with `unproven`.
+fn proven_or_not(timestamp: &TimestampReport) -> String {
+    timestamp.proven_time().map_or_else(
+        || format!("{} unproven", time_or_none(timestamp.claimed_time())),
+        |time| format!("{time} proven"),
+    )
+}
+
+impl SignatureView {
+    /// The record of this signature in `file`; `verbose` adds every
+    /// fact behind the verdict.
+    fn record(&self, file: &str, verbose: bool) -> Record {
+        let mut record = Record::default();
+        record.line(Key::File, file);
+        record.line(Key::Signer, &self.signer);
+        if let Some(countersigned) = &self.countersigns {
+            record.line(Key::Countersigns, countersigned);
         }
-    }
-    if !verbose {
-        if verdict == Verdict::Valid && signature.revocation == Revocation::Unavailable {
-            record.line(Key::Revocation, "not checked");
-        }
-        return record;
-    }
-    record.line(Key::Intact, yes_no(signature.document_intact));
-    record.line(Key::Signature, yes_no(signature.signature_valid));
-    record.line(Key::Chain, path(&signature.chain));
-    record.line(Key::Claimed, time_or_none(signature.claimed_signing_time));
-    for timestamp in &signature.signature_timestamps {
-        match timestamp {
-            SignatureTimestamp::Proven {
-                generated_at,
-                chain,
-            } => {
-                record.line(Key::Timestamp, format!("{generated_at} proven"));
-                record.line(Key::TimestampChain, path(chain));
+        let facts = match &self.judgement {
+            Judgement::Unsupported => {
+                record.line(Key::Signed, NONE);
+                record.line(Key::Verdict, Verdict::Unsupported.as_str());
+                record.line(Key::Reason, Reason::ProfileNotSupported.as_str());
+                return record;
             }
-            SignatureTimestamp::Unproven { claimed_at, chain } => {
-                record.line(
-                    Key::Timestamp,
-                    format!("{} unproven", time_or_none(*claimed_at)),
-                );
-                record.line(
-                    Key::TimestampChain,
-                    chain.as_ref().map_or_else(|| NONE.to_owned(), path),
-                );
+            Judgement::Judged(facts) => facts,
+        };
+        record.line(Key::Signed, time_or_none(facts.signed));
+        record.line(Key::Verdict, facts.verdict.as_str());
+        if facts.verdict == Verdict::NotValid {
+            for reason in facts.reasons() {
+                record.line(Key::Reason, reason.as_str());
             }
         }
-    }
-    record.line(
-        Key::Revocation,
-        match signature.revocation {
-            Revocation::Good { checked_at } => format!("good {checked_at}"),
-            Revocation::Revoked { revoked_at, reason } => {
-                format!("revoked {revoked_at} {}", reason_name(reason))
+        if !verbose {
+            if facts.verdict == Verdict::Valid && facts.revocation == Revocation::Unavailable {
+                record.line(Key::Revocation, "not checked");
             }
-            Revocation::Unavailable => "not checked".to_owned(),
-        },
-    );
-    for stamped in &signature.document_timestamps {
+            return record;
+        }
+        record.line(Key::Intact, yes_no(facts.intact));
+        record.line(Key::Signature, yes_no(facts.signature));
+        record.line(Key::Chain, &facts.chain);
+        record.line(Key::Claimed, time_or_none(facts.claimed));
+        for (timestamp, chain) in &facts.timestamps {
+            record.line(Key::Timestamp, timestamp);
+            record.line(Key::TimestampChain, chain);
+        }
         record.line(
-            Key::DocumentTimestamp,
-            match stamped {
-                DocumentTimestamp::Proven { generated_at } => format!("{generated_at} proven"),
-                DocumentTimestamp::Unproven { claimed_at } => {
-                    format!("{} unproven", time_or_none(*claimed_at))
+            Key::Revocation,
+            match facts.revocation {
+                Revocation::Good { at } => format!("good {at}"),
+                Revocation::Revoked { at, reason } => {
+                    format!("revoked {at} {}", reason_name(reason))
                 }
+                Revocation::Unavailable => "not checked".to_owned(),
             },
         );
+        for stamped in &facts.document_timestamps {
+            record.line(Key::DocumentTimestamp, stamped);
+        }
+        record
     }
-    record
 }
 
-/// The signer's name as the certificate spells it, or `-` when it is
-/// empty.
-fn signer_name(signer: &SignerIdentity) -> &str {
-    let name = signer.name.as_str();
-    if name.is_empty() { NONE } else { name }
+impl Facts {
+    /// Every cause of a not valid verdict, in check order.
+    fn reasons(&self) -> Vec<Reason> {
+        [
+            (self.intact, Reason::DocumentChanged),
+            (self.signature, Reason::SignatureInvalid),
+            (self.chained, Reason::ChainUnverified),
+        ]
+        .into_iter()
+        .filter_map(|(holds, reason)| (!holds).then_some(reason))
+        .collect()
+    }
+}
+
+/// A name as the certificate spells it, or `-` when it is empty.
+fn name_or_none(name: &str) -> String {
+    if name.is_empty() {
+        NONE.to_owned()
+    } else {
+        name.to_owned()
+    }
 }
 
 /// The verdict the facts reach: revoked first, then not valid.
 fn verdict(signature: &SignatureReport) -> Verdict {
-    if signature.is_revoked() {
+    if signature
+        .revocation()
+        .revoked_before(signature.proof_of_existence())
+    {
         Verdict::Revoked
     } else if signature.is_valid() {
         Verdict::Valid
@@ -411,50 +527,49 @@ fn verdict(signature: &SignatureReport) -> Verdict {
     }
 }
 
-/// Every cause of a not valid verdict, in check order.
-fn reasons(signature: &SignatureReport) -> Vec<Reason> {
-    [
-        (signature.document_intact, Reason::DocumentChanged),
-        (signature.signature_valid, Reason::SignatureInvalid),
-        (signature.chain_verified, Reason::ChainUnverified),
-    ]
-    .into_iter()
-    .filter_map(|(holds, reason)| (!holds).then_some(reason))
-    .collect()
-}
-
-/// A path's subject names, nearest first, joined by ` > `; a path
-/// that does not end in a trust anchor ends in ` > -`. A `>` in a
-/// common name is written `\>`, as RFC 4514 already writes it in a
-/// distinguished name, so ` > ` only ever separates.
-fn path(path: &CertificatePath) -> String {
-    let mut names: Vec<String> = path
-        .certificates
+/// `leading` and then `path`'s certificates, nearest first, by subject
+/// name, joined by ` > `; a path that does not end in a trust anchor
+/// ends in ` > -`.
+fn path(leading: &[OwnedCert], path: &CertificationPath) -> String {
+    let mut names: Vec<String> = leading
         .iter()
-        .map(|certificate| chain_name(SubjectName::of(certificate)))
+        .chain(path.certificates())
+        .map(chain_name)
         .collect();
-    if !path.anchored {
+    if !path.is_anchored() {
         names.push(NONE.to_owned());
     }
     names.join(PATH_SEPARATOR)
 }
 
-/// One name on a path line: a common name with every `>` written
-/// `\>`, a distinguished name as RFC 4514 escapes it.
-fn chain_name(name: SubjectName) -> String {
-    match name {
-        SubjectName::CommonName(name) => name.replace('>', r"\>"),
-        SubjectName::Distinguished(name) => name,
-    }
+/// One name on a path line: the common name with every `>` written
+/// `\>`, as RFC 4514 already writes it in a distinguished name, so
+/// ` > ` only ever separates; the distinguished name as RFC 4514
+/// escapes it when there is no common name.
+fn chain_name(certificate: &OwnedCert) -> String {
+    let subject = certificate.view().subject;
+    subject.common_name().map_or_else(
+        || subject.rfc4514().unwrap_or_default(),
+        |name| name.as_str().replace('>', r"\>"),
+    )
 }
 
 /// The revocation reason as RFC 5280 sec.5.3.1 names it. An answer
-/// that states none is `unspecified`: RFC 5280 has the extension left
-/// out in place of that code.
+/// that states none, or a code RFC 5280 does not define, is
+/// `unspecified`: RFC 5280 has the extension left out in place of that
+/// code.
 const fn reason_name(reason: Option<CrlReason>) -> &'static str {
     match reason {
-        Some(reason) => reason.name(),
-        None => CrlReason::Unspecified.name(),
+        None | Some(CrlReason::Unspecified) => "unspecified",
+        Some(CrlReason::KeyCompromise) => "keyCompromise",
+        Some(CrlReason::CaCompromise) => "cACompromise",
+        Some(CrlReason::AffiliationChanged) => "affiliationChanged",
+        Some(CrlReason::Superseded) => "superseded",
+        Some(CrlReason::CessationOfOperation) => "cessationOfOperation",
+        Some(CrlReason::CertificateHold) => "certificateHold",
+        Some(CrlReason::RemoveFromCrl) => "removeFromCRL",
+        Some(CrlReason::PrivilegeWithdrawn) => "privilegeWithdrawn",
+        Some(CrlReason::AaCompromise) => "aACompromise",
     }
 }
 
@@ -473,22 +588,15 @@ mod tests {
     use super::*;
     use crate::cli::argv::fixtures::remaining_argv as argv;
     use crate::test_util::{TestResult, check, check_true};
-    use refineid_lib_core::document::DocumentFailure;
-    use refineid_lib_core::x509::OwnedCert;
+    use refineid_doc_sign::verification::DocumentFailure;
 
     /// A public DVV intermediate, standing in for every certificate.
     const INTERMEDIATE_DER: &[u8] =
         include_bytes!("../../test-vectors/fineid-intermediate-01-citizen-g4e.der");
-    /// The public DVV root that issued it.
-    const ROOT_DER: &[u8] = include_bytes!("../../trust-anchors/dvv-gov-root-ca-g3-ecc.der");
     /// The signer's common name.
     const SIGNER: &str = "SURNAME GIVEN 12345678X";
     /// A name carrying a newline, a carriage return and NUL.
     const NAME_WITH_CONTROLS: &str = "SURNAME\nGIVEN\r\0";
-    /// A common name carrying the path separator.
-    const NAME_WITH_ARROW: &str = "Synthetic > CA";
-    /// A distinguished name RFC 4514 already escaped.
-    const ESCAPED_DISTINGUISHED: &str = r"O=Synthetic \> CA,C=FI";
     /// The file as named.
     const FILE: &str = "/documents/a.pdf";
     /// A second file.
@@ -509,63 +617,53 @@ mod tests {
     const ANSWERED: u8 = 11;
     /// The document timestamp day.
     const ARCHIVED: u8 = 12;
+    /// The path line of the DVV intermediate under its root.
+    const DVV_PATH: &str = "DVV Citizen Certificates - G4E > DVV Gov. Root CA - G3 ECC";
 
     /// Noon on `day` of the fixture month.
     fn at(day: u8) -> Result<DateTime, Box<dyn core::error::Error>> {
         Ok(DateTime::new(YEAR, MONTH, day, HOUR, 0, 0)?)
     }
 
-    /// The DVV intermediate and root, anchored or not.
-    fn dvv_path(anchored: bool) -> Result<CertificatePath, Box<dyn core::error::Error>> {
-        let mut certificates = vec![OwnedCert::from_der(INTERMEDIATE_DER)?];
-        if anchored {
-            certificates.push(OwnedCert::from_der(ROOT_DER)?);
-        }
-        Ok(CertificatePath {
-            certificates,
-            anchored,
-        })
-    }
-
-    /// A valid signature, timestamped and answered good.
-    fn valid() -> Result<SignatureReport, Box<dyn core::error::Error>> {
-        Ok(SignatureReport {
-            signer: SignerIdentity {
-                name: SubjectName::CommonName(SIGNER.to_owned()),
-                identifier: None,
-            },
-            signer_certificate: OwnedCert::from_der(INTERMEDIATE_DER)?,
-            chain: dvv_path(true)?,
-            document_intact: true,
-            signature_valid: true,
-            chain_verified: true,
-            claimed_signing_time: Some(at(CLAIMED)?),
-            proof_of_existence: Some(at(STAMPED)?),
-            signature_timestamps: vec![SignatureTimestamp::Proven {
-                generated_at: at(STAMPED)?,
-                chain: dvv_path(true)?,
-            }],
+    /// The facts of a valid signature, timestamped and answered good.
+    fn valid() -> Result<Facts, Box<dyn core::error::Error>> {
+        Ok(Facts {
+            signed: Some(at(STAMPED)?),
+            verdict: Verdict::Valid,
+            intact: true,
+            signature: true,
+            chained: true,
+            chain: DVV_PATH.to_owned(),
+            claimed: Some(at(CLAIMED)?),
+            timestamps: vec![(format!("{} proven", at(STAMPED)?), DVV_PATH.to_owned())],
+            revocation: Revocation::Good { at: at(ANSWERED)? },
             document_timestamps: Vec::new(),
-            covers_whole_document: true,
-            revocation: Revocation::Good {
-                checked_at: at(ANSWERED)?,
-            },
         })
     }
 
-    /// The default records of one report.
-    fn rendered(signatures: Vec<SignatureEntry>, verbose: bool) -> String {
-        join_records(&report_records(
-            FILE,
-            &DocumentReport { signatures },
-            verbose,
-        ))
+    /// A signature over the document by [`SIGNER`] with `facts`.
+    fn signed(facts: Facts) -> SignatureView {
+        SignatureView {
+            signer: SIGNER.to_owned(),
+            countersigns: None,
+            judgement: Judgement::Judged(Box::new(facts)),
+        }
+    }
+
+    /// The records of `views`, joined.
+    fn rendered(views: &[SignatureView], verbose: bool) -> String {
+        join_records(
+            &views
+                .iter()
+                .map(|view| view.record(FILE, verbose))
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[test]
     fn a_valid_signature_is_one_record() -> TestResult {
         check(
-            &rendered(vec![SignatureEntry::Judged(valid()?)], false).as_str(),
+            &rendered(&[signed(valid()?)], false).as_str(),
             &"\
 file: /documents/a.pdf
 signer: SURNAME GIVEN 12345678X
@@ -578,11 +676,12 @@ verdict: valid
 
     #[test]
     fn every_reason_of_a_not_valid_signature_is_a_line() -> TestResult {
-        let mut signature = valid()?;
-        signature.document_intact = false;
-        signature.chain_verified = false;
+        let mut facts = valid()?;
+        facts.verdict = Verdict::NotValid;
+        facts.intact = false;
+        facts.chained = false;
         check(
-            &rendered(vec![SignatureEntry::Judged(signature)], false).as_str(),
+            &rendered(&[signed(facts)], false).as_str(),
             &"\
 file: /documents/a.pdf
 signer: SURNAME GIVEN 12345678X
@@ -597,11 +696,11 @@ reason: certificate chain unverified
 
     #[test]
     fn an_untimestamped_signature_is_valid_with_no_signed_time() -> TestResult {
-        let mut signature = valid()?;
-        signature.proof_of_existence = None;
-        signature.signature_timestamps = Vec::new();
+        let mut facts = valid()?;
+        facts.signed = None;
+        facts.timestamps = Vec::new();
         check(
-            &rendered(vec![SignatureEntry::Judged(signature)], false).as_str(),
+            &rendered(&[signed(facts)], false).as_str(),
             &"\
 file: /documents/a.pdf
 signer: SURNAME GIVEN 12345678X
@@ -609,40 +708,6 @@ signed: -
 verdict: valid
 ",
             "record",
-        )
-    }
-
-    #[test]
-    fn an_untimestamped_signature_with_an_unverified_chain_names_the_chain() -> TestResult {
-        let mut signature = valid()?;
-        signature.proof_of_existence = None;
-        signature.signature_timestamps = Vec::new();
-        signature.chain_verified = false;
-        check(
-            &rendered(vec![SignatureEntry::Judged(signature)], false).as_str(),
-            &"\
-file: /documents/a.pdf
-signer: SURNAME GIVEN 12345678X
-signed: -
-verdict: not valid
-reason: certificate chain unverified
-",
-            "record",
-        )
-    }
-
-    #[test]
-    fn a_revocation_after_the_proven_time_leaves_the_verdict_valid() -> TestResult {
-        let mut signature = valid()?;
-        signature.revocation = Revocation::Revoked {
-            revoked_at: at(ANSWERED)?,
-            reason: None,
-        };
-        let out = rendered(vec![SignatureEntry::Judged(signature)], true);
-        check_true(
-            out.contains("\nverdict: valid\n")
-                && out.contains("\nrevocation: revoked 2026-06-11T12:00:00Z unspecified\n"),
-            "valid, with the later revocation listed",
         )
     }
 
@@ -662,15 +727,14 @@ reason: certificate chain unverified
             (Some(CrlReason::PrivilegeWithdrawn), "privilegeWithdrawn"),
             (Some(CrlReason::AaCompromise), "aACompromise"),
             (Some(CrlReason::Unspecified), "unspecified"),
-            (Some(CrlReason::Unrecognised), "unknown"),
             (None, "unspecified"),
         ] {
-            let mut signature = valid()?;
-            signature.revocation = Revocation::Revoked {
-                revoked_at: at(REVOKED)?,
+            let mut facts = valid()?;
+            facts.revocation = Revocation::Revoked {
+                at: at(REVOKED)?,
                 reason,
             };
-            let out = rendered(vec![SignatureEntry::Judged(signature)], true);
+            let out = rendered(&[signed(facts)], true);
             check_true(
                 out.contains(&format!(
                     "\nrevocation: revoked 2026-06-08T12:00:00Z {name}\n"
@@ -682,41 +746,16 @@ reason: certificate chain unverified
     }
 
     #[test]
-    fn a_key_compromise_after_the_proven_time_is_revoked() -> TestResult {
-        let mut signature = valid()?;
-        signature.revocation = Revocation::Revoked {
-            revoked_at: at(ANSWERED)?,
-            reason: Some(CrlReason::KeyCompromise),
-        };
-        check(
-            &verdict(&signature),
-            &Verdict::Revoked,
-            "compromise outweighs the proven time",
-        )
-    }
-
-    #[test]
-    fn without_a_proven_time_any_revocation_is_revoked() -> TestResult {
-        let mut signature = valid()?;
-        signature.proof_of_existence = None;
-        signature.signature_timestamps = Vec::new();
-        signature.revocation = Revocation::Revoked {
-            revoked_at: at(ANSWERED)?,
-            reason: None,
-        };
-        check(&verdict(&signature), &Verdict::Revoked, "revoked")
-    }
-
-    #[test]
     fn a_revoked_signer_is_revoked_without_reasons() -> TestResult {
-        let mut signature = valid()?;
-        signature.chain_verified = false;
-        signature.revocation = Revocation::Revoked {
-            revoked_at: at(REVOKED)?,
+        let mut facts = valid()?;
+        facts.verdict = Verdict::Revoked;
+        facts.chained = false;
+        facts.revocation = Revocation::Revoked {
+            at: at(REVOKED)?,
             reason: None,
         };
         check(
-            &rendered(vec![SignatureEntry::Judged(signature)], false).as_str(),
+            &rendered(&[signed(facts)], false).as_str(),
             &"\
 file: /documents/a.pdf
 signer: SURNAME GIVEN 12345678X
@@ -731,10 +770,11 @@ verdict: revoked
     fn an_unsupported_signature_names_its_reason() -> TestResult {
         check(
             &rendered(
-                vec![SignatureEntry::Unsupported(UnsupportedSignature {
-                    signer: None,
-                    profile: "PDF signature subfilter",
-                })],
+                &[SignatureView {
+                    signer: NONE.to_owned(),
+                    countersigns: None,
+                    judgement: Judgement::Unsupported,
+                }],
                 true,
             )
             .as_str(),
@@ -750,11 +790,36 @@ reason: profile not supported
     }
 
     #[test]
-    fn an_unchecked_revocation_follows_a_valid_verdict() -> TestResult {
-        let mut signature = valid()?;
-        signature.revocation = Revocation::Unavailable;
+    fn a_counter_signature_names_the_signer_it_countersigns() -> TestResult {
+        let counter = SignatureView {
+            signer: "SECOND SIGNER 87654321Y".to_owned(),
+            countersigns: Some(SIGNER.to_owned()),
+            judgement: Judgement::Judged(Box::new(valid()?)),
+        };
         check(
-            &rendered(vec![SignatureEntry::Judged(signature)], false).as_str(),
+            &rendered(&[signed(valid()?), counter], false).as_str(),
+            &"\
+file: /documents/a.pdf
+signer: SURNAME GIVEN 12345678X
+signed: 2026-06-10T12:00:00Z
+verdict: valid
+
+file: /documents/a.pdf
+signer: SECOND SIGNER 87654321Y
+countersigns: SURNAME GIVEN 12345678X
+signed: 2026-06-10T12:00:00Z
+verdict: valid
+",
+            "records",
+        )
+    }
+
+    #[test]
+    fn an_unchecked_revocation_follows_a_valid_verdict() -> TestResult {
+        let mut facts = valid()?;
+        facts.revocation = Revocation::Unavailable;
+        check(
+            &rendered(&[signed(facts)], false).as_str(),
             &"\
 file: /documents/a.pdf
 signer: SURNAME GIVEN 12345678X
@@ -767,40 +832,8 @@ revocation: not checked
     }
 
     #[test]
-    fn two_signatures_are_two_records() -> TestResult {
-        let mut second = valid()?;
-        second.signature_valid = false;
-        check(
-            &rendered(
-                vec![
-                    SignatureEntry::Judged(valid()?),
-                    SignatureEntry::Judged(second),
-                ],
-                false,
-            )
-            .as_str(),
-            &"\
-file: /documents/a.pdf
-signer: SURNAME GIVEN 12345678X
-signed: 2026-06-10T12:00:00Z
-verdict: valid
-
-file: /documents/a.pdf
-signer: SURNAME GIVEN 12345678X
-signed: 2026-06-10T12:00:00Z
-verdict: not valid
-reason: signature invalid
-",
-            "records",
-        )
-    }
-
-    #[test]
     fn two_files_are_records_in_command_line_order() -> TestResult {
-        let report = DocumentReport {
-            signatures: vec![SignatureEntry::Judged(valid()?)],
-        };
-        let mut records = report_records(FILE, &report, false);
+        let mut records = vec![signed(valid()?).record(FILE, false)];
         records.push(error_record(
             OTHER_FILE,
             &DocumentVerifyError::Failure {
@@ -844,29 +877,20 @@ error: not a signed document
 
     #[test]
     fn verbose_adds_every_fact_behind_the_verdict() -> TestResult {
-        let mut signature = valid()?;
-        signature
-            .signature_timestamps
-            .push(SignatureTimestamp::Unproven {
-                claimed_at: Some(at(STAMPED)?),
-                chain: Some(dvv_path(false)?),
-            });
-        signature
-            .signature_timestamps
-            .push(SignatureTimestamp::Unproven {
-                claimed_at: None,
-                chain: None,
-            });
-        signature.document_timestamps = vec![
-            DocumentTimestamp::Proven {
-                generated_at: at(ARCHIVED)?,
-            },
-            DocumentTimestamp::Unproven {
-                claimed_at: Some(at(ARCHIVED)?),
-            },
+        let mut facts = valid()?;
+        facts.timestamps.push((
+            format!("{} unproven", at(STAMPED)?),
+            "DVV Citizen Certificates - G4E > -".to_owned(),
+        ));
+        facts
+            .timestamps
+            .push(("- unproven".to_owned(), NONE.to_owned()));
+        facts.document_timestamps = vec![
+            format!("{} proven", at(ARCHIVED)?),
+            format!("{} unproven", at(ARCHIVED)?),
         ];
         check(
-            &rendered(vec![SignatureEntry::Judged(signature)], true).as_str(),
+            &rendered(&[signed(facts)], true).as_str(),
             &"\
 file: /documents/a.pdf
 signer: SURNAME GIVEN 12345678X
@@ -891,76 +915,22 @@ document-timestamp: 2026-06-12T12:00:00Z unproven
     }
 
     #[test]
-    fn an_unanchored_path_ends_in_a_dash() -> TestResult {
-        let mut signature = valid()?;
-        signature.chain = dvv_path(false)?;
-        signature.chain_verified = false;
-        signature.signature_timestamps = vec![SignatureTimestamp::Proven {
-            generated_at: at(STAMPED)?,
-            chain: dvv_path(false)?,
-        }];
-        signature.claimed_signing_time = None;
-        signature.revocation = Revocation::Unavailable;
+    fn a_path_names_each_certificate_and_an_unanchored_one_ends_in_a_dash() -> TestResult {
+        let intermediate = OwnedCert::from_der(INTERMEDIATE_DER)?;
         check(
-            &rendered(vec![SignatureEntry::Judged(signature)], true).as_str(),
-            &"\
-file: /documents/a.pdf
-signer: SURNAME GIVEN 12345678X
-signed: 2026-06-10T12:00:00Z
-verdict: not valid
-reason: certificate chain unverified
-intact: yes
-signature: yes
-chain: DVV Citizen Certificates - G4E > -
-claimed: -
-timestamp: 2026-06-10T12:00:00Z proven
-timestamp-chain: DVV Citizen Certificates - G4E > -
-revocation: not checked
-",
-            "record",
+            &path(&[], &CertificationPath::Partial(vec![intermediate.clone()])).as_str(),
+            &"DVV Citizen Certificates - G4E > -",
+            "partial",
+        )?;
+        check(
+            &path(
+                core::slice::from_ref(&intermediate),
+                &CertificationPath::Anchored(Vec::new()),
+            )
+            .as_str(),
+            &"DVV Citizen Certificates - G4E",
+            "a leading signer on an anchored path",
         )
-    }
-
-    #[test]
-    fn a_revoked_record_carries_the_revocation_time_with_v() -> TestResult {
-        let mut signature = valid()?;
-        signature.revocation = Revocation::Revoked {
-            revoked_at: at(REVOKED)?,
-            reason: None,
-        };
-        let out = rendered(vec![SignatureEntry::Judged(signature)], true);
-        check_true(
-            out.contains("\nverdict: revoked\n")
-                && out.contains("\nrevocation: revoked 2026-06-08T12:00:00Z unspecified\n"),
-            "revoked with its time",
-        )
-    }
-
-    #[test]
-    fn a_not_valid_verdict_always_names_a_reason() -> TestResult {
-        /// Both outcomes of one check.
-        const OUTCOMES: [bool; 2] = [false, true];
-        for intact in OUTCOMES {
-            for signed in OUTCOMES {
-                for chained in OUTCOMES {
-                    let mut signature = valid()?;
-                    signature.document_intact = intact;
-                    signature.signature_valid = signed;
-                    signature.chain_verified = chained;
-                    signature.covers_whole_document = false;
-                    let not_valid = verdict(&signature) == Verdict::NotValid;
-                    check_true(
-                        !not_valid || !reasons(&signature).is_empty(),
-                        "a not valid verdict has a reason",
-                    )?;
-                    check_true(
-                        not_valid != signature.is_valid(),
-                        "covering the whole document is reported, not judged",
-                    )?;
-                }
-            }
-        }
-        Ok(())
     }
 
     #[test]
@@ -994,9 +964,9 @@ revocation: not checked
 
     #[test]
     fn control_characters_stay_on_their_line() -> TestResult {
-        let mut signature = valid()?;
-        signature.signer.name = SubjectName::CommonName(NAME_WITH_CONTROLS.to_owned());
-        let out = rendered(vec![SignatureEntry::Judged(signature)], false);
+        let mut view = signed(valid()?);
+        view.signer = NAME_WITH_CONTROLS.to_owned();
+        let out = rendered(&[view], false);
         check(
             &out.lines().nth(1),
             &Some(r"signer: SURNAME\x0aGIVEN\x0d\x00"),
@@ -1006,22 +976,8 @@ revocation: not checked
     }
 
     #[test]
-    fn a_greater_than_sign_in_a_common_name_is_escaped_on_a_path() -> TestResult {
-        check(
-            &chain_name(SubjectName::CommonName(NAME_WITH_ARROW.to_owned())).as_str(),
-            &r"Synthetic \> CA",
-            "escaped common name",
-        )?;
-        check(
-            &chain_name(SubjectName::Distinguished(ESCAPED_DISTINGUISHED.to_owned())).as_str(),
-            &ESCAPED_DISTINGUISHED,
-            "distinguished name as RFC 4514 wrote it",
-        )
-    }
-
-    #[test]
     fn no_line_is_indented_or_tabbed() -> TestResult {
-        let out = rendered(vec![SignatureEntry::Judged(valid()?)], true);
+        let out = rendered(&[signed(valid()?)], true);
         check_true(
             out.lines()
                 .all(|line| !line.starts_with(' ') && !line.contains('\t') && line.contains(": ")),

@@ -27,7 +27,8 @@
 //!
 //! Both paths share the same option / report / error types and a
 //! shared internal driver (`sign_with_slot`) so the wire
-//! choreography stays in lockstep.
+//! choreography stays in lockstep. Signed documents are made by
+//! `refineid_doc_sign` (`document sign`), not here.
 
 use alloc::fmt;
 use std::path::PathBuf;
@@ -48,105 +49,14 @@ use refineid_lib_core::pace;
 use refineid_lib_core::pkcs15::Pkcs15Ops as _;
 use refineid_lib_core::pkcs15::{CertSlot, Pkcs15Error};
 use refineid_lib_core::secure_messaging::SmTransport;
-use refineid_lib_core::sign::asic::DataObject;
-use refineid_lib_core::sign::cades::{
-    DigestAlgorithm, SignatureAlgorithm, SignerParameters, SigningTime,
-};
-use refineid_lib_core::sign::document::{self, DocumentError, DocumentPlan, Format};
-use refineid_lib_core::sign::pades::{SignatureMetadata, StampLanguage, VisibleSignature};
-use refineid_lib_core::sign::timestamp::{self, TimestampError, VerifiedTimestampToken};
-use refineid_lib_core::sign::validation::ValidationMaterial;
 use refineid_lib_core::sign::{KeyRef, SignError, SignOps as _};
 use refineid_lib_core::transport::CardTransport;
 use refineid_lib_core::x509::{
-    Certificate, DateTime, EcCurve, OwnedCert, PublicKeyAlgorithm, extract_rsa_public_key,
+    Certificate, EcCurve, OwnedCert, PublicKeyAlgorithm, extract_rsa_public_key,
 };
 use refineid_lib_pcsc::{PcscBackend, PcscCard, PcscError};
-use zeroize::Zeroizing;
 
 use crate::pin_source::{PinEntryError, PinSource};
-use crate::signed_name::{BestSignatureTime, PendingSignedName};
-use crate::validation_material::{ChainStart, NoncePolicy};
-
-/// Maximum tolerated difference between this host and a live TSA.
-///
-/// A nonce proves that a response belongs to this request, but does not
-/// make an authority's asserted time sensible. A newly requested token
-/// outside this window must not choose the certificate-validation instant.
-const MAX_TIMESTAMP_CLOCK_SKEW: core::time::Duration = core::time::Duration::from_mins(5);
-
-/// Initial wait after a transient timestamp-authority failure.
-const TIMESTAMP_RETRY_INITIAL_DELAY: core::time::Duration = core::time::Duration::from_secs(1);
-/// Ceiling for repeated timestamp-authority retries.
-const TIMESTAMP_RETRY_MAX_DELAY: core::time::Duration = core::time::Duration::from_mins(1);
-
-/// Candidate EU-qualified timestamp endpoints used by first-party clients.
-///
-/// Whoever configures an authority answers for it: every returned
-/// token is cryptographically verified against the request digest and
-/// nonce, and nothing beyond that is checked about the operator.
-pub const EU_QUALIFIED_TIMESTAMP_AUTHORITIES: &[&str] = &[DEFAULT_TIMESTAMP_AUTHORITY];
-
-/// The timestamp authority used when the operator configures none.
-///
-/// The Sectigo qualified endpoint, shared by every first-party
-/// `RefineID` client and documented at
-/// <https://www.sectigo.com/resource-library/time-stamping-server>.
-pub const DEFAULT_TIMESTAMP_AUTHORITY: &str = "http://timestamp.sectigo.com/qualified";
-
-/// HTTP Basic credentials for one explicitly configured timestamp authority.
-///
-/// Both fields and the derived authorization header are zeroized on drop. The
-/// custom [`Debug`] implementation deliberately exposes neither field.
-#[derive(Clone)]
-pub struct TimestampCredentials {
-    username: Zeroizing<String>,
-    password: Zeroizing<String>,
-}
-
-impl TimestampCredentials {
-    /// Construct credentials supplied by an interactive caller.
-    ///
-    /// # Errors
-    /// An empty username or a username containing the Basic-auth separator is
-    /// rejected before any network request is attempted.
-    pub fn new(username: String, password: String) -> Result<Self, &'static str> {
-        let username = Zeroizing::new(username);
-        let password = Zeroizing::new(password);
-        if username.is_empty() {
-            return Err("timestamp username is empty");
-        }
-        if username.contains(':') {
-            return Err("timestamp username cannot contain ':'");
-        }
-        Ok(Self { username, password })
-    }
-
-    fn authorization_header(&self) -> Zeroizing<String> {
-        let mut plain = Zeroizing::new(Vec::with_capacity(
-            self.username.len() + 1 + self.password.len(),
-        ));
-        plain.extend_from_slice(self.username.as_bytes());
-        plain.push(b':');
-        plain.extend_from_slice(self.password.as_bytes());
-        let encoded = Zeroizing::new(refineid_lib_core::base64::encode(&plain));
-        let mut header = Zeroizing::new(String::with_capacity(6 + encoded.len()));
-        header.push_str("Basic ");
-        header.push_str(&encoded);
-        header
-    }
-
-    fn with_authorization_header<T>(&self, operation: impl FnOnce(&str) -> T) -> T {
-        let header = self.authorization_header();
-        operation(header.as_str())
-    }
-}
-
-impl fmt::Debug for TimestampCredentials {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("TimestampCredentials(REDACTED)")
-    }
-}
 
 /// Which on-card key slot to sign with.
 ///
@@ -170,14 +80,6 @@ impl SignSlot {
     /// (ref `0x01`), qualified-signature key uses
     /// `KeyRef::Sign` (ref `0x02`). Used as the `MSE:SET DST`
     /// data byte.
-    /// Operator-facing name of the slot, for diagnostics.
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Auth => "authentication",
-            Self::Qualified => "qualified-signature",
-        }
-    }
-
     const fn key_ref(self) -> KeyRef {
         match self {
             Self::Auth => KeyRef::Auth,
@@ -231,135 +133,6 @@ impl SignSlot {
     }
 }
 
-/// A document signature rather than a bare one.
-///
-/// Present in [`SignOptions`] when the operator asked for a format
-/// rather than raw signature bytes. The difference reaches all the way
-/// into the card session: a document signature covers a structure that
-/// names the signing certificate, so it cannot be built until the
-/// certificate has been read off the card.
-#[derive(Debug, Clone)]
-pub struct DocumentRequest {
-    /// Which format to produce.
-    pub format: Format,
-    /// Files beyond [`SignOptions::input`]. Only the container formats
-    /// accept any; the rest refuse a set rather than sign the first.
-    pub additional_inputs: Vec<PathBuf>,
-    /// Claimed signing time, supplied by the caller.
-    ///
-    /// Read from the clock in the CLI layer rather than here, so this
-    /// module stays deterministic and the claim stays the caller's to
-    /// make.
-    pub signing_time: SigningTime,
-    /// What to record in the signature. Used by `PAdES` only.
-    pub metadata: SignatureMetadata,
-    /// Full PKCS#15 serial of the card the operator was shown, when a
-    /// trusted inspection view captured one. Verified against the live
-    /// card before PIN verification, whatever the format, so a card
-    /// swap cannot spend the PIN on an undisplayed identity. `None`
-    /// only for flows that sign whichever card is present (the CLI).
-    pub expected_serial: Option<TokenSerial>,
-    /// Optional visible mark for `PAdES`: the seal advising the reader
-    /// to check the document's electronic signature.
-    pub visible_signature: Option<VisibleSignature>,
-    /// Add an archive timestamp over the finished document, raising it
-    /// to level LTA.
-    ///
-    /// This implies [`Self::long_term`] even when a direct API caller
-    /// leaves that field false: an archive timestamp is added only
-    /// after complete LT material has been collected and embedded.
-    ///
-    /// Implemented for `PAdES` and `ASiC-E` with `CAdES`. Standalone
-    /// `CAdES`, `XAdES`, and `ASiC-E` with `XAdES` need different
-    /// archive constructions that are not implemented yet.
-    pub archive: bool,
-    /// Collect and embed the chain and revocation answers, raising the
-    /// signature to level LT.
-    ///
-    /// Costs a handful of network round trips at signing time and buys
-    /// a signature that still checks when the responder is gone.
-    /// [`Self::archive`] always enables this operation too.
-    pub long_term: bool,
-    /// URLs of RFC 3161 Time Stamp Authorities, when the signature is
-    /// to carry an attested time rather than a claimed one.
-    ///
-    /// Empty leaves the signature at baseline level `B`: the time in it
-    /// is the signer's word. More than one is allowed and they are
-    /// alternatives, not a sequence -- each attests the same signature,
-    /// so the signature keeps a proven time for as long as any one of
-    /// them is still trusted.
-    pub timestamp_authorities: Vec<String>,
-    /// Optional credentials for the sole configured timestamp authority.
-    ///
-    /// Credentials are deliberately limited to one authority so they can
-    /// never be replayed to a fallback host.
-    pub timestamp_credentials: Option<TimestampCredentials>,
-}
-
-/// The locale variables that name the language of messages, in the
-/// order POSIX.1-2017 XBD 8.2 gives them precedence.
-const MESSAGE_LOCALE_VARIABLES: [&str; 3] = ["LC_ALL", "LC_MESSAGES", "LANG"];
-
-/// The verification seal in the language of the process locale.
-#[must_use]
-pub fn process_visible_signature() -> VisibleSignature {
-    VisibleSignature::verification(stamp_language(|name| std::env::var(name).ok()))
-}
-
-/// The stamp language of the first locale variable `lookup` finds set
-/// and non-empty; English when none is.
-fn stamp_language(lookup: impl Fn(&str) -> Option<String>) -> StampLanguage {
-    MESSAGE_LOCALE_VARIABLES
-        .iter()
-        .filter_map(|name| lookup(name))
-        .find(|value| !value.is_empty())
-        .map_or(StampLanguage::English, |value| {
-            StampLanguage::for_locale(&value)
-        })
-}
-
-impl DocumentRequest {
-    /// Whether this request must collect and embed complete LT material.
-    ///
-    /// Kept at the API boundary rather than only in CLI argument
-    /// normalization: callers may construct this public type directly,
-    /// and LTA without the preceding LT evidence is not a valid level.
-    const fn requires_long_term_material(&self) -> bool {
-        self.long_term || self.archive
-    }
-
-    /// Reject an impossible requested level before opening a reader or
-    /// asking for a PIN. Archive still normalizes to LT through
-    /// [`Self::requires_long_term_material`]; this only catches missing
-    /// authorities and formats whose archive construction is absent.
-    fn validate_signing_policy(&self) -> Result<(), SignErrorKind> {
-        if self.requires_long_term_material() && self.timestamp_authorities.is_empty() {
-            return Err(SignErrorKind::Timestamp(
-                "LT and LTA signatures need at least one timestamp authority".to_owned(),
-            ));
-        }
-        if self.timestamp_credentials.is_some() {
-            if self.timestamp_authorities.len() != 1 {
-                return Err(SignErrorKind::Timestamp(
-                    "timestamp credentials require exactly one authority".to_owned(),
-                ));
-            }
-            let authority =
-                refineid_lib_core::text::Uri::parse(self.timestamp_authorities[0].clone())
-                    .map_err(|error| SignErrorKind::Timestamp(error.to_string()))?;
-            if authority.scheme() != refineid_lib_core::text::Scheme::Https {
-                return Err(SignErrorKind::Timestamp(
-                    "timestamp credentials require HTTPS".to_owned(),
-                ));
-            }
-        }
-        if self.archive && !matches!(self.format, Format::Pades | Format::AsicECades) {
-            return Err(SignErrorKind::Document(DocumentError::ArchiveUnsupported));
-        }
-        Ok(())
-    }
-}
-
 /// Inputs.
 #[derive(Debug)]
 pub struct SignOptions {
@@ -368,9 +141,8 @@ pub struct SignOptions {
     /// and sent to the card via `PSO:HASH` per FINEID S1
     /// v4.2 §3.5.
     pub input: PathBuf,
-    /// Where the raw signature, or the finished document when
-    /// [`Self::document`] is set, is written.
-    pub output: SignOutput,
+    /// Where the raw signature is written, created or replaced.
+    pub output: PathBuf,
     /// The targeted slot's PIN, obtained after the card is found and
     /// checked, right before VERIFY. Zeroized at function return.
     pub pin: PinSource,
@@ -389,58 +161,6 @@ pub struct SignOptions {
     /// flow fails with [`SignErrorKind::NeedCan`] so the CLI can
     /// prompt and retry. Never logged.
     pub can: Option<Can>,
-    /// Produce a signed document rather than raw signature bytes.
-    ///
-    /// `None` keeps the original behaviour: `--out` receives the
-    /// signature the card computed over the input file, and nothing
-    /// else.
-    pub document: Option<DocumentRequest>,
-}
-
-/// Where [`SignOptions`] writes its result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SignOutput {
-    /// This path.
-    At(PathBuf),
-    /// The default signed-document name, carrying the signature's
-    /// best-signature-time once the signature exists. Never replaces
-    /// an existing file.
-    SignedName(PendingSignedName),
-}
-
-impl SignOutput {
-    /// The path, given the signature's best-signature-time.
-    #[must_use]
-    pub fn path(&self, best: Option<BestSignatureTime>) -> PathBuf {
-        match self {
-            Self::At(path) => path.clone(),
-            Self::SignedName(pending) => pending.path(best),
-        }
-    }
-
-    /// Write `bytes` to [`Self::path`] and return that path. A given
-    /// path is created or truncated; a default name must not exist
-    /// yet.
-    fn write(
-        &self,
-        best: Option<BestSignatureTime>,
-        bytes: &[u8],
-    ) -> Result<PathBuf, SignErrorKind> {
-        use std::io::Write as _;
-        let path = self.path(best);
-        let written = match self {
-            Self::At(_) => std::fs::write(&path, bytes),
-            Self::SignedName(_) => std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .and_then(|mut file| file.write_all(bytes)),
-        };
-        match written {
-            Ok(()) => Ok(path),
-            Err(source) => Err(SignErrorKind::SignatureWrite { path, source }),
-        }
-    }
 }
 
 /// One reader's worth of sign output.
@@ -462,19 +182,6 @@ pub struct SignReport {
     pub cert_path: Option<PathBuf>,
     /// Signature length in bytes (384 for RSA-3072, 96 for P-384).
     pub signature_len: usize,
-    /// How many timestamp tokens were actually obtained.
-    ///
-    /// This includes the outer archive timestamp for an LTA document,
-    /// in addition to the signature timestamps. It is a token count,
-    /// not a count of distinct authorities: one authority may issue
-    /// both kinds of token.
-    pub timestamps: usize,
-    /// Size of the file that was written.
-    ///
-    /// Equal to `signature_len` for a bare sign, and the size of the
-    /// finished document otherwise -- which is the number an operator
-    /// looking at `--out` expects to see.
-    pub output_len: usize,
     /// Subject CN of the on-card cert, when we could parse it.
     pub cert_subject_cn: Option<CommonName>,
     /// PIN retries reported by the card when VERIFY succeeded
@@ -550,31 +257,9 @@ impl fmt::Display for LocalVerifyOutcome {
 pub enum SignErrorKind {
     /// Reader-selection failure (none / multiple / bad filter).
     ReaderPick(ReaderPickError),
-    /// The requested document format could not be built. Raised
-    /// before the card signs anything, except for the PDF
-    /// "signature did not fit" case, which is only knowable after.
-    Document(DocumentError),
-    /// A visible signature was asked of a format without a page.
-    VisibleSignature(String),
-    /// The live card is not the card the operator was shown; refused
-    /// before PIN verification.
+    /// The card in the reader after the PIN prompt is not the card
+    /// checked before it, or its serial could not be read again.
     DisplayedCard(String),
-    /// The slot's certificate uses a key this crate can build a
-    /// document signature with, but whose digest pairing is not one
-    /// the formats name.
-    UnsupportedDocumentKey(SignSlot),
-    /// The chain or revocation answers could not be collected.
-    ///
-    /// Raised rather than falling back to a shorter-lived signature: a
-    /// caller who asked for LT and silently got T would not be able to
-    /// tell from the output.
-    Material(String),
-    /// The Time Stamp Authority could not be reached or refused.
-    ///
-    /// Raised rather than silently dropping the token: a caller who
-    /// asked for an attested time and got a claimed one would not be
-    /// able to tell from the output.
-    Timestamp(String),
     /// PC/SC connect / transmit error.
     Pcsc(PcscError),
     /// Input file I/O failure (`NotFound`, `PermissionDenied`, ...).
@@ -678,16 +363,7 @@ impl fmt::Display for SignErrorKind {
         match self {
             Self::ReaderPick(e) => write!(f, "{e}"),
             Self::Pcsc(e) => write!(f, "PC/SC: {e}"),
-            Self::Document(e) => write!(f, "{e}"),
-            Self::VisibleSignature(detail) => write!(f, "visible signature: {detail}"),
             Self::DisplayedCard(detail) => write!(f, "displayed card: {detail}"),
-            Self::Material(detail) => write!(f, "validation material: {detail}"),
-            Self::Timestamp(detail) => write!(f, "timestamp: {detail}"),
-            Self::UnsupportedDocumentKey(slot) => write!(
-                f,
-                "the {} certificate's key type cannot produce a document signature",
-                slot.label()
-            ),
             Self::InputRead { path, source } => {
                 write!(f, "read input {}: {source}", path.display())
             }
@@ -899,9 +575,6 @@ where
     B: ReaderBackend<Error = PcscError>,
     B::Transport: CardReset,
 {
-    if let Some(request) = options.document.as_ref() {
-        request.validate_signing_policy()?;
-    }
     let reader_id = backend.pick_single_reader(
         options
             .reader_filter
@@ -919,13 +592,6 @@ where
     let input_len: u64 = u64::try_from(input_bytes.len()).unwrap_or(u64::MAX);
     let input_sha256 = Sha256::of(&input_bytes);
 
-    // Stays Read (not PinSequence) deliberately: for document
-    // output, sign_chain calls assemble_document, which fetches
-    // timestamps from network authorities WHILE this transport is
-    // alive -- a held transaction across network IO would trip
-    // the resource manager's idle reset. PinSequence becomes
-    // possible here once document assembly moves after the card
-    // session closes.
     let mut transport = backend.open_session(&reader_id, ReaderAccessCap::Read)?;
 
     // SELECT the FINEID PKCS#15 application first. The qualified-
@@ -999,10 +665,12 @@ where
     };
 
     let signature_len = chain.signature_bytes.len();
-    let output_len = chain.output_bytes.len();
-    let output = options
-        .output
-        .write(chain.best_signature_time, &chain.output_bytes)?;
+    std::fs::write(&options.output, &chain.signature_bytes).map_err(|source| {
+        SignErrorKind::SignatureWrite {
+            path: options.output.clone(),
+            source,
+        }
+    })?;
 
     let cert_path = if let Some(path) = &options.save_cert {
         std::fs::write(path, chain.cert_der.as_bytes()).map_err(|source| {
@@ -1021,11 +689,9 @@ where
         slot,
         input_len,
         input_sha256,
-        signature_path: output,
+        signature_path: options.output,
         cert_path,
         signature_len,
-        timestamps: chain.timestamps,
-        output_len,
         cert_subject_cn: chain.cert_subject_cn,
         pin_retries_after: chain.pin_retries_after,
         local_verify: chain.local_verify,
@@ -1044,13 +710,6 @@ struct SignChainOutput {
     pin_retries_after: Option<u8>,
     /// Raw signature bytes off the card.
     signature_bytes: Vec<u8>,
-    /// Timestamp tokens actually obtained.
-    timestamps: usize,
-    /// The earliest signature timestamp's `genTime`; `None` without one.
-    best_signature_time: Option<BestSignatureTime>,
-    /// What gets written to `--out`: the raw signature for a bare
-    /// sign, or the finished document when a format was asked for.
-    output_bytes: Vec<u8>,
     /// Rule E7 local-verify outcome.
     local_verify: LocalVerifyOutcome,
 }
@@ -1092,32 +751,6 @@ fn sign_chain<T: CardTransport>(
     let cert_subject_cn = cert.subject.common_name();
     let cert_algorithm = cert.spki.algorithm();
 
-    // What the card actually signs. For a raw signature that is the
-    // input file. For a document it is a structure built around the
-    // certificate we just read -- CAdES signed attributes, or a
-    // canonical ds:SignedInfo -- which is why this cannot happen
-    // before the card is open.
-    let document = match options.document {
-        None => None,
-        Some(ref request) => {
-            ensure_displayed_card(transport, request)?;
-            let parameters = document_signer(&cert, cert_algorithm, slot, request.signing_time)?;
-            let objects = load_data_objects(options, request, input_bytes)?;
-            let metadata = document_metadata(request)?;
-            let plan = document::plan(request.format, objects, &parameters, &metadata)
-                .map_err(SignErrorKind::Document)?;
-            Some((plan, parameters))
-        }
-    };
-    let signed_octets: &[u8] = match document {
-        None => input_bytes,
-        Some((ref plan, _)) => plan.to_be_signed(),
-    };
-
-    // VERIFY PIN only after the document and any visible identity have been
-    // bound to this live card. A card swap or malformed appearance request
-    // therefore cannot consume a PIN retry.
-    //
     // The reference numbering is the card's to declare (citizen
     // S1 v4.2 vs organizational S4-2 v4.0), resolved by
     // counter-safe probes before the typed PIN is spent.
@@ -1161,14 +794,6 @@ fn sign_chain<T: CardTransport>(
         }
     };
 
-    // The RSA path signs this digest; the ECDSA path recomputes its
-    // own SHA-384 from the same octets. Both stay in step with the
-    // digest named in `document_signer`.
-    let signed_sha256 = match document {
-        None => input_sha256,
-        Some(_) => Sha256::of(signed_octets),
-    };
-
     // Branch on cert public-key shape per FINEID S4-1 v4.2 §4.2:
     // Older-scheme cards have an RSA-3072 auth key; Newer-scheme
     // cards have ECC P-384 (secp384r1) + SHA-384. The PSO chain
@@ -1178,58 +803,21 @@ fn sign_chain<T: CardTransport>(
         transport,
         slot,
         scheme,
-        &cert_owned.view(),
+        &cert,
         cert_algorithm,
-        signed_octets,
-        signed_sha256,
+        input_bytes,
+        input_sha256,
     )?;
-
-    // Local verify above proved the card signed what we asked it to.
-    // Only now is it worth assembling, because assembly can still
-    // fail -- a CAdES that outgrew the hole reserved in a PDF.
-    let AssembledDocument {
-        bytes: output_bytes,
-        timestamps,
-        best_signature_time,
-    } = match document {
-        None => AssembledDocument::new(signature_bytes.clone(), &[], false),
-        Some((plan, parameters)) => {
-            assemble_document(options, plan, &parameters, &signature_bytes, &cert_der)?
-        }
-    };
 
     Ok(SignChainOutput {
         cert_der,
         cert_subject_cn,
         pin_retries_after,
         signature_bytes,
-        timestamps,
-        best_signature_time,
-        output_bytes,
         local_verify,
     })
 }
 
-/// The signature metadata with the requested visible mark, refused for
-/// a format without a page.
-fn document_metadata(request: &DocumentRequest) -> Result<SignatureMetadata, SignErrorKind> {
-    let Some(visible) = request.visible_signature else {
-        return Ok(request.metadata.clone());
-    };
-    if request.format != Format::Pades {
-        return Err(SignErrorKind::VisibleSignature(
-            "visible marks are supported only for PAdES".to_owned(),
-        ));
-    }
-    let mut metadata = request.metadata.clone();
-    metadata.visible_signature = Some(visible);
-    Ok(metadata)
-}
-
-/// Refuse to sign when the live card is not the one the operator saw.
-///
-/// Runs before PIN verification for every document request carrying a
-/// displayed serial, whatever the format produces.
 /// The refusal when the card in the reader is not the one the PIN was
 /// entered for.
 pub(crate) const CARD_CHANGED_DURING_PROMPT: &str = "the card changed while the PIN was entered";
@@ -1242,801 +830,6 @@ fn live_token_serial<T: CardTransport>(
         SignErrorKind::DisplayedCard(format!("cannot re-read EF.TokenInfo: {error}"))
     })?;
     Ok(token.serial_number_hex.map(render_token_serial))
-}
-
-fn ensure_displayed_card<T: CardTransport>(
-    transport: &mut T,
-    request: &DocumentRequest,
-) -> Result<(), SignErrorKind> {
-    let Some(expected) = request.expected_serial.as_ref() else {
-        return Ok(());
-    };
-    let live = live_token_serial(transport)?;
-    ensure_expected_serial(expected, live.as_ref())
-}
-
-fn ensure_expected_serial(
-    expected: &TokenSerial,
-    live: Option<&TokenSerial>,
-) -> Result<(), SignErrorKind> {
-    match live {
-        Some(live) if live == expected => Ok(()),
-        Some(_different) => Err(SignErrorKind::DisplayedCard(
-            "the card in the reader is not the card displayed by the application".to_owned(),
-        )),
-        None => Err(SignErrorKind::DisplayedCard(
-            "the card does not publish a PKCS#15 serial for session binding".to_owned(),
-        )),
-    }
-}
-
-/// Ask a Time Stamp Authority to attest the signature's time.
-///
-/// The digest goes over the signature value as the format will store
-/// it, which [`DocumentPlan::timestamp_digest`] works out; this only
-/// carries it there and back.
-fn fetch_timestamp(
-    url: &str,
-    credentials: Option<&TimestampCredentials>,
-    retry_transient: bool,
-    plan: &DocumentPlan,
-    parameters: &SignerParameters<'_>,
-    signature: &[u8],
-    algorithm: DigestAlgorithm,
-) -> Result<VerifiedTimestampToken, SignErrorKind> {
-    /// A timestamp token with the TSA's certificate in it. Comfortably
-    /// above what any TSA returns, and a bound rather than a promise.
-    const MAX_RESPONSE: usize = 64 * 1024;
-    /// Nonce width. RFC 3161 sets no size; 64 bits is what the TSA
-    /// needs to tell one request from another.
-    const NONCE_BYTES: usize = 8;
-
-    // What gets timestamped depends on the format, so the plan is
-    // asked rather than assumed.
-    let digest = plan
-        .timestamp_digest(parameters, signature, algorithm)
-        .map_err(SignErrorKind::Document)?;
-    let nonce = refineid_lib_core::rng::array::<NONCE_BYTES>()
-        .map_err(|e| SignErrorKind::Timestamp(format!("no random nonce: {e}")))?;
-    let timestamp_query_der = timestamp::request(&digest, algorithm, Some(&nonce), true);
-
-    let uri = refineid_lib_core::text::Uri::parse(url.to_owned())
-        .map_err(|e| SignErrorKind::Timestamp(format!("{url}: {e}")))?;
-    let requested_at = crate::card_check::now_date_time();
-    let response = post_timestamp_query(
-        &uri,
-        &timestamp_query_der,
-        MAX_RESPONSE,
-        credentials,
-        retry_transient,
-    )
-    .map_err(|e| SignErrorKind::Timestamp(format!("POST {url}: {e}")))?;
-    let received_at = crate::card_check::now_date_time();
-
-    // Bound to this request: the digest we sent and the nonce we drew.
-    // Authenticated transport alone would still not prove that a valid
-    // old token answered this particular request.
-    let token = timestamp::verified_token(&response, &digest, algorithm, Some(&nonce))
-        .map_err(|e: TimestampError| SignErrorKind::Timestamp(format!("{e}")))?;
-    require_live_timestamp_time(&token, requested_at, received_at)?;
-    Ok(token)
-}
-
-fn post_timestamp_query(
-    uri: &refineid_lib_core::text::Uri,
-    timestamp_query_der: &[u8],
-    max_response: usize,
-    credentials: Option<&TimestampCredentials>,
-    retry_transient: bool,
-) -> Result<Vec<u8>, crate::http::HttpError> {
-    if !retry_transient {
-        return post_timestamp_query_once(uri, timestamp_query_der, max_response, credentials);
-    }
-    retry_timestamp_query(
-        || post_timestamp_query_once(uri, timestamp_query_der, max_response, credentials),
-        |delay, error| {
-            eprintln!(
-                "timestamp authority temporarily unavailable ({error}); retrying in {} seconds",
-                delay.as_secs()
-            );
-            std::thread::sleep(delay);
-        },
-    )
-}
-
-fn post_timestamp_query_once(
-    uri: &refineid_lib_core::text::Uri,
-    timestamp_query_der: &[u8],
-    max_response: usize,
-    credentials: Option<&TimestampCredentials>,
-) -> Result<Vec<u8>, crate::http::HttpError> {
-    credentials.map_or_else(
-        || {
-            crate::http::post_authority(
-                uri,
-                "application/timestamp-query",
-                timestamp_query_der,
-                max_response,
-                crate::user_agent::honest(),
-                None,
-            )
-        },
-        |credentials| {
-            credentials.with_authorization_header(|header| {
-                crate::http::post_authority(
-                    uri,
-                    "application/timestamp-query",
-                    timestamp_query_der,
-                    max_response,
-                    crate::user_agent::honest(),
-                    Some(header),
-                )
-            })
-        },
-    )
-}
-
-fn retry_timestamp_query<T>(
-    mut post: impl FnMut() -> Result<T, crate::http::HttpError>,
-    mut wait: impl FnMut(core::time::Duration, &crate::http::HttpError),
-) -> Result<T, crate::http::HttpError> {
-    let mut delay = TIMESTAMP_RETRY_INITIAL_DELAY;
-    loop {
-        match post() {
-            Ok(response) => return Ok(response),
-            Err(error) if error.is_retryable_authority_failure() => {
-                wait(delay, &error);
-                delay = delay
-                    .checked_mul(2)
-                    .unwrap_or(TIMESTAMP_RETRY_MAX_DELAY)
-                    .min(TIMESTAMP_RETRY_MAX_DELAY);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-const fn retry_transient_authority_failures(authority_count: usize) -> bool {
-    authority_count == 1
-}
-
-/// Require a nonce-bound response to describe the exchange that just ran.
-fn require_live_timestamp_time(
-    token: &VerifiedTimestampToken,
-    requested_at: DateTime,
-    received_at: DateTime,
-) -> Result<(), SignErrorKind> {
-    let earliest = requested_at
-        .unix_duration()
-        .saturating_sub(MAX_TIMESTAMP_CLOCK_SKEW);
-    let latest = received_at
-        .unix_duration()
-        .saturating_add(MAX_TIMESTAMP_CLOCK_SKEW);
-    let generated = token.generated_at.unix_duration();
-    if generated < earliest || generated > latest {
-        return Err(SignErrorKind::Timestamp(format!(
-            "authenticated genTime {} is outside this request's clock-skew window",
-            token.generated_at
-        )));
-    }
-    Ok(())
-}
-
-struct CollectedTimestamps {
-    tokens: Vec<VerifiedTimestampToken>,
-    material: ValidationMaterial,
-}
-
-/// Obtain and verify every signature timestamp that remains usable.
-///
-/// Authorities are alternatives: a refused answer is reported and
-/// skipped, while loss of every requested answer is fatal. The
-/// authority itself is trusted as configured -- whoever names one
-/// answers for it. LT/LTA additionally collects chain and current
-/// revocation evidence for each retained token, anchored on the
-/// certificates the token itself carries.
-fn collect_document_timestamps(
-    request: Option<&DocumentRequest>,
-    authorities: &[String],
-    plan: &DocumentPlan,
-    parameters: &SignerParameters<'_>,
-    signature_bytes: &[u8],
-) -> Result<CollectedTimestamps, SignErrorKind> {
-    let keep_material = request.is_some_and(DocumentRequest::requires_long_term_material);
-    let credentials = request.and_then(|request| request.timestamp_credentials.as_ref());
-    let mut tokens = Vec::with_capacity(authorities.len());
-    let mut material = ValidationMaterial::default();
-    let mut refusals = Vec::new();
-    for url in authorities {
-        let token = match fetch_timestamp(
-            url,
-            credentials,
-            retry_transient_authority_failures(authorities.len()),
-            plan,
-            parameters,
-            signature_bytes,
-            parameters.digest_algorithm,
-        ) {
-            Ok(token) => token,
-            Err(why) => {
-                refusals.push(format!("{url}: {why}"));
-                continue;
-            }
-        };
-        if keep_material {
-            match timestamp_validation_material(&token) {
-                Ok(evidence) => merge_material(&mut material, evidence),
-                Err(why) => {
-                    refusals.push(format!(
-                        "{url}: returned a cryptographically valid token, but complete current validation evidence for its chain could not be collected: {why}"
-                    ));
-                    continue;
-                }
-            }
-        }
-        tokens.push(token);
-    }
-    if (!authorities.is_empty()
-        || request.is_some_and(DocumentRequest::requires_long_term_material))
-        && tokens.is_empty()
-    {
-        let detail = if refusals.is_empty() {
-            "no timestamp authority was configured".to_owned()
-        } else {
-            refusals.join("; ")
-        };
-        return Err(SignErrorKind::Timestamp(format!(
-            "no timestamp authority produced an acceptable token, so the signature would carry no attested time -- {detail}"
-        )));
-    }
-    for refusal in &refusals {
-        eprintln!("timestamp authority declined, continuing without it -- {refusal}");
-    }
-    Ok(CollectedTimestamps { tokens, material })
-}
-
-/// What [`assemble_document`] made.
-#[derive(Debug, PartialEq, Eq)]
-struct AssembledDocument {
-    /// The finished document.
-    bytes: Vec<u8>,
-    /// Timestamp tokens in it, archive timestamp included.
-    timestamps: usize,
-    /// The best-signature-time of its signature timestamps.
-    best_signature_time: Option<BestSignatureTime>,
-}
-
-impl AssembledDocument {
-    /// `bytes` carrying `signature_timestamps`, plus one archive
-    /// timestamp when `archive_timestamp_obtained`.
-    fn new(
-        bytes: Vec<u8>,
-        signature_timestamps: &[VerifiedTimestampToken],
-        archive_timestamp_obtained: bool,
-    ) -> Self {
-        Self {
-            bytes,
-            timestamps: reported_timestamp_tokens(
-                signature_timestamps.len(),
-                archive_timestamp_obtained,
-            ),
-            best_signature_time: BestSignatureTime::of_signature_timestamps(signature_timestamps),
-        }
-    }
-}
-
-/// Fetch the timestamps and evidence a document signature asked for,
-/// then assemble it.
-///
-/// Everything here needs the network and the signature both, so it can
-/// only run once the card has answered -- and it runs with the card
-/// still held, because the signer parameters borrow a certificate that
-/// lives only for this session.
-fn assemble_document(
-    options: &SignOptions,
-    plan: DocumentPlan,
-    parameters: &SignerParameters<'_>,
-    signature_bytes: &[u8],
-    cert_der: &CertDer,
-) -> Result<AssembledDocument, SignErrorKind> {
-    // The timestamp is over the signature, so it can only be
-    // fetched now. That is a network round trip with the card
-    // still held exclusively; the alternative is dropping the
-    // card and re-reading the certificate to rebuild
-    // `parameters`, which trades a held reader for a second
-    // card session.
-    let request = options.document.as_ref();
-    let authorities = options
-        .document
-        .as_ref()
-        .map(|request| request.timestamp_authorities.as_slice())
-        .unwrap_or_default();
-    let CollectedTimestamps {
-        tokens,
-        material: mut timestamp_material,
-    } = collect_document_timestamps(request, authorities, &plan, parameters, signature_bytes)?;
-    let keep_material = request.is_some_and(DocumentRequest::requires_long_term_material);
-    let material = if keep_material {
-        // The tokens go in too, so the store answers for the
-        // authorities that attested the time as well as for the
-        // signer. The archive timestamp below cannot add new evidence
-        // after this store is written without changing the bytes it
-        // signs. It must therefore reuse a TSA path already frozen here;
-        // selection checks that exact coverage and revalidates current
-        // evidence before accepting the outer token. A later archive
-        // revision is where refreshed evidence for that token belongs.
-        let signer_anchors: Vec<&[u8]> = crate::trust_roots::PINNED_ROOT_DER
-            .iter()
-            .map(|(_label, der)| *der)
-            .collect();
-        let reference_time = tokens
-            .iter()
-            .map(|token| token.generated_at)
-            .min()
-            .unwrap_or_else(crate::card_check::now_date_time);
-        let signer_material = crate::validation_material::collect_chains(&[ChainStart {
-            leaf_der: cert_der.as_bytes(),
-            reference_time,
-            approved_anchor_ders: &signer_anchors,
-            nonce_policy: NoncePolicy::RequireEcho,
-            include_leaf: false,
-            include_anchor: false,
-        }])
-        .map_err(|e| SignErrorKind::Material(format!("signer path: {e}")))?;
-        merge_material(&mut timestamp_material, signer_material);
-        timestamp_material
-    } else {
-        ValidationMaterial::default()
-    };
-    let token_bytes: Vec<Vec<u8>> = tokens.iter().map(|token| token.token.clone()).collect();
-    // ASiC-E CAdES archives through a second manifest and a
-    // timestamp over it, not through the signature, so it
-    // branches here rather than after assembly.
-    if request.is_some_and(|r| r.archive)
-        && let Some(manifest) =
-            plan.archive_manifest(parameters, signature_bytes, parameters.digest_algorithm)
-    {
-        let digest = parameters.digest_algorithm.digest(&manifest);
-        let token = first_answering_token(
-            authorities,
-            request.and_then(|request| request.timestamp_credentials.as_ref()),
-            &digest,
-            parameters.digest_algorithm,
-            &material,
-        )?;
-        let archived = plan
-            .finish_archived(
-                parameters,
-                signature_bytes,
-                &token_bytes,
-                &material,
-                &manifest,
-                &token.token,
-            )
-            .map_err(SignErrorKind::Document)?;
-        return Ok(AssembledDocument::new(archived, &tokens, true));
-    }
-    let document = plan
-        .finish(parameters, signature_bytes, &token_bytes, &material)
-        .map_err(SignErrorKind::Document)?;
-    // The archive timestamp goes over the finished document,
-    // validation store and all, so it can only be taken once
-    // everything else is in place.
-    let (bytes, archive_timestamp_obtained) = if request.is_some_and(|r| r.archive) {
-        (
-            archive_timestamp(
-                &document,
-                authorities,
-                request.and_then(|request| request.timestamp_credentials.as_ref()),
-                parameters.digest_algorithm,
-                &material,
-            )?,
-            true,
-        )
-    } else {
-        (document, false)
-    };
-    Ok(AssembledDocument::new(
-        bytes,
-        &tokens,
-        archive_timestamp_obtained,
-    ))
-}
-
-fn reported_timestamp_tokens(
-    signature_timestamps: usize,
-    archive_timestamp_obtained: bool,
-) -> usize {
-    signature_timestamps.saturating_add(usize::from(archive_timestamp_obtained))
-}
-
-/// One RFC 3161 token from one authority, over `digest`.
-///
-/// The nonce is checked back, so an answer replayed from an earlier
-/// exchange is refused rather than accepted as fresh.
-fn request_token(
-    url: &str,
-    credentials: Option<&TimestampCredentials>,
-    retry_transient: bool,
-    digest: &[u8],
-    algorithm: DigestAlgorithm,
-) -> Result<VerifiedTimestampToken, SignErrorKind> {
-    /// Nonce width, as for the signature timestamps.
-    const NONCE_BYTES: usize = 8;
-    /// Cap on the authority's answer.
-    const MAX_RESPONSE: usize = 64 * 1024;
-
-    let nonce = refineid_lib_core::rng::array::<NONCE_BYTES>()
-        .map_err(|e| SignErrorKind::Timestamp(format!("no random nonce: {e}")))?;
-    let timestamp_query_der = timestamp::request(digest, algorithm, Some(&nonce), true);
-    let uri = refineid_lib_core::text::Uri::parse(url.to_owned())
-        .map_err(|e| SignErrorKind::Timestamp(format!("{url}: {e}")))?;
-    let requested_at = crate::card_check::now_date_time();
-    let response = post_timestamp_query(
-        &uri,
-        &timestamp_query_der,
-        MAX_RESPONSE,
-        credentials,
-        retry_transient,
-    )
-    .map_err(|e| SignErrorKind::Timestamp(format!("POST {url}: {e}")))?;
-    let received_at = crate::card_check::now_date_time();
-    let token = timestamp::verified_token(&response, digest, algorithm, Some(&nonce))
-        .map_err(|e: TimestampError| SignErrorKind::Timestamp(format!("{e}")))?;
-    require_live_timestamp_time(&token, requested_at, received_at)?;
-    Ok(token)
-}
-
-/// Wrap `pdf` in a `PAdES` document timestamp.
-///
-/// A further revision whose `/Contents` is an RFC 3161 token over the
-/// whole file, this dictionary included. It attests that the signature
-/// and the evidence beside it existed intact at a time a third party
-/// vouches for -- which is what makes the evidence archivable rather
-/// than merely present.
-fn archive_timestamp(
-    pdf: &[u8],
-    urls: &[String],
-    credentials: Option<&TimestampCredentials>,
-    algorithm: DigestAlgorithm,
-    covered_material: &ValidationMaterial,
-) -> Result<Vec<u8>, SignErrorKind> {
-    /// Room for the token. Generous: a token with the authority's
-    /// certificate chain in it runs to a few kilobytes.
-    const CAPACITY: usize = 16_384;
-    let placeholder = refineid_lib_core::sign::pades::prepare_document_timestamp(pdf, CAPACITY)
-        .map_err(|e| SignErrorKind::Document(DocumentError::Pdf(e)))?;
-    let token = first_answering_token(
-        urls,
-        credentials,
-        &placeholder.digest(algorithm),
-        algorithm,
-        covered_material,
-    )?;
-    placeholder
-        .finish(&token.token)
-        .map_err(|e| SignErrorKind::Document(DocumentError::Pdf(e)))
-}
-
-/// A token from the first authority that answers.
-///
-/// An archive timestamp is one token, not a set: the PDF revision has a
-/// single `/Contents` and the `ASiC` archive manifest names a single
-/// file. The authorities are tried in the order given, so put the one
-/// most trusted first; a refusal moves to the next rather than ending
-/// the signing, and only silence from all of them is fatal.
-fn first_answering_token(
-    urls: &[String],
-    credentials: Option<&TimestampCredentials>,
-    digest: &[u8],
-    algorithm: DigestAlgorithm,
-    covered_material: &ValidationMaterial,
-) -> Result<VerifiedTimestampToken, SignErrorKind> {
-    let mut refusals = Vec::new();
-    for url in urls {
-        match request_token(
-            url,
-            credentials,
-            retry_transient_authority_failures(urls.len()),
-            digest,
-            algorithm,
-        ) {
-            Ok(token) => {
-                if let Err(why) = authenticate_archive_timestamp(&token, covered_material) {
-                    refusals.push(format!(
-                        "{url} returned an archive timestamp without complete current validation evidence ({why}), trying the next"
-                    ));
-                    continue;
-                }
-                for refusal in &refusals {
-                    eprintln!("archive timestamp: {refusal}");
-                }
-                return Ok(token);
-            }
-            Err(why) => refusals.push(format!("{url} declined ({why}), trying the next")),
-        }
-    }
-    Err(SignErrorKind::Timestamp(if urls.is_empty() {
-        "an archive timestamp needs an authority".to_owned()
-    } else {
-        format!(
-            "no authority produced an acceptable archive timestamp -- {}",
-            refusals.join("; ")
-        )
-    }))
-}
-
-/// Prove the outer timestamp has complete current validation evidence
-/// before selecting it.
-///
-/// The returned evidence is deliberately only an acceptance gate. It
-/// cannot be embedded in the revision the token signs without changing
-/// those signed bytes; a later archive revision is where evidence for
-/// the preceding outer timestamp belongs.
-fn authenticate_archive_timestamp(
-    token: &VerifiedTimestampToken,
-    covered_material: &ValidationMaterial,
-) -> Result<(), String> {
-    authenticate_archive_timestamp_with(token, covered_material, timestamp_validation_material)
-}
-
-fn authenticate_archive_timestamp_with<F>(
-    token: &VerifiedTimestampToken,
-    covered_material: &ValidationMaterial,
-    collect_evidence: F,
-) -> Result<(), String>
-where
-    F: FnOnce(&VerifiedTimestampToken) -> Result<ValidationMaterial, String>,
-{
-    let path = embedded_timestamp_path(token)?;
-    require_archive_path_covered(&path, covered_material)?;
-    let _verified_current_evidence = collect_evidence(token)?;
-    Ok(())
-}
-
-/// Require every certificate verified for the outer token to be
-/// inside the LT store that token is about to cover.
-///
-/// Exact DER comparison includes the TSA leaf, intermediates, and the
-/// chain's anchor. A signer rotation after the inner signature
-/// timestamps were collected therefore moves to the next authority
-/// instead of producing an archive whose path is outside its signed
-/// validation store.
-fn require_archive_path_covered(
-    path: &[Vec<u8>],
-    covered_material: &ValidationMaterial,
-) -> Result<(), String> {
-    if path.is_empty() {
-        return Err("outer timestamp has an empty authenticated certificate path".to_owned());
-    }
-    if path
-        .iter()
-        .all(|certificate| covered_material.certificates.contains(certificate))
-    {
-        return Ok(());
-    }
-    Err(
-        "outer timestamp certificate path is not byte-for-byte covered by embedded LT material"
-            .to_owned(),
-    )
-}
-
-/// The token's certificate path, verified within its own embedded
-/// chain.
-///
-/// The authority is trusted as configured -- whoever names one answers
-/// for it. What is still verified is internal consistency: the signer
-/// must chain, with valid signatures and validity windows, to an
-/// anchor the token itself carries.
-fn embedded_timestamp_path(token: &VerifiedTimestampToken) -> Result<Vec<Vec<u8>>, String> {
-    let anchors = embedded_anchor_ders(token);
-    if anchors.is_empty() {
-        return Err("the token embeds no certificate usable as its chain anchor".to_owned());
-    }
-    let embedded: Vec<&[u8]> = token
-        .embedded_certificates
-        .iter()
-        .map(Vec::as_slice)
-        .collect();
-    crate::validation_material::verify_chain_to_approved_anchor(
-        &token.signer_certificate,
-        token.generated_at,
-        &anchors,
-        &embedded,
-    )
-    .map_err(|e| format!("no valid path within the token's embedded chain: {e}"))
-}
-
-/// The embedded certificates a token's path may stop at.
-///
-/// Preferring self-issued anchors makes the path run as deep as the
-/// token allows, so LT evidence covers the intermediates rather than
-/// stopping at the signer's immediate issuer.
-fn embedded_anchor_ders(token: &VerifiedTimestampToken) -> Vec<&[u8]> {
-    anchor_candidates(
-        &token.signer_certificate,
-        &token.embedded_certificates,
-        |der| {
-            OwnedCert::from_der(der).is_ok_and(|certificate| {
-                let view = certificate.view();
-                view.issuer.as_der() == view.subject.as_der()
-            })
-        },
-    )
-}
-
-/// The self-issued embedded certificates; without any, every embedded
-/// certificate above the token's signer, and the signer itself only
-/// when the token embeds nothing else.
-///
-/// A path ends at its anchor without asking for the anchor's status,
-/// so an anchored signer would leave the authority's own certificate
-/// without revocation evidence, and the signature without level LT.
-fn anchor_candidates<'a>(
-    signer: &[u8],
-    embedded: &'a [Vec<u8>],
-    is_self_issued: impl Fn(&[u8]) -> bool,
-) -> Vec<&'a [u8]> {
-    let self_issued: Vec<&[u8]> = embedded
-        .iter()
-        .map(Vec::as_slice)
-        .filter(|der| is_self_issued(der))
-        .collect();
-    if !self_issued.is_empty() {
-        return self_issued;
-    }
-    let above_signer: Vec<&[u8]> = embedded
-        .iter()
-        .map(Vec::as_slice)
-        .filter(|der| *der != signer)
-        .collect();
-    if above_signer.is_empty() {
-        embedded.iter().map(Vec::as_slice).collect()
-    } else {
-        above_signer
-    }
-}
-
-/// Collect chain and current revocation evidence for one token,
-/// anchored on the certificates the token itself carries.
-///
-/// LT and LTA retain the result for their validation store; level T
-/// has no store and skips this entirely.
-fn timestamp_validation_material(
-    token: &VerifiedTimestampToken,
-) -> Result<ValidationMaterial, String> {
-    let anchors = embedded_anchor_ders(token);
-    if anchors.is_empty() {
-        return Err("the token embeds no certificate usable as its chain anchor".to_owned());
-    }
-    let candidates: Vec<&[u8]> = token
-        .embedded_certificates
-        .iter()
-        .map(Vec::as_slice)
-        .collect();
-    crate::validation_material::collect_chains_with_candidates(
-        &[ChainStart {
-            leaf_der: &token.signer_certificate,
-            reference_time: token.generated_at,
-            approved_anchor_ders: &anchors,
-            nonce_policy: NoncePolicy::AllowMissingEcho,
-            include_leaf: true,
-            include_anchor: true,
-        }],
-        &candidates,
-    )
-    .map_err(|e| e.to_string())
-}
-
-/// Merge independently authenticated evidence without storing the same
-/// DER object more than once.
-fn merge_material(into: &mut ValidationMaterial, from: ValidationMaterial) {
-    merge_unique(&mut into.certificates, from.certificates);
-    merge_unique(&mut into.ocsp_responses, from.ocsp_responses);
-    merge_unique(&mut into.crls, from.crls);
-}
-
-fn merge_unique(into: &mut Vec<Vec<u8>>, from: Vec<Vec<u8>>) {
-    for item in from {
-        if !into.contains(&item) {
-            into.push(item);
-        }
-    }
-}
-
-/// The signer parameters a document signature is built from.
-///
-/// Digest and signature algorithm are taken from the certificate
-/// rather than chosen: the card will sign with the key the
-/// certificate names, under the one chain `sign_dispatch_by_alg`
-/// drives for that key shape. Naming a different digest here would
-/// produce a structure that claims one thing and carries another.
-const fn document_signer<'a>(
-    cert: &'a Certificate<'a>,
-    cert_algorithm: PublicKeyAlgorithm,
-    slot: SignSlot,
-    signing_time: SigningTime,
-) -> Result<SignerParameters<'a>, SignErrorKind> {
-    let (digest_algorithm, signature_algorithm) = match cert_algorithm {
-        PublicKeyAlgorithm::Rsa { .. } => {
-            (DigestAlgorithm::Sha256, SignatureAlgorithm::RsaPkcs1Sha256)
-        }
-        PublicKeyAlgorithm::Ec(EcCurve::Secp384r1) => {
-            (DigestAlgorithm::Sha384, SignatureAlgorithm::EcdsaSha384)
-        }
-        PublicKeyAlgorithm::Ec(_)
-        | PublicKeyAlgorithm::EcExplicit { .. }
-        | PublicKeyAlgorithm::Other => {
-            return Err(SignErrorKind::UnsupportedDocumentKey(slot));
-        }
-    };
-    Ok(SignerParameters {
-        certificate: cert,
-        digest_algorithm,
-        signature_algorithm,
-        signing_time: Some(signing_time),
-    })
-}
-
-/// Read every file the request covers, in the order it named them.
-///
-/// The primary input is already in memory, so it is reused rather
-/// than read twice; a container that signed a file which changed
-/// between the two reads would attest something that never existed.
-fn load_data_objects(
-    options: &SignOptions,
-    request: &DocumentRequest,
-    input_bytes: &[u8],
-) -> Result<Vec<DataObject>, SignErrorKind> {
-    let mut objects = vec![data_object(&options.input, input_bytes.to_vec())];
-    for path in &request.additional_inputs {
-        let content = std::fs::read(path).map_err(|source| SignErrorKind::InputRead {
-            path: path.clone(),
-            source,
-        })?;
-        objects.push(data_object(path, content));
-    }
-    Ok(objects)
-}
-
-/// Name and media type for one file inside a container.
-///
-/// The name is the file name alone: a container entry called
-/// `/home/someone/dossier.pdf` would leak a path and break the
-/// archive layout both.
-fn data_object(path: &std::path::Path, content: Vec<u8>) -> DataObject {
-    let name = path
-        .file_name()
-        .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned());
-    DataObject {
-        mime_type: media_type_for(path).to_owned(),
-        name,
-        content,
-    }
-}
-
-/// Media type guessed from the extension.
-///
-/// A guess is all this can be, and it is recorded in the signature,
-/// so the fallback is the honest one rather than a plausible one.
-fn media_type_for(path: &std::path::Path) -> &'static str {
-    match path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("pdf") => "application/pdf",
-        Some("txt") => "text/plain",
-        Some("xml") => "text/xml",
-        Some("html" | "htm") => "text/html",
-        Some("json") => "application/json",
-        Some("csv") => "text/csv",
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("odt") => "application/vnd.oasis.opendocument.text",
-        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        _ => "application/octet-stream",
-    }
 }
 
 /// Hoist [`pace::PaceError`] onto [`SignErrorKind`], with the
@@ -2113,17 +906,9 @@ impl fmt::Display for SignReport {
             f,
             "output: {} ({} bytes)",
             self.signature_path.display(),
-            self.output_len
+            self.signature_len
         )?;
-        // Named separately from the file size, which for a document
-        // format is the whole document rather than the signature.
         writeln!(f, "card signature: {} bytes", self.signature_len)?;
-        // How many tokens were obtained, including the outer archive
-        // timestamp. This is deliberately not called an authority
-        // count because one authority may issue both kinds of token.
-        if self.timestamps > 0 {
-            writeln!(f, "timestamp tokens obtained: {}", self.timestamps)?;
-        }
         if let Some(p) = &self.cert_path {
             writeln!(f, "cert DER: {}", p.display())?;
         }
@@ -2145,42 +930,6 @@ mod tests {
     use super::*;
     use crate::test_util::{TestResult, check, check_true};
     use refineid_lib_core::apdu::status_word::PinRetries;
-
-    /// A locale environment of `(variable, value)` pairs.
-    fn locale_lookup(set: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let set: Vec<(String, String)> = set
-            .iter()
-            .map(|&(name, value)| (name.to_owned(), value.to_owned()))
-            .collect();
-        move |name| {
-            set.iter()
-                .find(|(variable, _)| variable == name)
-                .map(|(_, value)| value.clone())
-        }
-    }
-
-    #[test]
-    fn the_stamp_language_follows_the_message_locale_precedence() {
-        for (set, language) in [
-            (&[][..], StampLanguage::English),
-            (&[("LANG", "fi_FI.UTF-8")][..], StampLanguage::Finnish),
-            (
-                &[("LANG", "fi_FI.UTF-8"), ("LC_MESSAGES", "sv_SE.UTF-8")][..],
-                StampLanguage::Swedish,
-            ),
-            (
-                &[("LC_MESSAGES", "sv_SE.UTF-8"), ("LC_ALL", "en_GB.UTF-8")][..],
-                StampLanguage::English,
-            ),
-            (
-                &[("LC_ALL", ""), ("LANG", "fi_FI.UTF-8")][..],
-                StampLanguage::Finnish,
-            ),
-            (&[("LANG", "C")][..], StampLanguage::English),
-        ] {
-            assert_eq!(stamp_language(locale_lookup(set)), language, "{set:?}");
-        }
-    }
 
     // ---- SignSlot: the FINEID slot -> {key ref, PIN, cert}
     // mapping (S1 v4.2 §3.5). Getting any of these wrong signs
@@ -2218,84 +967,6 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_credentials_are_encoded_and_redacted() -> TestResult {
-        let user = "test-user";
-        let pass = "test-pass";
-        let credentials =
-            TimestampCredentials::new(user.to_owned(), pass.to_owned()).map_err(str::to_owned)?;
-        let expected_header = format!(
-            "Basic {}",
-            refineid_lib_core::base64::encode(format!("{user}:{pass}").as_bytes())
-        );
-        check(
-            &credentials.authorization_header().as_str(),
-            &expected_header.as_str(),
-            "RFC 7617 Basic header",
-        )?;
-        check_true(
-            !format!("{credentials:?}").contains(user)
-                && !format!("{credentials:?}").contains(pass),
-            "credential debug output is redacted",
-        )
-    }
-
-    #[test]
-    fn timestamp_retry_uses_capped_exponential_backoff_until_success() {
-        assert!(retry_transient_authority_failures(1));
-        assert!(!retry_transient_authority_failures(2));
-        let mut attempts = 0_u8;
-        let mut delays = Vec::new();
-        let token = retry_timestamp_query(
-            || {
-                attempts = attempts.saturating_add(1);
-                if attempts <= 8 {
-                    Err(crate::http::HttpError::HttpStatus {
-                        code: 429,
-                        reason: "Too Many Requests".to_owned(),
-                        location: None,
-                    })
-                } else {
-                    Ok("timestamp")
-                }
-            },
-            |delay, _error| delays.push(delay),
-        )
-        .expect("a later attempt succeeds");
-        assert_eq!(token, "timestamp");
-        assert_eq!(attempts, 9);
-        assert_eq!(
-            delays,
-            [1, 2, 4, 8, 16, 32, 60, 60].map(core::time::Duration::from_secs)
-        );
-    }
-
-    #[test]
-    fn timestamp_retry_does_not_repeat_authentication_failure() {
-        let mut attempts = 0_u8;
-        let error = retry_timestamp_query(
-            || {
-                attempts = attempts.saturating_add(1);
-                Err::<(), _>(crate::http::HttpError::HttpStatus {
-                    code: 401,
-                    reason: "Unauthorized".to_owned(),
-                    location: None,
-                })
-            },
-            |_delay, _error| panic!("permanent failure must not wait"),
-        )
-        .expect_err("authentication failure is permanent");
-        assert!(matches!(
-            error,
-            crate::http::HttpError::HttpStatus { code: 401, .. }
-        ));
-        assert_eq!(attempts, 1);
-    }
-
-    // ---- LocalVerifyOutcome: is_ok / is_failed keep "rejected"
-    // and "not run" distinct, because the CLI maps only Failed to
-    // a sign-flow failure. ----
-
-    #[test]
     fn local_verify_predicates_separate_ok_failed_skipped() -> TestResult {
         check_true(LocalVerifyOutcome::Ok.is_ok(), "Ok.is_ok")?;
         check_true(!LocalVerifyOutcome::Ok.is_failed(), "Ok.is_failed")?;
@@ -2323,439 +994,6 @@ mod tests {
             "skipped",
         )
     }
-
-    #[test]
-    fn archive_request_implies_lt_material_for_direct_api_callers() -> TestResult {
-        let mut request = DocumentRequest {
-            format: Format::Pades,
-            additional_inputs: Vec::new(),
-            signing_time: SigningTime {
-                year: 2026,
-                month: 8,
-                day: 4,
-                hour: 12,
-                minute: 0,
-                second: 0,
-            },
-            metadata: SignatureMetadata::default(),
-            expected_serial: None,
-            visible_signature: None,
-            archive: true,
-            long_term: false,
-            timestamp_authorities: Vec::new(),
-            timestamp_credentials: None,
-        };
-        check_true(
-            request.requires_long_term_material(),
-            "archive implies complete LT collection independently of CLI normalization",
-        )?;
-        check_true(
-            request.validate_signing_policy().is_err(),
-            "missing archive authority is rejected before card access",
-        )?;
-        request
-            .timestamp_authorities
-            .push("https://tsa.example/qualified".to_owned());
-        check_true(
-            request.validate_signing_policy().is_ok(),
-            "archive with authority is normalized to LT",
-        )?;
-        request.timestamp_credentials = Some(
-            TimestampCredentials::new("user".to_owned(), "password".to_owned())
-                .map_err(str::to_owned)?,
-        );
-        check_true(
-            request.validate_signing_policy().is_ok(),
-            "one HTTPS authority may carry credentials",
-        )?;
-        request.timestamp_authorities[0] = "http://tsa.example/qualified".to_owned();
-        check_true(
-            request.validate_signing_policy().is_err(),
-            "credential transport is rejected before card access",
-        )?;
-        request.timestamp_authorities[0] = "https://tsa.example/qualified".to_owned();
-        request.timestamp_credentials = None;
-        request.format = Format::Cades;
-        check_true(
-            matches!(
-                request.validate_signing_policy(),
-                Err(SignErrorKind::Document(DocumentError::ArchiveUnsupported))
-            ),
-            "unsupported archive format rejected before card access",
-        )
-    }
-
-    #[test]
-    fn signing_is_bound_to_the_displayed_card() -> TestResult {
-        let displayed = TokenSerial::new("displayed-card".to_owned());
-        let same = TokenSerial::new("displayed-card".to_owned());
-        let replacement = TokenSerial::new("replacement-card".to_owned());
-        ensure_expected_serial(&displayed, Some(&same))?;
-        check_true(
-            ensure_expected_serial(&displayed, Some(&replacement)).is_err(),
-            "card swap is refused",
-        )?;
-        check_true(
-            ensure_expected_serial(&displayed, None).is_err(),
-            "missing live serial is refused",
-        )
-    }
-
-    #[test]
-    fn successful_archive_timestamp_is_included_in_reported_token_count() -> TestResult {
-        check(
-            &reported_timestamp_tokens(2, true),
-            &3_usize,
-            "two signature timestamps and one archive timestamp",
-        )?;
-        check(
-            &reported_timestamp_tokens(2, false),
-            &2_usize,
-            "signature timestamps without archive",
-        )
-    }
-
-    fn self_anchored_token_fixture() -> Result<VerifiedTimestampToken, Box<dyn core::error::Error>>
-    {
-        let signer_der = crate::trust_roots::PINNED_ROOT_DER
-            .first()
-            .map(|(_label, der)| *der)
-            .ok_or("missing test trust anchor")?;
-        let signer = OwnedCert::from_der(signer_der)?;
-        let generated_at = signer.view().not_before;
-        Ok(VerifiedTimestampToken {
-            token: vec![1],
-            signer_certificate: signer_der.to_vec(),
-            embedded_certificates: vec![signer_der.to_vec()],
-            generated_at,
-        })
-    }
-
-    #[test]
-    fn a_timestamp_signer_is_an_anchor_only_when_the_token_embeds_nothing_else() -> TestResult {
-        let signer = b"synthetic-timestamp-signer".to_vec();
-        let intermediate = b"synthetic-timestamp-intermediate".to_vec();
-        let root = b"synthetic-timestamp-root".to_vec();
-        let not_self_issued = |_: &[u8]| false;
-        check(
-            &anchor_candidates(
-                &signer,
-                &[signer.clone(), intermediate.clone()],
-                not_self_issued,
-            ),
-            &vec![intermediate.as_slice()],
-            "the signer under an embedded intermediate is no anchor",
-        )?;
-        check(
-            &anchor_candidates(&signer, std::slice::from_ref(&signer), not_self_issued),
-            &vec![signer.as_slice()],
-            "a lone embedded signer is its own anchor",
-        )?;
-        check(
-            &anchor_candidates(
-                &signer,
-                &[signer.clone(), intermediate.clone(), root.clone()],
-                |der| der == root.as_slice(),
-            ),
-            &vec![root.as_slice()],
-            "an embedded self-issued certificate is the anchor",
-        )
-    }
-
-    #[test]
-    fn embedded_path_terminates_at_the_tokens_own_anchor() -> TestResult {
-        let token = self_anchored_token_fixture()?;
-        let path = embedded_timestamp_path(&token)?;
-        check(
-            &path,
-            &vec![token.signer_certificate],
-            "the embedded self-issued certificate terminates the path",
-        )
-    }
-
-    #[test]
-    fn archive_rejects_a_token_without_current_complete_evidence() -> TestResult {
-        let token = self_anchored_token_fixture()?;
-        let covered_material = ValidationMaterial {
-            certificates: vec![token.signer_certificate.clone()],
-            ..ValidationMaterial::default()
-        };
-        let error = authenticate_archive_timestamp_with(&token, &covered_material, |_token| {
-            Err("current validation evidence unavailable".to_owned())
-        })
-        .err()
-        .ok_or("archive token unexpectedly survived missing validation evidence")?;
-        check(
-            &error,
-            &"current validation evidence unavailable".to_owned(),
-            "archive evidence failure",
-        )
-    }
-
-    #[test]
-    fn archive_path_must_be_frozen_in_the_covered_lt_store() -> TestResult {
-        let leaf = b"archive-tsa-leaf".to_vec();
-        let identity = b"archive-tsa-service-identity".to_vec();
-        let covered_material = ValidationMaterial {
-            certificates: vec![leaf.clone(), identity.clone()],
-            ..ValidationMaterial::default()
-        };
-        check(
-            &require_archive_path_covered(&[leaf, identity.clone()], &covered_material),
-            &Ok(()),
-            "covered archive path",
-        )?;
-
-        let rotated = b"rotated-archive-tsa-leaf".to_vec();
-        let error = require_archive_path_covered(&[rotated, identity], &covered_material)
-            .err()
-            .ok_or("rotated outer timestamp path unexpectedly passed LT coverage")?;
-        check_true(
-            error.contains("not byte-for-byte covered"),
-            "rotated path is rejected",
-        )
-    }
-
-    #[test]
-    fn validation_material_merge_deduplicates_each_der_collection() -> TestResult {
-        let mut material = ValidationMaterial {
-            certificates: vec![vec![1]],
-            ocsp_responses: vec![vec![2]],
-            crls: vec![vec![3]],
-        };
-        merge_material(
-            &mut material,
-            ValidationMaterial {
-                certificates: vec![vec![1], vec![4]],
-                ocsp_responses: vec![vec![2], vec![5]],
-                crls: vec![vec![3], vec![6]],
-            },
-        );
-        check(
-            &material,
-            &ValidationMaterial {
-                certificates: vec![vec![1], vec![4]],
-                ocsp_responses: vec![vec![2], vec![5]],
-                crls: vec![vec![3], vec![6]],
-            },
-            "merged material",
-        )
-    }
-
-    #[test]
-    fn an_archived_document_is_named_by_its_signature_timestamp() -> TestResult {
-        /// A synthetic signature timestamp generation time.
-        const SIGNATURE_TIMESTAMP_AT: u64 = 1_000_000_000;
-        /// The document timestamp a synthetic archive step adds later.
-        const DOCUMENT_TIMESTAMP_DELAY: u64 = 60;
-        /// A synthetic clock reading, after both.
-        const CLOCK_DELAY: u64 = 3_600;
-        let at = |seconds| DateTime::from_unix_duration(core::time::Duration::from_secs(seconds));
-        let signature_timestamp = VerifiedTimestampToken {
-            token: Vec::new(),
-            signer_certificate: Vec::new(),
-            embedded_certificates: Vec::new(),
-            generated_at: at(SIGNATURE_TIMESTAMP_AT)?,
-        };
-        let document_timestamp_at =
-            at(SIGNATURE_TIMESTAMP_AT.saturating_add(DOCUMENT_TIMESTAMP_DELAY))?;
-        let assembled = AssembledDocument::new(
-            b"synthetic document".to_vec(),
-            core::slice::from_ref(&signature_timestamp),
-            true,
-        );
-        check(
-            &assembled.timestamps,
-            &reported_timestamp_tokens(1, true),
-            "signature timestamp and document timestamp both counted",
-        )?;
-        let best = assembled
-            .best_signature_time
-            .map(BestSignatureTime::instant);
-        check(
-            &best,
-            &Some(signature_timestamp.generated_at),
-            "the signature timestamp's time",
-        )?;
-        check_true(
-            best != Some(document_timestamp_at),
-            "not the document timestamp's time",
-        )?;
-        let pending = PendingSignedName::new(
-            vec![PathBuf::from("/documents/report.pdf")],
-            Format::Pades,
-            at(SIGNATURE_TIMESTAMP_AT.saturating_add(CLOCK_DELAY))?,
-        );
-        check(
-            &SignOutput::SignedName(pending).path(assembled.best_signature_time),
-            &PathBuf::from("/documents/report-signed-2001-09-09T01-46-40Z.pdf"),
-            "named by the signature timestamp",
-        )
-    }
-
-    /// The pending default name of `/documents/report.pdf` at the
-    /// synthetic clock reading `seconds` after the epoch.
-    fn pending_report(
-        dir: &std::path::Path,
-        seconds: u64,
-    ) -> Result<PendingSignedName, Box<dyn core::error::Error>> {
-        Ok(PendingSignedName::new(
-            vec![dir.join("report.pdf")],
-            Format::Pades,
-            DateTime::from_unix_duration(core::time::Duration::from_secs(seconds))?,
-        ))
-    }
-
-    /// A synthetic clock reading.
-    const CLOCK_AT: u64 = 1_000_000_000;
-
-    #[test]
-    fn a_given_path_ignores_the_best_signature_time() -> TestResult {
-        let given = PathBuf::from("/documents/chosen.pdf");
-        let best = BestSignatureTime::of_signature_timestamps(&[VerifiedTimestampToken {
-            token: Vec::new(),
-            signer_certificate: Vec::new(),
-            embedded_certificates: Vec::new(),
-            generated_at: DateTime::from_unix_duration(core::time::Duration::from_secs(CLOCK_AT))?,
-        }]);
-        check_true(best.is_some(), "a best signature time")?;
-        check(
-            &SignOutput::At(given.clone()).path(best),
-            &given,
-            "the given path",
-        )
-    }
-
-    #[test]
-    fn a_default_name_never_replaces_an_existing_file() -> TestResult {
-        let dir = TempDir::new("signed-name-exists")?;
-        let output = SignOutput::SignedName(pending_report(dir.path(), CLOCK_AT)?);
-        let taken = output.path(None);
-        std::fs::write(&taken, b"earlier signature")?;
-        check_true(
-            matches!(
-                output.write(None, b"later signature"),
-                Err(SignErrorKind::SignatureWrite { ref path, .. }) if *path == taken
-            ),
-            "refused",
-        )?;
-        check(
-            &std::fs::read(&taken)?,
-            &b"earlier signature".to_vec(),
-            "the existing file is untouched",
-        )
-    }
-
-    #[test]
-    fn a_default_name_is_written_when_free_and_a_given_path_is_replaced() -> TestResult {
-        let dir = TempDir::new("signed-name-free")?;
-        let output = SignOutput::SignedName(pending_report(dir.path(), CLOCK_AT)?);
-        let written = output.write(None, b"signature")?;
-        check(&written, &output.path(None), "the default name")?;
-        check(&std::fs::read(&written)?, &b"signature".to_vec(), "content")?;
-        let given = dir.write("chosen.pdf", b"earlier")?;
-        SignOutput::At(given.clone()).write(None, b"later")?;
-        check(&std::fs::read(&given)?, &b"later".to_vec(), "replaced")
-    }
-
-    #[test]
-    fn live_timestamp_time_is_bounded_by_the_exchange() -> TestResult {
-        let requested_at =
-            DateTime::from_unix_duration(core::time::Duration::from_secs(1_700_000_000))?;
-        let received_at =
-            DateTime::from_unix_duration(core::time::Duration::from_secs(1_700_000_030))?;
-        let token_at = |seconds| -> Result<VerifiedTimestampToken, Box<dyn core::error::Error>> {
-            Ok(VerifiedTimestampToken {
-                token: Vec::new(),
-                signer_certificate: Vec::new(),
-                embedded_certificates: Vec::new(),
-                generated_at: DateTime::from_unix_duration(core::time::Duration::from_secs(
-                    seconds,
-                ))?,
-            })
-        };
-
-        require_live_timestamp_time(&token_at(1_699_999_700)?, requested_at, received_at)?;
-        require_live_timestamp_time(&token_at(1_700_000_330)?, requested_at, received_at)?;
-        check_true(
-            require_live_timestamp_time(&token_at(1_699_999_699)?, requested_at, received_at)
-                .is_err(),
-            "materially backdated token rejected",
-        )?;
-        check_true(
-            require_live_timestamp_time(&token_at(1_700_000_331)?, requested_at, received_at)
-                .is_err(),
-            "future token rejected",
-        )
-    }
-
-    #[test]
-    #[ignore = "needs the live Sectigo qualified timestamp service"]
-    fn live_sectigo_timestamp_response_verifies_directly() -> TestResult {
-        let digest = DigestAlgorithm::Sha384.digest(b"RefineID Sectigo interoperability probe");
-        let token = request_token(
-            "http://timestamp.sectigo.com/qualified",
-            None,
-            false,
-            &digest,
-            DigestAlgorithm::Sha384,
-        )?;
-        check_true(!token.token.is_empty(), "timestamp token returned")?;
-        check_true(
-            !token.signer_certificate.is_empty(),
-            "timestamp signer certificate authenticated",
-        )?;
-        check_true(
-            token.embedded_certificates.len() >= 2,
-            "timestamp signer chain retained",
-        )?;
-        let path = embedded_timestamp_path(&token)?;
-        check_true(!path.is_empty(), "timestamp path verified")?;
-        let material = timestamp_validation_material(&token)?;
-        check_true(
-            !material.certificates.is_empty(),
-            "timestamp path and LT evidence collected",
-        )
-    }
-
-    #[test]
-    #[ignore = "needs live timestamp authorities and revocation services"]
-    fn live_qualified_timestamp_and_lt_evidence_probe() -> TestResult {
-        let digest = [0_u8; 32];
-        let mut successes = 0_usize;
-        let mut failures = Vec::new();
-        for url in [DEFAULT_TIMESTAMP_AUTHORITY] {
-            let token = match request_token(url, None, false, &digest, DigestAlgorithm::Sha256) {
-                Ok(token) => token,
-                Err(error) => {
-                    failures.push(format!("{url}: {error}"));
-                    continue;
-                }
-            };
-            if let Err(error) = embedded_timestamp_path(&token) {
-                failures.push(format!("{url}: path: {error}"));
-                continue;
-            }
-            match timestamp_validation_material(&token) {
-                Ok(material) if !material.certificates.is_empty() => {
-                    successes = successes.saturating_add(1);
-                }
-                Ok(_empty) => failures.push(format!("{url}: LT material was empty")),
-                Err(error) => failures.push(format!("{url}: LT evidence: {error}")),
-            }
-        }
-        for failure in &failures {
-            eprintln!("{failure}");
-        }
-        check_true(
-            successes > 0,
-            "at least one configured authority produced a token with complete LT evidence",
-        )
-    }
-
-    // ---- SignErrorKind Display: each arm renders an
-    // operator-facing line; the PIN arms also pivot on the slot
-    // label and the VerifyOutcome shape. ----
 
     fn pin_retries(n: u8) -> Result<PinRetries, Box<dyn core::error::Error>> {
         PinRetries::from_nibble(n).ok_or_else(|| "bad nibble".into())
@@ -2916,8 +1154,6 @@ mod tests {
             signature_path: PathBuf::from("/tmp/out.sig"),
             cert_path: Some(PathBuf::from("/tmp/out.crt")),
             signature_len: 384,
-            timestamps: 0,
-            output_len: 384,
             cert_subject_cn: cn,
             pin_retries_after: None,
             local_verify: LocalVerifyOutcome::Ok,
@@ -2960,21 +1196,6 @@ mod tests {
     }
 
     #[test]
-    fn sign_report_labels_timestamp_tokens_without_calling_them_authorities() -> TestResult {
-        let mut report = sample_report(None);
-        report.timestamps = 2;
-        let rendered = report.to_string();
-        check_true(
-            rendered.contains("timestamp tokens obtained: 2"),
-            "inner and archive token count",
-        )?;
-        check_true(
-            !rendered.contains("timestamp authorities"),
-            "token count is not mislabeled as distinct authorities",
-        )
-    }
-
-    #[test]
     fn sign_report_display_omits_absent_optionals() -> TestResult {
         // No CN, no saved cert, no retry counter -> those lines
         // are skipped entirely.
@@ -3006,12 +1227,11 @@ mod tests {
         let (pin, asked) = counting_source();
         let options = SignOptions {
             input,
-            output: SignOutput::At(dir.path().join("signature.bin")),
+            output: dir.path().join("signature.bin"),
             pin,
             save_cert: None,
             reader_filter: None,
             can: None,
-            document: None,
         };
         let result = sign_with_slot(backend, SignSlot::Auth, options);
         Ok((result, prompts(&asked)))

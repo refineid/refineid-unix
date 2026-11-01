@@ -22,8 +22,8 @@ use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use refineid_doc_sign::cades::ecdsa_signature_to_cms;
 use refineid_lib_core::crypto::digest::Sha384;
-use refineid_lib_core::sign::cades::ecdsa_signature_to_cms;
 use refineid_lib_core::text::{Scheme, Uri};
 use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::operations::{

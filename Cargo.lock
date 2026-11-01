@@ -161,6 +161,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bp384"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc61f3a96b44a33fbb971e9917b81f4207d6dae9a6b0715845c785a48e73d9c2"
+dependencies = [
+ "elliptic-curve",
+ "primefield",
+ "primeorder",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -448,9 +459,11 @@ checksum = "9c035cb64cba03dad2fb921f3e218785e8cf9a41790da5eb3a1400f62fa2be11"
 dependencies = [
  "cpubits",
  "ctutils",
+ "hybrid-array",
  "num-traits",
  "rand_core 0.10.1",
  "serdect",
+ "subtle",
  "zeroize",
 ]
 
@@ -471,6 +484,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -489,6 +503,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2376ffd6f96d8a9db59875b4b6b0237d6900b5baf64279714e05493ce64828a"
 dependencies = [
  "cmov",
+ "subtle",
 ]
 
 [[package]]
@@ -612,6 +627,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
+name = "elliptic-curve"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "900f37e7e18d74a2347389af6cd69e3a30d5cc9e697f40004865679aa75e9c7c"
+dependencies = [
+ "base16ct",
+ "crypto-bigint",
+ "crypto-common 0.2.2",
+ "ff",
+ "group",
+ "hybrid-array",
+ "rand_core 0.10.1",
+ "sec1",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -652,6 +685,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "ff"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1f686ab92a9fb0eaf188f6c6c87b89490baa6fdb0db4544ba4dc47f7942489f"
+dependencies = [
+ "rand_core 0.10.1",
+ "subtle",
 ]
 
 [[package]]
@@ -1025,6 +1068,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "group"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
+dependencies = [
+ "ff",
+ "rand_core 0.10.1",
+ "subtle",
+]
+
+[[package]]
 name = "gsk4"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1230,7 +1284,9 @@ version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
+ "subtle",
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -1886,6 +1942,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "primefield"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
+dependencies = [
+ "crypto-bigint",
+ "crypto-common 0.2.2",
+ "ff",
+ "rand_core 0.10.1",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "primeorder"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c9f42978c78a00e3d68f69fc03e57a234debae69da4020a4fb588fcdcd07b06"
+dependencies = [
+ "elliptic-curve",
+ "primefield",
+ "wnaf",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2027,8 +2108,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-apdu"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "refineid-build-number",
  "zeroize",
@@ -2036,13 +2117,13 @@ dependencies = [
 
 [[package]]
 name = "refineid-atr"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 
 [[package]]
 name = "refineid-auth"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "hmac",
  "refineid-apdu",
@@ -2052,24 +2133,27 @@ dependencies = [
 
 [[package]]
 name = "refineid-ber"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 
 [[package]]
 name = "refineid-build-number"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 
 [[package]]
 name = "refineid-client"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
  "hex",
  "hickory-resolver",
  "refineid-dev-errors",
+ "refineid-doc-sign",
  "refineid-lib-core",
  "refineid-lib-pcsc",
  "refineid-lib-tls",
+ "refineid-pace",
+ "refineid-pcsc",
  "refineid-rapp-core",
  "rpassword",
  "sha1",
@@ -2080,8 +2164,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-cms"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "const-oid",
  "crypto-bigint",
@@ -2095,20 +2179,46 @@ dependencies = [
 
 [[package]]
 name = "refineid-dev-errors"
-version = "26.10.31"
+version = "26.11.1"
 
 [[package]]
 name = "refineid-digest"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "sha1",
  "sha2 0.11.0",
 ]
 
 [[package]]
+name = "refineid-doc-sign"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
+dependencies = [
+ "const-oid",
+ "crypto-bigint",
+ "getrandom 0.4.3",
+ "hex",
+ "miniz_oxide 0.9.1",
+ "refineid-apdu",
+ "refineid-auth",
+ "refineid-ber",
+ "refineid-cms",
+ "refineid-digest",
+ "refineid-pace",
+ "refineid-pcsc",
+ "refineid-pkcs15",
+ "refineid-sign",
+ "sha1",
+ "sha2 0.11.0",
+ "spki",
+ "x509-cert",
+ "zeroize",
+]
+
+[[package]]
 name = "refineid-gui"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
  "refineid-dev-errors",
  "refineid-gui-core",
@@ -2119,13 +2229,14 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-core"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
  "hex",
  "image",
  "pdfluent-jpeg2000",
  "refineid-client",
  "refineid-dev-errors",
+ "refineid-doc-sign",
  "refineid-lib-core",
  "refineid-lib-pcsc",
  "refineid-rapp-core",
@@ -2134,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-fltk"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
  "arboard",
  "fltk",
@@ -2149,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-gui-gtk4"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
  "gtk4",
  "image",
@@ -2162,7 +2273,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-core"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
  "aes 0.9.3",
  "cbc",
@@ -2172,11 +2283,9 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac",
- "miniz_oxide 0.9.1",
  "proptest",
  "refineid-apdu",
  "refineid-auth",
- "ring",
  "sha1",
  "sha2 0.11.0",
  "spki",
@@ -2187,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-pcsc"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
  "pcsc",
  "refineid-dev-errors",
@@ -2196,8 +2305,9 @@ dependencies = [
 
 [[package]]
 name = "refineid-lib-tls"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
+ "refineid-doc-sign",
  "refineid-lib-core",
  "refineid-rapp-core",
  "rustls",
@@ -2205,9 +2315,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "refineid-pace"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
+dependencies = [
+ "aes 0.9.3",
+ "bp384",
+ "cbc",
+ "cmac",
+ "getrandom 0.4.3",
+ "refineid-apdu",
+ "refineid-ber",
+ "sha2 0.11.0",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "refineid-pcsc"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "pcsc",
  "refineid-apdu",
@@ -2216,8 +2343,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-pin-cache"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "getrandom 0.4.3",
  "refineid-auth",
@@ -2228,8 +2355,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs11"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "getrandom 0.4.3",
  "hex",
@@ -2249,8 +2376,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-pkcs15"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "refineid-apdu",
  "refineid-ber",
@@ -2259,8 +2386,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-rapp"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
@@ -2274,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-rapp-core"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
  "getrandom 0.4.3",
  "refineid-dev-errors",
@@ -2286,16 +2413,16 @@ dependencies = [
 
 [[package]]
 name = "refineid-remote"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "refineid-digest",
 ]
 
 [[package]]
 name = "refineid-sign"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "refineid-apdu",
  "zeroize",
@@ -2303,7 +2430,7 @@ dependencies = [
 
 [[package]]
 name = "refineid-unix-pkcs11"
-version = "26.10.31"
+version = "26.11.1"
 dependencies = [
  "libc",
  "refineid-dev-errors",
@@ -2317,8 +2444,8 @@ dependencies = [
 
 [[package]]
 name = "refineid-x509"
-version = "26.10.31"
-source = "git+https://github.com/refineid/refineid-core.git?branch=main#a3170691e7ac2c2be037c612aab86f19538ec3aa"
+version = "26.11.1"
+source = "git+https://github.com/refineid/refineid-core.git?branch=main#a00ba2c12cde7f814af0b317e5a0e79aa653e6af"
 dependencies = [
  "refineid-ber",
 ]
@@ -2459,6 +2586,20 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "sec1"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d56d437c2f19203ce5f7122e507831de96f3d2d4d3be5af44a0b0a09d8a80e4d"
+dependencies = [
+ "base16ct",
+ "ctutils",
+ "der",
+ "hybrid-array",
+ "subtle",
+ "zeroize",
+]
 
 [[package]]
 name = "semver"
@@ -3288,6 +3429,18 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wnaf"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "795ca18b3fdb5e62bf982199278341ddcf7ebf7d32e25e212ad05d496e95f6fa"
+dependencies = [
+ "ff",
+ "group",
+ "hybrid-array",
+ "primefield",
+]
 
 [[package]]
 name = "writeable"

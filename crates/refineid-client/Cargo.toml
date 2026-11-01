@@ -40,8 +40,14 @@ tls-rustls = ["https", "refineid-lib-tls/tls-rustls"]
 # that touches the variables at all.
 pin-env-debug = []
 
+[dev-dependencies]
+refineid-doc-sign = { workspace = true, features = ["testkit"] }
+
 [dependencies]
 refineid-lib-core.workspace = true
+refineid-doc-sign.workspace = true
+refineid-pace.workspace = true
+refineid-pcsc.workspace = true
 refineid-rapp-core.workspace = true
 refineid-lib-pcsc.workspace = true
 refineid-dev-errors.workspace = true

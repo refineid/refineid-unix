@@ -54,19 +54,19 @@ pub mod card_sign;
 pub mod cert_chain;
 pub mod cert_show;
 pub mod cli;
+pub mod doc_sign_bridge;
+pub mod doc_sign_http;
 pub mod document_verify;
 pub mod events;
 pub mod exit_status;
 pub mod http;
 pub mod pin_source;
 pub mod reader_keyboard;
-pub mod signed_name;
 #[cfg(test)]
 mod test_card;
 pub mod text;
 pub mod trust_roots;
 pub mod user_agent;
-pub mod validation_material;
 pub mod verify;
 
 #[cfg(test)]

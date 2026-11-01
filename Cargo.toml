@@ -18,7 +18,7 @@ members = [
 # YY.M.D, the UTC day the code last changed, stamped by the pre-commit
 # hook (script/version-stamp.sh). refineid_lib_core::VERSION appends the
 # build number B for the project version YY.M.D.B.
-version = "26.10.31"
+version = "26.11.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]
@@ -46,6 +46,8 @@ refineid-emrtd = { git = "https://github.com/refineid/refineid-core.git", branch
 refineid-pcsc = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pkcs11 = { git = "https://github.com/refineid/refineid-core.git", branch = "main", default-features = false }
 refineid-remote = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
+refineid-doc-sign = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
+refineid-pace = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 fltk = "1.5.23"
 gtk4 = "0.9"
 
@@ -59,7 +61,6 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 sha2 = "0.11"
 hmac = "0.13"
 hex = "0.4"
-ring = { version = "0.17", default-features = false, features = ["alloc", "std"] }
 # Property-based testing (dev-only): falsification harness for the
 # Uri parser -- idempotence and total no-panic over generated inputs.
 proptest = "1"
@@ -80,12 +81,6 @@ socket2 = { version = "0.6", features = ["all"] }
 
 # Random generation for session-local secrets.
 getrandom = "0.4"
-
-# FlateDecode for reading a signed page's content streams, so the visible
-# signature mark can avoid what is already printed. Inflate only; nothing
-# here writes compressed data. Already in-tree transitively through
-# `image`'s PNG support.
-miniz_oxide = "0.9"
 
 # Crypto stack for PACE + secure messaging on the FINEID card.
 aes = "0.9"

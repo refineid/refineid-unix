@@ -243,9 +243,6 @@ pub mod known {
     /// `2.5.29.19` -- id-ce-basicConstraints (critical in FINEID S2).
     pub const BASIC_CONSTRAINTS: Oid<'static> = oid_dotted!("2.5.29.19");
 
-    /// `2.5.29.32` -- id-ce-certificatePolicies.
-    pub const CERTIFICATE_POLICIES: Oid<'static> = oid_dotted!("2.5.29.32");
-
     // ---- Named elliptic curves ----
 
     /// `1.3.36.3.3.2.8.1.1.7` -- brainpoolP256r1.
@@ -261,27 +258,6 @@ pub mod known {
 
     /// `2.5.4.6` -- id-at-countryName.
     pub const COUNTRY_NAME: Oid<'static> = oid_dotted!("2.5.4.6");
-
-    /// `2.5.4.7` -- id-at-localityName.
-    pub const LOCALITY_NAME: Oid<'static> = oid_dotted!("2.5.4.7");
-
-    /// `2.5.4.8` -- id-at-stateOrProvinceName.
-    pub const STATE_OR_PROVINCE_NAME: Oid<'static> = oid_dotted!("2.5.4.8");
-
-    /// `2.5.4.9` -- id-at-streetAddress.
-    pub const STREET_ADDRESS: Oid<'static> = oid_dotted!("2.5.4.9");
-
-    /// `2.5.4.10` -- id-at-organizationName.
-    pub const ORGANIZATION_NAME: Oid<'static> = oid_dotted!("2.5.4.10");
-
-    /// `2.5.4.11` -- id-at-organizationalUnitName.
-    pub const ORGANIZATIONAL_UNIT_NAME: Oid<'static> = oid_dotted!("2.5.4.11");
-
-    /// `0.9.2342.19200300.100.1.25` -- domainComponent (RFC 4519 sec.2.4).
-    pub const DOMAIN_COMPONENT: Oid<'static> = oid_dotted!("0.9.2342.19200300.100.1.25");
-
-    /// `0.9.2342.19200300.100.1.1` -- userId (RFC 4519 sec.2.39).
-    pub const USER_ID: Oid<'static> = oid_dotted!("0.9.2342.19200300.100.1.1");
 
     /// `2.5.29.31` -- id-ce-cRLDistributionPoints.
     pub const CRL_DISTRIBUTION_POINTS: Oid<'static> = oid_dotted!("2.5.29.31");
@@ -380,9 +356,6 @@ pub mod known {
     /// `2.5.29.17` -- id-ce-subjectAltName.
     pub const SUBJECT_ALT_NAME: Oid<'static> = oid_dotted!("2.5.29.17");
 
-    /// `2.5.29.14` -- id-ce-subjectKeyIdentifier.
-    pub const SUBJECT_KEY_IDENTIFIER: Oid<'static> = oid_dotted!("2.5.29.14");
-
     /// `2.5.4.4` -- id-at-surname.
     pub const SURNAME: Oid<'static> = oid_dotted!("2.5.4.4");
 
@@ -410,56 +383,6 @@ pub mod known {
 
     /// `1.2.840.113549.1.9.4` -- id-messageDigest (CMS signed attribute).
     pub const MESSAGE_DIGEST: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.4");
-
-    /// `1.2.840.113549.1.9.5` -- id-signingTime (CMS signed attribute).
-    pub const SIGNING_TIME: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.5");
-
-    /// `1.2.840.113549.1.9.16.1.4` -- id-ct-TSTInfo.
-    ///
-    /// RFC 3161. This is the eContentType of a `TimeStampToken`'s CMS
-    /// `SignedData`; the signed eContent is a DER `TSTInfo`.
-    pub const TST_INFO: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.1.4");
-
-    /// `1.3.6.1.5.5.7.16.2` -- id-ri-ocsp-response.
-    ///
-    /// RFC 5940. Names an OCSP response inside a CMS `crls` field,
-    /// which has no CHOICE for one of its own.
-    pub const OCSP_RESPONSE_REVOCATION_INFO: Oid<'static> = oid_dotted!("1.3.6.1.5.5.7.16.2");
-
-    /// `1.2.840.113549.1.9.16.2.14` -- id-aa-signatureTimeStampToken.
-    ///
-    /// RFC 3161 appendix A. Carries a TSA's token as an *unsigned*
-    /// attribute: it is computed over the signature, so it cannot be
-    /// inside what the signature covers.
-    pub const SIGNATURE_TIME_STAMP_TOKEN: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.2.14");
-
-    /// `1.2.840.113549.1.9.16.2.48` -- id-aa-ets-archiveTimestampV2.
-    ///
-    /// RFC 5126 sec.6.4.1: an unsigned attribute carrying a timestamp
-    /// over the signature and its validation material. `ETSI EN 319
-    /// 122-1` clause A.2.4 deprecates it in favour of the v3 below.
-    pub const ARCHIVE_TIME_STAMP_V2: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.2.48");
-
-    /// `0.4.0.1733.2.4` -- id-aa-ets-archiveTimestampV3.
-    ///
-    /// `ETSI EN 319 122-1` clause 5.5.3: an unsigned attribute carrying
-    /// a timestamp over the signature and the components its
-    /// `ats-hash-index-v3` protects.
-    pub const ARCHIVE_TIME_STAMP_V3: Oid<'static> = oid_dotted!("0.4.0.1733.2.4");
-
-    /// `1.2.840.113549.1.9.16.2.47` -- id-aa-signingCertificateV2.
-    ///
-    /// RFC 5035 sec.3, and mandatory in `CAdES`: it binds the signature
-    /// to the one certificate that made it, so a signature cannot be
-    /// replayed against another certificate carrying the same key.
-    pub const SIGNING_CERTIFICATE_V2: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.2.47");
-
-    /// `1.2.840.113549.1.9.16.2.12` -- id-aa-signingCertificate.
-    ///
-    /// RFC 2634 sec.5.4.1. This is the original SHA-1 ESS certificate
-    /// binding; RFC 3161 requires a signing-certificate attribute, while
-    /// RFC 5035 defines the SHA-2-capable v2 replacement above.
-    pub const SIGNING_CERTIFICATE: Oid<'static> = oid_dotted!("1.2.840.113549.1.9.16.2.12");
 
     // ---- OCSP response types (RFC 6960) ----
 
@@ -594,17 +517,5 @@ mod tests {
         // same OID -- the const constructor doesn't mangle.
         let runtime = Oid::new(&[0x55, 0x04, 0x03]).expect("commonName DER encoding parses");
         assert_eq!(known::COMMON_NAME.as_bytes(), runtime.as_bytes());
-    }
-
-    #[test]
-    fn archive_timestamp_identifiers_render_dotted() {
-        assert_eq!(
-            format!("{}", known::ARCHIVE_TIME_STAMP_V2),
-            "1.2.840.113549.1.9.16.2.48"
-        );
-        assert_eq!(
-            format!("{}", known::ARCHIVE_TIME_STAMP_V3),
-            "0.4.0.1733.2.4"
-        );
     }
 }

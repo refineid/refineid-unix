@@ -25,8 +25,9 @@ use refineid_client::card_check::{CardCheckError, CardCheckReport};
 use refineid_client::card_pin::{
     ActivateOptions, ChangePinOptions, PinManageSlot, UnblockPinOptions,
 };
-use refineid_client::card_sign::{DEFAULT_TIMESTAMP_AUTHORITY, SignOutput};
-use refineid_client::signed_name::PendingSignedName;
+use refineid_doc_sign::service::{DEFAULT_TIMESTAMP_AUTHORITY, SignOutput};
+use refineid_doc_sign::signed_name::PendingSignedName;
+use refineid_doc_sign::x509::DateTime;
 use refineid_lib_core::auth::{ChangePinOutcome, PinSlot, UnblockOutcome};
 use refineid_lib_core::backend::{ReaderFilter, ReaderPickError};
 use refineid_lib_core::identity::{CredentialIdentity, TokenSerial, render_token_serial};
@@ -34,7 +35,6 @@ use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
 use refineid_lib_core::pkcs15::CardGeneration;
-use refineid_lib_core::x509::DateTime;
 use refineid_rapp_core::engine::{OperationOutcome, PairingSearchError};
 
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
@@ -765,8 +765,7 @@ impl RefineIdController {
             let mut results = Vec::new();
 
             for doc in &documents {
-                let output =
-                    signed_output(doc, format, refineid_client::card_check::now_date_time());
+                let output = signed_output(doc, format, refineid_doc_sign::now_date_time());
                 let res = if format == SignFormat::AsicE {
                     refineid_client::card_manager::sign_asice(
                         refineid_client::card_manager::AsicSignOptions {
@@ -1084,16 +1083,24 @@ mod tests {
 
     #[test]
     fn a_signed_document_is_named_by_its_signature_timestamp_else_the_clock() {
-        use refineid_client::signed_name::BestSignatureTime;
-        use refineid_lib_core::sign::timestamp::VerifiedTimestampToken;
+        use refineid_doc_sign::signed_name::BestSignatureTime;
+        use refineid_doc_sign::timestamp::VerifiedTimestampToken;
+        use refineid_doc_sign::x509::OwnedCert;
+
+        /// A public DVV intermediate, standing in for the authority.
+        const AUTHORITY_DER: &[u8] = include_bytes!(
+            "../../refineid-client/test-vectors/fineid-intermediate-01-citizen-g4e.der"
+        );
 
         let clock = instant(SIGNATURE_TIMESTAMP_AT.saturating_add(CLOCK_DELAY));
-        let token = VerifiedTimestampToken {
-            token: Vec::new(),
-            signer_certificate: Vec::new(),
-            embedded_certificates: Vec::new(),
-            generated_at: instant(SIGNATURE_TIMESTAMP_AT),
-        };
+        let authority = OwnedCert::from_der(AUTHORITY_DER)
+            .unwrap_or_else(|e| panic!("synthetic authority: {e}"));
+        let token = VerifiedTimestampToken::from_parts_for_test(
+            Vec::new(),
+            authority,
+            Vec::new(),
+            instant(SIGNATURE_TIMESTAMP_AT),
+        );
         let best = BestSignatureTime::of_signature_timestamps(core::slice::from_ref(&token));
         let pdf = signed_output(Path::new("/documents/report.pdf"), SignFormat::Pades, clock);
         assert_eq!(

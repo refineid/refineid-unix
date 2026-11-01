@@ -138,21 +138,9 @@ impl CrlReason {
         })
     }
 
-    /// Whether the reason names a compromised key: the subject's
-    /// (`keyCompromise`), a CA's (`cACompromise`) or an attribute
-    /// authority's (`aACompromise`).
-    #[must_use]
-    pub const fn is_compromise(self) -> bool {
-        matches!(
-            self,
-            Self::KeyCompromise | Self::CaCompromise | Self::AaCompromise
-        )
-    }
-
     /// The reason as RFC 5280 sec.5.3.1 names it; `unknown` for
     /// [`Self::Unrecognised`].
-    #[must_use]
-    pub const fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Unspecified => "unspecified",
             Self::KeyCompromise => "keyCompromise",

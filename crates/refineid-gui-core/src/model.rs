@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use refineid_client::card_check::CardCheckReport;
 use refineid_client::card_pin::{ActivationCardContext, PinManageSlot};
+use refineid_doc_sign::document::Format;
 use refineid_lib_core::auth::{PinSlot, PinStatus, PukStatus, check_retry_floor};
 use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::CardGeneration;
-use refineid_lib_core::sign::document::Format;
 use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::remote::PairSummary;
 
