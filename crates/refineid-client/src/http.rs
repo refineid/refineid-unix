@@ -195,7 +195,17 @@ const MAX_AUTHORITY_REDIRECTS: usize = 1;
 impl core::error::Error for HttpError {}
 
 impl From<io::Error> for HttpError {
+    /// A socket here is blocking with a read and write timeout, so a
+    /// would-block answer means that timeout expired: some
+    /// systems (FreeBSD) report the expiry that way. It becomes a
+    /// timeout, so the message says what happened.
     fn from(e: io::Error) -> Self {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            return Self::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no answer within the socket timeout",
+            ));
+        }
         Self::Io(e)
     }
 }
@@ -581,10 +591,13 @@ fn post_once(
     }
 }
 
+/// How long a connection, a read or a write may wait.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn connected_stream(address: SocketAddr) -> Result<TcpStream, HttpError> {
-    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(30))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let stream = TcpStream::connect_timeout(&address, SOCKET_TIMEOUT)?;
+    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
     Ok(stream)
 }
 
@@ -1294,6 +1307,30 @@ mod tests {
         is_public, looks_like_numeric_address, post_authority, resolve_addresses,
     };
     use crate::test_util::{TestResult, check, check_true};
+
+    #[test]
+    fn a_socket_timeout_reported_as_would_block_is_a_timeout() -> TestResult {
+        let HttpError::Io(error) =
+            HttpError::from(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        else {
+            return Err("an I/O error stays an I/O error".into());
+        };
+        check(
+            &error.kind(),
+            &std::io::ErrorKind::TimedOut,
+            "the kind is a timeout",
+        )?;
+        let HttpError::Io(other) =
+            HttpError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+        else {
+            return Err("an I/O error stays an I/O error".into());
+        };
+        check(
+            &other.kind(),
+            &std::io::ErrorKind::ConnectionReset,
+            "other kinds pass through",
+        )
+    }
 
     #[test]
     fn authority_credentials_are_refused_before_plain_http_io() {
