@@ -141,7 +141,7 @@ pub struct UnblockPinOptions {
     pub slot: PinManageSlot,
     /// The 8 to 12-digit PUK code. Typed [`Puk`] forces construction
     /// via [`Puk::new`] at the operator-input boundary, so a
-    /// non-PUK `PinBytes` value (e.g. a PIN or activation code)
+    /// non-PUK `PinBytes` value (e.g. a PIN or the activation PIN)
     /// can't reach the `RESET RETRY COUNTER` APDU by accident.
     pub puk: Puk,
     /// New PIN value to set after the unblock succeeds. Consumed
@@ -927,7 +927,7 @@ pub struct ActivationCardContext {
 
 impl ActivationCardContext {
     /// The activation entry's exact digit count under the card's
-    /// scheme: the 8-digit activation code (the PUK) for FINEID
+    /// scheme: the 8-digit activation PIN (the PUK) for FINEID
     /// S4-1 v4.2 §4.6.1, the 7-digit preset activation PIN for
     /// §4.6.2.
     #[must_use]
@@ -1048,7 +1048,7 @@ pub struct ActivateOptions {
 /// s4.6), so one PIN can be set without the other.
 #[derive(Debug)]
 pub struct ActivateOneOptions {
-    /// Typed activation code; see [`ActivateOptions::activation_pin`].
+    /// Typed activation PIN; see [`ActivateOptions::activation_pin`].
     pub activation_pin: ActivationCode,
     /// The PIN to set.
     pub slot: PinManageSlot,
@@ -1190,8 +1190,8 @@ const fn change_to_unblock(o: ChangePinOutcome) -> UnblockOutcome {
 /// Per-slot setup for [`activate_first`], FINEID S4-1 v4.2 §4.6:
 ///
 /// - **§4.6.1, [`ActivationScheme::ActivationCodeIsPuk`]:** the
-///   PIN ships blocked and the 8-digit activation code is the PUK.
-///   `RESET RETRY COUNTER` (`INS=0x2C`) with `(activation code,
+///   PIN ships blocked and the 8-digit activation PIN is the PUK.
+///   `RESET RETRY COUNTER` (`INS=0x2C`) with `(activation PIN,
 ///   new PIN)`, under the PUK's retry floor. Organization cards
 ///   follow this scheme under their own reference numbering.
 /// - **§4.6.2, [`ActivationScheme::PresetActivationPin`]:** the
@@ -1214,7 +1214,7 @@ fn activate_slot_setup<T: refineid_lib_core::transport::CardTransport>(
             .map(change_to_unblock)
             .map_err(auth_to_card_pin),
         ActivationScheme::ActivationCodeIsPuk => {
-            // The activation code is presented as the PUK, under the
+            // The activation PIN is presented as the PUK, under the
             // PUK's counter.
             puk_gate(transport.puk_status_with_scheme(ctx.numbering).ok())?;
             transport
@@ -1309,7 +1309,7 @@ fn activation_gate<T: refineid_lib_core::transport::CardTransport>(
                 }
             }
         }
-        // The activation code is presented as the PUK.
+        // The activation PIN is presented as the PUK.
         ActivationScheme::ActivationCodeIsPuk => {
             puk_gate(transport.puk_status_with_scheme(ctx.numbering).ok())?;
         }
@@ -1513,7 +1513,7 @@ fn run_activation(
     re_verify_session(&mut transport, &ctx.bound_serial)?;
 
     // The per-PIN setup APDU takes PinBytes by value; build a
-    // transient PinBytes from the typed activation code's inner
+    // transient PinBytes from the typed activation PIN's inner
     // bytes. Done per-call so the typed wrapper stays the source
     // of truth at the API boundary; the transient PinBytes
     // zeroizes on drop just like every other secret material.
@@ -1601,7 +1601,7 @@ impl ActivateGuard {
     /// event when the activation entry's form doesn't fit the
     /// card's scheme.
     ///
-    /// FINEID S4-1 v4.2 §4.6.1 takes the 8-digit activation code
+    /// FINEID S4-1 v4.2 §4.6.1 takes the 8-digit activation PIN
     /// (the PUK), §4.6.2 the 7-digit preset activation PIN. The
     /// event is emitted *before* the typed error is returned so
     /// the audit trail captures the local-policy refusal even on
@@ -2181,7 +2181,7 @@ mod activate_tests {
             .ok_or("organization numbering has a scheme")?;
         check_true(
             scheme == ActivationScheme::ActivationCodeIsPuk,
-            "activation code is the PUK",
+            "activation PIN is the PUK",
         )?;
         let pf = classify_preflight(
             ActivationTarget::Both,

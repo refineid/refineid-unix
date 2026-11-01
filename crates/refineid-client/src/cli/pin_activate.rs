@@ -333,7 +333,7 @@ impl PinActivateHelpers {
     /// Prompt for the activation entry and lift it into the
     /// length-typed [`ActivationCode`] variant.
     ///
-    /// FINEID S4-1 v4.2 §4.6 -- the 8-digit activation code (the
+    /// FINEID S4-1 v4.2 §4.6 -- the 8-digit activation PIN (the
     /// PUK) under §4.6.1, the 7-digit preset activation PIN under
     /// §4.6.2. The length-typed constructor rejects out-of-shape
     /// input at the trust boundary so downstream code only ever

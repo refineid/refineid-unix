@@ -162,7 +162,7 @@ pub struct CardActivatePreflightReady<'a> {
     /// e.g. `"4.0"` or `"3.1"`.
     pub fineid_specification_version: &'a str,
     /// Activation entry length the card's scheme takes -- `"8"`
-    /// for the FINEID S4-1 v4.2 §4.6.1 activation code (the PUK),
+    /// for the FINEID S4-1 v4.2 §4.6.1 activation PIN (the PUK),
     /// `"7"` for the §4.6.2 preset activation PIN. The scheme
     /// comes from the reference numbering and the certificate's
     /// validity start, not from the card model.

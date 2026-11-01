@@ -299,7 +299,7 @@ pub struct UiState {
     pub pin1_unblock_available: bool,
     /// Whether unblocking PIN2 is available.
     pub pin2_unblock_available: bool,
-    /// Whether unblocking uses an activation code.
+    /// Whether unblocking uses an activation PIN.
     pub unblock_uses_activation_code: bool,
     /// Whether the selected card is an organization card (FINEID S4-2
     /// v4.0 §4.2 reference numbering).
@@ -391,7 +391,7 @@ impl Default for UiState {
 pub enum UserIntent {
     /// Factory activation for new cards.
     ActivateCard {
-        /// Activation code bytes.
+        /// Activation PIN bytes.
         activation_code: PinBytes,
         /// New PIN1 bytes.
         new_pin1: PinBytes,

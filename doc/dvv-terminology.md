@@ -20,12 +20,19 @@ PIN.
 
 UI text writes "PIN 1" and "PIN 2" with a space.
 
+The activation credential takes DVV's official name from the
+activation letters, under both activation schemes: "Activation
+PIN", Finnish "aktivointitunnusluku", Swedish "aktiveringskod"
+(definite "aktiveringskoden"). The organisation card letter reads
+"Aktivointitunnusluku / Aktiveringskod / Activation PIN". User-facing
+text never says "activation code".
+
 ### The two activation schemes
 
 FINEID S4-1 v4.2 §4.6 defines two activation procedures, and the
 card decides which one applies:
 
-- **§4.6.1, the activation code is the PUK.** Citizen cards
+- **§4.6.1, the activation PIN is the PUK.** Citizen cards
   issued before 13 January 2026, and every organization card.
   PIN 1 and PIN 2 ship blocked; activation sends RESET RETRY
   COUNTER with the 8-digit code from the letter for each PIN.
@@ -44,7 +51,7 @@ its surface.
 In refineid the two activation entries are *two distinct
 types*:
 
-- `ActivationPinEight` -- the §4.6.1 activation code
+- `ActivationPinEight` -- the §4.6.1 activation PIN
   (`ActivationScheme::ActivationCodeIsPuk`).
 - `ActivationPinSeven` -- the §4.6.2 preset activation PIN
   (`ActivationScheme::PresetActivationPin`).
@@ -83,7 +90,7 @@ Canonical DVV sources:
 
 ### Activation PIN (`aktivointitunnusluku` / `aktiveringskod`)
 
-- §4.6.1: the 8-digit activation code, which is the PUK; each
+- §4.6.1: the 8-digit activation PIN, which is the PUK; each
   wrong try spends one of the PUK's tries.
 - §4.6.2: the 7-digit preset activation PIN, the factory value
   of PIN 1 and PIN 2; each wrong try spends one of that PIN's
@@ -138,7 +145,7 @@ PIC.
 ### Activation PIN vs PUK -- code-side discipline
 
 Name the code by the scheme it belongs to. Under §4.6.1 the
-activation code *is* the PUK; under §4.6.2 the preset activation
+activation PIN *is* the PUK; under §4.6.2 the preset activation
 PIN is not a PUK. Prose that equates the two without naming the
 scheme, or that gives the activation PIN one length for every
 card, is wrong.
