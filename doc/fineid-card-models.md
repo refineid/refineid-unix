@@ -227,7 +227,7 @@ it.
 
 | Scheme | Cards | Factory state | Activation |
 | --- | --- | --- | --- |
-| §4.6.1, activation code is the PUK | citizen cards issued before 13 January 2026; every organization card | PIN 1 and PIN 2 blocked | RESET RETRY COUNTER with the 8-digit code (the PUK) for each PIN |
+| §4.6.1, activation PIN is the PUK | citizen cards issued before 13 January 2026; every organization card | PIN 1 and PIN 2 blocked | RESET RETRY COUNTER with the 8-digit code (the PUK) for each PIN |
 | §4.6.2, preset activation PIN | citizen cards issued from 13 January 2026 | PIN 1 and PIN 2 set to one 7-digit activation PIN | CHANGE REFERENCE DATA from the activation PIN for each PIN |
 
 The organization reference numbering decides §4.6.1 whatever the
@@ -293,7 +293,7 @@ terminology and the typed `ActivationPinSeven` /
 
 | Scheme | Activation entry |
 |--------|------------------|
-| §4.6.1, activation code is the PUK | 8 digits |
+| §4.6.1, activation PIN is the PUK | 8 digits |
 | §4.6.2, preset activation PIN | 7 digits |
 
 Engineering canonical for this dimension on the wire:

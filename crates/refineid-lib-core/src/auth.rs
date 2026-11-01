@@ -114,7 +114,7 @@ pub use refineid_auth::credentials::{
 ///
 /// "PUK" here is the unblock credential, citizen reference `0x83`
 /// -- the `RESET RETRY COUNTER` surface. Under FINEID S4-1 v4.2
-/// §4.6.1 the 8-digit activation code from the letter is this PUK.
+/// §4.6.1 the 8-digit activation PIN from the letter is this PUK.
 /// Under §4.6.2 the 7-digit preset activation PIN is the factory
 /// value of PIN 1 and PIN 2, presented through `CHANGE REFERENCE
 /// DATA`, not this path.
@@ -368,7 +368,7 @@ pub fn check_retry_floor(slot: PinSlot, status: PinStatus) -> Result<(), RetryFl
 }
 
 /// The same retry floor applied to the PUK's own counter: anything that
-/// presents the PUK -- RESET RETRY COUNTER, or the activation code on a
+/// presents the PUK -- RESET RETRY COUNTER, or the activation PIN on a
 /// card that ships with blocked PINs -- is sent only at five, four or
 /// three PUK tries left. A blocked or invalidated PUK, and a counter the
 /// card did not report, are refused.
@@ -2486,7 +2486,7 @@ mod tests {
     #[test]
     fn unblock_pin1_seven_digit_activation_code_rejected_locally() {
         let mut tx = ShouldNotTransmitTx;
-        // Seven digits is the new-card activation code, not a PUK.
+        // Seven digits is the new-card activation PIN, not a PUK.
         let err = tx
             .reset_retry_counter(&citizen(), PinSlot::Pin1, pb(b"1234567"), pb(b"4321"))
             .expect_err("short PUK is rejected locally");

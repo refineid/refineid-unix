@@ -34,7 +34,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// A syntactically valid FINEID PIN-family code: 4-12 ASCII digits.
 ///
 /// Role-specific types and operations may impose tighter bounds. For
-/// example, PIN2 requires at least 6 digits and activation codes have
+/// example, PIN2 requires at least 6 digits and activation PINs have
 /// an exact length. Padding to the card's stored length is done
 /// downstream in `auth::verify_pin`.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -230,7 +230,7 @@ impl PinBytes {
 /// 8 to 12 ASCII digits (FINEID S4-1 v4.2 section 8.1.5, EF.AOD:
 /// minLength 8, storedLength 12), under either activation scheme.
 ///
-/// Under FINEID S4-1 v4.2 §4.6.1 the 8-digit activation code from
+/// Under FINEID S4-1 v4.2 §4.6.1 the 8-digit activation PIN from
 /// the letter is the PUK ([`ActivationPinEight`] carries it for the
 /// activation itself). Under §4.6.2 the 7-digit preset activation
 /// PIN is the factory value of PIN 1 and PIN 2, not a PUK
@@ -325,7 +325,7 @@ impl core::fmt::Debug for ActivationPinSeven {
     }
 }
 
-/// The activation code of FINEID S4-1 v4.2 §4.6.1, 8 ASCII digits
+/// The activation PIN of FINEID S4-1 v4.2 §4.6.1, 8 ASCII digits
 /// exactly: the code is the PUK, and activation presents it in
 /// `RESET RETRY COUNTER` for each PIN, under the PUK's counter.
 ///
@@ -342,7 +342,7 @@ impl ActivationPinEight {
     /// 8 ASCII digits exactly.
     pub const LENGTH: usize = 8;
 
-    /// Parse `bytes` as a §4.6.1 activation code.
+    /// Parse `bytes` as a §4.6.1 activation PIN.
     ///
     /// # Errors
     /// Empty, wrong length (not exactly 8), or any non-digit
@@ -383,7 +383,7 @@ impl core::fmt::Debug for ActivationPinEight {
 pub enum ActivationCode {
     /// 7 ASCII digits: the §4.6.2 preset activation PIN.
     Seven(ActivationPinSeven),
-    /// 8 ASCII digits: the §4.6.1 activation code, which is the PUK.
+    /// 8 ASCII digits: the §4.6.1 activation PIN, which is the PUK.
     Eight(ActivationPinEight),
 }
 
