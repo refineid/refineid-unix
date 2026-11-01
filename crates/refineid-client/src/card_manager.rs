@@ -23,11 +23,16 @@ use refineid_lib_core::backend::{ReaderBackend as _, ReaderFilter};
 use refineid_lib_core::can::Can;
 use std::path::PathBuf;
 
+use refineid_doc_sign::cades::SigningTime;
+use refineid_doc_sign::document::Format;
+use refineid_doc_sign::pades::{SignatureMetadata, StampLanguage, VisibleSignature};
+use refineid_doc_sign::pin::{PinEntryError, PromptedPin};
+use refineid_doc_sign::service::{
+    DocumentRequest, SignErrorKind, SignOptions, SignOutput, SignReport, SignSlot,
+    TimestampCredentials,
+};
 use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
-use refineid_lib_core::sign::cades::SigningTime;
-use refineid_lib_core::sign::document::Format;
-use refineid_lib_core::sign::pades::{SignatureMetadata, VisibleSignature};
 use refineid_lib_pcsc::PcscBackend;
 
 use crate::card_check::{CardCheckError, CardCheckOptions, CardCheckReport};
@@ -36,11 +41,6 @@ use crate::card_pin::{
     ActivateOptions, ActivateReport, ActivationCardContext, CardPinError, ChangePinOptions,
     ChangePinReport, UnblockPinOptions, UnblockPinReport,
 };
-use crate::card_sign::{
-    DocumentRequest, SignErrorKind, SignOptions, SignOutput, SignReport, TimestampCredentials,
-    process_visible_signature,
-};
-use crate::pin_source::PinSource;
 
 /// Inputs for one visible qualified PDF signature from the graphical client.
 #[derive(Debug)]
@@ -187,24 +187,43 @@ pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, SignErrorKind> {
             ),
         });
     }
-    let visible_signature = Some(process_visible_signature());
+    let visible_signature = Some(VisibleSignature::verification(
+        StampLanguage::for_process_locale(),
+    ));
     let document = pdf_document_request(
         expected_serial,
         visible_signature,
         timestamp_authority,
         timestamp_credentials,
     );
-    crate::card_sign::sign_qualified_first(
-        PcscBackend,
+    sign_qualified(input, output, &pin2, can.as_ref(), reader_filter, document)
+}
+
+/// Sign `input` with the qualified-signature key into `document`,
+/// presenting the PIN 2 the holder already entered.
+fn sign_qualified(
+    input: PathBuf,
+    output: SignOutput,
+    pin2: &PinBytes,
+    can: Option<&Can>,
+    reader_filter: Option<String>,
+    document: DocumentRequest,
+) -> Result<SignReport, SignErrorKind> {
+    crate::doc_sign_http::install();
+    let mut pin =
+        PromptedPin::new(|_role| crate::doc_sign_bridge::pin(pin2).map_err(PinEntryError::NotAPin));
+    refineid_doc_sign::service::sign(
+        &refineid_pcsc::PcscBackend,
         SignOptions {
             input,
             output,
-            pin: PinSource::Given(pin2),
+            slot: SignSlot::Qualified,
             save_cert: None,
             reader_filter,
-            can,
+            can: can.and_then(crate::doc_sign_bridge::can),
             document: Some(document),
         },
+        &mut pin,
     )
 }
 
@@ -243,7 +262,7 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind>
             ),
         });
     }
-    let now = crate::card_check::now_date_time();
+    let now = refineid_doc_sign::now_date_time();
     let document = DocumentRequest {
         format: Format::AsicEXades,
         additional_inputs,
@@ -256,8 +275,7 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind>
             second: now.seconds(),
         },
         metadata: SignatureMetadata::default(),
-        expected_serial: Some(expected_serial),
-        visible_signature: None,
+        expected_serial: Some(crate::doc_sign_bridge::token_serial(&expected_serial)),
         // Level LT: an archive construction for `ASiC-E` with `XAdES`
         // is not implemented, and the format refuses to pretend.
         archive: false,
@@ -265,18 +283,7 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind>
         timestamp_authorities: vec![timestamp_authority],
         timestamp_credentials,
     };
-    crate::card_sign::sign_qualified_first(
-        PcscBackend,
-        SignOptions {
-            input,
-            output,
-            pin: PinSource::Given(pin2),
-            save_cert: None,
-            reader_filter,
-            can,
-            document: Some(document),
-        },
-    )
+    sign_qualified(input, output, &pin2, can.as_ref(), reader_filter, document)
 }
 
 fn pdf_document_request(
@@ -285,7 +292,7 @@ fn pdf_document_request(
     timestamp_authority: String,
     timestamp_credentials: Option<TimestampCredentials>,
 ) -> DocumentRequest {
-    let now = crate::card_check::now_date_time();
+    let now = refineid_doc_sign::now_date_time();
     DocumentRequest {
         format: Format::Pades,
         additional_inputs: Vec::new(),
@@ -297,9 +304,11 @@ fn pdf_document_request(
             minute: now.minutes(),
             second: now.seconds(),
         },
-        metadata: SignatureMetadata::default(),
-        expected_serial: Some(expected_serial),
-        visible_signature,
+        metadata: SignatureMetadata {
+            visible_signature,
+            ..SignatureMetadata::default()
+        },
+        expected_serial: Some(crate::doc_sign_bridge::token_serial(&expected_serial)),
         archive: true,
         long_term: true,
         timestamp_authorities: vec![timestamp_authority],
@@ -382,7 +391,7 @@ fn ensure_displayed_serial(
 mod tests {
     use refineid_lib_core::identity::TokenSerial;
 
-    use refineid_lib_core::sign::pades::{StampLanguage, VisibleSignature};
+    use refineid_doc_sign::pades::{StampLanguage, VisibleSignature};
 
     use super::{ensure_displayed_serial, pdf_document_request};
 
@@ -408,19 +417,19 @@ mod tests {
             "https://timestamp.sectigo.com/qualified".to_owned(),
             None,
         );
-        assert_eq!(
-            request.format,
-            refineid_lib_core::sign::document::Format::Pades
-        );
+        assert_eq!(request.format, refineid_doc_sign::document::Format::Pades);
         assert!(request.archive);
         assert!(request.long_term);
         assert_eq!(
             request.timestamp_authorities,
             ["https://timestamp.sectigo.com/qualified"]
         );
-        assert_eq!(request.expected_serial, Some(serial));
         assert_eq!(
-            request.visible_signature,
+            request.expected_serial.as_ref().map(|live| live.as_str()),
+            Some(serial.as_str())
+        );
+        assert_eq!(
+            request.metadata.visible_signature,
             Some(VisibleSignature::verification(StampLanguage::English))
         );
     }
@@ -433,6 +442,6 @@ mod tests {
             "https://timestamp.sectigo.com/qualified".to_owned(),
             None,
         );
-        assert!(request.visible_signature.is_none());
+        assert!(request.metadata.visible_signature.is_none());
     }
 }

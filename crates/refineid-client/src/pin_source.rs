@@ -22,7 +22,6 @@
 
 use alloc::boxed::Box;
 use core::fmt;
-use std::sync::{Arc, Mutex, PoisonError};
 
 use refineid_lib_core::pin::PinBytes;
 
@@ -49,84 +48,25 @@ pub type PinPrompt = Box<dyn FnMut() -> Result<PinBytes, PinEntryError> + Send>;
 
 /// Where a flow gets its PIN.
 pub enum PinSource {
-    /// A PIN the caller already holds.
-    Given(PinBytes),
     /// A prompt the flow runs at the point of use.
     Ask(PinPrompt),
 }
 
 impl PinSource {
-    /// The PIN to present. [`PinSource::Ask`] runs its prompt now.
+    /// The PIN to present: the prompt runs now.
     ///
     /// # Errors
     /// The prompt's [`PinEntryError`].
     pub fn obtain(&mut self) -> Result<PinBytes, PinEntryError> {
         match self {
-            Self::Given(pin) => Ok(pin.clone()),
             Self::Ask(prompt) => prompt(),
         }
-    }
-}
-
-/// One prompt shared by several sources: the first source to be
-/// obtained runs it, every later one answers with the same PIN. A
-/// prompt that failed is not remembered, so the next source asks
-/// again; callers that must not ask twice stop at the first failure.
-/// For a run that signs several documents with one PIN, asked once.
-/// Dropping it clears the answer even while a source still exists.
-pub struct SharedPin {
-    prompt: Arc<Mutex<PinPrompt>>,
-    answer: Arc<Mutex<Option<PinBytes>>>,
-}
-
-impl SharedPin {
-    /// Wrap `prompt` so that it runs once it has answered.
-    #[must_use]
-    pub fn new(prompt: PinPrompt) -> Self {
-        Self {
-            prompt: Arc::new(Mutex::new(prompt)),
-            answer: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    /// A source that asks the shared prompt, or repeats its answer.
-    #[must_use]
-    pub fn source(&self) -> PinSource {
-        let prompt = Arc::clone(&self.prompt);
-        let answer = Arc::clone(&self.answer);
-        PinSource::Ask(Box::new(move || {
-            let mut answer = answer.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(pin) = answer.as_ref() {
-                return Ok(pin.clone());
-            }
-            let pin = (prompt.lock().unwrap_or_else(PoisonError::into_inner))()?;
-            *answer = Some(pin.clone());
-            Ok(pin)
-        }))
-    }
-}
-
-impl Drop for SharedPin {
-    fn drop(&mut self) {
-        // The PIN zeroises here, not when the last source goes.
-        let _cleared: Option<PinBytes> = self
-            .answer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-    }
-}
-
-impl fmt::Debug for SharedPin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SharedPin")
     }
 }
 
 impl fmt::Debug for PinSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Given(_) => "PinSource::Given",
             Self::Ask(_) => "PinSource::Ask",
         })
     }
@@ -166,9 +106,8 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::test_support::{SYNTHETIC_PIN, counting_source, prompts};
+    use super::test_support::{counting_source, prompts};
     use super::*;
     use crate::test_util::{TestResult, check};
 
@@ -178,47 +117,6 @@ mod tests {
         check(&prompts(&asked), &0, "before obtain")?;
         let _pin: PinBytes = source.obtain()?;
         check(&prompts(&asked), &1, "after obtain")
-    }
-
-    #[test]
-    fn a_shared_prompt_runs_once_for_every_source() -> TestResult {
-        let (source, asked) = counting_source();
-        let PinSource::Ask(prompt) = source else {
-            return Err("counting source asks".into());
-        };
-        let shared = SharedPin::new(prompt);
-        let mut first = shared.source();
-        let mut second = shared.source();
-        let a: PinBytes = first.obtain()?;
-        let b: PinBytes = second.obtain()?;
-        check(&prompts(&asked), &1, "asked once")?;
-        check(&(a.as_bytes() == b.as_bytes()), &true, "the same PIN")
-    }
-
-    #[test]
-    fn a_failed_prompt_is_not_remembered() -> TestResult {
-        let asked = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&asked);
-        let shared = SharedPin::new(Box::new(move || {
-            let before = counter.fetch_add(1, Ordering::SeqCst);
-            if before == 0 {
-                return Err(PinEntryError {
-                    status: ExitStatus::RuntimeFailure,
-                });
-            }
-            PinBytes::new(SYNTHETIC_PIN.as_bytes().to_vec()).map_err(|_policy| PinEntryError {
-                status: ExitStatus::RuntimeFailure,
-            })
-        }));
-        check(
-            &shared.source().obtain().is_err(),
-            &true,
-            "the first attempt fails",
-        )?;
-        let _pin: PinBytes = shared.source().obtain()?;
-        check(&prompts(&asked), &2, "asked again after a failure")?;
-        let _again: PinBytes = shared.source().obtain()?;
-        check(&prompts(&asked), &2, "then remembered")
     }
 
     #[test]

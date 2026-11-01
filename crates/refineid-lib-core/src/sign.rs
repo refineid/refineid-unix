@@ -55,14 +55,7 @@ use crate::transport::{CardTransport, TransportDispatchError};
 /// across the sign module.
 type TxError<T> = TransportDispatchError<<T as CardTransport>::Error>;
 
-pub mod asic;
-pub mod cades;
 pub mod commands;
-pub mod document;
-pub mod pades;
-pub mod timestamp;
-pub mod validation;
-pub mod xades;
 
 /// PKCS#15 key reference for the FINEID **auth key** -- the one
 /// used for TLS client cert / SSH / agent identity. FINEID S1

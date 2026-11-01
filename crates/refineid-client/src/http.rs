@@ -166,39 +166,6 @@ impl fmt::Display for HttpError {
     }
 }
 
-impl HttpError {
-    /// Whether a timestamp authority request may be repeated unchanged.
-    pub(crate) fn is_retryable_authority_failure(&self) -> bool {
-        match self {
-            Self::Io(error) => matches!(
-                error.kind(),
-                io::ErrorKind::TimedOut
-                    | io::ErrorKind::Interrupted
-                    | io::ErrorKind::WouldBlock
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::ConnectionRefused
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::NotConnected
-                    | io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::BrokenPipe
-            ),
-            Self::HttpStatus { code, .. } => {
-                matches!(*code, 408 | 425 | 429 | 500 | 502 | 503 | 504)
-            }
-            Self::Https { retryable, .. } => *retryable,
-            Self::BadUrl(_)
-            | Self::UnsupportedScheme(_)
-            | Self::BadStatusLine(_)
-            | Self::UnknownBodyLength
-            | Self::BadChunkSize(_)
-            | Self::BodyTooLarge { .. }
-            | Self::UnsafeDestination(_)
-            | Self::UnsafeRedirect(_)
-            | Self::InsecureCredentials => false,
-        }
-    }
-}
-
 /// Why one HTTP exchange is being made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Endpoint {
@@ -257,7 +224,75 @@ impl HttpHelpers {
 /// URL parse failure, TCP failure, non-2xx HTTP status, malformed
 /// HTTP framing, body exceeding `max_bytes`.
 pub(crate) fn get(url: &Uri, max_bytes: usize, user_agent: &str) -> Result<Vec<u8>, HttpError> {
-    get_for(url, max_bytes, user_agent, Endpoint::CertificateMaterial)
+    get_for(
+        url,
+        max_bytes,
+        user_agent,
+        Endpoint::CertificateMaterial,
+        &|url| resolve_destination(url, Endpoint::CertificateMaterial),
+    )
+}
+
+/// Resolve a certificate-published `host`: DNSSEC-validated answers
+/// first, the platform resolver once when the zone is unsigned or
+/// validation is unavailable. Whether the answers are public is the
+/// caller's to judge.
+///
+/// # Errors
+/// A DNSSEC answer that fails validation, a secure denial with no
+/// other secure address, or the platform resolver's failure.
+pub(crate) fn resolve_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, HttpError> {
+    resolve_addresses(host, port, Endpoint::CertificateMaterial)
+}
+
+/// Where one hop of an exchange connects: the vetted address for a URL.
+pub(crate) type Destination<'a> = &'a dyn Fn(&Uri) -> Result<SocketAddr, HttpError>;
+
+/// GET a certificate-published `url`, connecting where `destination`
+/// says for the first hop and every redirect, under the same redirect
+/// policy as [`get`].
+///
+/// # Errors
+/// As for [`get`], and whatever `destination` refuses.
+pub(crate) fn get_to(
+    url: &Uri,
+    max_bytes: usize,
+    user_agent: &str,
+    destination: Destination<'_>,
+) -> Result<Vec<u8>, HttpError> {
+    get_for(
+        url,
+        max_bytes,
+        user_agent,
+        Endpoint::CertificateMaterial,
+        destination,
+    )
+}
+
+/// POST to a certificate-published `url`, connecting where
+/// `destination` says for the first hop and every redirect, under the
+/// same redirect policy as [`post`].
+///
+/// # Errors
+/// As for [`post`], and whatever `destination` refuses.
+pub(crate) fn post_to(
+    url: &Uri,
+    content_type: &str,
+    body: &[u8],
+    max_bytes: usize,
+    user_agent: &str,
+    destination: Destination<'_>,
+) -> Result<Vec<u8>, HttpError> {
+    post_for(
+        url,
+        content_type,
+        body,
+        max_bytes,
+        user_agent,
+        Endpoint::CertificateMaterial,
+        None,
+        destination,
+    )
 }
 
 /// Redirect statuses worth following for a `GET` of a static file
@@ -286,6 +321,7 @@ pub(crate) fn post(
         user_agent,
         Endpoint::CertificateMaterial,
         None,
+        &|url| resolve_destination(url, Endpoint::CertificateMaterial),
     )
 }
 
@@ -314,6 +350,7 @@ pub(crate) fn post_authority(
         user_agent,
         Endpoint::Authority,
         authorization,
+        &|url| resolve_destination(url, Endpoint::Authority),
     )
 }
 
@@ -338,11 +375,12 @@ fn get_for(
     max_bytes: usize,
     user_agent: &str,
     endpoint: Endpoint,
+    destination: Destination<'_>,
 ) -> Result<Vec<u8>, HttpError> {
     let mut current = url.clone();
     let maximum = maximum_redirects(endpoint);
     for followed in 0..=maximum {
-        let mut response = get_once(&current, max_bytes, user_agent, endpoint)?;
+        let mut response = get_once(&current, destination(&current)?, max_bytes, user_agent)?;
         if response.is_success() {
             return Ok(response.body);
         }
@@ -366,6 +404,10 @@ fn get_for(
     Err(HttpError::UnsafeRedirect("redirect loop".to_owned()))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one parameter per part of the exchange; the public entry points each fix the policy ones"
+)]
 fn post_for(
     url: &Uri,
     content_type: &str,
@@ -374,17 +416,18 @@ fn post_for(
     user_agent: &str,
     endpoint: Endpoint,
     authorization: Option<&str>,
+    destination: Destination<'_>,
 ) -> Result<Vec<u8>, HttpError> {
     let mut current = url.clone();
     let maximum = maximum_redirects(endpoint);
     for followed in 0..=maximum {
         let mut response = post_once(
             &current,
+            destination(&current)?,
             content_type,
             body,
             max_bytes,
             user_agent,
-            endpoint,
             authorization,
         )?;
         if response.is_success() {
@@ -453,11 +496,10 @@ fn check_redirect(from: &Uri, to: &Uri, endpoint: Endpoint) -> Result<(), HttpEr
 
 fn get_once(
     url: &Uri,
+    address: SocketAddr,
     max_bytes: usize,
     user_agent: &str,
-    endpoint: Endpoint,
 ) -> Result<ExchangeResponse, HttpError> {
-    let address = resolve_destination(url, endpoint)?;
     if url.scheme() == Scheme::Https {
         return https_get_to(url, address, max_bytes, user_agent);
     }
@@ -491,14 +533,13 @@ fn get_once(
 
 fn post_once(
     url: &Uri,
+    address: SocketAddr,
     content_type: &str,
     body: &[u8],
     max_bytes: usize,
     user_agent: &str,
-    endpoint: Endpoint,
     authorization: Option<&str>,
 ) -> Result<ExchangeResponse, HttpError> {
-    let address = resolve_destination(url, endpoint)?;
     if url.scheme() == Scheme::Https {
         return https_post_to(
             url,
@@ -1273,31 +1314,6 @@ mod tests {
         assert!(matches!(error, HttpError::InsecureCredentials));
     }
 
-    #[test]
-    fn authority_retry_classification_separates_temporary_and_permanent_failures() {
-        let status = |code| HttpError::HttpStatus {
-            code,
-            reason: String::new(),
-            location: None,
-        };
-        for code in [408, 425, 429, 500, 502, 503, 504] {
-            assert!(status(code).is_retryable_authority_failure(), "HTTP {code}");
-        }
-        for code in [400, 401, 403, 411, 413, 415, 501] {
-            assert!(
-                !status(code).is_retryable_authority_failure(),
-                "HTTP {code}"
-            );
-        }
-        assert!(
-            HttpError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut))
-                .is_retryable_authority_failure()
-        );
-        assert!(
-            !HttpError::UnsafeDestination("DNSSEC validation failed".to_owned())
-                .is_retryable_authority_failure()
-        );
-    }
     use hickory_resolver::proto::dnssec::Proof;
     use refineid_lib_core::text::Uri;
     use std::io::Cursor;

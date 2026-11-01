@@ -1491,6 +1491,7 @@ fn build_identity_page(
                         show_alert(&win_alert, &format!("Failed to save image: {e}"));
                     }
                 });
+                keep_until_response(&chooser);
                 chooser.show();
             }
         });
@@ -1529,6 +1530,7 @@ fn build_identity_page(
                         show_alert(&win_alert, &format!("Failed to save image: {e}"));
                     }
                 });
+                keep_until_response(&chooser);
                 chooser.show();
             }
         });
@@ -2393,6 +2395,7 @@ fn build_sign_page(
                     }
                 }
             });
+            keep_until_response(&chooser);
             chooser.show();
         });
     }
@@ -2821,4 +2824,14 @@ mod tests {
             assert!(texture_from_rgba(&valid).is_some());
         }
     }
+}
+
+/// Holds `chooser` until it answers. GTK keeps no reference to a native
+/// dialog of its own; the last reference dropping destroys it, and
+/// without a desktop portal it is gone before it is shown.
+fn keep_until_response(chooser: &gtk4::FileChooserNative) {
+    let held = std::rc::Rc::new(std::cell::RefCell::new(Some(chooser.clone())));
+    chooser.connect_response(move |_, _| {
+        let _released = held.borrow_mut().take();
+    });
 }

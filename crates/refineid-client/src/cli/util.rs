@@ -139,6 +139,24 @@ pub const fn reader_pick_status(err: &ReaderPickError) -> ExitStatus {
     }
 }
 
+/// [`reader_pick_status`] for the reader picker of the core card
+/// crates, which document signing runs on.
+pub const fn core_reader_pick_status(err: &refineid_pcsc::ReaderPickError) -> ExitStatus {
+    use refineid_pcsc::ReaderPickError;
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "ReaderPickError is #[non_exhaustive]; any variant beyond these maps to the catch-all RuntimeFailure (70), as in reader_pick_status."
+    )]
+    match err {
+        ReaderPickError::NoReaders => ExitStatus::NoReaders,
+        ReaderPickError::NoCardPresent => ExitStatus::NoCardPresent,
+        ReaderPickError::MultipleReadersNoFilter { .. }
+        | ReaderPickError::NoMatchingReader { .. }
+        | ReaderPickError::AmbiguousFilter { .. } => ExitStatus::BadInvocation,
+        _ => ExitStatus::RuntimeFailure,
+    }
+}
+
 /// Render an operator-facing `cmd: <error>` line to stderr, then
 /// map the [`ReaderPickError`] to its process [`ExitCode`] via
 /// [`reader_pick_status`].

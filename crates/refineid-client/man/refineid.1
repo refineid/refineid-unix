@@ -306,12 +306,18 @@ Prints one record per signature, records separated by one blank
 line.
 Each line of a record is a key, a colon, a space and the value; no
 line is indented or padded.
-.Bl -tag -width "revocation:"
+.Bl -tag -width "countersigns:"
 .It Li file\&:
 the file as named on the command line.
 .It Li signer\&:
 the signer certificate's common name exactly as the certificate
 spells it, or its whole subject when it has none.
+.It Li countersigns\&:
+on an XAdES counter-signature only, the
+.Li signer
+of the signature it counter-signs.
+A counter-signature is a record like any signature, and its verdict
+leaves the exit status as it is.
 .It Li signed\&:
 the time a verified timestamp proves the signature existed, or
 .Li -
@@ -376,7 +382,8 @@ ending in the trust anchor; a path that reaches no anchor ends in
 the signing time the signature claims, or
 .Li - .
 .It Li timestamp\&:
-one line per signature timestamp: its time and
+one line per signature timestamp, then per archive timestamp: its
+time and
 .Li proven ,
 or
 .Li unproven
@@ -407,9 +414,8 @@ the revocation time and the reason as RFC 5280 names it
 .Li aACompromise
 or
 .Li unspecified ,
-also when the answer states none;
-.Li unknown
-for a code RFC 5280 does not assign
+also when the answer states none or a code RFC 5280 does not
+assign
 .Pc ,
 or
 .Li not checked .

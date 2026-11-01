@@ -1383,13 +1383,17 @@ mod tests {
     const SWEEP_LOOK: Duration = Duration::from_millis(20);
 
     /// A fresh directory for a pairing store of the test's own.
+    /// A store path no other test in this process uses: tests run in
+    /// parallel and the clock can read the same instant for two of them.
     fn scratch_store() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("a clock after the epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "refineid-pkcs11-phone-{}-{nanos:x}",
+            "refineid-pkcs11-phone-{}-{nanos:x}-{serial}",
             std::process::id()
         ))
     }

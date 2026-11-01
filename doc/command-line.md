@@ -31,7 +31,10 @@ Citations are BibTeX keys in [`references.md`](references.md).
   column, no tabs. Values are printed as their source spells them; a
   signer's name is the certificate's common name verbatim, never
   reordered or joined with other attributes. Times are ISO 8601 in
-  UTC.
+  UTC. An XAdES counter-signature is a record of its own with one
+  more key, `countersigns:`, naming the signer it counter-signs; it
+  sits in unsigned material anyone can append to, so its verdict
+  leaves the exit status as the signatures over the document set it.
 - **A timestamp proves the signing time.** `refineid document verify`
   judges a signature at the earliest time a proven timestamp sets and
   prints it as `signed:`; without one the signature is judged as of

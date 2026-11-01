@@ -97,7 +97,7 @@ impl SignArgs {
         let run_once = |can: Option<Can>| {
             let options = crate::card_sign::SignOptions {
                 input: input.clone(),
-                output: crate::card_sign::SignOutput::At(output.clone()),
+                output: output.clone(),
                 pin: super::util::pin_source_at_use(
                     cmd,
                     env_var,
@@ -106,9 +106,6 @@ impl SignArgs {
                 save_cert: save_cert.clone(),
                 reader_filter: reader_filter.clone(),
                 can,
-                // The bare verbs produce signature bytes; the format
-                // choice lives in `document sign`.
-                document: None,
             };
             match slot {
                 SignSlot::Auth => crate::card_sign::sign_auth_first(backend, options),

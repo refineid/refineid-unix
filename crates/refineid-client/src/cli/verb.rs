@@ -562,12 +562,12 @@ pub fn route(
         .copied()
         .find(|tag| tag.label() == group);
     let verbs: Vec<(&str, VerbTag)> = VerbTag::verbs_of(group).collect();
-    let Some((&(first_verb, _), _)) = verbs.split_first() else {
+    if verbs.is_empty() {
         // A one-word command: `verify`.
         return bare
             .map(|tag| (tag, RemainingArgv::from_slice(rest)))
             .ok_or_else(|| VerbParseError::Unrecognized { got: first.clone() });
-    };
+    }
     let (tag, rest) = match rest {
         [second, more @ ..] if !second.starts_with(OPTION_START) => {
             match resolve(second, verbs.iter().map(|(word, _)| *word)) {
@@ -599,12 +599,28 @@ pub fn route(
             Some(tag) => (tag, rest),
             None => {
                 return Err(VerbParseError::Unrecognized {
-                    got: format!("{first} (missing sub-verb, try: {group} {first_verb})"),
+                    got: format!(
+                        "{first} (missing sub-verb, try: {})",
+                        alternatives(group, &verbs)
+                    ),
                 });
             }
         },
     };
     Ok((tag, RemainingArgv::from_slice(rest)))
+}
+
+/// Every verb of `group` spelled out, `group a, group b or group c`.
+fn alternatives(group: &str, verbs: &[(&str, VerbTag)]) -> String {
+    let spelled: Vec<String> = verbs
+        .iter()
+        .map(|(verb, _)| format!("{group} {verb}"))
+        .collect();
+    match spelled.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    }
 }
 
 /// The first character of an option, which a verb never starts with.
@@ -615,6 +631,19 @@ mod tests {
     use super::*;
     use crate::cli::argv::fixtures::process_argv as argv;
     use crate::test_util::{TestResult, check, check_true};
+
+    #[test]
+    fn a_group_without_its_verb_names_every_verb() -> TestResult {
+        let error = parse_argv(&argv(&["refineid", "document"]))
+            .err()
+            .ok_or("a bare document is refused")?;
+        check_true(
+            error
+                .to_string()
+                .contains("missing sub-verb, try: document sign or document verify"),
+            "both document verbs",
+        )
+    }
 
     #[test]
     fn bare_card_dispatches_to_check() -> TestResult {
