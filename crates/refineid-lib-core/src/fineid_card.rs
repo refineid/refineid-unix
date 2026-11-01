@@ -215,20 +215,19 @@ impl fmt::Display for Ats {
 
 /// DVV's category label for a certificate card.
 ///
-/// Three values, only [`Self::CitizenEid`] is currently in
-/// scope for refineid. The labels here are exactly the
-/// strings DVV uses in the ATR/ATS technology note, minus
-/// the trailing "card" / "cards" plural.
+/// The labels here are exactly the strings DVV uses in the
+/// ATR/ATS technology note, minus the trailing "card" / "cards"
+/// plural. The ATR classifier ([`Atr::classify`]) knows the
+/// [`Self::CitizenEid`] models; an organization card is
+/// recognised by its PIN reference numbering instead (FINEID S4-2
+/// v4.0 §4.2, `auth::PinReferenceScheme`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CardType {
-    /// DVV's "Citizen eID" category -- the only in-scope card
-    /// type for refineid.
+    /// DVV's "Citizen eID" category.
     CitizenEid,
     /// DVV's "Social welfare and organizational" category.
-    /// Out of scope today.
     SocialWelfareAndOrganizational,
-    /// DVV's "Health care and organizational" category. Out
-    /// of scope today.
+    /// DVV's "Health care and organizational" category.
     HealthCareAndOrganizational,
 }
 
@@ -472,10 +471,11 @@ impl FineidCardModel {
 /// Error returned by [`Atr::classify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CardClassificationError {
-    /// Observed ATR didn't match any in-scope FINEID card
-    /// model. Out-of-scope DVV cards (expired older
-    /// generations, social welfare / organizational, health
-    /// care) land here, as does any non-FINEID smartcard.
+    /// Observed ATR didn't match any FINEID citizen card model
+    /// the classifier knows. Expired `MultiApp` generations,
+    /// organization cards (recognised by their PIN reference
+    /// numbering instead) and any non-FINEID smartcard land
+    /// here.
     UnknownOrUnsupportedAtr {
         /// The ATR bytes that didn't classify. Surfaced so the
         /// operator can compare against
@@ -664,21 +664,6 @@ mod tests {
             }
             other => panic!("expected UnknownOrUnsupportedAtr, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn social_welfare_atr_is_rejected_in_citizen_classifier() {
-        // Idemia Cosmo X (FINEID S1 v5.0), Social welfare /
-        // organizational -- out of scope.
-        let bytes: [u8; 22] = [
-            0x3B, 0xDD, 0x96, 0x00, 0x80, 0x31, 0xFE, 0x45, 0x00, 0x31, 0xB8, 0x64, 0x04, 0x29,
-            0xEC, 0xC1, 0x73, 0x94, 0x01, 0x80, 0x83, 0x49,
-        ];
-        let atr = Atr::new(bytes).expect("social welfare ATR fixture parses");
-        assert!(matches!(
-            atr.classify(),
-            Err(CardClassificationError::UnknownOrUnsupportedAtr { .. })
-        ));
     }
 
     #[test]

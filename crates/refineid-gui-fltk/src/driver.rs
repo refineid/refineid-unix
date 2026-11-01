@@ -330,6 +330,7 @@ fn draw_keys(button: &mut Button) {
 #[derive(Clone)]
 struct ActivationFields {
     section: Group,
+    heading: Frame,
     inputs: [SecretInput; 5],
     button: Button,
 }
@@ -491,7 +492,7 @@ impl FltkDriver {
         // The activation form.
         let activation_height = LINE + 5 * (FIELD + GAP) + FIELD;
         let activation_section = section(activation_height);
-        let mut heading = line_frame(0, 0, CONTENT_WIDTH, LINE, window::CARD_ACTIVATION);
+        let mut heading = line_frame(0, 0, CONTENT_WIDTH, LINE, window::IDENTITY_CARD_ACTIVATION);
         heading.set_label_font(Font::HelveticaBold);
         let names = [
             window::ACTIVATION_PIN,
@@ -512,6 +513,7 @@ impl FltkDriver {
         column.fixed(&activation_section, activation_height);
         let activation = ActivationFields {
             section: activation_section,
+            heading,
             inputs,
             button: activate,
         };
@@ -1054,6 +1056,12 @@ impl UiDriver for FltkDriver {
             &mut widgets.activation.section,
             content == WindowContent::Activation,
         );
+        if content == WindowContent::Activation {
+            widgets
+                .activation
+                .heading
+                .set_label(window::activation_heading(state));
+        }
         if entered && content == WindowContent::Activation {
             let _ = widgets.activation.inputs[0].take_focus();
         }

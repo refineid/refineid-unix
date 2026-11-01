@@ -84,11 +84,14 @@ S2 §5 mandates `pathLenConstraint = 0` on every
 intermediate, so end-entity issuance is the only legal next
 hop -- no sub-sub-CAs.
 
-Other intermediates listed in S2 §5 (`DVV Service
+Other intermediates are listed in S2 §5 (`DVV Service
 Certificates - G5R`/`G5E`, `DVV Organisational Certificates -
-G4R`/`G4E`, social welfare / time stamp / temporary sub-CAs)
-are not in refineid's `pin activate` scope; see
-[`fineid-card-models.md`](fineid-card-models.md).
+G4R`/`G4E`, social welfare / time stamp / temporary sub-CAs).
+No issuer name, and no issuer key-family suffix, decides how a
+card is activated or whether it is an organization card: the
+reference numbering and the authentication certificate's
+validity start do; see
+[`fineid-card-models.md`](fineid-card-models.md#detecting-unactivated-vs-activated-cards).
 
 ### Test hierarchy
 

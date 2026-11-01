@@ -14,7 +14,7 @@ The interface follows **simple as possible, but no simpler**:
 
 Show feedback only when it helps the user act:
 
-- Show concise success/failure feedback for PIN activation, PIN changes, and PIN reactivation, on every supported card generation (S4-1 v3.1 RSA-3072 and v4.0 ECC P-384).
+- Show concise success/failure feedback for PIN activation, PIN changes, and PIN reactivation, under both activation schemes (FINEID S4-1 v4.2 §4.6.1 and §4.6.2) and on every supported card model.
 - Show detailed information for errors and warnings.
 - Do not show routine success messages such as card discovery or card selection.
 
@@ -33,7 +33,7 @@ Show feedback only when it helps the user act:
 - `WrongPuk { retries_left: ... }` is rendered as `Wrong PUK. N attempts remaining.`
 - The PUK has its own retry counter. A successful reset-retry-counter command
   resets both the target PIN retry counter and the PUK try counter to their
-  configured limits; production old- and new-generation cards confirm this.
+  configured limits.
 - Query PUK retries with the credential-free PIN-container `GET DATA` form
   from FINEID S1 v4.2 section 3.15. Never probe by submitting an intentionally
   wrong PUK because that consumes an attempt.

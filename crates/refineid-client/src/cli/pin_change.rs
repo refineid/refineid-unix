@@ -14,8 +14,6 @@
 
 //! `pin change 1|2` typed arguments.
 
-use refineid_lib_core::auth::check_retry_floor;
-
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::PinManageSlot;
 
@@ -79,18 +77,19 @@ impl ChangePinArgs {
                 }
             };
         let ctx = session.into_pin_management_context();
-        let retry_status = match crate::card_pin::probe_pin_status_for_cli(backend, &ctx, slot) {
-            Ok(status) => status,
+        // A change presents the current PIN, so it is a PIN attempt: refuse
+        // a PIN that awaits activation, or one below the retry floor,
+        // before prompting.
+        match crate::card_pin::probe_change_gate_for_cli(backend, &ctx, slot) {
+            Ok(()) => {}
+            Err(refusal @ crate::card_pin::CardPinError::RetryFloor(_)) => {
+                eprintln!("{cmd}: {refusal}");
+                return ExitStatus::CardCredentialRejected.into();
+            }
             Err(error) => {
                 eprintln!("{cmd}: {error}");
                 return ExitStatus::RuntimeFailure.into();
             }
-        };
-        // A change presents the current PIN, so it is a PIN attempt: refuse
-        // below the retry floor before prompting.
-        if let Err(refusal) = check_retry_floor(slot.as_pin_slot(), retry_status) {
-            eprintln!("{cmd}: {refusal}");
-            return ExitStatus::CardCredentialRejected.into();
         }
         let (current_env, new_env) = match slot {
             PinManageSlot::Pin1 => ("REFINEID_CURRENT_PIN1", "REFINEID_NEW_PIN1"),

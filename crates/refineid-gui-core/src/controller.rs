@@ -27,14 +27,13 @@ use refineid_client::card_pin::{
 use refineid_doc_sign::service::{DEFAULT_TIMESTAMP_AUTHORITY, SignOutput};
 use refineid_doc_sign::signed_name::PendingSignedName;
 use refineid_doc_sign::x509::DateTime;
-use refineid_lib_core::auth::{ChangePinOutcome, PinSlot, UnblockOutcome};
+use refineid_lib_core::auth::{ActivationScheme, ChangePinOutcome, PinSlot, UnblockOutcome};
 use refineid_lib_core::backend::{ReaderFilter, ReaderPickError};
 use refineid_lib_core::can::Can;
 use refineid_lib_core::identity::{CredentialIdentity, TokenSerial, render_token_serial};
 use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
-use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_rapp_core::engine::{OperationOutcome, PairingSearchError};
 use refineid_rapp_core::ids::PairId;
 
@@ -338,7 +337,6 @@ impl RefineIdController {
                 state.pin2_change_available =
                     is_local && card.pin_change_available(PinSlot::Pin2, card.report.pin2.as_ref());
                 state.activation_available = is_local && card.activation_available();
-                state.legacy_activation = is_local && card.legacy_activation_required();
                 let (p1_rec, p2_rec) = if is_local {
                     card.recovery_availability()
                 } else {
@@ -350,11 +348,12 @@ impl RefineIdController {
                     && card
                         .activation_context
                         .as_ref()
-                        .is_some_and(|ctx| ctx.generation == CardGeneration::Older);
+                        .is_some_and(|ctx| ctx.scheme == ActivationScheme::ActivationCodeIsPuk);
+                state.organization_card = card.is_organization_card();
+                // A card here signs whatever its activation scheme; the
+                // phone's card signs when the pairing grants it.
                 state.signature_supported = if is_local {
-                    card.activation_context
-                        .as_ref()
-                        .is_some_and(|ctx| ctx.generation == CardGeneration::Newer)
+                    true
                 } else {
                     state
                         .phone
@@ -373,7 +372,7 @@ impl RefineIdController {
                 state.pin1_change_available = false;
                 state.pin2_change_available = false;
                 state.activation_available = false;
-                state.legacy_activation = false;
+                state.organization_card = false;
                 state.pin1_unblock_available = false;
                 state.pin2_unblock_available = false;
                 state.unblock_uses_activation_code = false;
@@ -557,18 +556,15 @@ impl RefineIdController {
                 let context =
                     refineid_client::card_manager::prepare_activation(reader_filter.as_ref())
                         .map_err(|e| e.to_string())?;
-                let expected = context.expected_activation_pin_length().ok_or_else(|| {
-                    "Card generation did not determine activation-code length".to_owned()
-                })?;
-                let activation_pin = match expected {
-                    ActivationPinSeven::LENGTH => ActivationPinSeven::new(activation_code_bytes)
-                        .map(ActivationCode::Seven)
-                        .map_err(|e| e.to_string())?,
-                    ActivationPinEight::LENGTH => ActivationPinEight::new(activation_code_bytes)
-                        .map(ActivationCode::Eight)
-                        .map_err(|e| e.to_string())?,
-                    other => return Err(format!("Unsupported activation-code length {other}")),
-                };
+                let activation_pin = match context.scheme {
+                    ActivationScheme::PresetActivationPin => {
+                        ActivationPinSeven::new(activation_code_bytes).map(ActivationCode::Seven)
+                    }
+                    ActivationScheme::ActivationCodeIsPuk => {
+                        ActivationPinEight::new(activation_code_bytes).map(ActivationCode::Eight)
+                    }
+                }
+                .map_err(|e| e.to_string())?;
 
                 refineid_client::card_manager::activate(
                     context,
@@ -1400,10 +1396,45 @@ mod tests {
         assert!(!state.pin1_change_available);
         assert!(!state.pin2_change_available);
         assert!(!state.activation_available);
-        assert!(!state.legacy_activation);
+        assert!(!state.organization_card);
         assert!(!state.pin1_unblock_available);
         assert!(!state.pin2_unblock_available);
         assert!(!state.unblock_uses_activation_code);
+    }
+
+    /// Signing does not depend on the activation scheme: a card here
+    /// signs whether or not an activation context was built for it.
+    #[test]
+    fn a_card_here_signs_whatever_its_activation_scheme() {
+        let report = CardCheckReport {
+            reader: "Synthetic Card Reader".to_owned(),
+            identity: CredentialIdentity::new(),
+            atr_hex: "3b00".to_owned(),
+            token_info: refineid_lib_core::pkcs15::TokenInfo::default(),
+            card_access: refineid_lib_core::card_access::CardAccess::default(),
+            certs: Vec::new(),
+            pin_reference_scheme: refineid_lib_core::auth::PinReferenceScheme::Citizen,
+            pin1: Some(PinStatus::Verified),
+            pin2: Some(PinStatus::Verified),
+            puk: None,
+            pin1_policy: None,
+            pin2_policy: None,
+            puk_policy: None,
+            pin1_changed: Some(true),
+            pin2_changed: Some(true),
+            emrtd: None,
+            emrtd_error: None,
+        };
+        let controller = RefineIdController::new(|_| {});
+        controller.replace_cards(vec![ManagedCard {
+            source: CardSource::Local,
+            report,
+            activation_context: None,
+        }]);
+        let state = controller.state();
+        assert!(state.selected_card_is_local);
+        assert!(state.signature_supported);
+        assert!(!state.activation_available);
     }
 
     #[test]

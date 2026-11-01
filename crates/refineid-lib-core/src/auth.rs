@@ -48,6 +48,7 @@ use crate::apdu::iso7816::ApduClass;
 use crate::apdu::status_word::{PinRetries, StatusWord};
 use crate::pin::PinBytes;
 use crate::transport::{CardTransport, TransportDispatchError};
+use crate::x509::DateTime;
 
 /// Shortened alias for the transport-error variant produced by a
 /// dispatch on a `CardTransport`-implementing type. Used to keep
@@ -114,19 +115,15 @@ pub const ORGANIZATIONAL_PIN_MIN_LENGTH: usize = 4;
 /// PUK stored-length: 12 bytes, padded with [`PIN_PAD_BYTE`].
 ///
 /// The PUK uses the same 12-byte padded slot as the PIN1 / PIN2
-/// references. A PUK is 8 to 12 digits independent of card generation.
+/// references. A PUK is 8 to 12 digits under either activation
+/// scheme.
 ///
-/// "PUK" here refers to the unblock-counter password in card
-/// slot ref `0x83` -- the `RESET RETRY COUNTER` surface. Only
-/// on cards issued **before 2026-01-13** does the activation
-/// letter's 8-digit *aktivointitunnusluku* double as this PUK
-/// (reusable -- effectively a permanent PIN-reset code, which
-/// is why newer cards dropped the scheme). Cards issued on or
-/// after 2026-01-13 ship a 7-digit **single-use** activation
-/// code that is consumed by activation (`CHANGE REFERENCE
-/// DATA`, not this path) and can never unblock anything; their
-/// separately ordered PUK is 8 to 12 digits; its length is not selected
-/// from card generation.
+/// "PUK" here is the unblock credential, citizen reference `0x83`
+/// -- the `RESET RETRY COUNTER` surface. Under FINEID S4-1 v4.2
+/// §4.6.1 the 8-digit activation code from the letter is this PUK.
+/// Under §4.6.2 the 7-digit preset activation PIN is the factory
+/// value of PIN 1 and PIN 2, presented through `CHANGE REFERENCE
+/// DATA`, not this path.
 /// See `doc/dvv-terminology.md` and `pin::ActivationPinSeven`
 /// / `pin::ActivationPinEight` / `pin::Puk`.
 pub const PUK_STORED_LENGTH: usize = 12;
@@ -223,6 +220,84 @@ impl PinReferenceScheme {
         match self {
             Self::Citizen => PUK_REFERENCE_PKCS15,
             Self::Organizational => PUK_REFERENCE_ORGANIZATIONAL,
+        }
+    }
+
+    /// The activation procedure (FINEID S4-1 v4.2 §4.6) a card with
+    /// this numbering follows.
+    ///
+    /// The organization numbering activates by §4.6.1 (the activation
+    /// code is the PUK) whatever the certificate date. Under the
+    /// citizen numbering the authentication certificate's validity
+    /// start decides; a validity start that could not be read gives no
+    /// scheme.
+    #[must_use]
+    pub fn activation_scheme(self, validity_start: Option<DateTime>) -> Option<ActivationScheme> {
+        match self {
+            Self::Organizational => Some(ActivationScheme::ActivationCodeIsPuk),
+            Self::Citizen => validity_start.and_then(|start| {
+                i64::try_from(start.unix_duration().as_secs())
+                    .ok()
+                    .map(ActivationScheme::from_validity_start)
+            }),
+        }
+    }
+}
+
+/// Whether one PIN still awaits activation (FINEID S4-1 v4.2 §4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinReadiness {
+    /// The PIN is in its factory state and awaits activation.
+    AwaitsActivation,
+    /// The holder has set the PIN.
+    Activated,
+    /// The card's answers decide neither. Every consumer treats it
+    /// as [`Self::Activated`]: activation refuses it, change and
+    /// unblock meet only the retry floor.
+    Undecided,
+}
+
+impl PinReadiness {
+    /// Judge one PIN from its PIN changed flag (FINEID S1 v4.2
+    /// §3.15.3) and its counter-safe status probe.
+    ///
+    /// The flag decides under both schemes: unchanged awaits
+    /// activation, changed is activated. Without the flag, §4.6.1 reads
+    /// the counter: a blocked, invalidated or exhausted PIN awaits
+    /// activation, a usable counter or a verified PIN is activated.
+    /// §4.6.2, or no scheme, makes no decision without the flag.
+    #[must_use]
+    pub const fn judge(
+        scheme: Option<ActivationScheme>,
+        changed: Option<bool>,
+        status: Option<PinStatus>,
+    ) -> Self {
+        match (changed, scheme, status) {
+            (Some(false), _, _) => Self::AwaitsActivation,
+            (Some(true), _, _) => Self::Activated,
+            (None, Some(ActivationScheme::ActivationCodeIsPuk), Some(PinStatus::Locked)) => {
+                Self::AwaitsActivation
+            }
+            (
+                None,
+                Some(ActivationScheme::ActivationCodeIsPuk),
+                Some(PinStatus::Remaining(retries)),
+            ) => {
+                if retries.is_exhausted() {
+                    Self::AwaitsActivation
+                } else {
+                    Self::Activated
+                }
+            }
+            (None, Some(ActivationScheme::ActivationCodeIsPuk), Some(PinStatus::Verified)) => {
+                Self::Activated
+            }
+            (
+                None,
+                Some(ActivationScheme::ActivationCodeIsPuk),
+                None | Some(PinStatus::NoInfo | PinStatus::Other(_)),
+            )
+            | (None, Some(ActivationScheme::PresetActivationPin) | None, _) => Self::Undecided,
         }
     }
 }
@@ -964,19 +1039,17 @@ pub trait PinOps: CardTransport {
     ///
     /// Returns:
     /// - `Ok(Some(true))` if the PIN has been changed since
-    ///   manufacture (the FINEID activation-state signal for new-
-    ///   scheme cards),
+    ///   manufacture (activated, under either activation scheme;
+    ///   see [`PinReadiness::judge`]),
     /// - `Ok(Some(false))` if it is still at the factory value,
     /// - `Ok(None)` for any card response that did not yield a
     ///   parseable `DF 2F` flag -- either the card returned a
-    ///   non-success SW (pre-FINEID-S1-v4.0 cards may not
-    ///   implement GET DATA for the PIN container at all and
-    ///   reply `SW=6A88` "Referenced data not found"), or the
+    ///   non-success SW (`SW=6A88` "Referenced data not found"
+    ///   for a reference the card does not hold), or the
     ///   response body did not carry a DF2F TLV (the spec marks
     ///   the flag as returned only if the "Return PIN changed
-    ///   flag" parameter is set, S1 v4.2 §3.15.2 caveat below
-    ///   Table 16). Callers should treat `None` as "flag
-    ///   indeterminate; proceed with the existing preflight."
+    ///   flag" parameter was set at personalization, S1 v4.2
+    ///   §3.15.2 caveat below Table 16).
     ///
     /// Side effects: **none**. Counter-safe -- neither the PIN try
     /// counter nor the PIN usage counter is decremented. Same
@@ -1353,6 +1426,117 @@ mod tests {
             .expect("resolution succeeds");
         assert_eq!(scheme, PinReferenceScheme::Citizen);
         assert_eq!(tx.cursor, tx.script.len());
+    }
+
+    /// The FINEID S4-1 v4.2 §4.6 cutover day, 13 January 2026.
+    const CUTOVER_YEAR: u16 = 2026;
+    /// See [`CUTOVER_YEAR`].
+    const CUTOVER_MONTH: u8 = 1;
+    /// See [`CUTOVER_YEAR`].
+    const CUTOVER_DAY: u8 = 13;
+    /// The day before the cutover.
+    const DAY_BEFORE_CUTOVER: u8 = 12;
+    /// Midnight, UTC.
+    const MIDNIGHT: u8 = 0;
+
+    fn day(day: u8) -> DateTime {
+        DateTime::new(
+            CUTOVER_YEAR,
+            CUTOVER_MONTH,
+            day,
+            MIDNIGHT,
+            MIDNIGHT,
+            MIDNIGHT,
+        )
+        .expect("valid fixture date")
+    }
+
+    #[test]
+    fn citizen_numbering_takes_the_scheme_from_the_validity_start() {
+        let citizen = PinReferenceScheme::Citizen;
+        assert_eq!(
+            citizen.activation_scheme(Some(day(DAY_BEFORE_CUTOVER))),
+            Some(ActivationScheme::ActivationCodeIsPuk)
+        );
+        assert_eq!(
+            citizen.activation_scheme(Some(day(CUTOVER_DAY))),
+            Some(ActivationScheme::PresetActivationPin)
+        );
+        assert_eq!(citizen.activation_scheme(None), None);
+    }
+
+    #[test]
+    fn organization_numbering_activates_by_the_puk_scheme_whatever_the_date() {
+        let organization = PinReferenceScheme::Organizational;
+        for start in [None, Some(day(DAY_BEFORE_CUTOVER)), Some(day(CUTOVER_DAY))] {
+            assert_eq!(
+                organization.activation_scheme(start),
+                Some(ActivationScheme::ActivationCodeIsPuk)
+            );
+        }
+    }
+
+    #[test]
+    fn the_pin_changed_flag_decides_readiness_under_every_scheme() {
+        let fresh = PinRetries::from_nibble(PIN_TRY_LIMIT).expect("try limit fits a nibble");
+        for scheme in [
+            None,
+            Some(ActivationScheme::ActivationCodeIsPuk),
+            Some(ActivationScheme::PresetActivationPin),
+        ] {
+            for status in [
+                None,
+                Some(PinStatus::Locked),
+                Some(PinStatus::Remaining(fresh)),
+            ] {
+                assert_eq!(
+                    PinReadiness::judge(scheme, Some(false), status),
+                    PinReadiness::AwaitsActivation
+                );
+                assert_eq!(
+                    PinReadiness::judge(scheme, Some(true), status),
+                    PinReadiness::Activated
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn without_the_flag_only_the_puk_scheme_reads_the_counter() {
+        const NO_TRIES_LEFT: u8 = 0;
+        let fresh = PinRetries::from_nibble(PIN_TRY_LIMIT).expect("try limit fits a nibble");
+        let exhausted = PinRetries::from_nibble(NO_TRIES_LEFT).expect("zero fits a nibble");
+        let puk = Some(ActivationScheme::ActivationCodeIsPuk);
+        for factory in [PinStatus::Locked, PinStatus::Remaining(exhausted)] {
+            assert_eq!(
+                PinReadiness::judge(puk, None, Some(factory)),
+                PinReadiness::AwaitsActivation
+            );
+        }
+        for set in [PinStatus::Remaining(fresh), PinStatus::Verified] {
+            assert_eq!(
+                PinReadiness::judge(puk, None, Some(set)),
+                PinReadiness::Activated
+            );
+        }
+        for unclear in [None, Some(PinStatus::NoInfo)] {
+            assert_eq!(
+                PinReadiness::judge(puk, None, unclear),
+                PinReadiness::Undecided
+            );
+        }
+        for scheme in [Some(ActivationScheme::PresetActivationPin), None] {
+            for status in [
+                None,
+                Some(PinStatus::Locked),
+                Some(PinStatus::Remaining(fresh)),
+            ] {
+                assert_eq!(
+                    PinReadiness::judge(scheme, None, status),
+                    PinReadiness::Undecided
+                );
+            }
+        }
     }
 
     #[test]

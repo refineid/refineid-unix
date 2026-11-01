@@ -69,14 +69,11 @@ pub const PINNED_ROOT_SHA256: &[(&str, Sha256)] = &[
     ),
 ];
 
-/// `true` if `fingerprint` matches one of the pinned roots or dynamically cached roots.
+/// `true` if `fingerprint` matches one of the pinned roots. Only the
+/// compiled-in pins are a source of trust; nothing read from a card
+/// is ever added to them.
 #[must_use]
 pub fn is_pinned_root(fingerprint: Sha256) -> bool {
-    if let Some(cached) = refineid_lib_core::trust_roots::active_root_certificates()
-        && cached.contains_fingerprint(fingerprint)
-    {
-        return true;
-    }
     PINNED_ROOT_SHA256
         .iter()
         .any(|(_, pinned)| *pinned == fingerprint)
@@ -86,11 +83,6 @@ pub fn is_pinned_root(fingerprint: Sha256) -> bool {
 /// `fingerprint`, or `None` if no pin matches.
 #[must_use]
 pub fn pinned_root_label(fingerprint: Sha256) -> Option<&'static str> {
-    if let Some(cached) = refineid_lib_core::trust_roots::active_root_certificates()
-        && cached.contains_fingerprint(fingerprint)
-    {
-        return Some("On-Card Issuing Root CA");
-    }
     PINNED_ROOT_SHA256
         .iter()
         .find(|(_, fp)| *fp == fingerprint)

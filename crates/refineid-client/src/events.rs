@@ -124,8 +124,8 @@ impl EventRecord for CardTarget<'_> {
 // ===========================================================
 
 /// `card.activate.preflight.ready` -- emitted once after the
-/// activation trust gate passes and the card generation is
-/// classified, just before the operator is prompted for the
+/// activation trust gate passes and the card's activation scheme
+/// is decided, just before the operator is prompted for the
 /// activation PIN.
 ///
 /// The structured form of "here's what we know about the card
@@ -152,10 +152,13 @@ pub struct CardActivatePreflightReady<'a> {
     /// Lowercase hex SHA-256 (64 chars) of the on-card root
     /// cert that the pin matched.
     pub trust_root_sha256: &'a str,
-    /// Auth cert `notBefore` as `YYYY-MM-DD`.
+    /// Auth cert `notBefore` as `YYYY-MM-DD`; `""` when it was
+    /// not readable.
     pub card_issued: &'a str,
     /// DVV category label, e.g. `"Citizen eID"`. See
-    /// `doc/fineid-card-models.md` for the allowed set.
+    /// `doc/fineid-card-models.md` for the allowed set. This and
+    /// the other model fields are `""` for an organization card
+    /// the ATR classifier does not know.
     pub card_type: &'a str,
     /// Vendor brand DVV publishes for this model, e.g.
     /// `"Thales"` or `"Gemalto"`.
@@ -171,14 +174,14 @@ pub struct CardActivatePreflightReady<'a> {
     /// Version of the FINEID specification document, bare,
     /// e.g. `"4.0"` or `"3.1"`.
     pub fineid_specification_version: &'a str,
-    /// Activation PIN length the card expects -- `"7"` for
-    /// post-2026-01-13 issuance, `"8"` for pre-cutoff. The
-    /// length is determined by `card_issued` against the DVV
-    /// cutoff, not by the card model itself (the cutoff lands
-    /// inside `"Thales MultiApp 5.0"`'s production window).
+    /// Activation entry length the card's scheme takes -- `"8"`
+    /// for the FINEID S4-1 v4.2 §4.6.1 activation code (the PUK),
+    /// `"7"` for the §4.6.2 preset activation PIN. The scheme
+    /// comes from the reference numbering and the certificate's
+    /// validity start, not from the card model.
     pub activation_pin_length: &'a str,
-    /// Card-side wrong-try cap before the activation PIN
-    /// locks. `"5"` for both pre- and post-cutoff cards.
+    /// Card-side wrong-try cap before the activation entry
+    /// locks. `"5"` under both schemes.
     pub wrong_tries_to_lock: &'a str,
     /// `"1"` -- refineid runs one activation attempt per
     /// invocation by design.
@@ -296,23 +299,22 @@ impl EventRecord for CardActivatePreflightReady<'_> {
 /// `card.activate.preflight.refused` -- PIN-status pre-flight
 /// refused the activation.
 ///
-/// Detected the card has likely been activated already (Older
-/// scheme only; Newer cards cannot be classified this way) and
-/// `--allow-reactivate` was not passed. The flow aborts before
-/// any modify APDU lands.
+/// A targeted PIN reads as activated (a PIN the card does not
+/// show to await activation reads as activated) and
+/// `--allow-reactivate` was not passed. The flow aborts before any
+/// modify APDU lands.
 #[derive(Debug)]
 pub struct CardActivatePreflightRefused<'a> {
     /// Reader the probe ran against.
     pub reader: &'a str,
-    /// PIN1 probe outcome that triggered the refusal, rendered
+    /// PIN1 status probe outcome, rendered
     /// via [`PinStatus`]' `Debug` ("Verified", "Remaining(5)",
     /// "Locked").
     ///
     /// [`PinStatus`]: refineid_lib_core::auth::PinStatus
     pub pin1_status: &'a str,
-    /// PIN2 probe outcome -- auxiliary, not part of the refusal
-    /// trigger. `""` when the PIN2 probe didn't return a status
-    /// word.
+    /// PIN2 status probe outcome. `""` when the PIN2 probe
+    /// didn't return a status word.
     pub pin2_status: &'a str,
 }
 
@@ -366,8 +368,8 @@ impl EventRecord for CardActivatePreflightRefused<'_> {
 // ===========================================================
 
 /// `card.activate.preflight.length_mismatch` -- typed activation
-/// code variant did not match the card generation's required
-/// length.
+/// entry variant did not match the length the card's activation
+/// scheme requires.
 ///
 /// Refineid refuses *before* any modify APDU so the operator can
 /// re-prompt without burning a card-side try.
@@ -375,14 +377,14 @@ impl EventRecord for CardActivatePreflightRefused<'_> {
 pub struct CardActivatePreflightLengthMismatch<'a> {
     /// Reader the operator targeted.
     pub reader: &'a str,
-    /// Generation classifier verdict for the card (`"Older"` /
-    /// `"Newer"` / `"Unknown"`), rendered via
-    /// [`CardGeneration`]'s `Debug`.
+    /// The card's activation scheme (`"ActivationCodeIsPuk"` /
+    /// `"PresetActivationPin"`), rendered via
+    /// [`ActivationScheme`]'s `Debug`.
     ///
-    /// [`CardGeneration`]: refineid_lib_core::pkcs15::CardGeneration
-    pub generation: &'a str,
-    /// Activation-PIN length the spec requires for that
-    /// generation (`"7"` for Newer, `"8"` for Older).
+    /// [`ActivationScheme`]: refineid_lib_core::auth::ActivationScheme
+    pub activation_scheme: &'a str,
+    /// Activation-entry length the scheme requires (`"8"` for
+    /// §4.6.1, `"7"` for §4.6.2).
     pub expected_length: &'a str,
 }
 
@@ -397,9 +399,9 @@ impl CardActivatePreflightLengthMismatch<'_> {
     /// Reader name.
     pub const F_READER: FieldDescriptor =
         FieldDescriptor::new(FieldName::new("reader"), FieldPrivacy::Public);
-    /// Generation classifier verdict.
-    pub const F_GENERATION: FieldDescriptor =
-        FieldDescriptor::new(FieldName::new("generation"), FieldPrivacy::Public);
+    /// The card's activation scheme.
+    pub const F_ACTIVATION_SCHEME: FieldDescriptor =
+        FieldDescriptor::new(FieldName::new("activation_scheme"), FieldPrivacy::Public);
     /// Expected PIN length (`"7"` / `"8"`).
     pub const F_EXPECTED_LENGTH: FieldDescriptor =
         FieldDescriptor::new(FieldName::new("expected_length"), FieldPrivacy::Public);
@@ -425,7 +427,7 @@ impl EventRecord for CardActivatePreflightLengthMismatch<'_> {
 
     fn for_each_field(&self, f: &mut dyn FnMut(FieldDescriptor, &dyn fmt::Display)) {
         f(Self::F_READER, &self.reader);
-        f(Self::F_GENERATION, &self.generation);
+        f(Self::F_ACTIVATION_SCHEME, &self.activation_scheme);
         f(Self::F_EXPECTED_LENGTH, &self.expected_length);
     }
 }
@@ -437,11 +439,9 @@ impl EventRecord for CardActivatePreflightLengthMismatch<'_> {
 /// `card.activate.preflight.pin_changed_probed` -- emitted after
 /// the GET DATA `DF 2F` probe for both PIN slots.
 ///
-/// On Newer cards this is the authoritative fresh-vs-activated
-/// signal (S1 v4.2 §3.15.2 Table 19); on Older cards it is
-/// informational (the existing PIN-status probe already
-/// distinguishes activation state by whether the slot is
-/// blocked).
+/// The flag decides whether each PIN awaits activation under
+/// either scheme (S1 v4.2 §3.15.3); without it, §4.6.1 reads the
+/// PIN counter and §4.6.2 makes no decision.
 #[derive(Debug)]
 pub struct CardActivatePreflightPinChangedProbed<'a> {
     /// PIN1 "PIN changed" flag, `"yes"` / `"no"` /
@@ -497,8 +497,8 @@ impl EventRecord for CardActivatePreflightPinChangedProbed<'_> {
 // ===========================================================
 
 /// `card.activate.scheme.selected` -- emitted after the
-/// preflight gate clears and refineid has chosen the per-
-/// generation activation APDU. See `doc/observability.md` for
+/// preflight gate clears and refineid has chosen the card's
+/// activation scheme and its APDU. See `doc/observability.md` for
 /// the naming convention.
 ///
 /// Useful for log triage when activation fails: tells the
@@ -508,8 +508,9 @@ impl EventRecord for CardActivatePreflightPinChangedProbed<'_> {
 /// have been a deviation from.
 #[derive(Debug)]
 pub struct CardActivateSchemeSelected<'a> {
-    /// `"new"` (S4-1 v4.2 §4.6.2 CHANGE REFERENCE DATA) or
-    /// `"old"` (§4.6.1 RESET RETRY COUNTER).
+    /// `"preset_activation_pin"` (S4-1 v4.2 §4.6.2 CHANGE
+    /// REFERENCE DATA) or `"activation_code_is_puk"` (§4.6.1
+    /// RESET RETRY COUNTER).
     pub scheme: &'a str,
     /// ISO 7816-4 instruction byte the per-slot setup APDU will
     /// carry, lowercase hex (`"24"` / `"2c"`).
@@ -526,7 +527,8 @@ impl CardActivateSchemeSelected<'_> {
     pub const LEVEL: Severity = Severity::Notice;
     /// Persistence per Rule E18: ephemeral.
     pub const PERSISTENCE: Persistence = Persistence::Ephemeral;
-    /// Selected scheme (`"new"` / `"old"`).
+    /// Selected scheme (`"preset_activation_pin"` /
+    /// `"activation_code_is_puk"`).
     pub const F_SCHEME: FieldDescriptor =
         FieldDescriptor::new(FieldName::new("scheme"), FieldPrivacy::Public);
     /// APDU instruction byte (hex).

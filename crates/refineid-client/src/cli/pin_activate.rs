@@ -21,8 +21,8 @@ use std::process::ExitCode;
 /// `doc/typing-discipline.md`).
 struct PinActivateHelpers;
 
-use refineid_lib_core::auth::UnblockOutcome;
-use refineid_lib_core::pin::ActivationCode;
+use refineid_lib_core::auth::{ActivationScheme, UnblockOutcome};
+use refineid_lib_core::pin::{ActivationCode, ActivationPinEight, ActivationPinSeven};
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::{
@@ -42,8 +42,10 @@ except a line on stderr when the other PIN is still unactivated; -v
 shows each step.
   --allow-reactivate  run on a card that already looks activated
   --reader S          narrow to readers whose name contains S
-WARNING: wrong tries consume the activation PIN's retry counter;
-locking it leaves recovery to the separately orderable paid PUK.
+The card decides the activation PIN: 8 digits (the PUK) on citizen
+cards issued before 13 January 2026 and on organization cards, 7 digits
+on citizen cards issued from that day.
+WARNING: a wrong activation PIN spends one of its tries.
 ";
 
 /// Parsed `pin activate [1|2] [--allow-reactivate] [--reader SUBSTR]`
@@ -96,8 +98,8 @@ const fn other_pin(slot: PinManageSlot) -> PinManageSlot {
     }
 }
 
-/// Env var consulted (alpha-period debug aid) for the 7-/8-digit
-/// activation PIN before the interactive prompt. See
+/// Env var consulted (alpha-period debug aid) for the activation
+/// entry before the interactive prompt. See
 /// [`PinActivateHelpers::read_pin_env_or_prompt`] for the
 /// semantics and the AGENTS.md §6 alpha exception.
 const ENV_ACTIVATION_PIN: &str = "REFINEID_ACTIVATION_PIN";
@@ -138,16 +140,6 @@ impl ActivateArgs {
                 return ExitStatus::RuntimeFailure.into();
             }
         };
-        let Some(expected_len) = ctx.expected_activation_pin_length() else {
-            eprintln!(
-                "{cmd}: couldn't classify card generation from auth cert; \
-                 refusing to guess at activation PIN length"
-            );
-            return ExitStatus::RuntimeFailure.into();
-        };
-        if verbose {
-            PinActivateHelpers::note_generation_disagreement(cmd, &ctx, verbose);
-        }
         // Refuse an activated card, or a counter below the retry floor,
         // before prompting.
         match crate::card_pin::probe_activation_gate_for_cli(
@@ -171,8 +163,8 @@ impl ActivateArgs {
                 return ExitStatus::RuntimeFailure.into();
             }
         }
-        PinActivateHelpers::emit_preflight_event(&ctx, expected_len);
-        let activation_pin = match PinActivateHelpers::prompt_activation_pin(cmd, expected_len) {
+        PinActivateHelpers::emit_preflight_event(&ctx);
+        let activation_pin = match PinActivateHelpers::prompt_activation_pin(cmd, ctx.scheme) {
             Ok(p) => p,
             Err(exit) => return exit,
         };
@@ -288,35 +280,6 @@ impl ActivateArgs {
     }
 }
 
-/// Single-line note when the issuance-date generation verdict
-/// disagrees with the issuer-CN heuristic. The issuance-date
-/// verdict wins regardless; the line just records the
-/// disagreement for the operator's log.
-impl PinActivateHelpers {
-    /// Print a one-line operator note when the two card-
-    /// generation signals disagree; the caller does so under `-v`.
-    ///
-    /// The card-issuance-date signal (FINEID S4-1 v4.2 §1.3
-    /// table) and the auth-cert issuer-CN heuristic should
-    /// usually agree on whether this is a 7- or 8-digit-PIN
-    /// generation. Disagreement is uncommon but not fatal --
-    /// the issuance-date verdict wins and the flow continues;
-    /// the note exists so the discrepancy lands in the audit
-    /// log.
-    fn note_generation_disagreement(cmd: &str, ctx: &ActivationCardContext, verbose: bool) {
-        if verbose
-            && ctx.generation != ctx.generation_by_issuer_cn
-            && ctx.generation_by_issuer_cn != refineid_lib_core::pkcs15::CardGeneration::Unknown
-        {
-            eprintln!(
-                "{cmd}: note: card generation by issuance-date ({:?}) disagrees with \
-             issuer-CN heuristic ({:?}); proceeding with the issuance-date verdict",
-                ctx.generation, ctx.generation_by_issuer_cn,
-            );
-        }
-    }
-}
-
 /// Emit the JSONL pre-flight event with trust-state + card-model
 /// metadata. The operator's `pin activate` invocation flushes
 /// this *before* the activation-PIN prompt so log scrapers can
@@ -330,7 +293,7 @@ impl PinActivateHelpers {
     /// pair the JSONL line with the human prompt. Required by
     /// `doc/observability.md` -- the pre-flight event is part
     /// of the audit baseline.
-    fn emit_preflight_event(ctx: &ActivationCardContext, expected_len: usize) {
+    fn emit_preflight_event(ctx: &ActivationCardContext) {
         let (trust_root_label, trust_root_sha256_hex) = match &ctx.trust {
             CardTrustAttestation::PinnedRootMatched {
                 root_label,
@@ -339,25 +302,27 @@ impl PinActivateHelpers {
             CardTrustAttestation::PinnedRootMismatch { .. }
             | CardTrustAttestation::RootCertUnavailable { .. } => ("", String::new()),
         };
-        let card_issued = format!(
-            "{:04}-{:02}-{:02}",
-            ctx.issuance_date.year(),
-            ctx.issuance_date.month(),
-            ctx.issuance_date.day(),
-        );
-        let activation_pin_length_str = format!("{expected_len}");
+        let card_issued = ctx.validity_start.map_or_else(String::new, |start| {
+            format!(
+                "{:04}-{:02}-{:02}",
+                start.year(),
+                start.month(),
+                start.day()
+            )
+        });
+        let activation_pin_length_str = format!("{}", ctx.activation_entry_digit_count());
         let model = ctx.model;
         crate::events::CardActivatePreflightReady {
             trust_state: "pinned_root_matched",
             trust_root_label,
             trust_root_sha256: &trust_root_sha256_hex,
             card_issued: &card_issued,
-            card_type: model.card_type().as_dvv_label(),
-            card_vendor: model.vendor().as_dvv_label(),
-            card_vendor_product: model.vendor_product(),
-            card_vendor_product_version: model.vendor_product_version(),
-            fineid_specification: model.fineid_specification(),
-            fineid_specification_version: model.fineid_specification_version(),
+            card_type: model.map_or("", |m| m.card_type().as_dvv_label()),
+            card_vendor: model.map_or("", |m| m.vendor().as_dvv_label()),
+            card_vendor_product: model.map_or("", |m| m.vendor_product()),
+            card_vendor_product_version: model.map_or("", |m| m.vendor_product_version()),
+            fineid_specification: model.map_or("", |m| m.fineid_specification()),
+            fineid_specification_version: model.map_or("", |m| m.fineid_specification_version()),
             activation_pin_length: &activation_pin_length_str,
             wrong_tries_to_lock: "5",
             attempts_this_invocation: "1",
@@ -366,47 +331,41 @@ impl PinActivateHelpers {
     }
 }
 
-/// Prompt for the activation PIN and wrap it in the typed
-/// [`ActivationCode`] variant that matches `expected_len` (7
-/// for current-generation DVV cards, 8 for legacy). Either
+/// Prompt for the activation entry and wrap it in the typed
+/// [`ActivationCode`] variant the card's scheme takes. Either
 /// length-typed constructor rejects a mistyped value at the
 /// trust boundary so the activate call only sees the in-shape
 /// form.
 impl PinActivateHelpers {
-    /// Prompt for the activation PIN and lift it into the
+    /// Prompt for the activation entry and lift it into the
     /// length-typed [`ActivationCode`] variant.
     ///
-    /// FINEID S4-1 §4.6 -- 7 digits for newer cards, 8 for
-    /// older. The length-typed constructor rejects out-of-shape
-    /// input at the trust boundary so downstream code only
-    /// ever sees an in-shape value. An "unexpected length
-    /// contract" return is a host bug, not a card outcome --
-    /// the calling site should already have classified the
-    /// generation.
-    fn prompt_activation_pin(cmd: &str, expected_len: usize) -> Result<ActivationCode, ExitCode> {
+    /// FINEID S4-1 v4.2 §4.6 -- the 8-digit activation code (the
+    /// PUK) under §4.6.1, the 7-digit preset activation PIN under
+    /// §4.6.2. The length-typed constructor rejects out-of-shape
+    /// input at the trust boundary so downstream code only ever
+    /// sees an in-shape value.
+    fn prompt_activation_pin(
+        cmd: &str,
+        scheme: ActivationScheme,
+    ) -> Result<ActivationCode, ExitCode> {
         let raw = super::util::pin_env_or_prompt(
             cmd,
             ENV_ACTIVATION_PIN,
             super::util::PROMPT_ACTIVATION_PIN,
         )?;
-        match expected_len {
-            7 => refineid_lib_core::pin::ActivationPinSeven::new(raw)
-                .map(ActivationCode::Seven)
-                .map_err(|e| {
-                    eprintln!("{cmd}: activation PIN: {e}");
-                    ExitCode::from(ExitStatus::BadInvocation)
-                }),
-            8 => refineid_lib_core::pin::ActivationPinEight::new(raw)
-                .map(ActivationCode::Eight)
-                .map_err(|e| {
-                    eprintln!("{cmd}: activation PIN: {e}");
-                    ExitCode::from(ExitStatus::BadInvocation)
-                }),
-            other => {
-                eprintln!("{cmd}: unexpected activation PIN length contract: {other}");
-                Err(ExitStatus::RuntimeFailure.into())
+        let parsed = match scheme {
+            ActivationScheme::PresetActivationPin => {
+                ActivationPinSeven::new(raw).map(ActivationCode::Seven)
             }
-        }
+            ActivationScheme::ActivationCodeIsPuk => {
+                ActivationPinEight::new(raw).map(ActivationCode::Eight)
+            }
+        };
+        parsed.map_err(|e| {
+            eprintln!("{cmd}: activation PIN: {e}");
+            ExitCode::from(ExitStatus::BadInvocation)
+        })
     }
 }
 
