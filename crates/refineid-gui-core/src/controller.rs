@@ -36,6 +36,7 @@ use refineid_lib_core::pin::{
 };
 use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_rapp_core::engine::{OperationOutcome, PairingSearchError};
+use refineid_rapp_core::ids::PairId;
 
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
 use refineid_rapp_core::remote::{CardRequest, RemoteError, RemoteReader};
@@ -296,11 +297,16 @@ impl RefineIdController {
                         .activation_context
                         .as_ref()
                         .is_some_and(|ctx| ctx.generation == CardGeneration::Older);
-                state.signature_supported = is_local
-                    && card
-                        .activation_context
+                state.signature_supported = if is_local {
+                    card.activation_context
                         .as_ref()
-                        .is_some_and(|ctx| ctx.generation == CardGeneration::Newer);
+                        .is_some_and(|ctx| ctx.generation == CardGeneration::Newer)
+                } else {
+                    state
+                        .phone
+                        .as_ref()
+                        .is_some_and(|phone| phone.signs_documents)
+                };
 
                 // Look up cached images
                 let key = card.key();
@@ -731,19 +737,36 @@ impl RefineIdController {
         });
     }
 
-    fn sign_documents(self: &Arc<Self>, pin2: PinBytes) {
-        let (reader, serial, documents, format) = {
+    fn sign_documents(self: &Arc<Self>, pin2: Option<PinBytes>) {
+        let (source, reader, serial, documents, format, phone) = {
             let state = self.state();
+            if !state.signature_supported {
+                return;
+            }
             let Some(card) = state.selected_card.and_then(|idx| state.cards.get(idx)) else {
                 self.update_state(|s| s.status_message = "No card selected for signing.".into());
                 return;
             };
             (
+                card.source,
                 card.report.reader.clone(),
                 card.report.token_info.serial_number_hex.clone(),
                 state.pdf_documents.clone(),
                 state.sign_format,
+                state.phone.as_ref().map(|phone| phone.pair_id),
             )
+        };
+
+        // The phone's card is listed only while no reader here holds a
+        // card, so a phone card in use means the phone signs.
+        if source == CardSource::Phone {
+            if let Some(pair_id) = phone {
+                self.sign_on_phone(pair_id, documents, format);
+            }
+            return;
+        }
+        let Some(pin2) = pin2 else {
+            return;
         };
 
         let Some(serial) = serial else {
@@ -814,6 +837,62 @@ impl RefineIdController {
                     .collect();
                 s.status_message = failures.join("; ");
                 s.sign_result = Some(format!("Signed {successes} of {}", results.len()));
+            });
+        });
+    }
+
+    /// Signs every queued document with the paired phone's card in one
+    /// request: one consent and one PIN 2 entry, both on the phone.
+    fn sign_on_phone(
+        self: &Arc<Self>,
+        pair_id: PairId,
+        documents: Vec<PathBuf>,
+        format: SignFormat,
+    ) {
+        if documents.is_empty() {
+            self.update_state(|s| s.status_message = "No documents queued for signing.".into());
+            return;
+        }
+        self.update_state(|s| s.busy = true);
+        let controller = Arc::clone(self);
+        thread::spawn(move || {
+            let total = documents.len();
+            let now = refineid_doc_sign::now_date_time();
+            let documents = documents
+                .iter()
+                .map(|doc| refineid_client::card_manager::PhoneSignDocument {
+                    input: doc.clone(),
+                    output: signed_output(doc, format, now),
+                    format: format.into(),
+                })
+                .collect();
+            let outcome = refineid_client::card_manager::sign_on_phone(
+                pair_id,
+                documents,
+                DEFAULT_TIMESTAMP_AUTHORITY,
+            );
+            controller.update_state(|s| {
+                s.busy = false;
+                match &outcome {
+                    Ok(results) => {
+                        let successes = results.iter().filter(|r| r.is_ok()).count();
+                        s.status_message = results
+                            .iter()
+                            .filter_map(|r| r.as_ref().err())
+                            .inspect(|error| {
+                                refineid_dev_errors::report!(Gui, "document not signed", error);
+                            })
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        s.sign_result = Some(format!("Signed {successes} of {total}"));
+                    }
+                    Err(failure) => {
+                        refineid_dev_errors::report!(Gui, "document not signed", failure);
+                        s.status_message = failure.to_string();
+                        s.sign_result = Some(format!("Signed 0 of {total}"));
+                    }
+                }
             });
         });
     }
@@ -1256,6 +1335,32 @@ mod tests {
         assert!(!state.pin1_unblock_available);
         assert!(!state.pin2_unblock_available);
         assert!(!state.unblock_uses_activation_code);
+    }
+
+    #[test]
+    fn the_phone_card_signs_when_the_pairing_grants_signing() {
+        use refineid_rapp_core::ids::PairId;
+        for signs_documents in [true, false] {
+            let controller = RefineIdController::new(|_| {});
+            controller.update_state(|state| {
+                state.phone = Some(PairedPhone {
+                    pair_id: PairId::from_array(*b"synthetic-pair-1"),
+                    name: "custodian-1".to_owned(),
+                    platform: "Synthetic".to_owned(),
+                    certificate_cached: false,
+                    signs_documents,
+                });
+            });
+            controller.replace_cards(vec![phone_card(
+                "custodian-1",
+                TokenSerial::new("1".to_owned()),
+                CredentialIdentity::new(),
+            )]);
+            let state = controller.state();
+            assert!(!state.selected_card_is_local);
+            assert_eq!(state.phone_signs(), signs_documents);
+            assert_eq!(state.signature_supported, signs_documents);
+        }
     }
 
     #[test]

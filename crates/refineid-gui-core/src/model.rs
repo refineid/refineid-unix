@@ -25,6 +25,7 @@ use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::CardGeneration;
 use refineid_rapp_core::ids::PairId;
+use refineid_rapp_core::profiles::ProfileName;
 use refineid_rapp_core::remote::PairSummary;
 
 use crate::image::RgbaImageBuffer;
@@ -138,6 +139,18 @@ impl ManagedCard {
     }
 }
 
+impl UiState {
+    /// Whether the paired phone's card signs: the card in use is the
+    /// phone's, which it is only while no reader here holds a card, and
+    /// the pairing grants document signing. The
+    /// signing then takes PIN 2 on the phone: a driver shows no PIN 2
+    /// field and sends [`UserIntent::SignDocuments`] with `pin2: None`.
+    #[must_use]
+    pub fn phone_signs(&self) -> bool {
+        self.selected_card.is_some() && !self.selected_card_is_local && self.signature_supported
+    }
+}
+
 /// Supported signing output formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignFormat {
@@ -176,6 +189,9 @@ pub struct PairedPhone {
     pub platform: String,
     /// Whether the phone's authentication certificate is cached.
     pub certificate_cached: bool,
+    /// Whether the pairing grants document signing: the phone's card
+    /// signs, and PIN 2 is typed on the phone.
+    pub signs_documents: bool,
 }
 
 impl PairedPhone {
@@ -188,6 +204,9 @@ impl PairedPhone {
             name: summary.peer_display_name.clone(),
             platform: summary.peer_platform.clone(),
             certificate_cached: summary.auth_cert.is_some(),
+            signs_documents: summary
+                .granted_profiles
+                .contains(&ProfileName::DocumentSigning),
         })
     }
 }
@@ -342,8 +361,10 @@ pub enum UserIntent {
     SetSignFormat(SignFormat),
     /// Sign all queued documents.
     SignDocuments {
-        /// Qualified signature PIN2 bytes.
-        pin2: PinBytes,
+        /// Qualified signature PIN2 bytes for a card in a reader here;
+        /// `None` when the paired phone signs, which takes PIN 2 on its
+        /// own screen.
+        pin2: Option<PinBytes>,
     },
     /// Pair with the phone showing this code.
     StartPairing {

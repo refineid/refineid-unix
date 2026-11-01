@@ -27,16 +27,19 @@ use refineid_doc_sign::cades::SigningTime;
 use refineid_doc_sign::document::Format;
 use refineid_doc_sign::pades::{SignatureMetadata, StampLanguage, VisibleSignature};
 use refineid_doc_sign::pin::{PinEntryError, PinRole, PromptedPin};
+use refineid_doc_sign::remote::PhoneSignOptions;
 use refineid_doc_sign::service::{
     DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES,
-    SignErrorKind, SignOptions, SignOutput, SignReport, SignSlot,
+    SignErrorKind, SignOptions, SignOutput, SignReport, SignSlot, SigningDevice,
 };
 use refineid_doc_sign::signed_name::PendingSignedName;
 use refineid_doc_sign::x509::DateTime;
 use refineid_lib_core::can::Can;
+use refineid_rapp_core::ids::PairId;
 
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::exit_status::ExitStatus;
+use crate::phone_sign::SigningSource;
 
 /// What `refineid document sign help`
 /// prints. The man page refineid(1) carries the same facts.
@@ -49,7 +52,8 @@ Sign FILE into a format a counterparty can open. Several PDFs are
 signed one by one, each with its own seal; any other set, or a
 container --format, goes into one container under one signature.
 PIN2 and the qualified-signature key by default, asked once for the
-whole run. Prints nothing on success; -v shows each step.
+whole run. With no card in a reader, the paired phone signs: PIN2 is
+typed on the phone. Prints nothing on success; -v shows each step.
   --format F    pades          signature inside the PDF
                 cades          CMS, document attached
                 cades-detached CMS, document left outside
@@ -191,6 +195,32 @@ impl DocumentSignArgs {
             ..SignatureMetadata::default()
         };
         let signing_time = signing_time_at(now);
+        let request = |additional_inputs: Vec<PathBuf>| DocumentRequest {
+            format,
+            additional_inputs,
+            signing_time,
+            metadata: metadata.clone(),
+            // The CLI signs whichever card is present; there is no
+            // prior inspection view to bind to.
+            expected_serial: None,
+            timestamp_authorities: timestamp_authorities.clone(),
+            timestamp_credentials: None,
+            long_term,
+            archive,
+        };
+        let level = Level {
+            format,
+            long_term,
+            archive,
+        };
+        // The phone signs only with its card's qualified key, and only
+        // when no reader here holds a card; a reader or a CAN on the
+        // command line names a reader.
+        let phone = (slot == SignSlot::Qualified && reader_filter.is_none() && can.is_none())
+            .then(crate::phone_sign::current_source);
+        if let Some(SigningSource::Phone(pair_id)) = phone {
+            return sign_on_phone(cmd, verbose, pair_id, jobs, &request, &level).into();
+        }
         // One PIN for the run: the first document asks for it at its
         // point of use, once the card is in hand; the rest repeat it.
         // A prompt that ends without a PIN has already told the
@@ -222,19 +252,7 @@ impl DocumentSignArgs {
                 save_cert: None,
                 reader_filter: reader_filter.clone(),
                 can: can.as_ref().and_then(crate::doc_sign_bridge::can),
-                document: Some(DocumentRequest {
-                    format,
-                    additional_inputs: inputs.clone(),
-                    signing_time,
-                    metadata: metadata.clone(),
-                    // The CLI signs whichever card is present; there
-                    // is no prior inspection view to bind to.
-                    expected_serial: None,
-                    timestamp_authorities: timestamp_authorities.clone(),
-                    timestamp_credentials: None,
-                    long_term,
-                    archive,
-                }),
+                document: Some(request(inputs.clone())),
             };
 
             let mut result = refineid_doc_sign::service::sign(&backend, options(can), &mut pin);
@@ -253,11 +271,7 @@ impl DocumentSignArgs {
                 cmd,
                 verbose,
                 result,
-                &Level {
-                    format,
-                    long_term,
-                    archive,
-                },
+                &level,
                 entry_status.get(),
                 name.as_deref(),
             );
@@ -491,13 +505,17 @@ const fn slot_label(slot: SignSlot) -> &'static str {
 impl core::fmt::Display for DocumentReport<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let sign = self.sign;
-        writeln!(f, "reader: {}", sign.reader)?;
-        writeln!(
-            f,
-            "slot: {} (key ref {:#04X})",
-            slot_label(sign.slot),
-            sign.slot.key_ref().as_byte()
-        )?;
+        writeln!(f, "{}", sign.device)?;
+        // The phone picks its card's key itself.
+        match sign.device {
+            SigningDevice::Reader(_) => writeln!(
+                f,
+                "slot: {} (key ref {:#04X})",
+                slot_label(sign.slot),
+                sign.slot.key_ref().as_byte()
+            )?,
+            SigningDevice::PairedPhone => writeln!(f, "slot: {}", slot_label(sign.slot))?,
+        }
         if let Some(cn) = &sign.cert_subject_cn {
             writeln!(f, "cert subject CN: {cn}")?;
         }
@@ -598,6 +616,50 @@ fn report_outcome(
             ExitStatus::RuntimeFailure
         }
     }
+}
+
+/// Sign every job on the paired phone in one request: one consent and
+/// one PIN 2 entry, both on the phone. No PIN is asked here. Returns
+/// the run's status: the first failure's.
+fn sign_on_phone(
+    cmd: &str,
+    verbose: bool,
+    pair_id: PairId,
+    jobs: Vec<Job>,
+    request: &dyn Fn(Vec<PathBuf>) -> DocumentRequest,
+    level: &Level,
+) -> ExitStatus {
+    let several = jobs.len() > 1;
+    let mut names = Vec::with_capacity(jobs.len());
+    let documents = jobs
+        .into_iter()
+        .map(|job| {
+            let mut inputs = job.inputs;
+            let input = inputs.remove(0);
+            names.push(several.then(|| input.display().to_string()));
+            PhoneSignOptions {
+                input,
+                output: job.output,
+                document: request(inputs),
+            }
+        })
+        .collect();
+    let outcomes = match crate::phone_sign::sign(pair_id, documents) {
+        Ok(outcomes) => outcomes,
+        Err(failure) => {
+            refineid_dev_errors::report!(Cli, "document not signed", failure);
+            eprintln!("{cmd}: {failure}");
+            return failure.exit_status();
+        }
+    };
+    let mut worst = ExitStatus::Ok;
+    for (result, name) in outcomes.into_iter().zip(names) {
+        let status = report_outcome(cmd, verbose, result, level, None, name.as_deref());
+        if worst == ExitStatus::Ok {
+            worst = status;
+        }
+    }
+    worst
 }
 
 /// `true` when a failure ends the run: no reader or card, a CAN still
@@ -801,7 +863,8 @@ mod tests {
 
     use super::{
         DEFAULT_TIMESTAMP_AUTHORITY, DateTime, DocumentReport, DocumentSignArgs, Format, Level,
-        SignReport, SignSlot, check_inputs, describe_level, jobs_for, parse_format, stops_the_run,
+        SignReport, SignSlot, SigningDevice, check_inputs, describe_level, jobs_for, parse_format,
+        stops_the_run,
     };
     use crate::cli::ArgParseError;
     use crate::cli::argv::fixtures::remaining_argv as argv;
@@ -830,7 +893,7 @@ mod tests {
     /// The report of a synthetic level-T `PAdES` signature.
     fn signed_report() -> SignReport {
         SignReport {
-            reader: READER.to_owned(),
+            device: SigningDevice::Reader(READER.to_owned()),
             slot: SignSlot::Qualified,
             input_len: u64::try_from(DOCUMENT.len()).unwrap_or(u64::MAX),
             input_sha256: Sha256::of(DOCUMENT),
@@ -871,6 +934,22 @@ mod tests {
         check_true(text.contains("local verify"), "local verify line")?;
         check_true(text.contains("format:"), "format line")?;
         check_true(text.contains("signature level:  B-T"), "level line")
+    }
+
+    #[test]
+    fn a_document_signed_on_the_phone_reports_the_phone() -> TestResult {
+        let mut sign = signed_report();
+        sign.device = SigningDevice::PairedPhone;
+        let report = DocumentReport {
+            sign: &sign,
+            level: &PADES_T,
+        };
+        let mut out = Vec::new();
+        write_report(&mut out, true, &report)?;
+        let text = String::from_utf8(out)?;
+        check_true(text.contains("signed on: the paired phone"), "phone line")?;
+        check_true(!text.contains(READER), "no reader line")?;
+        check_true(!text.contains("key ref"), "the phone picks the key")
     }
 
     #[test]

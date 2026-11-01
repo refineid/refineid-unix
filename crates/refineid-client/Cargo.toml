@@ -49,6 +49,7 @@ refineid-doc-sign.workspace = true
 refineid-pace.workspace = true
 refineid-pcsc.workspace = true
 refineid-rapp-core.workspace = true
+refineid-remote.workspace = true
 refineid-lib-pcsc.workspace = true
 refineid-dev-errors.workspace = true
 refineid-lib-tls = { workspace = true, optional = true }

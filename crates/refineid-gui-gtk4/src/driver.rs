@@ -1058,6 +1058,8 @@ impl Gtk4Widgets {
             && state.selected_card.is_some()
             && state.signature_supported;
         self.sign.sign_button.set_sensitive(can_sign);
+        // PIN 2 for the phone's card is typed on the phone.
+        self.sign.sign_pin2_entry.set_visible(!state.phone_signs());
 
         if let Some(ref res) = state.sign_result {
             self.sign.sign_result_banner.set_visible(true);
@@ -2277,6 +2279,10 @@ fn build_sign_page(
         let c = Arc::clone(controller);
         let pin2_in = sign_pin2_entry.clone();
         sign_button.connect_clicked(move |btn| {
+            if c.state().phone_signs() {
+                c.handle_intent(UserIntent::SignDocuments { pin2: None });
+                return;
+            }
             let win = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
             let pin2_v = pin2_in.text();
             if pin2_v.len() < MIN_PIN2_DIGITS || pin2_v.len() > MAX_PIN2_DIGITS {
@@ -2292,7 +2298,7 @@ fn build_sign_page(
                 return;
             }
             if let Some(pin2) = to_pin_bytes(&pin2_v) {
-                c.handle_intent(UserIntent::SignDocuments { pin2 });
+                c.handle_intent(UserIntent::SignDocuments { pin2: Some(pin2) });
                 pin2_in.set_text("");
             } else {
                 pin2_in.set_text("");

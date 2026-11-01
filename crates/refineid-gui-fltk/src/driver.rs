@@ -85,6 +85,10 @@ struct FltkWidgets {
     format_pades: RadioRoundButton,
     format_asice: RadioRoundButton,
     sign_btn: Button,
+    /// The settings column the PIN 2 field sits in.
+    sign_settings: Group,
+    sign_pin2_label: Frame,
+    sign_pin2_input: SecretInput,
     sign_result_frame: Frame,
     pair_code_input: Input,
     /// Whether the last rendered state had a pairing ceremony running.
@@ -734,6 +738,10 @@ impl FltkDriver {
             let c = Arc::clone(controller);
             let mut p2 = sign_pin2_input.clone();
             sign_btn.set_callback(move |_| {
+                if c.state().phone_signs() {
+                    c.handle_intent(UserIntent::SignDocuments { pin2: None });
+                    return;
+                }
                 let pin2_val = p2.value();
                 if pin2_val.len() < 6 {
                     alert(200, 200, "PIN2 must be at least 6 digits.");
@@ -743,7 +751,7 @@ impl FltkDriver {
                     alert(200, 200, "PIN2 contains invalid characters.");
                     return;
                 };
-                c.handle_intent(UserIntent::SignDocuments { pin2 });
+                c.handle_intent(UserIntent::SignDocuments { pin2: Some(pin2) });
                 p2.set_value("");
             });
         }
@@ -797,6 +805,9 @@ impl FltkDriver {
             format_pades,
             format_asice,
             sign_btn,
+            sign_settings,
+            sign_pin2_label: p2_label,
+            sign_pin2_input,
             sign_result_frame,
             pair_code_input,
             pairing_running: false,
@@ -1110,9 +1121,23 @@ impl UiDriver for FltkDriver {
             SignFormat::AsicE => widgets.format_asice.set_value(true),
         }
 
-        let can_sign =
-            !state.pdf_documents.is_empty() && !state.busy && state.selected_card.is_some();
+        let can_sign = !state.pdf_documents.is_empty()
+            && !state.busy
+            && state.selected_card.is_some()
+            && state.signature_supported;
         set_active(&mut widgets.sign_btn, can_sign);
+        // PIN 2 for the phone's card is typed on the phone.
+        let pin2_shown = !state.phone_signs();
+        if widgets.sign_pin2_input.visible() != pin2_shown {
+            if pin2_shown {
+                widgets.sign_pin2_label.show();
+                widgets.sign_pin2_input.show();
+            } else {
+                widgets.sign_pin2_label.hide();
+                widgets.sign_pin2_input.hide();
+            }
+            widgets.sign_settings.redraw();
+        }
 
         if let Some(ref result) = state.sign_result {
             widgets.sign_result_frame.set_label(result);

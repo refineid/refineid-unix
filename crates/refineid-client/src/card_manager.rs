@@ -25,8 +25,10 @@ use std::path::PathBuf;
 
 use refineid_doc_sign::cades::SigningTime;
 use refineid_doc_sign::document::Format;
+use refineid_doc_sign::identity::TokenSerial as CoreTokenSerial;
 use refineid_doc_sign::pades::{SignatureMetadata, StampLanguage, VisibleSignature};
 use refineid_doc_sign::pin::{PinEntryError, PromptedPin};
+use refineid_doc_sign::remote::PhoneSignOptions;
 use refineid_doc_sign::service::{
     DocumentRequest, SignErrorKind, SignOptions, SignOutput, SignReport, SignSlot,
     TimestampCredentials,
@@ -34,6 +36,7 @@ use refineid_doc_sign::service::{
 use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_pcsc::PcscBackend;
+use refineid_rapp_core::ids::PairId;
 
 use crate::card_check::{CardCheckError, CardCheckOptions, CardCheckReport};
 use crate::card_emrtd::{EmrtdReadError, EmrtdReadOptions, EmrtdReadReport};
@@ -41,6 +44,7 @@ use crate::card_pin::{
     ActivateOptions, ActivateReport, ActivationCardContext, CardPinError, ChangePinOptions,
     ChangePinReport, UnblockPinOptions, UnblockPinReport,
 };
+use crate::phone_sign::PhoneSignFailure;
 
 /// Inputs for one visible qualified PDF signature from the graphical client.
 #[derive(Debug)]
@@ -191,7 +195,7 @@ pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, SignErrorKind> {
         StampLanguage::for_process_locale(),
     ));
     let document = pdf_document_request(
-        expected_serial,
+        Some(crate::doc_sign_bridge::token_serial(&expected_serial)),
         visible_signature,
         timestamp_authority,
         timestamp_credentials,
@@ -262,53 +266,112 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind>
             ),
         });
     }
+    let document = asice_document_request(
+        additional_inputs,
+        Some(crate::doc_sign_bridge::token_serial(&expected_serial)),
+        timestamp_authority,
+        timestamp_credentials,
+    );
+    sign_qualified(input, output, &pin2, can.as_ref(), reader_filter, document)
+}
+
+/// One document for the paired phone to sign from the graphical client.
+#[derive(Debug)]
+pub struct PhoneSignDocument {
+    /// Existing document chosen by the user.
+    pub input: PathBuf,
+    /// Where the signed document goes; distinct from every original.
+    pub output: SignOutput,
+    /// The signed PDF with its seal, or an `ASiC-E` container.
+    pub format: Format,
+}
+
+/// Sign every document with the card on the phone of `pair_id`, in one
+/// request: the holder enters PIN 2 once, on the phone. No PIN passes
+/// through this computer. A PDF is signed as [`sign_pdf`] signs it, any
+/// other format as [`sign_asice`] does, each bound to the certificate the
+/// phone returns rather than to a displayed serial.
+///
+/// # Errors
+/// [`PhoneSignFailure`] when nothing was written; once the phone's
+/// signatures verified, each document's own outcome is at its position.
+pub fn sign_on_phone(
+    pair_id: PairId,
+    documents: Vec<PhoneSignDocument>,
+    timestamp_authority: &str,
+) -> Result<Vec<Result<SignReport, SignErrorKind>>, PhoneSignFailure> {
+    let documents = documents
+        .into_iter()
+        .map(|document| PhoneSignOptions {
+            input: document.input,
+            output: document.output,
+            document: if document.format == Format::Pades {
+                pdf_document_request(
+                    None,
+                    Some(VisibleSignature::verification(
+                        StampLanguage::for_process_locale(),
+                    )),
+                    timestamp_authority.to_owned(),
+                    None,
+                )
+            } else {
+                asice_document_request(Vec::new(), None, timestamp_authority.to_owned(), None)
+            },
+        })
+        .collect();
+    crate::phone_sign::sign(pair_id, documents)
+}
+
+/// The claimed signing time: now.
+fn signing_time_now() -> SigningTime {
     let now = refineid_doc_sign::now_date_time();
-    let document = DocumentRequest {
+    SigningTime {
+        year: now.year(),
+        month: now.month(),
+        day: now.day(),
+        hour: now.hour(),
+        minute: now.minutes(),
+        second: now.seconds(),
+    }
+}
+
+/// An `ASiC-E` with `XAdES` request at level LT: an archive
+/// construction for the format is not implemented, and the format
+/// refuses to pretend.
+fn asice_document_request(
+    additional_inputs: Vec<PathBuf>,
+    expected_serial: Option<CoreTokenSerial>,
+    timestamp_authority: String,
+    timestamp_credentials: Option<TimestampCredentials>,
+) -> DocumentRequest {
+    DocumentRequest {
         format: Format::AsicEXades,
         additional_inputs,
-        signing_time: SigningTime {
-            year: now.year(),
-            month: now.month(),
-            day: now.day(),
-            hour: now.hour(),
-            minute: now.minutes(),
-            second: now.seconds(),
-        },
+        signing_time: signing_time_now(),
         metadata: SignatureMetadata::default(),
-        expected_serial: Some(crate::doc_sign_bridge::token_serial(&expected_serial)),
-        // Level LT: an archive construction for `ASiC-E` with `XAdES`
-        // is not implemented, and the format refuses to pretend.
+        expected_serial,
         archive: false,
         long_term: true,
         timestamp_authorities: vec![timestamp_authority],
         timestamp_credentials,
-    };
-    sign_qualified(input, output, &pin2, can.as_ref(), reader_filter, document)
+    }
 }
 
 fn pdf_document_request(
-    expected_serial: TokenSerial,
+    expected_serial: Option<CoreTokenSerial>,
     visible_signature: Option<VisibleSignature>,
     timestamp_authority: String,
     timestamp_credentials: Option<TimestampCredentials>,
 ) -> DocumentRequest {
-    let now = refineid_doc_sign::now_date_time();
     DocumentRequest {
         format: Format::Pades,
         additional_inputs: Vec::new(),
-        signing_time: SigningTime {
-            year: now.year(),
-            month: now.month(),
-            day: now.day(),
-            hour: now.hour(),
-            minute: now.minutes(),
-            second: now.seconds(),
-        },
+        signing_time: signing_time_now(),
         metadata: SignatureMetadata {
             visible_signature,
             ..SignatureMetadata::default()
         },
-        expected_serial: Some(crate::doc_sign_bridge::token_serial(&expected_serial)),
+        expected_serial,
         archive: true,
         long_term: true,
         timestamp_authorities: vec![timestamp_authority],
@@ -412,7 +475,7 @@ mod tests {
     fn graphical_pdf_signing_requests_qualified_lta() {
         let serial = TokenSerial::new("same-card".to_owned());
         let request = pdf_document_request(
-            serial.clone(),
+            Some(crate::doc_sign_bridge::token_serial(&serial)),
             Some(VisibleSignature::verification(StampLanguage::English)),
             "https://timestamp.sectigo.com/qualified".to_owned(),
             None,
@@ -437,7 +500,9 @@ mod tests {
     #[test]
     fn no_visible_signature_is_requested_without_one() {
         let request = pdf_document_request(
-            TokenSerial::new("same-card".to_owned()),
+            Some(crate::doc_sign_bridge::token_serial(&TokenSerial::new(
+                "same-card".to_owned(),
+            ))),
             None,
             "https://timestamp.sectigo.com/qualified".to_owned(),
             None,
