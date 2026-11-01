@@ -187,6 +187,11 @@ fn section(height: i32) -> Group {
     group
 }
 
+/// Lets `input` hold at most `limit` digits.
+fn limit_digits(input: &mut SecretInput, limit: usize) {
+    input.set_maximum_size(i32::try_from(limit).unwrap_or(i32::MAX));
+}
+
 /// A form row: the name, then a masked PIN entry that keeps digits only.
 fn pin_row(y: i32, label: &str) -> (Frame, SecretInput) {
     let frame = line_frame(0, y, LABEL_WIDTH, FIELD, label);
@@ -196,9 +201,12 @@ fn pin_row(y: i32, label: &str) -> (Frame, SecretInput) {
     (frame, input)
 }
 
-/// Keeps the digits a PIN input was given.
+/// Keeps the digits a PIN input was given, as many as it holds.
 fn keep_pin_digits(input: &mut SecretInput) {
-    let kept = digits_only(&input.value(), PinBytes::MAX_LENGTH);
+    let kept = digits_only(
+        &input.value(),
+        usize::try_from(input.maximum_size()).unwrap_or(0),
+    );
     if kept != input.value() {
         input.set_value(&kept);
     }
@@ -641,12 +649,18 @@ impl FltkDriver {
             for mut input in activation.inputs.clone() {
                 let fields = fields.clone();
                 let mut button = button.clone();
+                let memory = Rc::clone(&self.memory);
                 input.set_callback(move |input| {
                     keep_pin_digits(input);
                     let text = fields.each_ref().map(SecretInput::value);
                     set_active(
                         &mut button,
-                        activation_complete(&text[0], [&text[1], &text[2]], [&text[3], &text[4]]),
+                        activation_complete(
+                            &memory.borrow().last,
+                            &text[0],
+                            [&text[1], &text[2]],
+                            [&text[3], &text[4]],
+                        ),
                     );
                 });
             }
@@ -660,7 +674,12 @@ impl FltkDriver {
                 for field in &mut fields {
                     field.set_value("");
                 }
-                if !activation_complete(&text[0], [&text[1], &text[2]], [&text[3], &text[4]]) {
+                if !activation_complete(
+                    &c.state(),
+                    &text[0],
+                    [&text[1], &text[2]],
+                    [&text[3], &text[4]],
+                ) {
                     return;
                 }
                 if let (Some(activation_code), Some(new_pin1), Some(new_pin2)) = (
@@ -891,14 +910,16 @@ fn show_pin_task(pin: &mut PinCodes, task: PinTask, state: &UiState) {
     for (button_task, button) in &mut pin.task_buttons {
         button.set_value(*button_task == task);
     }
-    for ((label, input), name) in pin
+    for (((label, input), name), limit) in pin
         .labels
         .iter_mut()
         .zip(&mut pin.inputs)
         .zip(task.fields())
+        .zip(task.field_limits(state))
     {
         label.set_label(name);
         input.set_value("");
+        limit_digits(input, limit);
     }
     pin.action.set_label(task.action());
     update_pin_action(pin, state);
@@ -909,7 +930,7 @@ fn show_pin_task(pin: &mut PinCodes, task: PinTask, state: &UiState) {
 fn update_pin_action(pin: &mut PinCodes, state: &UiState) {
     let task = *pin.task.borrow();
     let text = pin.inputs.each_ref().map(SecretInput::value);
-    let ready = task.complete(text.each_ref().map(String::as_str)) && task.available(state);
+    let ready = task.complete(state, text.each_ref().map(String::as_str)) && task.available(state);
     set_active(&mut pin.action, ready);
 }
 
@@ -943,7 +964,7 @@ fn wire_pin_codes(
         for input in &mut shown.inputs {
             input.set_value("");
         }
-        if !task.complete(text.each_ref().map(String::as_str)) {
+        if !task.complete(&c.state(), text.each_ref().map(String::as_str)) {
             return;
         }
         let (Some(presented), Some(new_pin)) = (to_pin_bytes(&text[0]), to_pin_bytes(&text[1]))
@@ -1061,6 +1082,14 @@ impl UiDriver for FltkDriver {
                 .activation
                 .heading
                 .set_label(window::activation_heading(state));
+            for (input, limit) in widgets
+                .activation
+                .inputs
+                .iter_mut()
+                .zip(window::activation_field_limits(state))
+            {
+                limit_digits(input, limit);
+            }
         }
         if entered && content == WindowContent::Activation {
             let _ = widgets.activation.inputs[0].take_focus();
@@ -1136,6 +1165,10 @@ impl UiDriver for FltkDriver {
             set_shown(&mut pin.form, !tasks.is_empty());
             if !tasks.contains(&pin.task.borrow()) {
                 show_pin_task(pin, Recovery::initial_task(recovery), state);
+            }
+            let task = *pin.task.borrow();
+            for (input, limit) in pin.inputs.iter_mut().zip(task.field_limits(state)) {
+                limit_digits(input, limit);
             }
             update_pin_action(pin, state);
             let entries = window::attempts_below_full(state);

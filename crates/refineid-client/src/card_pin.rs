@@ -32,9 +32,9 @@
 use alloc::fmt;
 
 use refineid_lib_core::auth::{
-    ActivationScheme, AuthError, ChangePinOutcome, PinOps as _, PinPolicyReason, PinReadiness,
-    PinReferenceScheme, PinSlot, PinStatus, PukStatus, RetryFloorRefusal, UnblockOutcome,
-    check_puk_retry_floor, check_retry_floor,
+    ActivationScheme, AuthError, CardPinLengths, ChangePinOutcome, PinOps as _, PinPolicyReason,
+    PinReadiness, PinReferenceScheme, PinSlot, PinStatus, PukStatus, RetryFloorRefusal,
+    UnblockOutcome, check_puk_retry_floor, check_retry_floor,
 };
 use refineid_lib_core::backend::{
     ReaderAccessCap, ReaderBackend as _, ReaderFilter, ReaderPickError,
@@ -141,7 +141,7 @@ pub struct UnblockPinOptions {
     pub slot: PinManageSlot,
     /// The 8 to 12-digit PUK code. Typed [`Puk`] forces construction
     /// via [`Puk::new`] at the operator-input boundary, so a
-    /// non-PUK `PinBytes` value (e.g. a PIN or activation code)
+    /// non-PUK `PinBytes` value (e.g. a PIN or the activation PIN)
     /// can't reach the `RESET RETRY COUNTER` APDU by accident.
     pub puk: Puk,
     /// New PIN value to set after the unblock succeeds. Consumed
@@ -362,6 +362,10 @@ pub struct CardSession {
     /// ([`PinReferenceScheme::activation_scheme`]); `None` gives no
     /// activation decision.
     pub activation_scheme: Option<ActivationScheme>,
+    /// The PIN 1, PIN 2 and PUK lengths the card accepts, read under
+    /// `numbering` at session open; every entry of the flow is
+    /// prompted for and checked against them.
+    pub lengths: CardPinLengths,
 }
 
 impl CardSession {
@@ -444,6 +448,11 @@ impl PinManagementCardContext {
     pub const fn activation_scheme(&self) -> Option<ActivationScheme> {
         self.session.activation_scheme
     }
+    /// The PIN and PUK lengths the card accepts.
+    #[must_use]
+    pub const fn lengths(&self) -> &CardPinLengths {
+        &self.session.lengths
+    }
 }
 
 /// Open the card session against the picked reader.
@@ -459,6 +468,7 @@ impl PinManagementCardContext {
 /// 4. Capture the PKCS#15 long serial for session binding.
 /// 5. Read the authentication certificate's validity start and
 ///    decide the activation scheme.
+/// 6. Read the PIN 1, PIN 2 and PUK lengths the card accepts.
 ///
 /// Returns a [`CardSession`] the caller flows into the
 /// modify step. The transport from this call is dropped; the
@@ -526,6 +536,9 @@ pub fn establish_card_session(
         .and_then(|der| OwnedCert::from_der(der.as_bytes()).ok())
         .map(|cert| cert.view().not_before);
     let activation_scheme = numbering.activation_scheme(validity_start);
+    let lengths = transport
+        .read_card_pin_lengths(numbering)
+        .map_err(|e| CardPinError::Transport(format!("PIN lengths read: {e}")))?;
 
     Ok(CardSession {
         reader_id,
@@ -535,6 +548,7 @@ pub fn establish_card_session(
         numbering,
         validity_start,
         activation_scheme,
+        lengths,
     })
 }
 
@@ -705,9 +719,9 @@ pub(crate) fn change_pin_first_for_cli(
     re_verify_session(&mut transport, ctx.bound_serial())?;
 
     let outcome = transport
-        .change_pin_with_scheme(
+        .change_pin(
+            ctx.lengths(),
             slot,
-            numbering,
             options.current.clone(),
             options.new.clone(),
         )
@@ -781,7 +795,7 @@ pub fn unblock_pin_first(
     // secret material.
     let puk_bytes = options.puk.to_pin_bytes();
     let outcome = transport
-        .reset_retry_counter_with_scheme(slot, numbering, puk_bytes, options.new_pin.clone())
+        .reset_retry_counter(ctx.lengths(), slot, puk_bytes, options.new_pin.clone())
         .map_err(auth_to_card_pin)?;
     Ok(UnblockPinReport {
         reader: ctx.reader_id().as_str().to_owned(),
@@ -906,11 +920,14 @@ pub struct ActivationCardContext {
     ///
     /// [doc]: ../../../doc/fineid-card-models.md
     pub model: Option<FineidCardModel>,
+    /// The PIN 1, PIN 2 and PUK lengths the card accepts, read at
+    /// session open.
+    pub lengths: CardPinLengths,
 }
 
 impl ActivationCardContext {
     /// The activation entry's exact digit count under the card's
-    /// scheme: the 8-digit activation code (the PUK) for FINEID
+    /// scheme: the 8-digit activation PIN (the PUK) for FINEID
     /// S4-1 v4.2 §4.6.1, the 7-digit preset activation PIN for
     /// §4.6.2.
     #[must_use]
@@ -950,6 +967,7 @@ pub fn classify_card_for_activation(
         numbering: session.numbering,
         bound_serial: session.bound_serial,
         model: session.model,
+        lengths: session.lengths,
     })
 }
 
@@ -1016,9 +1034,9 @@ pub struct ActivateOptions {
     /// match the card's [`ActivationScheme`]; a mismatch is
     /// reported as [`CardPinError::ActivationLengthMismatch`].
     pub activation_pin: ActivationCode,
-    /// New basic PIN (PIN1, 4-12 digits).
+    /// New basic PIN (PIN1), within the card's PIN 1 lengths.
     pub new_pin1: PinBytes,
-    /// New signature PIN (PIN2, 6-12 digits).
+    /// New signature PIN (PIN2), within the card's PIN 2 lengths.
     pub new_pin2: PinBytes,
     /// Override the pre-flight refusal when a targeted PIN reads
     /// as activated. Defaults to refuse-on-already-set.
@@ -1030,7 +1048,7 @@ pub struct ActivateOptions {
 /// s4.6), so one PIN can be set without the other.
 #[derive(Debug)]
 pub struct ActivateOneOptions {
-    /// Typed activation code; see [`ActivateOptions::activation_pin`].
+    /// Typed activation PIN; see [`ActivateOptions::activation_pin`].
     pub activation_pin: ActivationCode,
     /// The PIN to set.
     pub slot: PinManageSlot,
@@ -1172,8 +1190,8 @@ const fn change_to_unblock(o: ChangePinOutcome) -> UnblockOutcome {
 /// Per-slot setup for [`activate_first`], FINEID S4-1 v4.2 §4.6:
 ///
 /// - **§4.6.1, [`ActivationScheme::ActivationCodeIsPuk`]:** the
-///   PIN ships blocked and the 8-digit activation code is the PUK.
-///   `RESET RETRY COUNTER` (`INS=0x2C`) with `(activation code,
+///   PIN ships blocked and the 8-digit activation PIN is the PUK.
+///   `RESET RETRY COUNTER` (`INS=0x2C`) with `(activation PIN,
 ///   new PIN)`, under the PUK's retry floor. Organization cards
 ///   follow this scheme under their own reference numbering.
 /// - **§4.6.2, [`ActivationScheme::PresetActivationPin`]:** the
@@ -1192,15 +1210,15 @@ fn activate_slot_setup<T: refineid_lib_core::transport::CardTransport>(
 ) -> Result<UnblockOutcome, CardPinError> {
     match ctx.scheme {
         ActivationScheme::PresetActivationPin => transport
-            .change_pin_with_scheme(slot, ctx.numbering, activation_pin_bytes, new_pin)
+            .change_pin(&ctx.lengths, slot, activation_pin_bytes, new_pin)
             .map(change_to_unblock)
             .map_err(auth_to_card_pin),
         ActivationScheme::ActivationCodeIsPuk => {
-            // The activation code is presented as the PUK, under the
+            // The activation PIN is presented as the PUK, under the
             // PUK's counter.
             puk_gate(transport.puk_status_with_scheme(ctx.numbering).ok())?;
             transport
-                .reset_retry_counter_with_scheme(slot, ctx.numbering, activation_pin_bytes, new_pin)
+                .reset_retry_counter(&ctx.lengths, slot, activation_pin_bytes, new_pin)
                 .map_err(auth_to_card_pin)
         }
     }
@@ -1291,7 +1309,7 @@ fn activation_gate<T: refineid_lib_core::transport::CardTransport>(
                 }
             }
         }
-        // The activation code is presented as the PUK.
+        // The activation PIN is presented as the PUK.
         ActivationScheme::ActivationCodeIsPuk => {
             puk_gate(transport.puk_status_with_scheme(ctx.numbering).ok())?;
         }
@@ -1495,7 +1513,7 @@ fn run_activation(
     re_verify_session(&mut transport, &ctx.bound_serial)?;
 
     // The per-PIN setup APDU takes PinBytes by value; build a
-    // transient PinBytes from the typed activation code's inner
+    // transient PinBytes from the typed activation PIN's inner
     // bytes. Done per-call so the typed wrapper stays the source
     // of truth at the API boundary; the transient PinBytes
     // zeroizes on drop just like every other secret material.
@@ -1583,7 +1601,7 @@ impl ActivateGuard {
     /// event when the activation entry's form doesn't fit the
     /// card's scheme.
     ///
-    /// FINEID S4-1 v4.2 §4.6.1 takes the 8-digit activation code
+    /// FINEID S4-1 v4.2 §4.6.1 takes the 8-digit activation PIN
     /// (the PUK), §4.6.2 the 7-digit preset activation PIN. The
     /// event is emitted *before* the typed error is returned so
     /// the audit trail captures the local-policy refusal even on
@@ -2163,7 +2181,7 @@ mod activate_tests {
             .ok_or("organization numbering has a scheme")?;
         check_true(
             scheme == ActivationScheme::ActivationCodeIsPuk,
-            "activation code is the PUK",
+            "activation PIN is the PUK",
         )?;
         let pf = classify_preflight(
             ActivationTarget::Both,

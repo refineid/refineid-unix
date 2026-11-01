@@ -22,22 +22,66 @@ use std::ops::RangeInclusive;
 
 use refineid_client::card_pin::PinManageSlot;
 use refineid_lib_core::auth::{
-    PinSlot, PinStatus, PukStatus, check_puk_retry_floor, check_retry_floor,
+    CardPinLengths, CredentialLengths, PIN_MAX_LENGTH, PIN_MIN_LENGTH, PinReferenceScheme, PinSlot,
+    PinStatus, PukStatus, check_puk_retry_floor, check_retry_floor,
 };
-use refineid_lib_core::pin::{ActivationPinEight, ActivationPinSeven, PinBytes, Puk};
+use refineid_lib_core::pin::{ActivationPinEight, ActivationPinSeven};
 
 use crate::model::{CanRequest, CardSource, ReaderPresence, UiState};
 
-/// How many digits `slot`'s PIN may have.
-#[must_use]
-pub fn pin_digits(slot: PinSlot) -> RangeInclusive<usize> {
-    slot.min_length()..=PinBytes::MAX_LENGTH
+/// The PIN and PUK lengths of the card in use where PINs are set: what
+/// its activation session read, or the FINEID bounds.
+fn card_lengths(state: &UiState) -> CardPinLengths {
+    state.pin_lengths.unwrap_or_else(|| {
+        let numbering = if state.organization_card {
+            PinReferenceScheme::Organizational
+        } else {
+            PinReferenceScheme::Citizen
+        };
+        CardPinLengths::not_listed(numbering.into())
+    })
 }
 
-/// How many digits the PUK may have.
+/// The digit counts a credential with `lengths` accepts; `None` when
+/// the card accepts none.
+fn accepted(lengths: CredentialLengths) -> Option<RangeInclusive<usize>> {
+    lengths.accepted().map(|range| range.min()..=range.max())
+}
+
+/// How many digits `slot`'s PIN may have where it is set on the card in
+/// use; `None` when the card accepts no length.
 #[must_use]
-pub fn puk_digits() -> RangeInclusive<usize> {
-    Puk::MIN_LENGTH..=Puk::MAX_LENGTH
+pub fn pin_digits(state: &UiState, slot: PinSlot) -> Option<RangeInclusive<usize>> {
+    accepted(card_lengths(state).slot(slot.into()))
+}
+
+/// How many digits the PUK may have on the card in use; `None` when the
+/// card accepts no length.
+#[must_use]
+pub fn puk_digits(state: &UiState) -> Option<RangeInclusive<usize>> {
+    accepted(card_lengths(state).puk())
+}
+
+/// How many digits the PIN 2 that signs may have: any PIN length a
+/// FINEID card may list, and the card decides.
+#[must_use]
+pub fn signing_pin_digits() -> RangeInclusive<usize> {
+    PIN_MIN_LENGTH..=PIN_MAX_LENGTH
+}
+
+/// The most digits a field taking `digits` keeps: none when the card
+/// accepts no length.
+fn most(digits: Option<RangeInclusive<usize>>) -> usize {
+    digits.map_or(0, |digits| *digits.end())
+}
+
+/// The most digits each activation field keeps: the activation PIN, the
+/// new PIN 1 twice, the new PIN 2 twice.
+#[must_use]
+pub fn activation_field_limits(state: &UiState) -> [usize; 5] {
+    let pin1 = most(pin_digits(state, PinSlot::Pin1));
+    let pin2 = most(pin_digits(state, PinSlot::Pin2));
+    [*activation_digits().end(), pin1, pin1, pin2, pin2]
 }
 
 /// How many digits an activation PIN may have: seven for the preset
@@ -51,6 +95,11 @@ pub fn activation_digits() -> RangeInclusive<usize> {
 /// Whether `entry` is digits only, as many as `digits` allows.
 fn fits(entry: &str, digits: &RangeInclusive<usize>) -> bool {
     digits.contains(&entry.len()) && entry.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// [`fits`] for a credential whose digits the card in use decides.
+fn fits_card(entry: &str, digits: Option<&RangeInclusive<usize>>) -> bool {
+    digits.is_some_and(|digits| fits(entry, digits))
 }
 
 /// Keeps the digits of `typed`, at most `max` of them.
@@ -71,17 +120,17 @@ pub fn can_sign(state: &UiState, pin2: &str) -> bool {
         && !state.busy
         && state.selected_card.is_some()
         && state.signature_supported
-        && (!asks_pin2_here(state) || fits(pin2, &pin_digits(PinSlot::Pin2)))
+        && (!asks_pin2_here(state) || fits(pin2, &signing_pin_digits()))
 }
 
 /// Whether the activation form is filled in: an activation PIN, and each
-/// new PIN typed twice alike.
+/// new PIN typed twice alike within the card's lengths.
 #[must_use]
-pub fn activation_complete(code: &str, pin1: [&str; 2], pin2: [&str; 2]) -> bool {
+pub fn activation_complete(state: &UiState, code: &str, pin1: [&str; 2], pin2: [&str; 2]) -> bool {
     fits(code, &activation_digits())
-        && fits(pin1[0], &pin_digits(PinSlot::Pin1))
+        && fits_card(pin1[0], pin_digits(state, PinSlot::Pin1).as_ref())
         && pin1[0] == pin1[1]
-        && fits(pin2[0], &pin_digits(PinSlot::Pin2))
+        && fits_card(pin2[0], pin_digits(state, PinSlot::Pin2).as_ref())
         && pin2[0] == pin2[1]
 }
 
@@ -532,17 +581,32 @@ impl PinTask {
         }
     }
 
-    /// Whether the three entries are filled in: the code presented, and
-    /// the new PIN typed twice alike and differing from the current one.
-    #[must_use]
-    pub fn complete(self, entries: [&str; 3]) -> bool {
-        let [presented, new, again] = entries;
-        let presented_fits = if self.uses_puk() {
-            fits(presented, &puk_digits())
+    /// The digits the code presented may have on the card in use.
+    fn presented_digits(self, state: &UiState) -> Option<RangeInclusive<usize>> {
+        if self.uses_puk() {
+            puk_digits(state)
         } else {
-            fits(presented, &pin_digits(self.slot())) && presented != new
-        };
-        presented_fits && fits(new, &pin_digits(self.slot())) && new == again
+            pin_digits(state, self.slot())
+        }
+    }
+
+    /// Whether the three entries are filled in within the card's
+    /// lengths: the code presented, and the new PIN typed twice alike
+    /// and differing from the current one.
+    #[must_use]
+    pub fn complete(self, state: &UiState, entries: [&str; 3]) -> bool {
+        let [presented, new, again] = entries;
+        let new_digits = pin_digits(state, self.slot());
+        let presented_fits = fits_card(presented, self.presented_digits(state).as_ref())
+            && (self.uses_puk() || presented != new);
+        presented_fits && fits_card(new, new_digits.as_ref()) && new == again
+    }
+
+    /// The most digits each of the three fields keeps on the card in use.
+    #[must_use]
+    pub fn field_limits(self, state: &UiState) -> [usize; 3] {
+        let new = most(pin_digits(state, self.slot()));
+        [most(self.presented_digits(state)), new, new]
     }
 
     /// Whether the card in a reader here lets the task run: the counter
@@ -658,7 +722,7 @@ mod tests {
                 token_info: refineid_lib_core::pkcs15::TokenInfo::default(),
                 card_access: refineid_lib_core::card_access::CardAccess::default(),
                 certs: Vec::new(),
-                pin_reference_scheme: refineid_lib_core::auth::PinReferenceScheme::Citizen,
+                pin_reference_scheme: PinReferenceScheme::Citizen,
                 pin1: None,
                 pin2: None,
                 puk: None,
@@ -867,23 +931,62 @@ mod tests {
 
     #[test]
     fn a_task_is_complete_when_its_entries_fit() {
-        assert!(PinTask::ChangePin1.complete(["2719", "3842", "3842"]));
-        assert!(!PinTask::ChangePin1.complete(["2719", "3842", "3843"]));
-        assert!(!PinTask::ChangePin1.complete(["2719", "2719", "2719"]));
-        assert!(!PinTask::ChangePin2.complete(["271946", "3842", "3842"]));
-        assert!(PinTask::ResetPin2.complete(["27194638", "384251", "384251"]));
-        assert!(!PinTask::ResetPin2.complete(["2719", "384251", "384251"]));
+        let state = local_card_state();
+        assert!(PinTask::ChangePin1.complete(&state, ["2719", "3842", "3842"]));
+        assert!(!PinTask::ChangePin1.complete(&state, ["2719", "3842", "3843"]));
+        assert!(!PinTask::ChangePin1.complete(&state, ["2719", "2719", "2719"]));
+        assert!(!PinTask::ChangePin2.complete(&state, ["271946", "3842", "3842"]));
+        assert!(PinTask::ResetPin2.complete(&state, ["27194638", "384251", "384251"]));
+        assert!(!PinTask::ResetPin2.complete(&state, ["2719", "384251", "384251"]));
         assert!(activation_complete(
+            &state,
             "2719463",
             ["3842", "3842"],
             ["384251", "384251"]
         ));
         assert!(!activation_complete(
+            &state,
             "27194",
             ["3842", "3842"],
             ["384251", "384251"]
         ));
         assert_eq!(digits_only("27a19 46", 4), "2719");
+    }
+
+    #[test]
+    fn a_card_listing_no_lengths_takes_the_fineid_bounds() {
+        use refineid_lib_core::auth::{
+            FINEID_PIN1_MIN_LENGTH, FINEID_PIN2_MIN_LENGTH, PUK_MAX_LENGTH, PUK_MIN_LENGTH,
+        };
+        let state = local_card_state();
+        assert_eq!(
+            pin_digits(&state, PinSlot::Pin1),
+            Some(FINEID_PIN1_MIN_LENGTH..=PIN_MAX_LENGTH)
+        );
+        assert_eq!(
+            pin_digits(&state, PinSlot::Pin2),
+            Some(FINEID_PIN2_MIN_LENGTH..=PIN_MAX_LENGTH)
+        );
+        assert_eq!(puk_digits(&state), Some(PUK_MIN_LENGTH..=PUK_MAX_LENGTH));
+        assert_eq!(
+            PinTask::ResetPin1.field_limits(&state),
+            [PUK_MAX_LENGTH, PIN_MAX_LENGTH, PIN_MAX_LENGTH]
+        );
+        assert_eq!(
+            activation_field_limits(&state),
+            [
+                ActivationPinEight::LENGTH,
+                PIN_MAX_LENGTH,
+                PIN_MAX_LENGTH,
+                PIN_MAX_LENGTH,
+                PIN_MAX_LENGTH
+            ]
+        );
+    }
+
+    #[test]
+    fn signing_takes_any_pin_length_and_the_card_decides() {
+        assert_eq!(signing_pin_digits(), PIN_MIN_LENGTH..=PIN_MAX_LENGTH);
     }
 
     #[test]
