@@ -159,16 +159,11 @@ each qualified signature; it never attempts to verify PIN1 on that path.
 | (DVV technote v1.0) | `3B 7F 96 00 00 80 31 B8 65 B0 85 04 02 1B 12 00 F6 82 90 00`     | `14 78 77 95 02 80 31 B8 65 B0 85 04 02 1B 12 00 F6 82 90 00`              |
 
 ATR matching is a classification signal, **not** a trust
-signal. The trust gate remains the pinned-root SHA-256 check
-(see `crates/refineid-client/src/card_pin.rs` and
-[`doc/typing-discipline.md`](typing-discipline.md)). A
-forged card could in principle reproduce an ATR; only the
-pinned root anchors trust.
-
-That said, ATR matching is a useful weak counterfeit-card
-detector: a card whose ATR matches no known citizen model is
-rejected unless it answers the organization reference
-numbering, regardless of trust gate state.
+signal: a forged card could in principle reproduce an ATR.
+PIN management and activation compare no on-card certificate
+against a pinned root. A card whose ATR matches no known
+citizen model is rejected unless it answers the organization
+reference numbering.
 
 ## Out of scope, but recorded for context
 

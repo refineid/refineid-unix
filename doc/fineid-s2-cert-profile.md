@@ -66,9 +66,8 @@ DVV Gov. Root CA - G3 ECC
 
 These are the pinned trust anchors in
 `crates/refineid-client/src/trust_roots.rs::PINNED_ROOT_SHA256`.
-Both are pinned. A card whose on-card root cert (EF.4334)
-hashes to neither value is refused by the activation flow's
-trust gate.
+PIN management and activation do not compare the on-card root
+cert (EF.4334) against them.
 
 ### Intermediate sub-CAs (citizen scope)
 
@@ -374,7 +373,7 @@ each with its S2 citation:
 - [`doc/typing-discipline.md`](typing-discipline.md) -- the
   cert state lattice this profile binds to.
 - [`doc/observability.md`](observability.md) -- the JSON
-  Lines wire shape for trust-gate / cert-validation events.
+  Lines wire shape for cert-validation events.
 - [`doc/dvv-terminology.md`](dvv-terminology.md) -- DVV
   vocabulary, activation-PIN / PUK terminology.
 - FINEID S2 v5.2 PDF (cited above).

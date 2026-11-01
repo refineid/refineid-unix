@@ -65,8 +65,7 @@ impl ChangePinArgs {
             .as_deref()
             .map(refineid_lib_core::backend::ReaderFilter::new);
         let session =
-            match crate::card_pin::establish_trusted_session(backend, typed_reader_filter.as_ref())
-            {
+            match crate::card_pin::establish_card_session(backend, typed_reader_filter.as_ref()) {
                 Ok(s) => s,
                 Err(crate::card_pin::CardPinError::ReaderPick(pe)) => {
                     return super::util::reader_pick_exit(cmd, &pe);

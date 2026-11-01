@@ -224,7 +224,7 @@ impl PinReferenceScheme {
     }
 
     /// The activation procedure (FINEID S4-1 v4.2 §4.6) a card with
-    /// this numbering follows.
+    /// this numbering follows, as refineid-core decides it.
     ///
     /// The organization numbering activates by §4.6.1 (the activation
     /// code is the PUK) whatever the certificate date. Under the
@@ -233,14 +233,13 @@ impl PinReferenceScheme {
     /// scheme.
     #[must_use]
     pub fn activation_scheme(self, validity_start: Option<DateTime>) -> Option<ActivationScheme> {
-        match self {
-            Self::Organizational => Some(ActivationScheme::ActivationCodeIsPuk),
-            Self::Citizen => validity_start.and_then(|start| {
-                i64::try_from(start.unix_duration().as_secs())
-                    .ok()
-                    .map(ActivationScheme::from_validity_start)
-            }),
-        }
+        let numbering = match self {
+            Self::Citizen => refineid_auth::PinReferenceScheme::Citizen,
+            Self::Organizational => refineid_auth::PinReferenceScheme::Organizational,
+        };
+        let validity_start_seconds =
+            validity_start.and_then(|start| i64::try_from(start.unix_duration().as_secs()).ok());
+        ActivationScheme::from_numbering_and_validity_start(numbering, validity_start_seconds)
     }
 }
 
