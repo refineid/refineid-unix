@@ -28,9 +28,10 @@ use refineid_doc_sign::document::Format;
 use refineid_doc_sign::pades::{SignatureMetadata, StampLanguage, VisibleSignature};
 use refineid_doc_sign::pin::{PinEntryError, PinRole, PromptedPin};
 use refineid_doc_sign::remote::PhoneSignOptions;
+use refineid_doc_sign::service::reader::{ReaderSignError, SignOptions};
 use refineid_doc_sign::service::{
-    DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES,
-    SignErrorKind, SignOptions, SignOutput, SignReport, SignSlot, SigningDevice,
+    DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES, SignOutput,
+    SignReport, SignSlot, SigningDevice,
 };
 use refineid_doc_sign::signed_name::PendingSignedName;
 use refineid_doc_sign::x509::DateTime;
@@ -200,9 +201,6 @@ impl DocumentSignArgs {
             additional_inputs,
             signing_time,
             metadata: metadata.clone(),
-            // The CLI signs whichever card is present; there is no
-            // prior inspection view to bind to.
-            expected_serial: None,
             timestamp_authorities: timestamp_authorities.clone(),
             timestamp_credentials: None,
             long_term,
@@ -252,18 +250,22 @@ impl DocumentSignArgs {
                 save_cert: None,
                 reader_filter: reader_filter.clone(),
                 can: can.as_ref().and_then(crate::doc_sign_bridge::can),
+                // The CLI signs whichever card is present; there is no
+                // prior inspection view to bind to.
+                expected_serial: None,
                 document: Some(request(inputs.clone())),
             };
 
-            let mut result = refineid_doc_sign::service::sign(&backend, options(can), &mut pin);
+            let mut result =
+                refineid_doc_sign::service::reader::sign(&backend, options(can), &mut pin);
             // Same contactless retry as the bare sign verbs: the PACE
             // seal is reported by the first SELECT, before any PIN
             // counter has been touched.
-            if matches!(result, Err(SignErrorKind::NeedCan))
+            if matches!(result, Err(ReaderSignError::NeedCan))
                 && let Some(prompted) = super::util::prompt_can_if_tty()
             {
                 can = Some(prompted);
-                result = refineid_doc_sign::service::sign(&backend, options(can), &mut pin);
+                result = refineid_doc_sign::service::reader::sign(&backend, options(can), &mut pin);
             }
             let stop = stops_the_run(&result);
             let name = several.then(|| primary.display().to_string());
@@ -562,11 +564,12 @@ impl core::fmt::Display for DocumentReport<'_> {
 /// error on stderr otherwise, prefixed with `name` when the run has
 /// several documents. `entry_status` is what a PIN prompt that ended
 /// without a PIN maps to; it has already said why. Returns the status
-/// the document earns.
+/// the document earns. A phone's outcome arrives as
+/// [`ReaderSignError::Document`], the document's own failure.
 fn report_outcome(
     cmd: &str,
     verbose: bool,
-    result: Result<SignReport, SignErrorKind>,
+    result: Result<SignReport, ReaderSignError>,
     level: &Level,
     entry_status: Option<ExitStatus>,
     name: Option<&str>,
@@ -590,20 +593,20 @@ fn report_outcome(
                 ExitStatus::RuntimeFailure
             }
         }
-        Err(SignErrorKind::ReaderPick(pe)) => {
+        Err(ReaderSignError::ReaderPick(pe)) => {
             eprintln!("{cmd}: {whose}{pe}");
             super::util::core_reader_pick_status(&pe)
         }
-        Err(SignErrorKind::PinEntry(entry)) => entry_status.unwrap_or_else(|| {
+        Err(ReaderSignError::PinEntry(entry)) => entry_status.unwrap_or_else(|| {
             eprintln!("{cmd}: {whose}{entry}");
             ExitStatus::BadInvocation
         }),
         Err(e)
             if matches!(
                 &e,
-                SignErrorKind::PinRejected { .. }
-                    | SignErrorKind::RetryFloor(_)
-                    | SignErrorKind::PinPolicy { .. }
+                ReaderSignError::PinRejected { .. }
+                    | ReaderSignError::RetryFloor(_)
+                    | ReaderSignError::PinPolicy { .. }
             ) =>
         {
             refineid_dev_errors::report!(Cli, "document not signed", e);
@@ -654,6 +657,7 @@ fn sign_on_phone(
     };
     let mut worst = ExitStatus::Ok;
     for (result, name) in outcomes.into_iter().zip(names) {
+        let result = result.map_err(ReaderSignError::from);
         let status = report_outcome(cmd, verbose, result, level, None, name.as_deref());
         if worst == ExitStatus::Ok {
             worst = status;
@@ -667,15 +671,15 @@ fn sign_on_phone(
 /// not given. The next document would fail the same way or ask again
 /// for a code already refused. A document that fails on its own
 /// account, a format or an authority, lets the rest be signed.
-fn stops_the_run(result: &Result<SignReport, SignErrorKind>) -> bool {
+fn stops_the_run(result: &Result<SignReport, ReaderSignError>) -> bool {
     matches!(
         result,
-        Err(SignErrorKind::ReaderPick(_)
-            | SignErrorKind::NeedCan
-            | SignErrorKind::PinEntry(_)
-            | SignErrorKind::PinRejected { .. }
-            | SignErrorKind::RetryFloor(_)
-            | SignErrorKind::PinPolicy { .. })
+        Err(ReaderSignError::ReaderPick(_)
+            | ReaderSignError::NeedCan
+            | ReaderSignError::PinEntry(_)
+            | ReaderSignError::PinRejected { .. }
+            | ReaderSignError::RetryFloor(_)
+            | ReaderSignError::PinPolicy { .. })
     )
 }
 
@@ -1036,12 +1040,13 @@ mod tests {
     #[test]
     fn a_card_or_code_failure_ends_the_run_and_a_document_failure_does_not() -> TestResult {
         use refineid_doc_sign::service::SignErrorKind;
+        use refineid_doc_sign::service::reader::ReaderSignError;
         check_true(
-            stops_the_run(&Err(SignErrorKind::NeedCan)),
+            stops_the_run(&Err(ReaderSignError::NeedCan)),
             "a CAN still missing stops",
         )?;
         check_true(
-            !stops_the_run(&Err(SignErrorKind::VisibleSignatureFormat)),
+            !stops_the_run(&Err(SignErrorKind::VisibleSignatureFormat.into())),
             "a document's own failure lets the rest be signed",
         )
     }

@@ -25,13 +25,12 @@ use std::path::PathBuf;
 
 use refineid_doc_sign::cades::SigningTime;
 use refineid_doc_sign::document::Format;
-use refineid_doc_sign::identity::TokenSerial as CoreTokenSerial;
 use refineid_doc_sign::pades::{SignatureMetadata, StampLanguage, VisibleSignature};
 use refineid_doc_sign::pin::{PinEntryError, PromptedPin};
 use refineid_doc_sign::remote::PhoneSignOptions;
+use refineid_doc_sign::service::reader::{ReaderSignError, SignOptions};
 use refineid_doc_sign::service::{
-    DocumentRequest, SignErrorKind, SignOptions, SignOutput, SignReport, SignSlot,
-    TimestampCredentials,
+    DocumentRequest, SignErrorKind, SignOutput, SignReport, SignSlot, TimestampCredentials,
 };
 use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
@@ -149,7 +148,7 @@ pub fn inspect_cards(
 /// # Errors
 /// Reader/card access, card-swap binding, PIN, document construction,
 /// timestamp, revocation-evidence, or output-write failure.
-pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, SignErrorKind> {
+pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, ReaderSignError> {
     let PdfSignOptions {
         input,
         output,
@@ -169,34 +168,44 @@ pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, SignErrorKind> {
                 std::io::ErrorKind::InvalidInput,
                 "signed PDF destination must differ from the original",
             ),
-        });
+        }
+        .into());
     }
     let visible_signature = Some(VisibleSignature::verification(
         StampLanguage::for_process_locale(),
     ));
     let document = pdf_document_request(
-        Some(crate::doc_sign_bridge::token_serial(&expected_serial)),
         visible_signature,
         timestamp_authority,
         timestamp_credentials,
     );
-    sign_qualified(input, output, &pin2, can.as_ref(), reader_filter, document)
+    sign_qualified(
+        input,
+        output,
+        &pin2,
+        can.as_ref(),
+        reader_filter,
+        &expected_serial,
+        document,
+    )
 }
 
 /// Sign `input` with the qualified-signature key into `document`,
-/// presenting the PIN 2 the holder already entered.
+/// presenting the PIN 2 the holder already entered. The card in the
+/// reader must be the one whose `expected_serial` the view displayed.
 fn sign_qualified(
     input: PathBuf,
     output: SignOutput,
     pin2: &PinBytes,
     can: Option<&Can>,
     reader_filter: Option<String>,
+    expected_serial: &TokenSerial,
     document: DocumentRequest,
-) -> Result<SignReport, SignErrorKind> {
+) -> Result<SignReport, ReaderSignError> {
     crate::doc_sign_http::install();
     let mut pin =
         PromptedPin::new(|_role| crate::doc_sign_bridge::pin(pin2).map_err(PinEntryError::NotAPin));
-    refineid_doc_sign::service::sign(
+    refineid_doc_sign::service::reader::sign(
         &refineid_pcsc::PcscBackend,
         SignOptions {
             input,
@@ -205,6 +214,7 @@ fn sign_qualified(
             save_cert: None,
             reader_filter,
             can: can.and_then(crate::doc_sign_bridge::can),
+            expected_serial: Some(crate::doc_sign_bridge::token_serial(expected_serial)),
             document: Some(document),
         },
         &mut pin,
@@ -223,7 +233,7 @@ fn sign_qualified(
 /// # Errors
 /// Reader/card access, PIN, document construction, timestamp,
 /// revocation-evidence, or output-write failure.
-pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind> {
+pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, ReaderSignError> {
     let AsicSignOptions {
         input,
         additional_inputs,
@@ -244,15 +254,23 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind>
                 std::io::ErrorKind::InvalidInput,
                 "signed container destination must differ from every original",
             ),
-        });
+        }
+        .into());
     }
     let document = asice_document_request(
         additional_inputs,
-        Some(crate::doc_sign_bridge::token_serial(&expected_serial)),
         timestamp_authority,
         timestamp_credentials,
     );
-    sign_qualified(input, output, &pin2, can.as_ref(), reader_filter, document)
+    sign_qualified(
+        input,
+        output,
+        &pin2,
+        can.as_ref(),
+        reader_filter,
+        &expected_serial,
+        document,
+    )
 }
 
 /// One document for the paired phone to sign from the graphical client.
@@ -291,7 +309,6 @@ pub fn sign_on_phone(
             output: document.output,
             document: if document.format == Format::Pades {
                 pdf_document_request(
-                    None,
                     Some(VisibleSignature::verification(
                         StampLanguage::for_process_locale(),
                     )),
@@ -301,7 +318,6 @@ pub fn sign_on_phone(
             } else {
                 asice_document_request(
                     document.additional_inputs,
-                    None,
                     timestamp_authority.to_owned(),
                     None,
                 )
@@ -329,7 +345,6 @@ fn signing_time_now() -> SigningTime {
 /// refuses to pretend.
 fn asice_document_request(
     additional_inputs: Vec<PathBuf>,
-    expected_serial: Option<CoreTokenSerial>,
     timestamp_authority: String,
     timestamp_credentials: Option<TimestampCredentials>,
 ) -> DocumentRequest {
@@ -338,7 +353,6 @@ fn asice_document_request(
         additional_inputs,
         signing_time: signing_time_now(),
         metadata: SignatureMetadata::default(),
-        expected_serial,
         archive: false,
         long_term: true,
         timestamp_authorities: vec![timestamp_authority],
@@ -347,7 +361,6 @@ fn asice_document_request(
 }
 
 fn pdf_document_request(
-    expected_serial: Option<CoreTokenSerial>,
     visible_signature: Option<VisibleSignature>,
     timestamp_authority: String,
     timestamp_credentials: Option<TimestampCredentials>,
@@ -360,7 +373,6 @@ fn pdf_document_request(
             visible_signature,
             ..SignatureMetadata::default()
         },
-        expected_serial,
         archive: true,
         long_term: true,
         timestamp_authorities: vec![timestamp_authority],
@@ -462,9 +474,7 @@ mod tests {
 
     #[test]
     fn graphical_pdf_signing_requests_qualified_lta() {
-        let serial = TokenSerial::new("same-card".to_owned());
         let request = pdf_document_request(
-            Some(crate::doc_sign_bridge::token_serial(&serial)),
             Some(VisibleSignature::verification(StampLanguage::English)),
             "https://timestamp.sectigo.com/qualified".to_owned(),
             None,
@@ -477,10 +487,6 @@ mod tests {
             ["https://timestamp.sectigo.com/qualified"]
         );
         assert_eq!(
-            request.expected_serial.as_ref().map(|live| live.as_str()),
-            Some(serial.as_str())
-        );
-        assert_eq!(
             request.metadata.visible_signature,
             Some(VisibleSignature::verification(StampLanguage::English))
         );
@@ -489,9 +495,6 @@ mod tests {
     #[test]
     fn no_visible_signature_is_requested_without_one() {
         let request = pdf_document_request(
-            Some(crate::doc_sign_bridge::token_serial(&TokenSerial::new(
-                "same-card".to_owned(),
-            ))),
             None,
             "https://timestamp.sectigo.com/qualified".to_owned(),
             None,
