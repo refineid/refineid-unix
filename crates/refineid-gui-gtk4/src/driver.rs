@@ -82,9 +82,12 @@ fn access_number(typed: &str) -> String {
     digits_only(typed, CAN_DIGITS)
 }
 
-/// Keeps the digits of a typed PIN, up to the longest PIN.
-fn pin_entry(typed: &str) -> String {
-    digits_only(typed, PinBytes::MAX_LENGTH)
+/// A field's digit limit, shared with the handler that enforces it.
+type DigitLimit = Rc<Cell<usize>>;
+
+/// A digit limit of `limit` digits.
+fn digit_limit(limit: usize) -> DigitLimit {
+    Rc::new(Cell::new(limit))
 }
 
 fn to_pin_bytes(s: &str) -> Option<PinBytes> {
@@ -114,15 +117,17 @@ fn column() -> gtk4::Box {
         .build()
 }
 
-/// A masked PIN entry that keeps digits only, named for screen readers.
-fn pin_field(label: &str) -> gtk4::PasswordEntry {
+/// A masked PIN entry that keeps digits only, at most `limit` of them,
+/// named for screen readers.
+fn pin_field(label: &str, limit: &DigitLimit) -> gtk4::PasswordEntry {
     let entry = gtk4::PasswordEntry::builder()
         .show_peek_icon(true)
         .hexpand(true)
         .build();
     name(&entry, label);
-    entry.connect_changed(|entry| {
-        let kept = pin_entry(&entry.text());
+    let limit = Rc::clone(limit);
+    entry.connect_changed(move |entry| {
+        let kept = digits_only(&entry.text(), limit.get());
         if kept != entry.text().as_str() {
             entry.set_text(&kept);
             entry.set_position(-1);
@@ -271,6 +276,8 @@ struct ActivationWidgets {
     container: gtk4::Box,
     heading: gtk4::Label,
     code: gtk4::PasswordEntry,
+    /// The digit limits of the activation PIN and the new PINs.
+    limits: [DigitLimit; 5],
 }
 
 /// The PIN codes window.
@@ -287,6 +294,8 @@ struct PinCodesWidgets {
     attempts_entries: gtk4::Box,
     error: gtk4::Label,
     task: Cell<PinTask>,
+    /// The digit limits of the three fields.
+    limits: [DigitLimit; 3],
 }
 
 /// Every widget the driver updates, and what it remembers between
@@ -551,7 +560,7 @@ impl Ui {
         method.append(&package);
         name(&method, window::SIGNING_METHOD);
         signing.append(&form_row(&text_label(window::SIGNING_METHOD), &method));
-        let pin2 = pin_field(window::PIN_2);
+        let pin2 = pin_field(window::PIN_2, &digit_limit(PinBytes::MAX_LENGTH));
         let pin2_row = form_row(&text_label(window::PIN_2), &pin2);
         signing.append(&pin2_row);
         let action = gtk4::Box::builder()
@@ -775,13 +784,24 @@ impl Ui {
     fn update_pin_action(&self) {
         let task = self.pin_codes.task.get();
         let entries = self.pin_entries();
-        let ready = task.complete(entries.each_ref().map(String::as_str))
-            && task.available(&self.last.borrow());
+        let state = self.last.borrow();
+        let ready =
+            task.complete(&state, entries.each_ref().map(String::as_str)) && task.available(&state);
         self.pin_codes.action.set_sensitive(ready);
+    }
+
+    /// Sets the PIN codes fields' digit limits from the card in use for
+    /// the task shown.
+    fn limit_pin_fields(&self) {
+        let limits = self.pin_codes.task.get().field_limits(&self.last.borrow());
+        for (limit, digits) in self.pin_codes.limits.iter().zip(limits) {
+            limit.set(digits);
+        }
     }
 
     fn show_pin_task(&self, task: PinTask) {
         self.pin_codes.task.set(task);
+        self.limit_pin_fields();
         for (label, text) in self.pin_codes.field_labels.iter().zip(task.fields()) {
             label.set_label(text);
         }
@@ -799,7 +819,7 @@ impl Ui {
         for entry in &self.pin_codes.entries {
             entry.set_text("");
         }
-        if !task.complete(entries.each_ref().map(String::as_str)) {
+        if !task.complete(&self.last.borrow(), entries.each_ref().map(String::as_str)) {
             return;
         }
         let (Some(presented), Some(new_pin)) =
@@ -904,6 +924,14 @@ impl Ui {
             self.activation
                 .heading
                 .set_label(window::activation_heading(state));
+            for (limit, digits) in self
+                .activation
+                .limits
+                .iter()
+                .zip(window::activation_field_limits(state))
+            {
+                limit.set(digits);
+            }
         }
         if entered && content == WindowContent::Activation {
             self.activation.code.grab_focus();
@@ -1038,6 +1066,7 @@ impl Ui {
             }
             self.show_pin_task(initial);
         }
+        self.limit_pin_fields();
         self.update_pin_action();
 
         let entries = window::attempts_below_full(state);
@@ -1072,15 +1101,16 @@ fn build_activation(controller: &Arc<RefineIdController>) -> ActivationWidgets {
     let heading = text_label(window::IDENTITY_CARD_ACTIVATION);
     heading.add_css_class("heading");
     container.append(&heading);
-    let code = pin_field(window::ACTIVATION_PIN);
+    let limits = window::activation_field_limits(&controller.state()).map(digit_limit);
+    let code = pin_field(window::ACTIVATION_PIN, &limits[0]);
     container.append(&form_row(&text_label(window::ACTIVATION_PIN), &code));
     let pin1 = [
-        pin_field(window::NEW_PIN_1),
-        pin_field(window::NEW_PIN_1_AGAIN),
+        pin_field(window::NEW_PIN_1, &limits[1]),
+        pin_field(window::NEW_PIN_1_AGAIN, &limits[2]),
     ];
     let pin2 = [
-        pin_field(window::NEW_PIN_2),
-        pin_field(window::NEW_PIN_2_AGAIN),
+        pin_field(window::NEW_PIN_2, &limits[3]),
+        pin_field(window::NEW_PIN_2_AGAIN, &limits[4]),
     ];
     for (entry, text) in pin1.iter().chain(&pin2).zip([
         window::NEW_PIN_1,
@@ -1101,9 +1131,15 @@ fn build_activation(controller: &Arc<RefineIdController>) -> ActivationWidgets {
         .collect();
     let filled = {
         let entries = entries.clone();
+        let controller = Arc::clone(controller);
         move || {
             let text: Vec<String> = entries.iter().map(|e| e.text().to_string()).collect();
-            activation_complete(&text[0], [&text[1], &text[2]], [&text[3], &text[4]])
+            activation_complete(
+                &controller.state(),
+                &text[0],
+                [&text[1], &text[2]],
+                [&text[3], &text[4]],
+            )
         }
     };
     let filled = Rc::new(filled);
@@ -1122,7 +1158,12 @@ fn build_activation(controller: &Arc<RefineIdController>) -> ActivationWidgets {
         for entry in &entries {
             entry.set_text("");
         }
-        if !activation_complete(&text[0], [&text[1], &text[2]], [&text[3], &text[4]]) {
+        if !activation_complete(
+            &controller.state(),
+            &text[0],
+            [&text[1], &text[2]],
+            [&text[3], &text[4]],
+        ) {
             return;
         }
         if let (Some(activation_code), Some(new_pin1), Some(new_pin2)) = (
@@ -1141,6 +1182,7 @@ fn build_activation(controller: &Arc<RefineIdController>) -> ActivationWidgets {
         container,
         heading,
         code,
+        limits,
     }
 }
 
@@ -1184,7 +1226,12 @@ fn build_pin_codes(parent: &gtk4::Window) -> PinCodesWidgets {
     let form = column();
     let fields = PinTask::ChangePin1.fields();
     let field_labels = fields.map(text_label);
-    let entries = fields.map(pin_field);
+    let limits = [PinBytes::MAX_LENGTH; 3].map(digit_limit);
+    let mut limit_of = limits.iter();
+    let entries = fields.map(|label| {
+        let limit = limit_of.next().map_or_else(|| digit_limit(0), Rc::clone);
+        pin_field(label, &limit)
+    });
     for (label, entry) in field_labels.iter().zip(&entries) {
         form.append(&form_row(label, entry));
     }
@@ -1229,6 +1276,7 @@ fn build_pin_codes(parent: &gtk4::Window) -> PinCodesWidgets {
         attempts_entries,
         error,
         task: Cell::new(PinTask::ChangePin1),
+        limits,
     }
 }
 

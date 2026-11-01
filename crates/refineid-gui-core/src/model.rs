@@ -20,7 +20,8 @@ use refineid_client::card_check::CardCheckReport;
 use refineid_client::card_pin::{ActivationCardContext, PinManageSlot};
 use refineid_doc_sign::document::Format;
 use refineid_lib_core::auth::{
-    PinReadiness, PinReferenceScheme, PinSlot, PinStatus, PukStatus, check_retry_floor,
+    CardPinLengths, PinReadiness, PinReferenceScheme, PinSlot, PinStatus, PukStatus,
+    check_retry_floor,
 };
 use refineid_lib_core::can::Can;
 use refineid_lib_core::identity::TokenSerial;
@@ -305,6 +306,10 @@ pub struct UiState {
     pub organization_card: bool,
     /// Whether the card model supports digital signatures.
     pub signature_supported: bool,
+    /// The PIN and PUK lengths the card in a reader here accepts where
+    /// PINs are set, read in its activation session; `None` when they
+    /// were not read, and the FINEID bounds apply.
+    pub pin_lengths: Option<CardPinLengths>,
 
     /// Whether a card in a reader attached to this computer was read.
     /// A local card overrides the paired phone.
@@ -363,6 +368,7 @@ impl Default for UiState {
             unblock_uses_activation_code: false,
             organization_card: false,
             signature_supported: false,
+            pin_lengths: None,
             has_local_card: false,
             selected_card_is_local: false,
             reader: ReaderPresence::NoReader,
