@@ -81,6 +81,20 @@ pub struct CardArgs {
     pub remote: bool,
 }
 
+/// The holder line for a card a phone serves: the holder name the phone
+/// sent, followed by the organization its certificates' subject names,
+/// as an organization card's does.
+fn remote_holder_line(holder_name: String, certificates: &[Vec<u8>]) -> String {
+    let organization = certificates.iter().find_map(|der| {
+        refineid_lib_core::x509::OwnedCert::from_der(der)
+            .ok()?
+            .view()
+            .subject
+            .organization_name()
+    });
+    refineid_lib_core::identity::holder_line(holder_name, organization.as_ref())
+}
+
 impl CardArgs {
     /// Execute the bare `card` (unified per-card readout) verb.
     /// `verbose` adds the connection step of a paired-phone readout.
@@ -197,7 +211,10 @@ impl CardArgs {
 
         match identity_res {
             Ok(CardOperationResult::Identity(identity)) => {
-                println!("  Card Holder:  {}", identity.holder_name);
+                println!(
+                    "  Card Holder:  {}",
+                    remote_holder_line(identity.holder_name.clone(), &identity.certificates)
+                );
                 println!("  Card ID:      {}", identity.card_id);
                 println!(
                     "  Valid:        {} to {}",

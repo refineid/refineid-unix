@@ -959,6 +959,67 @@ impl PartialEq<&str> for CommonName {
     }
 }
 
+/// X.509 subject `organizationName` attribute value (OID 2.5.4.10),
+/// verbatim as the certificate carries it.
+///
+/// An organization card's certificate names the organization here; a
+/// citizen certificate has no such attribute.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OrganizationName(String);
+
+impl OrganizationName {
+    /// # Errors
+    /// [`FreeTextError::Empty`] if `s` is empty,
+    /// [`FreeTextError::TooLong`] if `s` exceeds
+    /// [`FREE_TEXT_MAX_BYTES`].
+    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
+        FreeText::parse(&s)?;
+        Ok(Self(s))
+    }
+
+    /// Borrow the underlying organization-name string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for OrganizationName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for OrganizationName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for OrganizationName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What joins the holder's name to the organization on the
+/// holder line.
+const ORGANIZATION_SEPARATOR: &str = ", ";
+
+/// The holder line a window shows: the holder's name, followed by
+/// the organization when the certificate names one. A name alone
+/// when there is no organization; empty when there is no name.
+#[must_use]
+pub fn holder_line(person: String, organization: Option<&OrganizationName>) -> String {
+    match organization {
+        Some(organization) if !person.is_empty() => {
+            format!("{person}{ORGANIZATION_SEPARATOR}{organization}")
+        }
+        _ => person,
+    }
+}
+
 // =========================================================
 // Per-slot given-name newtypes.
 //
@@ -2945,6 +3006,10 @@ pub struct CredentialIdentity {
     /// session state, not person identity, and lives on the
     /// card session (`bound_serial` field).
     pub printed_serial: Option<PrintedSerial>,
+    /// X.520 `organizationName` (OID 2.5.4.10) from the
+    /// certificate subject. `Some` on an organization card,
+    /// `None` on a citizen card.
+    pub organization: Option<OrganizationName>,
 }
 
 impl CredentialIdentity {
@@ -3001,6 +3066,13 @@ impl CredentialIdentity {
     #[must_use]
     pub fn with_common_name(mut self, value: CommonName) -> Self {
         self.common_name = Some(value);
+        self
+    }
+
+    /// Set the [`organization`](Self::organization) and return `self`.
+    #[must_use]
+    pub fn with_organization(mut self, value: OrganizationName) -> Self {
+        self.organization = Some(value);
         self
     }
 
@@ -3089,6 +3161,7 @@ impl CredentialIdentity {
             && self.peuin.is_none()
             && self.date_of_birth.is_none()
             && self.printed_serial.is_none()
+            && self.organization.is_none()
     }
 
     /// Render for a PIN / PUK prompt with a bounded byte
@@ -3441,6 +3514,32 @@ mod tests {
                 SecondName::new(SAMPLE_SECOND.to_owned()).expect("sample second name is valid"),
             )
             .with_peuin(Peuin::new(SAMPLE_PEUIN).expect("sample PEUIN is valid"))
+    }
+
+    fn sample_organization() -> OrganizationName {
+        OrganizationName::new("Testiorganisaatio Oy".to_owned())
+            .expect("sample organization is valid")
+    }
+
+    #[test]
+    fn an_organization_card_holder_line_names_the_organization() {
+        assert_eq!(
+            holder_line("Juutilainen Denis".to_owned(), Some(&sample_organization())),
+            "Juutilainen Denis, Testiorganisaatio Oy"
+        );
+    }
+
+    #[test]
+    fn a_citizen_card_holder_line_is_the_name_alone() {
+        assert_eq!(
+            holder_line("SPECIMEN-TRAVEL VILMA SOFIA".to_owned(), None),
+            "SPECIMEN-TRAVEL VILMA SOFIA"
+        );
+    }
+
+    #[test]
+    fn an_organization_without_a_name_shows_nothing() {
+        assert_eq!(holder_line(String::new(), Some(&sample_organization())), "");
     }
 
     fn full_with_both_serials() -> CredentialIdentity {
