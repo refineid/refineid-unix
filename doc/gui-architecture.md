@@ -208,6 +208,8 @@ The window follows the Mac app's (`refineid-apple`, `Documentation/design/macos.
    - remote use on, no phone paired: "*phone* forgot this computer" when the phone said so, then the pairing prompt;
    - a paired phone: "Insert the card into the phone's card reader." when it reports no card there, "*HOLDER NAME* (via phone)" while it serves a card, "Connecting to the phone…" otherwise.
 
+   The holder's name is the authentication certificate's common name without its identifier; on an organisation card the organisation the subject names follows verbatim after a comma ("Juutilainen Denis, Testiorganisaatio Oy").
+
    Only the holder's name is in the primary text colour.
 2. **The document drop area**, while an identity is available or documents wait: files are dragged in or picked with "Choose…"; the pile lists every document with its own removal ("Remove *name*"), "Add…" and "Clear".
 3. **The signing controls**, while documents wait: "Signing method" with "Separately (PDF)" and "As a package" (locked to the package while anything but PDFs waits), "PIN 2" unless the paired phone signs, and "Sign…". The phone signs when its card is in use and the pairing grants document signing; PIN 2 is then typed on the phone. A package is one container over every document.

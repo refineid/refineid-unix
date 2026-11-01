@@ -1167,6 +1167,9 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
         if let Some(peuin) = view.subject.peuin() {
             identity = identity.with_peuin(peuin);
         }
+        if let Some(organization) = view.subject.organization_name() {
+            identity = identity.with_organization(organization);
+        }
         cards.push(phone_card(&pair.peer_display_name, serial, identity));
     }
 

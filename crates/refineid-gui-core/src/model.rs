@@ -24,7 +24,7 @@ use refineid_lib_core::auth::{
     check_retry_floor,
 };
 use refineid_lib_core::can::Can;
-use refineid_lib_core::identity::TokenSerial;
+use refineid_lib_core::identity::{TokenSerial, holder_line};
 use refineid_lib_core::pin::PinBytes;
 use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::profiles::ProfileName;
@@ -78,13 +78,15 @@ impl ManagedCard {
 
     /// The cardholder line: the certificate subject's common name
     /// without the identifier it ends with, or the person string when
-    /// the certificate was not read.
+    /// the certificate was not read, followed by the organization when
+    /// the subject names one, as an organization card's does.
     pub fn display_name(&self) -> String {
         let identity = &self.report.identity;
-        identity.common_name.as_ref().map_or_else(
+        let name = identity.common_name.as_ref().map_or_else(
             || self.person_name(),
             |cn| holder_name(cn.as_str(), identity.peuin.as_ref().map(AsRef::as_ref)),
-        )
+        );
+        holder_line(name, identity.organization.as_ref())
     }
 
     /// Whether a change with the current PIN passes the retry floor for
