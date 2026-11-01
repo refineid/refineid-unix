@@ -24,12 +24,6 @@ impl Gtk4Driver {
     pub fn create() -> (Self, StateChangeCallback) {
         (Self, Box::new(|_| {}))
     }
-
-    /// Select initial tab.
-    pub fn set_initial_tab(&mut self, _tab: &str) {}
-
-    /// Open on phone tab.
-    pub fn open_on_phone_tab(&mut self) {}
 }
 
 impl UiDriver for Gtk4Driver {

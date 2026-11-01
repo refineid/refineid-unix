@@ -13,11 +13,8 @@ workspace = true
 
 [dependencies]
 refineid-gui-core = { path = "../refineid-gui-core", version = "26" }
-refineid-client = { path = "../refineid-client", version = "26" }
 refineid-lib-core.workspace = true
 refineid-rapp-core.workspace = true
-zeroize.workspace = true
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-gtk4 = { workspace = true }
+gtk4 = { workspace = true, features = ["v4_6"] }

@@ -23,8 +23,6 @@ pub enum GuiCoreError {
     Card(String),
     /// Cryptographic or secret validation error.
     Validation(String),
-    /// Image decoding or conversion error.
-    Image(String),
     /// Signing operation error.
     Signing(String),
     /// RAPP pairing or remote reader error.
@@ -40,7 +38,6 @@ impl fmt::Display for GuiCoreError {
         match self {
             Self::Card(msg) => write!(f, "card error: {msg}"),
             Self::Validation(msg) => write!(f, "validation error: {msg}"),
-            Self::Image(msg) => write!(f, "image error: {msg}"),
             Self::Signing(msg) => write!(f, "signing error: {msg}"),
             Self::Pairing(msg) => write!(f, "pairing error: {msg}"),
             Self::Driver(msg) => write!(f, "driver error: {msg}"),

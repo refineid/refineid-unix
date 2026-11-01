@@ -39,7 +39,6 @@ use refineid_lib_pcsc::PcscBackend;
 use refineid_rapp_core::ids::PairId;
 
 use crate::card_check::{CardCheckError, CardCheckOptions, CardCheckReport};
-use crate::card_emrtd::{EmrtdReadError, EmrtdReadOptions, EmrtdReadReport};
 use crate::card_pin::{
     ActivateOptions, ActivateReport, ActivationCardContext, CardPinError, ChangePinOptions,
     ChangePinReport, UnblockPinOptions, UnblockPinReport,
@@ -117,47 +116,28 @@ pub fn present_readers() -> Result<Vec<String>, refineid_lib_pcsc::PcscError> {
     Ok(readers)
 }
 
-/// Inspect every connected FINEID card without network access or secret input.
+/// Inspect every connected FINEID card without network access.
 ///
 /// The report includes certificate-derived identity, card metadata, and PIN
-/// retry status. Portrait and displayed-signature images remain unavailable
-/// until the caller explicitly supplies the card's CAN to [`read_images`].
+/// retry status. A contactless card opens only with `can`, its card access
+/// number; without one its inspection fails with
+/// [`CardCheckError::NeedCan`].
 ///
 /// # Errors
-/// PC/SC enumeration, reader selection, or card-read failure.
+/// PC/SC enumeration, reader selection, PACE, or card-read failure.
 pub fn inspect_cards(
     reader_filter: Option<String>,
+    can: Option<&Can>,
 ) -> Result<Vec<CardCheckReport>, CardCheckError> {
     let options = CardCheckOptions {
         reader_filter,
         offline: true,
-        can: None,
+        can,
         crl_file: None,
         save_cert_dir: None,
         now: None,
     };
     crate::card_check::check_all(PcscBackend, &options)
-}
-
-/// Read CAN-protected eMRTD personal data, including DG2 portrait and DG7
-/// displayed-signature images when provisioned by the card issuer.
-///
-/// No image is written to disk. The caller owns display and explicit clipboard
-/// actions, and should discard the returned report when the view is closed.
-///
-/// # Errors
-/// Reader selection, PC/SC, PACE/CAN, secure-messaging, or data parsing failure.
-pub fn read_images(
-    can: Can,
-    reader_filter: Option<String>,
-) -> Result<EmrtdReadReport, EmrtdReadError> {
-    let options = EmrtdReadOptions {
-        can,
-        save_face: None,
-        save_signature: None,
-        reader_filter,
-    };
-    crate::card_emrtd::read_first(PcscBackend, &options)
 }
 
 /// Produce a qualified `PAdES-LTA` signature carrying the seal that asks
@@ -278,8 +258,11 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, SignErrorKind>
 /// One document for the paired phone to sign from the graphical client.
 #[derive(Debug)]
 pub struct PhoneSignDocument {
-    /// Existing document chosen by the user.
+    /// Existing document chosen by the user; the first file of a
+    /// container.
     pub input: PathBuf,
+    /// The container's other files, in order; empty for a PDF.
+    pub additional_inputs: Vec<PathBuf>,
     /// Where the signed document goes; distinct from every original.
     pub output: SignOutput,
     /// The signed PDF with its seal, or an `ASiC-E` container.
@@ -289,7 +272,8 @@ pub struct PhoneSignDocument {
 /// Sign every document with the card on the phone of `pair_id`, in one
 /// request: the holder enters PIN 2 once, on the phone. No PIN passes
 /// through this computer. A PDF is signed as [`sign_pdf`] signs it, any
-/// other format as [`sign_asice`] does, each bound to the certificate the
+/// other format as [`sign_asice`] does, a container over the
+/// document's input and its additional inputs, each bound to the certificate the
 /// phone returns rather than to a displayed serial.
 ///
 /// # Errors
@@ -315,7 +299,12 @@ pub fn sign_on_phone(
                     None,
                 )
             } else {
-                asice_document_request(Vec::new(), None, timestamp_authority.to_owned(), None)
+                asice_document_request(
+                    document.additional_inputs,
+                    None,
+                    timestamp_authority.to_owned(),
+                    None,
+                )
             },
         })
         .collect();

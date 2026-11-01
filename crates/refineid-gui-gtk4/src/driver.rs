@@ -1,410 +1,343 @@
 // Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
 
-//! GTK 4 presentation driver for RefineID.
+//! GTK 4 presentation driver for RefineID: one window, laid out as the
+//! Mac app's (`doc/gui-architecture.md`).
 //!
-//! Follows Apple macOS Human Interface Guidelines (HIG):
-//! - Unified titlebar with segmented pill view switcher (`Identity`, `PINs`, `Sign`, `Phone`).
-//! - Rounded inset grouped cards (`.apple-card`).
-//! - SF-style typography hierarchy and colored status pills for retry counters and pairing.
-//! - Masked `PasswordEntry` with zero PIN data or candidate PIN-length logging.
-//! - 6-box pairing code entry for RAPP phone pairing.
-//! - Native file choosers and system clipboard integration for visual credentials.
+//! From the top: the identity line, then the document drop area with the
+//! signing controls and the outcome of the last action. A contactless
+//! card asking for its access number, a card waiting to be taken into
+//! use, and the pairing prompt replace that content. The header bar holds
+//! one control: the remote-use switch, or the button that opens the PIN
+//! codes window while a card is in a reader here.
 
-use std::cell::RefCell;
-use std::path::Path;
+use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use refineid_gui_core::PinManageSlot;
 use refineid_gui_core::controller::RefineIdController;
 use refineid_gui_core::driver::UiDriver;
 use refineid_gui_core::error::GuiCoreError;
-use refineid_gui_core::image::RgbaImageBuffer;
-use refineid_gui_core::model::{SignFormat, UiState, UserIntent};
-use refineid_lib_core::auth::{PIN_TRY_LIMIT, PinStatus, PukStatus};
-use refineid_lib_core::can::CAN_DIGITS;
-use refineid_lib_core::pin::{ActivationPinEight, ActivationPinSeven, PinBytes, Puk};
+use refineid_gui_core::model::{CanRequest, SignFormat, UiState, UserIntent};
+use refineid_gui_core::window::{
+    self, IdentityLine, PinTask, Recovery, WindowContent, activation_complete, digits_only,
+};
+use refineid_lib_core::can::{CAN_DIGITS, Can};
+use refineid_lib_core::pin::PinBytes;
 use refineid_rapp_core::offer::{
     PAIRING_CODE_GROUP_SIZE, PAIRING_CODE_LENGTH, pairing_code_character,
 };
 
 use gtk4::gdk;
+use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 
-/// Minimum and maximum PUK length (8..=12 digits, FINEID S4-1 §8.1.5).
-const MIN_PUK_DIGITS: usize = Puk::MIN_LENGTH;
-const MAX_PUK_DIGITS: usize = Puk::MAX_LENGTH;
+/// The window's natural width, as the Mac window's.
+const WINDOW_WIDTH: i32 = 560;
+/// The space around and between the window's sections.
+const SPACING: i32 = 14;
+/// The margin around the window's content.
+const PADDING: i32 = 24;
+/// The drop area's least height.
+const DROP_HEIGHT: i32 = 96;
+/// The pile's height before it scrolls.
+const PILE_HEIGHT: i32 = 132;
+/// One code box's width and height.
+const CODE_BOX_WIDTH: i32 = 40;
+const CODE_BOX_HEIGHT: i32 = 48;
+/// The gap between two-character clusters of the pairing code.
+const CODE_GROUP_GAP: i32 = 12;
+/// How often the driver takes the controller's state snapshots.
+const STATE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+/// The icons of the header bar and the drop area.
+const PHONE_ICON: &str = "phone-symbolic";
+const PIN_CODES_ICON: &str = "dialog-password-symbolic";
+const DROP_ICON: &str = "document-open-symbolic";
+const REMOVE_ICON: &str = "window-close-symbolic";
+const BELOW_FLOOR_ICON: &str = "dialog-error-symbolic";
 
-/// Minimum and maximum Activation Code length (7 digits for newer cards, 8 for older cards).
-const MIN_ACTIVATION_CODE_DIGITS: usize = ActivationPinSeven::LENGTH;
-const MAX_ACTIVATION_CODE_DIGITS: usize = ActivationPinEight::LENGTH;
+/// The styles GTK's own theme lacks: the code boxes and the drop area's
+/// highlight while a drag is over it.
+const CSS: &str = "
+.code-box { border: 1px solid alpha(currentColor, 0.3); border-radius: 8px; }
+.code-box.active { border: 2px solid @accent_color; }
+.code-box.refused { border: 2px solid @error_color; }
+.code-char { font-family: monospace; font-size: 20px; font-weight: bold; }
+.drop-area { border: 1px solid alpha(currentColor, 0.15); border-radius: 10px; padding: 12px; }
+.drop-area.targeted { border: 2px solid @accent_color; }
+";
 
-/// Minimum and maximum allowed digits for PIN 1.
-const MIN_PIN1_DIGITS: usize = PinBytes::MIN_LENGTH;
-const MAX_PIN1_DIGITS: usize = PinBytes::MAX_LENGTH;
+/// Keeps the code characters of `typed`, up to the code's length.
+fn pairing_code(typed: &str) -> String {
+    typed
+        .chars()
+        .filter_map(pairing_code_character)
+        .take(PAIRING_CODE_LENGTH)
+        .collect()
+}
 
-/// Minimum and maximum allowed digits for PIN 2.
-const MIN_PIN2_DIGITS: usize = 6;
-const MAX_PIN2_DIGITS: usize = PinBytes::MAX_LENGTH;
+/// Keeps the digits of `typed`, up to the access number's length.
+fn access_number(typed: &str) -> String {
+    digits_only(typed, CAN_DIGITS)
+}
 
-/// Total characters for RAPP pairing code.
-const PAIRING_CODE_LEN: usize = PAIRING_CODE_LENGTH;
+/// Keeps the digits of a typed PIN, up to the longest PIN.
+fn pin_entry(typed: &str) -> String {
+    digits_only(typed, PinBytes::MAX_LENGTH)
+}
 
-/// Safely construct [`PinBytes`] from user input.
 fn to_pin_bytes(s: &str) -> Option<PinBytes> {
     PinBytes::new(s.as_bytes().to_vec()).ok()
 }
 
-/// Filter string to valid pairing-code characters up to [`PAIRING_CODE_LEN`].
-fn filter_pairing_code(text: &str) -> String {
-    text.chars()
-        .filter_map(pairing_code_character)
-        .take(PAIRING_CODE_LEN)
-        .collect()
+/// Gives `widget` the name a screen reader reads.
+fn name(widget: &impl IsA<gtk4::Accessible>, label: &str) {
+    widget.update_property(&[gtk4::accessible::Property::Label(label)]);
 }
 
-/// Filter string to numeric ASCII digits up to `max` count.
-fn filter_digits(text: &str, max: usize) -> String {
-    text.chars()
-        .filter(|c| c.is_ascii_digit())
-        .take(max)
-        .collect()
+/// A label aligned to the start, wrapping.
+fn text_label(text: &str) -> gtk4::Label {
+    gtk4::Label::builder()
+        .label(text)
+        .halign(gtk4::Align::Start)
+        .xalign(0.0)
+        .wrap(true)
+        .build()
 }
 
-/// Convert an [`RgbaImageBuffer`] into a [`gdk::Texture`] for rendering.
-fn texture_from_rgba(buf: &RgbaImageBuffer) -> Option<gdk::Texture> {
-    if buf.width() == 0 || buf.height() == 0 || buf.rgba_bytes().is_empty() {
-        return None;
-    }
-    let width: i32 = buf.width().try_into().ok()?;
-    let height: i32 = buf.height().try_into().ok()?;
-    let rowstride: i32 = buf.width().checked_mul(4)?.try_into().ok()?;
-    let required_len = (rowstride as usize).checked_mul(height as usize)?;
-    if buf.rgba_bytes().len() < required_len {
-        return None;
-    }
-    let bytes = glib::Bytes::from(buf.rgba_bytes());
-    let pixbuf = gtk4::gdk_pixbuf::Pixbuf::from_bytes(
-        &bytes,
-        gtk4::gdk_pixbuf::Colorspace::Rgb,
-        true,
-        8,
-        width,
-        height,
-        rowstride,
-    );
-    Some(gdk::Texture::for_pixbuf(&pixbuf))
+/// A vertical box with the window's spacing.
+fn column() -> gtk4::Box {
+    gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(SPACING)
+        .build()
 }
 
-/// Copy a texture to the system clipboard.
-fn copy_texture_to_clipboard(texture: &gdk::Texture) {
-    if let Some(display) = gdk::Display::default() {
-        display.clipboard().set_texture(texture);
-    }
+/// A masked PIN entry that keeps digits only, named for screen readers.
+fn pin_field(label: &str) -> gtk4::PasswordEntry {
+    let entry = gtk4::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .hexpand(true)
+        .build();
+    name(&entry, label);
+    entry.connect_changed(|entry| {
+        let kept = pin_entry(&entry.text());
+        if kept != entry.text().as_str() {
+            entry.set_text(&kept);
+            entry.set_position(-1);
+        }
+    });
+    entry
 }
 
-/// Save an RGBA image buffer to a PNG file.
-fn save_buffer_to_png(path: &Path, buf: &RgbaImageBuffer) -> Result<(), String> {
-    let mut save_path = path.to_path_buf();
-    save_path.set_extension("png");
-    image::save_buffer(
-        &save_path,
-        buf.rgba_bytes(),
-        buf.width(),
-        buf.height(),
-        image::ExtendedColorType::Rgba8,
-    )
-    .map_err(|e| e.to_string())
+/// A form row: the field's name before the field.
+fn form_row(label: &gtk4::Label, field: &impl IsA<gtk4::Widget>) -> gtk4::Box {
+    let row = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(SPACING)
+        .build();
+    label.set_width_chars(20);
+    label.set_wrap(false);
+    row.append(label);
+    row.append(field);
+    row
 }
 
-/// Single character box inside the RAPP pairing code control.
-#[derive(Clone)]
-struct CodeBox {
-    frame: gtk4::Frame,
-    label: gtk4::Label,
-}
-
-/// 6-character Apple-style code boxes grouped in pairs: `[ 7 ][ K ]   [ X ][ 4 ]   [ M ][ 9 ]`.
+/// The six-box code entry: one box per character, typed into a hidden
+/// entry that carries the field's accessible name.
 #[derive(Clone)]
 struct CodeBoxes {
-    container_widget: gtk4::Box,
-    boxes: Vec<CodeBox>,
+    container: gtk4::Box,
+    frames: Vec<gtk4::Frame>,
+    labels: Vec<gtk4::Label>,
     entry: gtk4::Entry,
 }
 
 impl CodeBoxes {
-    fn new() -> Self {
+    fn new(
+        length: usize,
+        group: Option<usize>,
+        label: &str,
+        caption: Option<&str>,
+        filter: fn(&str) -> String,
+        on_complete: impl Fn(String) + 'static,
+    ) -> Self {
         let container = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
-            .spacing(8)
-            .halign(gtk4::Align::Center)
-            .valign(gtk4::Align::Center)
+            .spacing(6)
+            .halign(gtk4::Align::Start)
             .build();
-
-        let mut boxes = Vec::with_capacity(PAIRING_CODE_LEN);
-        for i in 0..PAIRING_CODE_LEN {
-            if i > 0 && i % PAIRING_CODE_GROUP_SIZE == 0 {
-                let spacer = gtk4::Box::builder().width_request(14).build();
-                container.append(&spacer);
+        if let Some(caption) = caption {
+            let caption = gtk4::Label::new(Some(caption));
+            caption.add_css_class("dim-label");
+            container.append(&caption);
+        }
+        let mut frames = Vec::with_capacity(length);
+        let mut labels = Vec::with_capacity(length);
+        for index in 0..length {
+            if group.is_some_and(|size| index > 0 && index % size == 0) {
+                container.append(&gtk4::Box::builder().width_request(CODE_GROUP_GAP).build());
             }
-
             let frame = gtk4::Frame::builder()
-                .width_request(48)
-                .height_request(56)
+                .width_request(CODE_BOX_WIDTH)
+                .height_request(CODE_BOX_HEIGHT)
                 .build();
             frame.add_css_class("code-box");
-
-            let label = gtk4::Label::builder()
-                .label("")
-                .halign(gtk4::Align::Center)
-                .valign(gtk4::Align::Center)
-                .build();
-            label.add_css_class("code-char");
-            frame.set_child(Some(&label));
-
+            let character = gtk4::Label::new(None);
+            character.add_css_class("code-char");
+            frame.set_child(Some(&character));
             container.append(&frame);
-            boxes.push(CodeBox { frame, label });
+            frames.push(frame);
+            labels.push(character);
         }
-
         let entry = gtk4::Entry::builder()
             .opacity(0.0)
             .width_request(1)
-            .height_request(1)
-            .can_focus(true)
+            .max_length(i32::try_from(length).unwrap_or(i32::MAX))
             .build();
+        name(&entry, label);
         container.append(&entry);
-
-        let click_gesture = gtk4::GestureClick::new();
-        let e_click = entry.clone();
-        click_gesture.connect_pressed(move |_, _, _, _| {
-            e_click.grab_focus();
+        let click = gtk4::GestureClick::new();
+        let focus = entry.clone();
+        click.connect_pressed(move |_, _, _, _| {
+            focus.grab_focus();
         });
-        container.add_controller(click_gesture);
+        container.add_controller(click);
 
-        Self {
-            container_widget: container,
-            boxes,
+        let boxes = Self {
+            container,
+            frames,
+            labels,
             entry,
+        };
+        let shown = boxes.clone();
+        boxes.entry.connect_changed(move |entry| {
+            let kept = filter(&entry.text());
+            if kept != entry.text().as_str() {
+                entry.set_text(&kept);
+                entry.set_position(-1);
+                return;
+            }
+            shown.set_refused(false);
+            shown.render();
+            if kept.chars().count() == length {
+                on_complete(kept);
+            }
+        });
+        let focused = boxes.clone();
+        let focus_events = gtk4::EventControllerFocus::new();
+        focus_events.connect_enter(move |_| focused.render());
+        let unfocused = boxes.clone();
+        focus_events.connect_leave(move |_| unfocused.render());
+        boxes.entry.add_controller(focus_events);
+        boxes
+    }
+
+    /// Draws the typed characters into the boxes; the box the next one
+    /// lands in carries the accent while the entry has focus.
+    fn render(&self) {
+        let typed: Vec<char> = self.entry.text().chars().collect();
+        let focused = self.entry.has_focus();
+        for (index, (frame, label)) in self.frames.iter().zip(&self.labels).enumerate() {
+            label.set_label(&typed.get(index).map(char::to_string).unwrap_or_default());
+            if focused && index == typed.len() {
+                frame.add_css_class("active");
+            } else {
+                frame.remove_css_class("active");
+            }
         }
     }
 
-    fn container(&self) -> &gtk4::Box {
-        &self.container_widget
+    fn clear(&self) {
+        self.entry.set_text("");
+        self.render();
     }
 
-    fn render(&self, code: &str) {
-        let chars: Vec<char> = code.chars().collect();
-        for (i, b) in self.boxes.iter().enumerate() {
-            let ch = chars.get(i).map(|c| c.to_string()).unwrap_or_default();
-            b.label.set_label(&ch);
-
-            if i == chars.len() && chars.len() < PAIRING_CODE_LEN {
-                b.frame.add_css_class("code-box-active");
+    /// Marks every box as refused until the next character is typed.
+    fn set_refused(&self, refused: bool) {
+        for frame in &self.frames {
+            if refused {
+                frame.add_css_class("refused");
             } else {
-                b.frame.remove_css_class("code-box-active");
-            }
-
-            if i < chars.len() {
-                b.frame.add_css_class("code-box-filled");
-            } else {
-                b.frame.remove_css_class("code-box-filled");
+                frame.remove_css_class("refused");
             }
         }
     }
 }
 
-/// The fewest tries left at which a PIN or the PUK is still served.
-const SERVED_TRIES_FLOOR: usize = 3;
-
-/// A PIN's status pill: empty at the try limit, the tries left below it,
-/// red below the floor and when blocked.
-fn format_pin_status(status: Option<&PinStatus>, changed: Option<bool>) -> (String, &'static str) {
-    let limit = PIN_TRY_LIMIT as usize;
-    let (count, class) = match status {
-        Some(PinStatus::Remaining(retries)) => {
-            let count = retries.get() as usize;
-            let class = if count < SERVED_TRIES_FLOOR {
-                "status-pill-red"
-            } else {
-                "status-pill-gray"
-            };
-            if count == 0 {
-                ("Blocked".to_string(), class)
-            } else if count < limit {
-                (format!("{count} / {limit}"), class)
-            } else {
-                (String::new(), class)
-            }
-        }
-        Some(PinStatus::Locked) => ("Blocked".to_string(), "status-pill-red"),
-        Some(PinStatus::NoInfo) => ("No retry count".to_string(), "status-pill-gray"),
-        Some(PinStatus::Other(sw)) => (format!("Status {sw:04X}"), "status-pill-gray"),
-        Some(PinStatus::Verified) | None => (String::new(), "status-pill-gray"),
-    };
-    let text = match (changed, count.is_empty()) {
-        (Some(false), true) => "Factory value".to_string(),
-        (Some(false), false) => format!("{count} • Factory value"),
-        (Some(true) | None, _) => count,
-    };
-    (text, class)
+/// The activation form.
+struct ActivationWidgets {
+    container: gtk4::Box,
+    code: gtk4::PasswordEntry,
 }
 
-/// The PUK's status pill, by the same rule as [`format_pin_status`].
-fn format_puk_status(status: Option<&PukStatus>) -> (String, &'static str) {
-    match status {
-        Some(PukStatus::Remaining(retries)) => {
-            let count = retries.get() as usize;
-            let class = if count < SERVED_TRIES_FLOOR {
-                "status-pill-red"
-            } else {
-                "status-pill-gray"
-            };
-            if count == 0 {
-                ("Blocked".to_string(), class)
-            } else if count < PIN_TRY_LIMIT as usize {
-                (format!("{count} remaining"), class)
-            } else {
-                (String::new(), class)
-            }
-        }
-        Some(PukStatus::Locked) => ("Blocked".to_string(), "status-pill-red"),
-        Some(PukStatus::Invalidated) => ("Invalidated".to_string(), "status-pill-red"),
-        Some(PukStatus::NoInfo) => ("No count".to_string(), "status-pill-gray"),
-        Some(PukStatus::Other(sw)) => (format!("Status {sw:04X}"), "status-pill-gray"),
-        None => (String::new(), "status-pill-gray"),
-    }
-}
-
-/// Visual widgets associated with the Identity tab.
-struct IdentityWidgets {
-    holder_name_label: gtk4::Label,
-    can_entry: gtk4::Entry,
-    load_photo_button: gtk4::Button,
-    portrait_picture: gtk4::Picture,
-    copy_portrait_button: gtk4::Button,
-    save_portrait_button: gtk4::Button,
-    signature_picture: gtk4::Picture,
-    copy_signature_button: gtk4::Button,
-    save_signature_button: gtk4::Button,
-}
-
-/// Visual widgets associated with the PINs tab.
-#[allow(
-    dead_code,
-    reason = "Widget handles retained for GTK UI hierarchy lifetime"
-)]
-struct PinsWidgets {
-    pin1_pill: gtk4::Label,
-    pin2_pill: gtk4::Label,
-    puk_pill: gtk4::Label,
-    task_stack: gtk4::Stack,
-    btn_task_p1: gtk4::ToggleButton,
-    btn_task_p2: gtk4::ToggleButton,
-    btn_task_unblock: gtk4::ToggleButton,
-    btn_task_activate: gtk4::ToggleButton,
-
-    // Change PIN 1
-    p1_current_entry: gtk4::PasswordEntry,
-    p1_new_entry: gtk4::PasswordEntry,
-    p1_confirm_entry: gtk4::PasswordEntry,
-    change_pin1_button: gtk4::Button,
-
-    // Change PIN 2
-    p2_current_entry: gtk4::PasswordEntry,
-    p2_new_entry: gtk4::PasswordEntry,
-    p2_confirm_entry: gtk4::PasswordEntry,
-    change_pin2_button: gtk4::Button,
-
-    // Reactivate / Unblock
-    unblock_slot_combo: gtk4::DropDown,
-    puk_entry: gtk4::PasswordEntry,
-    unblock_new_entry: gtk4::PasswordEntry,
-    unblock_confirm_entry: gtk4::PasswordEntry,
-    unblock_button: gtk4::Button,
-
-    // Activate Card
-    act_code_entry: gtk4::PasswordEntry,
-    act_p1_entry: gtk4::PasswordEntry,
-    act_p1_confirm_entry: gtk4::PasswordEntry,
-    act_p2_entry: gtk4::PasswordEntry,
-    act_p2_confirm_entry: gtk4::PasswordEntry,
-    activate_button: gtk4::Button,
-}
-
-/// Visual widgets associated with the Document Signing tab.
-#[allow(
-    dead_code,
-    reason = "Widget handles retained for GTK UI hierarchy lifetime"
-)]
-struct SignWidgets {
-    doc_list: gtk4::ListBox,
-    add_doc_button: gtk4::Button,
-    remove_doc_button: gtk4::Button,
-    clear_doc_button: gtk4::Button,
-    btn_format_pades: gtk4::ToggleButton,
-    btn_format_asice: gtk4::ToggleButton,
-    sign_pin2_entry: gtk4::PasswordEntry,
-    sign_button: gtk4::Button,
-    sign_result_banner: gtk4::Box,
-    sign_result_label: gtk4::Label,
-    last_pdf_documents: RefCell<Vec<std::path::PathBuf>>,
-}
-
-/// Visual widgets associated with the Phone (RAPP) tab.
-#[allow(
-    dead_code,
-    reason = "Widget handles retained for GTK UI hierarchy lifetime"
-)]
-struct PhoneWidgets {
-    reader_card: gtk4::Box,
-    code_boxes: CodeBoxes,
-    pair_status_label: gtk4::Label,
-
-    phone_card: gtk4::Box,
-    phone_name_label: gtk4::Label,
-    phone_state_pill: gtk4::Label,
-    forget_phone_button: gtk4::Button,
-}
-
-/// Bottom status bar widgets.
-struct StatusBarWidgets {
-    status_label: gtk4::Label,
-    spinner: gtk4::Spinner,
-}
-
-/// Internal handle set for all controls rendered by [`Gtk4Driver`].
-#[allow(
-    dead_code,
-    reason = "Widget handles retained for GTK UI hierarchy lifetime"
-)]
-struct Gtk4Widgets {
+/// The PIN codes window.
+struct PinCodesWidgets {
     window: gtk4::Window,
-    stack: gtk4::Stack,
-    btn_tab_identity: gtk4::ToggleButton,
-    btn_tab_pins: gtk4::ToggleButton,
-    btn_tab_sign: gtk4::ToggleButton,
-    btn_tab_phone: gtk4::ToggleButton,
-    identity: IdentityWidgets,
-    pins: PinsWidgets,
-    sign: SignWidgets,
-    phone: PhoneWidgets,
-    status_bar: StatusBarWidgets,
-    cached_portrait: Option<Arc<RgbaImageBuffer>>,
-    cached_signature: Option<Arc<RgbaImageBuffer>>,
+    recovery: [gtk4::Label; 2],
+    tasks: gtk4::Box,
+    task_buttons: Vec<(PinTask, gtk4::ToggleButton)>,
+    form: gtk4::Box,
+    field_labels: [gtk4::Label; 3],
+    entries: [gtk4::PasswordEntry; 3],
+    action: gtk4::Button,
+    attempts: gtk4::Box,
+    attempts_entries: gtk4::Box,
+    error: gtk4::Label,
+    task: Cell<PinTask>,
+}
+
+/// Every widget the driver updates, and what it remembers between
+/// snapshots.
+struct Ui {
+    controller: Arc<RefineIdController>,
+    window: gtk4::Window,
+    remote_switch: gtk4::ToggleButton,
+    pin_codes_button: gtk4::Button,
+    identity: gtk4::Label,
+    prompt: gtk4::Box,
+    pairing_boxes: CodeBoxes,
+    pairing_spinner: gtk4::Spinner,
+    can: gtk4::Box,
+    can_boxes: CodeBoxes,
+    activation: ActivationWidgets,
+    documents: gtk4::Box,
+    drop_area: gtk4::Box,
+    invitation: gtk4::Box,
+    pile: gtk4::ScrolledWindow,
+    pile_list: gtk4::ListBox,
+    pile_footer: gtk4::Box,
+    signing: gtk4::Box,
+    separately: gtk4::ToggleButton,
+    package: gtk4::ToggleButton,
+    pin2_row: gtk4::Box,
+    pin2: gtk4::PasswordEntry,
+    sign_spinner: gtk4::Spinner,
+    sign: gtk4::Button,
+    result: gtk4::Label,
+    error: gtk4::Label,
+    pin_codes: PinCodesWidgets,
+    last: RefCell<UiState>,
+    shown_pile: RefCell<Vec<PathBuf>>,
+    /// Set while a snapshot is applied, so that the toggles it sets are
+    /// not taken for the user's clicks.
+    applying: Cell<bool>,
+    content: Cell<Option<WindowContent>>,
+    pairing_running: Cell<bool>,
+    /// Whether the PIN codes window opened by itself for the card now in
+    /// the reader.
+    opened_for_card: Cell<bool>,
 }
 
 /// Presentation driver using GTK 4.
 pub struct Gtk4Driver {
-    initial_tab: Option<String>,
     receiver: Option<std::sync::mpsc::Receiver<UiState>>,
 }
 
 impl std::fmt::Debug for Gtk4Driver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Gtk4Driver")
-            .field("initial_tab", &self.initial_tab)
-            .finish_non_exhaustive()
+        f.debug_struct("Gtk4Driver").finish_non_exhaustive()
     }
 }
 
@@ -412,273 +345,27 @@ impl std::fmt::Debug for Gtk4Driver {
 pub type StateChangeCallback = Box<dyn Fn(&UiState) + Send + Sync + 'static>;
 
 impl Gtk4Driver {
-    /// Set the tab to display when the window opens (`identity`, `pins`, `sign`, `phone`).
-    pub fn set_initial_tab(&mut self, tab: &str) {
-        self.initial_tab = Some(tab.to_string());
-    }
-
-    /// Opens the window on the Phone tab with the code boxes focused.
-    pub fn open_on_phone_tab(&mut self) {
-        self.set_initial_tab("phone");
-    }
-
     /// Construct a new driver and its state notification callback.
     pub fn create() -> (Self, StateChangeCallback) {
         let (sender, receiver) = std::sync::mpsc::channel::<UiState>();
         let on_state_change: StateChangeCallback = Box::new(move |state: &UiState| {
             let _ = sender.send(state.clone());
         });
-
-        let driver = Self {
-            initial_tab: None,
-            receiver: Some(receiver),
-        };
-
-        (driver, on_state_change)
+        (
+            Self {
+                receiver: Some(receiver),
+            },
+            on_state_change,
+        )
     }
 
-    /// Load Apple macOS Human Interface Guidelines CSS styling into GTK display.
     fn load_css() {
-        let css_provider = gtk4::CssProvider::new();
-        css_provider.load_from_data(
-            "
-            /* macOS HIG Foundation */
-            window {
-                background-color: #f5f5f7;
-                color: #1d1d1f;
-                font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Cantarell, sans-serif;
-            }
-
-            /* Inset Grouped Apple Card */
-            .apple-card {
-                background-color: #ffffff;
-                border-radius: 12px;
-                border: 1px solid rgba(0, 0, 0, 0.08);
-                box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
-                padding: 18px 20px;
-            }
-
-            .apple-card-title {
-                font-size: 15px;
-                font-weight: 700;
-                color: #1d1d1f;
-            }
-
-            .apple-card-subtitle {
-                font-size: 12px;
-                color: #86868b;
-            }
-
-            /* Apple Segmented Control (Pill Switcher) */
-            .apple-segmented-bar {
-                background-color: rgba(120, 120, 128, 0.14);
-                border-radius: 9px;
-                padding: 3px;
-            }
-
-            .apple-segmented-button {
-                background-color: transparent;
-                color: #1d1d1f;
-                border: none;
-                border-radius: 7px;
-                padding: 6px 18px;
-                font-weight: 500;
-                font-size: 13px;
-                box-shadow: none;
-                transition: all 150ms ease-in-out;
-            }
-
-            .apple-segmented-button:checked {
-                background-color: #ffffff;
-                color: #000000;
-                font-weight: 600;
-                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 1px 1px rgba(0, 0, 0, 0.08);
-            }
-
-            .apple-segmented-button:hover:not(:checked) {
-                background-color: rgba(255, 255, 255, 0.4);
-            }
-
-            /* Primary Action Button (macOS Blue) */
-            .apple-primary-button {
-                background-image: none;
-                background-color: #007aff;
-                color: #ffffff;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 18px;
-                font-weight: 600;
-                font-size: 13px;
-                box-shadow: 0 1px 2px rgba(0, 122, 255, 0.2);
-            }
-
-            .apple-primary-button:hover {
-                background-image: none;
-                background-color: #0069d9;
-            }
-
-            .apple-primary-button:active {
-                background-image: none;
-                background-color: #0056b3;
-            }
-
-            .apple-primary-button:disabled {
-                background-image: none;
-                background-color: #e5e5ea;
-                color: #8e8e93;
-                box-shadow: none;
-            }
-
-            /* Secondary Action Button (macOS White Button) */
-            .apple-secondary-button {
-                background-image: none;
-                background-color: #ffffff;
-                color: #1d1d1f;
-                border: 1px solid #d1d1d6;
-                border-radius: 8px;
-                padding: 7px 16px;
-                font-weight: 500;
-                font-size: 13px;
-            }
-
-            .apple-secondary-button:hover {
-                background-color: #f5f5f7;
-                border-color: #c7c7cc;
-            }
-
-            .apple-secondary-button:active {
-                background-color: #e5e5ea;
-            }
-
-            .apple-secondary-button:disabled {
-                color: #8e8e93;
-                border-color: #e5e5ea;
-            }
-
-            /* Destructive Action Button (macOS Red) */
-            .apple-destructive-button {
-                background-color: #ff3b30;
-                color: #ffffff;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 16px;
-                font-weight: 600;
-                font-size: 13px;
-            }
-
-            .apple-destructive-button:hover {
-                background-color: #d70015;
-            }
-
-            /* Status Pill Badges */
-            .status-pill {
-                border-radius: 12px;
-                padding: 3px 10px;
-                font-size: 11px;
-                font-weight: 600;
-            }
-
-            .status-pill-red {
-                background-color: rgba(255, 59, 48, 0.15);
-                color: #d70015;
-            }
-
-            .status-pill-gray {
-                background-color: rgba(142, 142, 147, 0.15);
-                color: #8e8e93;
-            }
-
-            /* Code Boxes (Phone Pairing) */
-            .code-box {
-                background-color: #ffffff;
-                border: 2px solid #d1d1d6;
-                border-radius: 10px;
-                transition: all 120ms ease-in-out;
-            }
-
-            .code-box.code-box-active {
-                border-color: #007aff;
-                box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.25);
-            }
-
-            .code-box.code-box-filled {
-                border-color: #8e8e93;
-                background-color: #fbfbfd;
-            }
-
-            .code-char {
-                font-family: 'SF Mono', 'Menlo', monospace;
-                font-size: 22px;
-                font-weight: 700;
-                color: #1d1d1f;
-            }
-
-            /* Input Fields */
-            entry {
-                background-color: #ffffff;
-                border: 1px solid #d1d1d6;
-                border-radius: 8px;
-                padding: 6px 10px;
-                color: #1d1d1f;
-            }
-
-            entry:focus {
-                border-color: #007aff;
-                box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.2);
-            }
-
-            passwordentry {
-                background-color: #ffffff;
-                border: 1px solid #d1d1d6;
-                border-radius: 8px;
-                padding: 6px 10px;
-                color: #1d1d1f;
-            }
-
-            passwordentry:focus-within {
-                border-color: #007aff;
-                box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.2);
-            }
-
-            /* Inset Media Preview Containers */
-            .media-preview-frame {
-                background-color: #fbfbfd;
-                border: 1px solid #e5e5ea;
-                border-radius: 10px;
-            }
-
-            /* Result Banners */
-            .result-banner-success {
-                background-color: rgba(52, 199, 89, 0.12);
-                border: 1px solid rgba(52, 199, 89, 0.3);
-                border-radius: 8px;
-                padding: 10px 14px;
-                color: #1f7a33;
-                font-weight: 500;
-            }
-
-            .result-banner-error {
-                background-color: rgba(255, 59, 48, 0.12);
-                border: 1px solid rgba(255, 59, 48, 0.3);
-                border-radius: 8px;
-                padding: 10px 14px;
-                color: #d70015;
-                font-weight: 500;
-            }
-
-            /* Bottom Bar */
-            .bottom-bar {
-                background-color: rgba(245, 245, 247, 0.85);
-                border-top: 1px solid rgba(0, 0, 0, 0.08);
-                padding: 8px 16px;
-            }
-            ",
-        );
-
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(CSS);
         if let Some(display) = gdk::Display::default() {
             gtk4::style_context_add_provider_for_display(
                 &display,
-                &css_provider,
+                &provider,
                 gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
         }
@@ -694,39 +381,30 @@ impl UiDriver for Gtk4Driver {
 
     fn run(mut self, controller: Arc<RefineIdController>) -> Result<(), GuiCoreError> {
         gtk4::init().map_err(|e| GuiCoreError::Driver(e.to_string()))?;
+        glib::set_prgname(Some("refineid-gui"));
+        glib::set_application_name("RefineID");
         Self::load_css();
 
-        let context = glib::MainContext::default();
-        let widgets = Gtk4Widgets::build(&controller, self.initial_tab.as_deref());
-        let widgets_cell = Rc::new(RefCell::new(widgets));
+        let ui = Ui::build(&controller);
+        ui.apply(&controller.state());
 
-        // Initial render
-        widgets_cell.borrow_mut().apply_state(&controller.state());
-
-        // Connect reactive state receiver from background tasks via main context
         if let Some(receiver) = self.receiver.take() {
-            let w = Rc::clone(&widgets_cell);
-            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let polled = Rc::clone(&ui);
+            glib::timeout_add_local(STATE_POLL, move || {
                 while let Ok(state) = receiver.try_recv() {
-                    w.borrow_mut().apply_state(&state);
+                    polled.apply(&state);
                 }
                 glib::ControlFlow::Continue
             });
         }
 
-        let main_loop = glib::MainLoop::new(Some(&context), false);
-        let loop_for_close = main_loop.clone();
-
-        widgets_cell
-            .borrow()
-            .window
-            .connect_close_request(move |_| {
-                loop_for_close.quit();
-                glib::Propagation::Proceed
-            });
-
-        widgets_cell.borrow().window.present();
-
+        let main_loop = glib::MainLoop::new(None, false);
+        let quit = main_loop.clone();
+        ui.window.connect_close_request(move |_| {
+            quit.quit();
+            glib::Propagation::Proceed
+        });
+        ui.window.present();
         main_loop.run();
 
         controller.stop();
@@ -734,1761 +412,814 @@ impl UiDriver for Gtk4Driver {
     }
 }
 
-impl Gtk4Widgets {
-    /// Build entire GTK4 UI with Apple HIG presentation.
-    fn build(controller: &Arc<RefineIdController>, initial_tab: Option<&str>) -> Self {
+impl Ui {
+    fn build(controller: &Arc<RefineIdController>) -> Rc<Self> {
         let window = gtk4::Window::builder()
             .title("RefineID")
-            .default_width(940)
-            .default_height(680)
+            .default_width(WINDOW_WIDTH)
             .build();
 
-        // Top Navigation Header
-        let header_box = gtk4::Box::builder()
-            .orientation(gtk4::Orientation::Vertical)
-            .spacing(12)
-            .margin_top(12)
-            .margin_bottom(8)
-            .margin_start(16)
-            .margin_end(16)
+        let header = gtk4::HeaderBar::new();
+        let remote_switch = gtk4::ToggleButton::builder()
+            .icon_name(PHONE_ICON)
+            .tooltip_text(window::REMOTE_ACCESS)
             .build();
+        name(&remote_switch, window::REMOTE_ACCESS);
+        let pin_codes_button = gtk4::Button::builder()
+            .icon_name(PIN_CODES_ICON)
+            .tooltip_text(window::PIN_CODES)
+            .visible(false)
+            .build();
+        name(&pin_codes_button, window::PIN_CODES);
+        header.pack_end(&remote_switch);
+        header.pack_end(&pin_codes_button);
+        window.set_titlebar(Some(&header));
 
-        // Apple Segmented Control in Top Bar
-        let segmented_bar = gtk4::Box::builder()
+        let root = column();
+        root.set_margin_top(PADDING);
+        root.set_margin_bottom(PADDING);
+        root.set_margin_start(PADDING);
+        root.set_margin_end(PADDING);
+
+        let identity = text_label("");
+        identity.set_selectable(true);
+        root.append(&identity);
+
+        // The pairing prompt.
+        let prompt = column();
+        prompt.append(&text_label(window::PAIRING_PROMPT));
+        let prompt_row = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Horizontal)
-            .spacing(2)
-            .halign(gtk4::Align::Center)
+            .spacing(SPACING)
             .build();
-        segmented_bar.add_css_class("apple-segmented-bar");
+        let pairing_controller = Arc::clone(controller);
+        let pairing_boxes = CodeBoxes::new(
+            PAIRING_CODE_LENGTH,
+            Some(PAIRING_CODE_GROUP_SIZE),
+            window::PAIRING_CODE,
+            None,
+            pairing_code,
+            move |code| pairing_controller.handle_intent(UserIntent::StartPairing { code }),
+        );
+        let pairing_spinner = gtk4::Spinner::new();
+        name(&pairing_spinner, window::CONNECTING_TO_PHONE_PROGRESS);
+        prompt_row.append(&pairing_boxes.container);
+        prompt_row.append(&pairing_spinner);
+        prompt.append(&prompt_row);
+        root.append(&prompt);
 
-        let btn_tab_identity = gtk4::ToggleButton::builder().label("Identity").build();
-        btn_tab_identity.add_css_class("apple-segmented-button");
-
-        let btn_tab_pins = gtk4::ToggleButton::builder().label("PINs").build();
-        btn_tab_pins.add_css_class("apple-segmented-button");
-
-        let btn_tab_sign = gtk4::ToggleButton::builder().label("Sign").build();
-        btn_tab_sign.add_css_class("apple-segmented-button");
-
-        let btn_tab_phone = gtk4::ToggleButton::builder().label("Phone").build();
-        btn_tab_phone.add_css_class("apple-segmented-button");
-
-        segmented_bar.append(&btn_tab_identity);
-        segmented_bar.append(&btn_tab_pins);
-        segmented_bar.append(&btn_tab_sign);
-        segmented_bar.append(&btn_tab_phone);
-        header_box.append(&segmented_bar);
-
-        // Main Stack for the 4 primary views
-        let stack = gtk4::Stack::builder()
-            .transition_type(gtk4::StackTransitionType::Crossfade)
-            .vexpand(true)
-            .hexpand(true)
-            .build();
-
-        // 1. Identity Tab
-        let (identity_page, identity) = build_identity_page(controller, &window);
-        stack.add_named(&identity_page, Some("identity"));
-
-        // 2. PINs Tab
-        let (pins_page, pins) = build_pins_page(controller);
-        stack.add_named(&pins_page, Some("pins"));
-
-        // 3. Sign Tab
-        let (sign_page, sign) = build_sign_page(controller, &window);
-        stack.add_named(&sign_page, Some("sign"));
-
-        // 4. Phone Tab
-        let (phone_page, phone) = build_phone_page(controller);
-        stack.add_named(&phone_page, Some("phone"));
-
-        // Wire segmented bar buttons to stack using ToggleButton grouping
-        btn_tab_pins.set_group(Some(&btn_tab_identity));
-        btn_tab_sign.set_group(Some(&btn_tab_identity));
-        btn_tab_phone.set_group(Some(&btn_tab_identity));
-
-        {
-            let s = stack.clone();
-            btn_tab_identity.connect_toggled(move |btn| {
-                if btn.is_active() {
-                    s.set_visible_child_name("identity");
+        // The card access number entry.
+        let can = column();
+        let can_controller = Arc::clone(controller);
+        let can_boxes = CodeBoxes::new(
+            CAN_DIGITS,
+            None,
+            window::CARD_ACCESS_NUMBER,
+            Some(window::CAN_CAPTION),
+            access_number,
+            move |digits| {
+                if let Ok(number) = Can::new(&digits) {
+                    can_controller.handle_intent(UserIntent::EnterCan(number));
                 }
-            });
+            },
+        );
+        can.append(&can_boxes.container);
+        root.append(&can);
 
-            let s = stack.clone();
-            btn_tab_pins.connect_toggled(move |btn| {
-                if btn.is_active() {
-                    s.set_visible_child_name("pins");
-                }
-            });
+        let activation = build_activation(controller);
+        root.append(&activation.container);
 
-            let s = stack.clone();
-            btn_tab_sign.connect_toggled(move |btn| {
-                if btn.is_active() {
-                    s.set_visible_child_name("sign");
-                }
-            });
-
-            let s = stack.clone();
-            btn_tab_phone.connect_toggled(move |btn| {
-                if btn.is_active() {
-                    s.set_visible_child_name("phone");
-                }
-            });
-        }
-
-        // Initial tab selection
-        match initial_tab {
-            Some("phone") => {
-                btn_tab_phone.set_active(true);
-                stack.set_visible_child_name("phone");
-                phone.code_boxes.entry.grab_focus();
-            }
-            Some("pins") => {
-                btn_tab_pins.set_active(true);
-                stack.set_visible_child_name("pins");
-            }
-            Some("sign") => {
-                btn_tab_sign.set_active(true);
-                stack.set_visible_child_name("sign");
-            }
-            _ => {
-                btn_tab_identity.set_active(true);
-                stack.set_visible_child_name("identity");
-            }
-        }
-
-        // Bottom Status Bar
-        let (status_bar_box, status_bar) = build_status_bar();
-
-        let root = gtk4::Box::builder()
+        // The drop area, the signing controls and the outcome.
+        let documents = column();
+        let drop_area = column();
+        drop_area.add_css_class("drop-area");
+        drop_area.set_size_request(-1, DROP_HEIGHT);
+        name(&drop_area, window::DOCUMENTS_TO_SIGN);
+        let invitation = gtk4::Box::builder()
             .orientation(gtk4::Orientation::Vertical)
+            .spacing(6)
+            .valign(gtk4::Align::Center)
+            .vexpand(true)
             .build();
-        root.append(&header_box);
-        root.append(&stack);
-        root.append(&status_bar_box);
+        let drop_icon = gtk4::Image::from_icon_name(DROP_ICON);
+        drop_icon.set_pixel_size(32);
+        drop_icon.add_css_class("dim-label");
+        invitation.append(&drop_icon);
+        let invitation_text = gtk4::Label::new(Some(window::DROP_INVITATION));
+        invitation_text.add_css_class("dim-label");
+        invitation.append(&invitation_text);
+        let choose = gtk4::Button::with_label(window::CHOOSE);
+        choose.add_css_class("flat");
+        choose.set_halign(gtk4::Align::Center);
+        invitation.append(&choose);
+        drop_area.append(&invitation);
+
+        let pile_list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .build();
+        name(&pile_list, window::DOCUMENTS_TO_SIGN);
+        let pile = gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(PILE_HEIGHT)
+            .child(&pile_list)
+            .build();
+        drop_area.append(&pile);
+        let pile_footer = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .halign(gtk4::Align::End)
+            .build();
+        let add = gtk4::Button::with_label(window::ADD);
+        add.add_css_class("flat");
+        let clear = gtk4::Button::with_label(window::CLEAR);
+        clear.add_css_class("flat");
+        pile_footer.append(&add);
+        pile_footer.append(&clear);
+        drop_area.append(&pile_footer);
+        documents.append(&drop_area);
+
+        let signing = column();
+        let method = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .build();
+        method.add_css_class("linked");
+        let separately = gtk4::ToggleButton::with_label(window::SEPARATELY);
+        let package = gtk4::ToggleButton::with_label(window::AS_A_PACKAGE);
+        package.set_group(Some(&separately));
+        method.append(&separately);
+        method.append(&package);
+        name(&method, window::SIGNING_METHOD);
+        signing.append(&form_row(&text_label(window::SIGNING_METHOD), &method));
+        let pin2 = pin_field(window::PIN_2);
+        let pin2_row = form_row(&text_label(window::PIN_2), &pin2);
+        signing.append(&pin2_row);
+        let action = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(SPACING)
+            .halign(gtk4::Align::End)
+            .build();
+        let sign_spinner = gtk4::Spinner::new();
+        name(&sign_spinner, window::SIGNING_DOCUMENT);
+        let sign = gtk4::Button::with_label(window::SIGN);
+        sign.add_css_class("suggested-action");
+        action.append(&sign_spinner);
+        action.append(&sign);
+        signing.append(&action);
+        documents.append(&signing);
+        root.append(&documents);
+
+        let result = text_label("");
+        result.set_selectable(true);
+        root.append(&result);
+        let error = text_label("");
+        error.add_css_class("error");
+        error.set_selectable(true);
+        root.append(&error);
 
         window.set_child(Some(&root));
+        let pin_codes = build_pin_codes(&window);
 
-        Self {
+        let ui = Rc::new(Self {
+            controller: Arc::clone(controller),
             window,
-            stack,
-            btn_tab_identity,
-            btn_tab_pins,
-            btn_tab_sign,
-            btn_tab_phone,
+            remote_switch,
+            pin_codes_button,
             identity,
-            pins,
+            prompt,
+            pairing_boxes,
+            pairing_spinner,
+            can,
+            can_boxes,
+            activation,
+            documents,
+            drop_area,
+            invitation,
+            pile,
+            pile_list,
+            pile_footer,
+            signing,
+            separately,
+            package,
+            pin2_row,
+            pin2,
+            sign_spinner,
             sign,
-            phone,
-            status_bar,
-            cached_portrait: None,
-            cached_signature: None,
-        }
+            result,
+            error,
+            pin_codes,
+            last: RefCell::new(UiState::default()),
+            shown_pile: RefCell::new(Vec::new()),
+            applying: Cell::new(false),
+            content: Cell::new(None),
+            pairing_running: Cell::new(false),
+            opened_for_card: Cell::new(false),
+        });
+        ui.wire(&choose, &add, &clear);
+        ui
     }
 
-    /// Apply an updated [`UiState`] snapshot across all Apple HIG widgets.
-    fn apply_state(&mut self, state: &UiState) {
-        self.window.set_title(Some(&state.window_title));
+    /// Connects the controls that need the whole window.
+    fn wire(self: &Rc<Self>, choose: &gtk4::Button, add: &gtk4::Button, clear: &gtk4::Button) {
+        let ui = Rc::clone(self);
+        self.remote_switch.connect_toggled(move |switch| {
+            if !ui.applying.get() {
+                ui.controller
+                    .handle_intent(UserIntent::SetRemoteUse(switch.is_active()));
+            }
+        });
+        let ui = Rc::clone(self);
+        self.pin_codes_button
+            .connect_clicked(move |_| ui.pin_codes.window.present());
 
-        // 1. Identity Tab
-        let holder = state
-            .selected_card
-            .and_then(|idx| state.cards.get(idx))
-            .map(|c| c.display_name())
-            .unwrap_or_else(|| "No card".to_string());
-        self.identity.holder_name_label.set_label(&holder);
-
-        if state.selected_card_is_local {
-            self.identity.can_entry.set_sensitive(true);
-            self.identity
-                .load_photo_button
-                .set_sensitive(!state.busy && state.selected_card.is_some());
-        } else {
-            self.identity.can_entry.set_sensitive(false);
-            self.identity.load_photo_button.set_sensitive(false);
+        for button in [choose, add] {
+            let ui = Rc::clone(self);
+            button.connect_clicked(move |_| ui.choose_documents());
         }
-
-        if state.can_text.is_empty() && !state.busy && !self.identity.can_entry.text().is_empty() {
-            self.identity.can_entry.set_text("");
-        } else if !state.can_text.is_empty() && self.identity.can_entry.text().is_empty() {
-            self.identity.can_entry.set_text(&state.can_text);
-        }
-
-        // Render portrait
-        if state.portrait != self.cached_portrait {
-            self.cached_portrait = state.portrait.clone();
-            if let Some(ref buf) = state.portrait {
-                if let Some(texture) = texture_from_rgba(buf) {
-                    self.identity.portrait_picture.set_paintable(Some(&texture));
-                    self.identity.portrait_picture.set_visible(true);
-                    self.identity.copy_portrait_button.set_sensitive(true);
-                    self.identity.save_portrait_button.set_sensitive(true);
-                }
-            } else {
-                self.identity
-                    .portrait_picture
-                    .set_paintable(None::<&gdk::Texture>);
-                self.identity.portrait_picture.set_visible(false);
-                self.identity.copy_portrait_button.set_sensitive(false);
-                self.identity.save_portrait_button.set_sensitive(false);
-            }
-        }
-
-        // Render signature
-        if state.signature != self.cached_signature {
-            self.cached_signature = state.signature.clone();
-            if let Some(ref buf) = state.signature {
-                if let Some(texture) = texture_from_rgba(buf) {
-                    self.identity
-                        .signature_picture
-                        .set_paintable(Some(&texture));
-                    self.identity.signature_picture.set_visible(true);
-                    self.identity.copy_signature_button.set_sensitive(true);
-                    self.identity.save_signature_button.set_sensitive(true);
-                }
-            } else {
-                self.identity
-                    .signature_picture
-                    .set_paintable(None::<&gdk::Texture>);
-                self.identity.signature_picture.set_visible(false);
-                self.identity.copy_signature_button.set_sensitive(false);
-                self.identity.save_signature_button.set_sensitive(false);
-            }
-        }
-
-        // 2. PINs Tab
-        let (p1_text, p1_cls) = format_pin_status(state.pin1_status.as_ref(), state.pin1_changed);
-        self.pins.pin1_pill.set_label(&p1_text);
-        self.pins.pin1_pill.set_visible(!p1_text.is_empty());
-        self.pins
-            .pin1_pill
-            .set_css_classes(&["status-pill", p1_cls]);
-
-        let (p2_text, p2_cls) = format_pin_status(state.pin2_status.as_ref(), state.pin2_changed);
-        self.pins.pin2_pill.set_label(&p2_text);
-        self.pins.pin2_pill.set_visible(!p2_text.is_empty());
-        self.pins
-            .pin2_pill
-            .set_css_classes(&["status-pill", p2_cls]);
-
-        let (puk_text, puk_cls) = format_puk_status(state.puk_status.as_ref());
-        self.pins.puk_pill.set_label(&puk_text);
-        self.pins.puk_pill.set_visible(!puk_text.is_empty());
-        self.pins
-            .puk_pill
-            .set_css_classes(&["status-pill", puk_cls]);
-
-        // Toggle activation tab availability
-        self.pins
-            .btn_task_activate
-            .set_visible(state.activation_available);
-
-        self.pins
-            .change_pin1_button
-            .set_sensitive(state.pin1_change_available && !state.busy);
-        self.pins
-            .change_pin2_button
-            .set_sensitive(state.pin2_change_available && !state.busy);
-        self.pins.unblock_button.set_sensitive(
-            (state.pin1_unblock_available || state.pin2_unblock_available) && !state.busy,
-        );
-        self.pins
-            .activate_button
-            .set_sensitive(state.activation_available && !state.busy);
-
-        // 3. Sign Tab
-        let mut cached_docs = self.sign.last_pdf_documents.borrow_mut();
-        if *cached_docs != state.pdf_documents {
-            *cached_docs = state.pdf_documents.clone();
-            let prev_selected = self.sign.doc_list.selected_row().map(|r| r.index());
-            while let Some(row) = self.sign.doc_list.first_child() {
-                self.sign.doc_list.remove(&row);
-            }
-            for (i, path) in state.pdf_documents.iter().enumerate() {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("document.pdf");
-                let row = gtk4::ListBoxRow::builder().build();
-                let h = gtk4::Box::builder()
-                    .orientation(gtk4::Orientation::Horizontal)
-                    .spacing(12)
-                    .margin_top(8)
-                    .margin_bottom(8)
-                    .margin_start(12)
-                    .margin_end(12)
-                    .build();
-                let icon = gtk4::Image::from_icon_name("x-office-document");
-                let title = gtk4::Label::builder()
-                    .label(name)
-                    .halign(gtk4::Align::Start)
-                    .hexpand(true)
-                    .build();
-                let path_lbl = gtk4::Label::builder()
-                    .label(path.display().to_string())
-                    .halign(gtk4::Align::End)
-                    .build();
-                path_lbl.add_css_class("apple-card-subtitle");
-
-                h.append(&icon);
-                h.append(&title);
-                h.append(&path_lbl);
-                row.set_child(Some(&h));
-                self.sign.doc_list.append(&row);
-                if Some(i as i32) == prev_selected {
-                    self.sign.doc_list.select_row(Some(&row));
-                }
-            }
-        }
-
-        match state.sign_format {
-            SignFormat::Pades => {
-                self.sign.btn_format_pades.set_active(true);
-                self.sign.btn_format_asice.set_active(false);
-            }
-            SignFormat::AsicE => {
-                self.sign.btn_format_asice.set_active(true);
-                self.sign.btn_format_pades.set_active(false);
-            }
-        }
-
-        let can_sign = !state.pdf_documents.is_empty()
-            && !state.busy
-            && state.selected_card.is_some()
-            && state.signature_supported;
-        self.sign.sign_button.set_sensitive(can_sign);
-        // PIN 2 for the phone's card is typed on the phone.
-        self.sign.sign_pin2_entry.set_visible(!state.phone_signs());
-
-        if let Some(ref res) = state.sign_result {
-            self.sign.sign_result_banner.set_visible(true);
-            self.sign.sign_result_label.set_label(res);
-            if res.to_lowercase().contains("error") || res.to_lowercase().contains("fail") {
-                self.sign
-                    .sign_result_banner
-                    .remove_css_class("result-banner-success");
-                self.sign
-                    .sign_result_banner
-                    .add_css_class("result-banner-error");
-            } else {
-                self.sign
-                    .sign_result_banner
-                    .remove_css_class("result-banner-error");
-                self.sign
-                    .sign_result_banner
-                    .add_css_class("result-banner-success");
-            }
-        } else {
-            self.sign.sign_result_banner.set_visible(false);
-        }
-
-        // 4. Phone Tab (RAPP Continuity)
-        if state.has_local_card {
-            self.btn_tab_phone.set_visible(false);
-            if self.stack.visible_child_name().as_deref() == Some("phone") {
-                self.btn_tab_identity.set_active(true);
-                self.stack.set_visible_child_name("identity");
-            }
-        } else {
-            self.btn_tab_phone.set_visible(true);
-            if let Some(ref phone) = state.phone {
-                self.phone.phone_name_label.set_label(&phone.name);
-                self.phone
-                    .phone_state_pill
-                    .set_label(if phone.certificate_cached {
-                        &phone.platform
-                    } else {
-                        "Reading card"
-                    });
-                self.phone.reader_card.set_visible(false);
-                self.phone.phone_card.set_visible(true);
-            } else {
-                self.phone.phone_card.set_visible(false);
-                self.phone.reader_card.set_visible(true);
-
-                if let Some(ref pairing) = state.pairing {
-                    self.phone.pair_status_label.set_label(&pairing.status);
-                    self.phone.code_boxes.render(&pairing.code);
-                    self.phone.code_boxes.entry.set_sensitive(false);
-                } else {
-                    self.phone.pair_status_label.set_label("");
-                    self.phone.code_boxes.entry.set_sensitive(true);
-                }
-            }
-        }
-
-        // 5. Bottom Status Bar
-        self.status_bar
-            .status_label
-            .set_label(&state.status_message);
-        self.status_bar.spinner.set_spinning(state.busy);
-        self.status_bar.spinner.set_visible(state.busy);
-    }
-}
-
-/// Helper alert modal dialog.
-fn show_alert(parent: &gtk4::Window, message: &str) {
-    let dialog = gtk4::MessageDialog::builder()
-        .transient_for(parent)
-        .modal(true)
-        .title("RefineID")
-        .text(message)
-        .message_type(gtk4::MessageType::Warning)
-        .buttons(gtk4::ButtonsType::Ok)
-        .build();
-    dialog.connect_response(|d, _| {
-        d.close();
-    });
-    dialog.present();
-}
-
-// ---------------------------------------------------------------------------
-// Page Builders
-// ---------------------------------------------------------------------------
-
-fn build_identity_page(
-    controller: &Arc<RefineIdController>,
-    window: &gtk4::Window,
-) -> (gtk4::ScrolledWindow, IdentityWidgets) {
-    let scrolled = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vscrollbar_policy(gtk4::PolicyType::Automatic)
-        .build();
-
-    let page = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(16)
-        .margin_bottom(20)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
-
-    // Card 1: Cardholder and CAN Bar
-    let card1 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(14)
-        .build();
-    card1.add_css_class("apple-card");
-
-    let holder_row = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(12)
-        .build();
-    let id_icon = gtk4::Image::from_icon_name("avatar-default-symbolic");
-    id_icon.set_pixel_size(24);
-
-    let holder_name_label = gtk4::Label::builder()
-        .label("No card")
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .build();
-    holder_name_label.add_css_class("apple-card-title");
-
-    holder_row.append(&id_icon);
-    holder_row.append(&holder_name_label);
-    card1.append(&holder_row);
-
-    let sep = gtk4::Separator::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .build();
-    card1.append(&sep);
-
-    let can_row = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(12)
-        .build();
-    let can_label = gtk4::Label::builder()
-        .label("CAN")
-        .halign(gtk4::Align::Start)
-        .build();
-
-    let can_entry = gtk4::Entry::builder()
-        .max_length(CAN_DIGITS as i32)
-        .width_chars(16)
-        .build();
-
-    can_entry.connect_changed(|entry| {
-        let cur = entry.text();
-        let filtered = filter_digits(&cur, CAN_DIGITS);
-        if filtered != cur.as_str() {
-            entry.set_text(&filtered);
-            entry.set_position(filtered.chars().count() as i32);
-        }
-    });
-
-    let load_photo_button = gtk4::Button::builder().label("Load photo").build();
-    load_photo_button.add_css_class("apple-primary-button");
-
-    can_row.append(&can_label);
-    can_row.append(&can_entry);
-    can_row.append(&gtk4::Box::builder().hexpand(true).build());
-    can_row.append(&load_photo_button);
-    card1.append(&can_row);
-
-    {
-        let c = Arc::clone(controller);
-        let e = can_entry.clone();
-        load_photo_button.connect_clicked(move |btn| {
-            let val = e.text();
-            if val.len() != CAN_DIGITS {
-                e.set_text("");
-                if let Some(root) = btn.root()
-                    && let Ok(win) = root.downcast::<gtk4::Window>()
-                {
-                    show_alert(&win, "CAN must be exactly 6 numeric digits.");
-                }
-                return;
-            }
-            if let Some(pin) = to_pin_bytes(&val) {
-                c.handle_intent(UserIntent::LoadImages { can: pin });
-                e.set_text("");
-            } else {
-                e.set_text("");
-                if let Some(root) = btn.root()
-                    && let Ok(win) = root.downcast::<gtk4::Window>()
-                {
-                    show_alert(&win, "CAN contains invalid characters.");
-                }
-            }
-        });
-    }
-
-    // Card 2: Visual Credentials
-    let card2 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(20)
-        .build();
-    card2.add_css_class("apple-card");
-
-    // Official Photo Column
-    let photo_col = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(10)
-        .hexpand(true)
-        .build();
-    let photo_title = gtk4::Label::builder()
-        .label("Photo")
-        .halign(gtk4::Align::Start)
-        .build();
-    photo_title.add_css_class("apple-card-title");
-
-    let photo_frame = gtk4::Frame::builder()
-        .width_request(260)
-        .height_request(320)
-        .build();
-    photo_frame.add_css_class("media-preview-frame");
-
-    let portrait_picture = gtk4::Picture::builder()
-        .can_shrink(true)
-        .halign(gtk4::Align::Center)
-        .valign(gtk4::Align::Center)
-        .build();
-    portrait_picture.set_visible(false);
-
-    photo_frame.set_child(Some(&portrait_picture));
-
-    let photo_actions = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let copy_portrait_button = gtk4::Button::builder().label("Copy photo").build();
-    copy_portrait_button.add_css_class("apple-secondary-button");
-    let save_portrait_button = gtk4::Button::builder().label("Save as…").build();
-    save_portrait_button.add_css_class("apple-secondary-button");
-    photo_actions.append(&copy_portrait_button);
-    photo_actions.append(&save_portrait_button);
-
-    photo_col.append(&photo_title);
-    photo_col.append(&photo_frame);
-    photo_col.append(&photo_actions);
-
-    // Cardholder Signature Column
-    let sig_col = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(10)
-        .hexpand(true)
-        .build();
-    let sig_title = gtk4::Label::builder()
-        .label("Signature")
-        .halign(gtk4::Align::Start)
-        .build();
-    sig_title.add_css_class("apple-card-title");
-
-    let sig_frame = gtk4::Frame::builder()
-        .width_request(360)
-        .height_request(160)
-        .build();
-    sig_frame.add_css_class("media-preview-frame");
-
-    let signature_picture = gtk4::Picture::builder()
-        .can_shrink(true)
-        .halign(gtk4::Align::Center)
-        .valign(gtk4::Align::Center)
-        .build();
-    signature_picture.set_visible(false);
-
-    sig_frame.set_child(Some(&signature_picture));
-
-    let sig_actions = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let copy_signature_button = gtk4::Button::builder().label("Copy signature").build();
-    copy_signature_button.add_css_class("apple-secondary-button");
-    let save_signature_button = gtk4::Button::builder().label("Save as…").build();
-    save_signature_button.add_css_class("apple-secondary-button");
-    sig_actions.append(&copy_signature_button);
-    sig_actions.append(&save_signature_button);
-
-    sig_col.append(&sig_title);
-    sig_col.append(&sig_frame);
-    sig_col.append(&sig_actions);
-
-    card2.append(&photo_col);
-    card2.append(&sig_col);
-
-    page.append(&card1);
-    page.append(&card2);
-    scrolled.set_child(Some(&page));
-
-    // Clipboard and File Saving Callbacks
-    {
-        let c = Arc::clone(controller);
-        copy_portrait_button.connect_clicked(move |_| {
-            if let Some(ref buf) = c.state().portrait
-                && let Some(texture) = texture_from_rgba(buf)
-            {
-                copy_texture_to_clipboard(&texture);
-            }
-        });
-    }
-    {
-        let c = Arc::clone(controller);
-        let win_clone = window.clone();
-        save_portrait_button.connect_clicked(move |_| {
-            if let Some(ref buf) = c.state().portrait {
-                let chooser = gtk4::FileChooserNative::new(
-                    Some("Save Photo As"),
-                    Some(&win_clone),
-                    gtk4::FileChooserAction::Save,
-                    Some("Save"),
-                    Some("Cancel"),
-                );
-                chooser.set_current_name("official_photo.png");
-                let buf_clone = buf.clone();
-                let win_alert = win_clone.clone();
-                chooser.connect_response(move |dialog, resp| {
-                    if resp == gtk4::ResponseType::Accept
-                        && let Some(file) = dialog.file()
-                        && let Some(path) = file.path()
-                        && let Err(e) = save_buffer_to_png(&path, &buf_clone)
-                    {
-                        show_alert(&win_alert, &format!("Failed to save image: {e}"));
-                    }
-                });
-                keep_until_response(&chooser);
-                chooser.show();
-            }
-        });
-    }
-    {
-        let c = Arc::clone(controller);
-        copy_signature_button.connect_clicked(move |_| {
-            if let Some(ref buf) = c.state().signature
-                && let Some(texture) = texture_from_rgba(buf)
-            {
-                copy_texture_to_clipboard(&texture);
-            }
-        });
-    }
-    {
-        let c = Arc::clone(controller);
-        let win_clone = window.clone();
-        save_signature_button.connect_clicked(move |_| {
-            if let Some(ref buf) = c.state().signature {
-                let chooser = gtk4::FileChooserNative::new(
-                    Some("Save Signature As"),
-                    Some(&win_clone),
-                    gtk4::FileChooserAction::Save,
-                    Some("Save"),
-                    Some("Cancel"),
-                );
-                chooser.set_current_name("cardholder_signature.png");
-                let buf_clone = buf.clone();
-                let win_alert = win_clone.clone();
-                chooser.connect_response(move |dialog, resp| {
-                    if resp == gtk4::ResponseType::Accept
-                        && let Some(file) = dialog.file()
-                        && let Some(path) = file.path()
-                        && let Err(e) = save_buffer_to_png(&path, &buf_clone)
-                    {
-                        show_alert(&win_alert, &format!("Failed to save image: {e}"));
-                    }
-                });
-                keep_until_response(&chooser);
-                chooser.show();
-            }
-        });
-    }
-
-    (
-        scrolled,
-        IdentityWidgets {
-            holder_name_label,
-            can_entry,
-            load_photo_button,
-            portrait_picture,
-            copy_portrait_button,
-            save_portrait_button,
-            signature_picture,
-            copy_signature_button,
-            save_signature_button,
-        },
-    )
-}
-
-fn build_pins_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindow, PinsWidgets) {
-    let scrolled = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vscrollbar_policy(gtk4::PolicyType::Automatic)
-        .build();
-
-    let page = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(16)
-        .margin_bottom(20)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
-
-    // Card 1: Attempts Overview
-    let card1 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
-        .build();
-    card1.add_css_class("apple-card");
-
-    let tiles_row = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(16)
-        .homogeneous(true)
-        .build();
-
-    // Tile 1: PIN 1
-    let t1 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(6)
-        .build();
-    let t1_head = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let l1 = gtk4::Label::builder()
-        .label("PIN 1")
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .build();
-    l1.add_css_class("apple-card-title");
-    let pin1_pill = gtk4::Label::builder().build();
-    pin1_pill.add_css_class("status-pill");
-    pin1_pill.add_css_class("status-pill-gray");
-    pin1_pill.set_visible(false);
-    t1_head.append(&l1);
-    t1_head.append(&pin1_pill);
-    t1.append(&t1_head);
-
-    // Tile 2: PIN 2
-    let t2 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(6)
-        .build();
-    let t2_head = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let l2 = gtk4::Label::builder()
-        .label("PIN 2")
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .build();
-    l2.add_css_class("apple-card-title");
-    let pin2_pill = gtk4::Label::builder().build();
-    pin2_pill.add_css_class("status-pill");
-    pin2_pill.add_css_class("status-pill-gray");
-    pin2_pill.set_visible(false);
-    t2_head.append(&l2);
-    t2_head.append(&pin2_pill);
-    t2.append(&t2_head);
-
-    // Tile 3: PUK
-    let t3 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(6)
-        .build();
-    let t3_head = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let l3 = gtk4::Label::builder()
-        .label("PUK")
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .build();
-    l3.add_css_class("apple-card-title");
-    let puk_pill = gtk4::Label::builder().build();
-    puk_pill.add_css_class("status-pill");
-    puk_pill.add_css_class("status-pill-gray");
-    puk_pill.set_visible(false);
-    t3_head.append(&l3);
-    t3_head.append(&puk_pill);
-    t3.append(&t3_head);
-
-    tiles_row.append(&t1);
-    tiles_row.append(&t2);
-    tiles_row.append(&t3);
-    card1.append(&tiles_row);
-
-    // Card 2: Management Tasks
-    let card2 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(16)
-        .build();
-    card2.add_css_class("apple-card");
-
-    // Task Selector Bar
-    let task_bar = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(2)
-        .halign(gtk4::Align::Start)
-        .build();
-    task_bar.add_css_class("apple-segmented-bar");
-
-    let btn_task_p1 = gtk4::ToggleButton::builder().label("Change PIN 1").build();
-    btn_task_p1.add_css_class("apple-segmented-button");
-
-    let btn_task_p2 = gtk4::ToggleButton::builder().label("Change PIN 2").build();
-    btn_task_p2.add_css_class("apple-segmented-button");
-
-    let btn_task_unblock = gtk4::ToggleButton::builder().label("Unblock PIN").build();
-    btn_task_unblock.add_css_class("apple-segmented-button");
-
-    let btn_task_activate = gtk4::ToggleButton::builder().label("Activate Card").build();
-    btn_task_activate.add_css_class("apple-segmented-button");
-    btn_task_activate.set_visible(false);
-
-    task_bar.append(&btn_task_p1);
-    task_bar.append(&btn_task_p2);
-    task_bar.append(&btn_task_unblock);
-    task_bar.append(&btn_task_activate);
-    card2.append(&task_bar);
-
-    let task_stack = gtk4::Stack::builder()
-        .transition_type(gtk4::StackTransitionType::Crossfade)
-        .build();
-
-    // Subform 1: Change PIN 1
-    let p1_form = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(8)
-        .build();
-    let p1_current_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Current PIN 1")
-        .show_peek_icon(true)
-        .build();
-    let p1_new_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("New PIN 1")
-        .show_peek_icon(true)
-        .build();
-    let p1_confirm_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Confirm new PIN 1")
-        .show_peek_icon(true)
-        .build();
-    let change_pin1_button = gtk4::Button::builder().label("Change PIN 1").build();
-    change_pin1_button.add_css_class("apple-primary-button");
-
-    p1_form.append(&p1_current_entry);
-    p1_form.append(&p1_new_entry);
-    p1_form.append(&p1_confirm_entry);
-    p1_form.append(&change_pin1_button);
-    task_stack.add_named(&p1_form, Some("p1"));
-
-    // Subform 2: Change PIN 2
-    let p2_form = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(8)
-        .build();
-    let p2_current_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Current PIN 2")
-        .show_peek_icon(true)
-        .build();
-    let p2_new_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("New PIN 2")
-        .show_peek_icon(true)
-        .build();
-    let p2_confirm_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Confirm new PIN 2")
-        .show_peek_icon(true)
-        .build();
-    let change_pin2_button = gtk4::Button::builder().label("Change PIN 2").build();
-    change_pin2_button.add_css_class("apple-primary-button");
-
-    p2_form.append(&p2_current_entry);
-    p2_form.append(&p2_new_entry);
-    p2_form.append(&p2_confirm_entry);
-    p2_form.append(&change_pin2_button);
-    task_stack.add_named(&p2_form, Some("p2"));
-
-    // Subform 3: Unblock PIN
-    let unblock_form = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(8)
-        .build();
-    let unblock_slot_combo = gtk4::DropDown::from_strings(&["PIN 1", "PIN 2"]);
-    let puk_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("PUK Code")
-        .show_peek_icon(true)
-        .build();
-    let unblock_new_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("New PIN")
-        .show_peek_icon(true)
-        .build();
-    let unblock_confirm_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Confirm new PIN")
-        .show_peek_icon(true)
-        .build();
-    let unblock_button = gtk4::Button::builder().label("Unblock PIN").build();
-    unblock_button.add_css_class("apple-primary-button");
-
-    unblock_form.append(&unblock_slot_combo);
-    unblock_form.append(&puk_entry);
-    unblock_form.append(&unblock_new_entry);
-    unblock_form.append(&unblock_confirm_entry);
-    unblock_form.append(&unblock_button);
-    task_stack.add_named(&unblock_form, Some("unblock"));
-
-    // Subform 4: Activate Card
-    let activate_form = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(8)
-        .build();
-    let act_code_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Activation code")
-        .show_peek_icon(true)
-        .build();
-    let act_p1_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Initial PIN 1")
-        .show_peek_icon(true)
-        .build();
-    let act_p1_confirm_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Confirm Initial PIN 1")
-        .show_peek_icon(true)
-        .build();
-    let act_p2_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Initial PIN 2")
-        .show_peek_icon(true)
-        .build();
-    let act_p2_confirm_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Confirm Initial PIN 2")
-        .show_peek_icon(true)
-        .build();
-    let activate_button = gtk4::Button::builder().label("Activate Card").build();
-    activate_button.add_css_class("apple-primary-button");
-
-    activate_form.append(&act_code_entry);
-    activate_form.append(&act_p1_entry);
-    activate_form.append(&act_p1_confirm_entry);
-    activate_form.append(&act_p2_entry);
-    activate_form.append(&act_p2_confirm_entry);
-    activate_form.append(&activate_button);
-    task_stack.add_named(&activate_form, Some("activate"));
-
-    card2.append(&task_stack);
-
-    // Wire task segmented switcher using ToggleButton grouping
-    btn_task_p2.set_group(Some(&btn_task_p1));
-    btn_task_unblock.set_group(Some(&btn_task_p1));
-    btn_task_activate.set_group(Some(&btn_task_p1));
-
-    {
-        let ts = task_stack.clone();
-        btn_task_p1.connect_toggled(move |btn| {
-            if btn.is_active() {
-                ts.set_visible_child_name("p1");
-            }
-        });
-
-        let ts = task_stack.clone();
-        btn_task_p2.connect_toggled(move |btn| {
-            if btn.is_active() {
-                ts.set_visible_child_name("p2");
-            }
-        });
-
-        let ts = task_stack.clone();
-        btn_task_unblock.connect_toggled(move |btn| {
-            if btn.is_active() {
-                ts.set_visible_child_name("unblock");
-            }
-        });
-
-        let ts = task_stack.clone();
-        btn_task_activate.connect_toggled(move |btn| {
-            if btn.is_active() {
-                ts.set_visible_child_name("activate");
-            }
-        });
-    }
-
-    btn_task_p1.set_active(true);
-    task_stack.set_visible_child_name("p1");
-
-    page.append(&card1);
-    page.append(&card2);
-    scrolled.set_child(Some(&page));
-
-    // PIN Management Action Callbacks
-    {
-        let c = Arc::clone(controller);
-        let cur = p1_current_entry.clone();
-        let new = p1_new_entry.clone();
-        let conf = p1_confirm_entry.clone();
-        change_pin1_button.connect_clicked(move |btn| {
-            let win = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-            let cur_v = cur.text();
-            let new_v = new.text();
-            let conf_v = conf.text();
-            if new_v != conf_v {
-                new.set_text("");
-                conf.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "New PIN 1 entries do not match.");
-                }
-                return;
-            }
-            if new_v.len() < MIN_PIN1_DIGITS || new_v.len() > MAX_PIN1_DIGITS {
-                new.set_text("");
-                conf.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(
-                        w,
-                        &format!(
-                            "PIN 1 must be between {MIN_PIN1_DIGITS} and {MAX_PIN1_DIGITS} digits."
-                        ),
-                    );
-                }
-                return;
-            }
-            if let (Some(cur_pin), Some(new_pin)) = (to_pin_bytes(&cur_v), to_pin_bytes(&new_v)) {
-                c.handle_intent(UserIntent::ChangePin {
-                    slot: PinManageSlot::Pin1,
-                    current_pin: cur_pin,
-                    new_pin,
-                });
-                cur.set_text("");
-                new.set_text("");
-                conf.set_text("");
-            } else {
-                cur.set_text("");
-                new.set_text("");
-                conf.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "PIN contains invalid characters.");
-                }
-            }
-        });
-    }
-    {
-        let c = Arc::clone(controller);
-        let cur = p2_current_entry.clone();
-        let new = p2_new_entry.clone();
-        let conf = p2_confirm_entry.clone();
-        change_pin2_button.connect_clicked(move |btn| {
-            let win = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-            let cur_v = cur.text();
-            let new_v = new.text();
-            let conf_v = conf.text();
-            if new_v != conf_v {
-                new.set_text("");
-                conf.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "New PIN 2 entries do not match.");
-                }
-                return;
-            }
-            if new_v.len() < MIN_PIN2_DIGITS || new_v.len() > MAX_PIN2_DIGITS {
-                new.set_text("");
-                conf.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(
-                        w,
-                        &format!(
-                            "PIN 2 must be between {MIN_PIN2_DIGITS} and {MAX_PIN2_DIGITS} digits."
-                        ),
-                    );
-                }
-                return;
-            }
-            if let (Some(cur_pin), Some(new_pin)) = (to_pin_bytes(&cur_v), to_pin_bytes(&new_v)) {
-                c.handle_intent(UserIntent::ChangePin {
-                    slot: PinManageSlot::Pin2,
-                    current_pin: cur_pin,
-                    new_pin,
-                });
-                cur.set_text("");
-                new.set_text("");
-                conf.set_text("");
-            } else {
-                cur.set_text("");
-                new.set_text("");
-                conf.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "PIN contains invalid characters.");
-                }
-            }
-        });
-    }
-    {
-        let c = Arc::clone(controller);
-        let slot_dd = unblock_slot_combo.clone();
-        let puk_in = puk_entry.clone();
-        let new_in = unblock_new_entry.clone();
-        let conf_in = unblock_confirm_entry.clone();
-        unblock_button.connect_clicked(move |btn| {
-            let win = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-            let puk_v = puk_in.text();
-            let new_v = new_in.text();
-            let conf_v = conf_in.text();
-            if new_v != conf_v {
-                new_in.set_text("");
-                conf_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "New PIN entries do not match.");
-                }
-                return;
-            }
-            if puk_v.len() < MIN_PUK_DIGITS || puk_v.len() > MAX_PUK_DIGITS {
-                puk_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(
-                        w,
-                        &format!(
-                            "PUK must be between {MIN_PUK_DIGITS} and {MAX_PUK_DIGITS} digits."
-                        ),
-                    );
-                }
-                return;
-            }
-            let slot = match slot_dd.selected() {
-                1 => PinManageSlot::Pin2,
-                _ => PinManageSlot::Pin1,
+        let controller = Arc::clone(&self.controller);
+        clear.connect_clicked(move |_| controller.handle_intent(UserIntent::ClearDocuments));
+
+        let drop = gtk4::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let controller = Arc::clone(&self.controller);
+        let area = self.drop_area.clone();
+        drop.connect_drop(move |_, value, _, _| {
+            area.remove_css_class("targeted");
+            let Ok(files) = value.get::<gdk::FileList>() else {
+                return false;
             };
-            let (min_len, max_len) = match slot {
-                PinManageSlot::Pin1 => (MIN_PIN1_DIGITS, MAX_PIN1_DIGITS),
-                PinManageSlot::Pin2 => (MIN_PIN2_DIGITS, MAX_PIN2_DIGITS),
-            };
-            if new_v.len() < min_len || new_v.len() > max_len {
-                new_in.set_text("");
-                conf_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(
-                        w,
-                        &format!("PIN must be between {min_len} and {max_len} digits."),
-                    );
-                }
-                return;
+            let paths: Vec<PathBuf> = files
+                .files()
+                .iter()
+                .filter_map(|file| file.path())
+                .collect();
+            if paths.is_empty() {
+                return false;
             }
-            if let (Some(puk_pin), Some(new_pin)) = (to_pin_bytes(&puk_v), to_pin_bytes(&new_v)) {
-                c.handle_intent(UserIntent::ReactivatePin {
-                    slot,
-                    puk: puk_pin,
-                    new_pin,
-                });
-                puk_in.set_text("");
-                new_in.set_text("");
-                conf_in.set_text("");
-            } else {
-                puk_in.set_text("");
-                new_in.set_text("");
-                conf_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "PUK or PIN contains invalid characters.");
-                }
-            }
+            controller.handle_intent(UserIntent::AddDocuments(paths));
+            true
         });
-    }
-    {
-        let c = Arc::clone(controller);
-        let act_in = act_code_entry.clone();
-        let p1_in = act_p1_entry.clone();
-        let p1c_in = act_p1_confirm_entry.clone();
-        let p2_in = act_p2_entry.clone();
-        let p2c_in = act_p2_confirm_entry.clone();
-        activate_button.connect_clicked(move |btn| {
-            let win = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-            let act_v = act_in.text();
-            let p1_v = p1_in.text();
-            let p1c_v = p1c_in.text();
-            let p2_v = p2_in.text();
-            let p2c_v = p2c_in.text();
-            if p1_v != p1c_v {
-                p1_in.set_text("");
-                p1c_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "PIN 1 entries do not match.");
-                }
-                return;
-            }
-            if p2_v != p2c_v {
-                p2_in.set_text("");
-                p2c_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "PIN 2 entries do not match.");
-                }
-                return;
-            }
-            if act_v.len() < MIN_ACTIVATION_CODE_DIGITS || act_v.len() > MAX_ACTIVATION_CODE_DIGITS {
-                act_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(
-                        w,
-                        &format!(
-                            "Activation code must be between {MIN_ACTIVATION_CODE_DIGITS} and {MAX_ACTIVATION_CODE_DIGITS} digits."
-                        ),
-                    );
-                }
-                return;
-            }
-            if p1_v.len() < MIN_PIN1_DIGITS || p1_v.len() > MAX_PIN1_DIGITS {
-                p1_in.set_text("");
-                p1c_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(
-                        w,
-                        &format!(
-                            "PIN 1 must be between {MIN_PIN1_DIGITS} and {MAX_PIN1_DIGITS} digits."
-                        ),
-                    );
-                }
-                return;
-            }
-            if p2_v.len() < MIN_PIN2_DIGITS || p2_v.len() > MAX_PIN2_DIGITS {
-                p2_in.set_text("");
-                p2c_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(
-                        w,
-                        &format!(
-                            "PIN 2 must be between {MIN_PIN2_DIGITS} and {MAX_PIN2_DIGITS} digits."
-                        ),
-                    );
-                }
-                return;
-            }
-            if let (Some(act_code), Some(new_pin1), Some(new_pin2)) = (
-                to_pin_bytes(&act_v),
-                to_pin_bytes(&p1_v),
-                to_pin_bytes(&p2_v),
-            ) {
-                c.handle_intent(UserIntent::ActivateCard {
-                    activation_code: act_code,
-                    new_pin1,
-                    new_pin2,
-                });
-                act_in.set_text("");
-                p1_in.set_text("");
-                p1c_in.set_text("");
-                p2_in.set_text("");
-                p2c_in.set_text("");
-            } else {
-                act_in.set_text("");
-                p1_in.set_text("");
-                p1c_in.set_text("");
-                p2_in.set_text("");
-                p2c_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "Activation code or PINs contain invalid characters.");
-                }
-            }
+        let area = self.drop_area.clone();
+        drop.connect_enter(move |_, _, _| {
+            area.add_css_class("targeted");
+            gdk::DragAction::COPY
         });
-    }
+        let area = self.drop_area.clone();
+        drop.connect_leave(move |_| area.remove_css_class("targeted"));
+        self.drop_area.add_controller(drop);
 
-    (
-        scrolled,
-        PinsWidgets {
-            pin1_pill,
-            pin2_pill,
-            puk_pill,
-            task_stack,
-            btn_task_p1,
-            btn_task_p2,
-            btn_task_unblock,
-            btn_task_activate,
-            p1_current_entry,
-            p1_new_entry,
-            p1_confirm_entry,
-            change_pin1_button,
-            p2_current_entry,
-            p2_new_entry,
-            p2_confirm_entry,
-            change_pin2_button,
-            unblock_slot_combo,
-            puk_entry,
-            unblock_new_entry,
-            unblock_confirm_entry,
-            unblock_button,
-            act_code_entry,
-            act_p1_entry,
-            act_p1_confirm_entry,
-            act_p2_entry,
-            act_p2_confirm_entry,
-            activate_button,
-        },
-    )
-}
-
-fn build_sign_page(
-    controller: &Arc<RefineIdController>,
-    window: &gtk4::Window,
-) -> (gtk4::ScrolledWindow, SignWidgets) {
-    let scrolled = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vscrollbar_policy(gtk4::PolicyType::Automatic)
-        .build();
-
-    let page = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(16)
-        .margin_bottom(20)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
-
-    // Card 1: Documents Queue
-    let card1 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
-        .build();
-    card1.add_css_class("apple-card");
-
-    let card1_head = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let card1_title = gtk4::Label::builder()
-        .label("Documents")
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .build();
-    card1_title.add_css_class("apple-card-title");
-    card1_head.append(&card1_title);
-    card1.append(&card1_head);
-
-    let doc_scroller = gtk4::ScrolledWindow::builder()
-        .min_content_height(140)
-        .max_content_height(180)
-        .build();
-    doc_scroller.add_css_class("media-preview-frame");
-
-    let doc_list = gtk4::ListBox::builder()
-        .selection_mode(gtk4::SelectionMode::Single)
-        .build();
-    doc_scroller.set_child(Some(&doc_list));
-    card1.append(&doc_scroller);
-
-    let doc_actions = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let add_doc_button = gtk4::Button::builder().label("Add documents…").build();
-    add_doc_button.add_css_class("apple-primary-button");
-    let remove_doc_button = gtk4::Button::builder().label("Remove").build();
-    remove_doc_button.add_css_class("apple-secondary-button");
-    let clear_doc_button = gtk4::Button::builder().label("Clear all").build();
-    clear_doc_button.add_css_class("apple-secondary-button");
-
-    doc_actions.append(&add_doc_button);
-    doc_actions.append(&remove_doc_button);
-    doc_actions.append(&clear_doc_button);
-    card1.append(&doc_actions);
-
-    // Card 2: Signature Format
-    let card2 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(10)
-        .build();
-    card2.add_css_class("apple-card");
-
-    let card2_title = gtk4::Label::builder()
-        .label("Signing method")
-        .halign(gtk4::Align::Start)
-        .build();
-    card2_title.add_css_class("apple-card-title");
-    card2.append(&card2_title);
-
-    let format_bar = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(2)
-        .halign(gtk4::Align::Start)
-        .build();
-    format_bar.add_css_class("apple-segmented-bar");
-
-    let btn_format_pades = gtk4::ToggleButton::builder()
-        .label("Separately (PDF)")
-        .build();
-    btn_format_pades.add_css_class("apple-segmented-button");
-
-    let btn_format_asice = gtk4::ToggleButton::builder().label("As a package").build();
-    btn_format_asice.add_css_class("apple-segmented-button");
-    btn_format_asice.set_group(Some(&btn_format_pades));
-
-    format_bar.append(&btn_format_pades);
-    format_bar.append(&btn_format_asice);
-    card2.append(&format_bar);
-
-    // Card 3: PIN 2 and the sign action
-    let card3 = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
-        .build();
-    card3.add_css_class("apple-card");
-
-    let sign_row = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(12)
-        .build();
-    let sign_pin2_entry = gtk4::PasswordEntry::builder()
-        .placeholder_text("Signature PIN 2")
-        .show_peek_icon(true)
-        .hexpand(true)
-        .build();
-    let sign_button = gtk4::Button::builder().label("Sign documents").build();
-    sign_button.add_css_class("apple-primary-button");
-
-    sign_row.append(&sign_pin2_entry);
-    sign_row.append(&sign_button);
-    card3.append(&sign_row);
-
-    let sign_result_banner = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    sign_result_banner.add_css_class("result-banner-success");
-    let sign_result_label = gtk4::Label::builder()
-        .label("")
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .build();
-    sign_result_banner.append(&sign_result_label);
-    sign_result_banner.set_visible(false);
-    card3.append(&sign_result_banner);
-
-    page.append(&card1);
-    page.append(&card2);
-    page.append(&card3);
-    scrolled.set_child(Some(&page));
-
-    // Sign Document Callbacks
-    {
-        let c = Arc::clone(controller);
-        let win_clone = window.clone();
-        add_doc_button.connect_clicked(move |_| {
-            let chooser = gtk4::FileChooserNative::new(
-                Some("Choose documents"),
-                Some(&win_clone),
-                gtk4::FileChooserAction::Open,
-                Some("Add"),
-                Some("Cancel"),
-            );
-            chooser.set_select_multiple(true);
-            let filter = gtk4::FileFilter::new();
-            filter.set_name(Some("PDF Documents"));
-            filter.add_pattern("*.pdf");
-            filter.add_pattern("*.PDF");
-            chooser.add_filter(&filter);
-
-            let c_resp = Arc::clone(&c);
-            chooser.connect_response(move |dialog, resp| {
-                if resp == gtk4::ResponseType::Accept {
-                    let files = dialog.files();
-                    let mut paths = Vec::new();
-                    for i in 0..files.n_items() {
-                        if let Some(item) = files.item(i)
-                            && let Ok(file) = item.downcast::<gtk4::gio::File>()
-                            && let Some(path) = file.path()
-                        {
-                            paths.push(path);
-                        }
-                    }
-                    if !paths.is_empty() {
-                        c_resp.handle_intent(UserIntent::AddDocuments(paths));
-                    }
+        for (button, format) in [
+            (&self.separately, SignFormat::Pades),
+            (&self.package, SignFormat::AsicE),
+        ] {
+            let ui = Rc::clone(self);
+            button.connect_toggled(move |button| {
+                if button.is_active() && !ui.applying.get() {
+                    ui.controller
+                        .handle_intent(UserIntent::SetSignFormat(format));
                 }
             });
-            keep_until_response(&chooser);
-            chooser.show();
-        });
-    }
-    {
-        let c = Arc::clone(controller);
-        let dl = doc_list.clone();
-        remove_doc_button.connect_clicked(move |_| {
-            if let Some(row) = dl.selected_row() {
-                let idx = row.index() as usize;
-                let current = c.state().pdf_documents.clone();
-                if idx < current.len() {
-                    let mut updated = current;
-                    updated.remove(idx);
-                    c.handle_intent(UserIntent::ClearDocuments);
-                    if !updated.is_empty() {
-                        c.handle_intent(UserIntent::AddDocuments(updated));
-                    }
-                }
-            }
-        });
-    }
-    {
-        let c = Arc::clone(controller);
-        clear_doc_button.connect_clicked(move |_| {
-            c.handle_intent(UserIntent::ClearDocuments);
-        });
-    }
-    {
-        let c = Arc::clone(controller);
-        btn_format_pades.connect_toggled(move |btn| {
-            if btn.is_active() {
-                c.handle_intent(UserIntent::SetSignFormat(SignFormat::Pades));
-            }
-        });
+        }
 
-        let c = Arc::clone(controller);
-        btn_format_asice.connect_toggled(move |btn| {
-            if btn.is_active() {
-                c.handle_intent(UserIntent::SetSignFormat(SignFormat::AsicE));
+        let ui = Rc::clone(self);
+        self.pin2.connect_changed(move |_| ui.update_sign_button());
+        let ui = Rc::clone(self);
+        self.pin2.connect_activate(move |_| ui.sign());
+        let ui = Rc::clone(self);
+        self.sign.connect_clicked(move |_| ui.sign());
+
+        let ui = Rc::clone(self);
+        self.pin_codes.window.connect_close_request(move |window| {
+            window.set_visible(false);
+            for entry in &ui.pin_codes.entries {
+                entry.set_text("");
+            }
+            glib::Propagation::Stop
+        });
+        for entry in &self.pin_codes.entries {
+            let ui = Rc::clone(self);
+            entry.connect_changed(move |_| ui.update_pin_action());
+        }
+        let ui = Rc::clone(self);
+        self.pin_codes
+            .action
+            .connect_clicked(move |_| ui.run_pin_task());
+        for (task, button) in &self.pin_codes.task_buttons {
+            let ui = Rc::clone(self);
+            let task = *task;
+            button.connect_toggled(move |button| {
+                if button.is_active() && !ui.applying.get() {
+                    ui.show_pin_task(task);
+                }
+            });
+        }
+    }
+
+    /// Opens the file dialog; the chosen files join the pile.
+    fn choose_documents(&self) {
+        let chooser = gtk4::FileChooserNative::new(
+            None,
+            Some(&self.window),
+            gtk4::FileChooserAction::Open,
+            None,
+            None,
+        );
+        chooser.set_select_multiple(true);
+        let controller = Arc::clone(&self.controller);
+        chooser.connect_response(move |dialog, response| {
+            if response != gtk4::ResponseType::Accept {
+                return;
+            }
+            let files = dialog.files();
+            let paths: Vec<PathBuf> = (0..files.n_items())
+                .filter_map(|index| files.item(index))
+                .filter_map(|item| item.downcast::<gio::File>().ok())
+                .filter_map(|file| file.path())
+                .collect();
+            if !paths.is_empty() {
+                controller.handle_intent(UserIntent::AddDocuments(paths));
+            }
+        });
+        keep_until_response(&chooser);
+        chooser.show();
+    }
+
+    fn sign(&self) {
+        let state = self.last.borrow().clone();
+        let typed = self.pin2.text();
+        if !window::can_sign(&state, &typed) {
+            return;
+        }
+        self.pin2.set_text("");
+        if state.phone_signs() {
+            // PIN 2 for the phone's card is typed on the phone.
+            self.controller
+                .handle_intent(UserIntent::SignDocuments { pin2: None });
+        } else if let Some(pin2) = to_pin_bytes(&typed) {
+            self.controller
+                .handle_intent(UserIntent::SignDocuments { pin2: Some(pin2) });
+        }
+    }
+
+    fn update_sign_button(&self) {
+        let ready = window::can_sign(&self.last.borrow(), &self.pin2.text());
+        self.sign.set_sensitive(ready);
+    }
+
+    fn pin_entries(&self) -> [String; 3] {
+        self.pin_codes
+            .entries
+            .each_ref()
+            .map(|entry| entry.text().to_string())
+    }
+
+    fn update_pin_action(&self) {
+        let task = self.pin_codes.task.get();
+        let entries = self.pin_entries();
+        let ready = task.complete(entries.each_ref().map(String::as_str))
+            && task.available(&self.last.borrow());
+        self.pin_codes.action.set_sensitive(ready);
+    }
+
+    fn show_pin_task(&self, task: PinTask) {
+        self.pin_codes.task.set(task);
+        for (label, text) in self.pin_codes.field_labels.iter().zip(task.fields()) {
+            label.set_label(text);
+        }
+        for (entry, text) in self.pin_codes.entries.iter().zip(task.fields()) {
+            entry.set_text("");
+            name(entry, text);
+        }
+        self.pin_codes.action.set_label(task.action());
+        self.update_pin_action();
+    }
+
+    fn run_pin_task(&self) {
+        let task = self.pin_codes.task.get();
+        let entries = self.pin_entries();
+        for entry in &self.pin_codes.entries {
+            entry.set_text("");
+        }
+        if !task.complete(entries.each_ref().map(String::as_str)) {
+            return;
+        }
+        let (Some(presented), Some(new_pin)) =
+            (to_pin_bytes(&entries[0]), to_pin_bytes(&entries[1]))
+        else {
+            return;
+        };
+        let slot = task.manage_slot();
+        self.controller.handle_intent(if task.uses_puk() {
+            UserIntent::ReactivatePin {
+                slot,
+                puk: presented,
+                new_pin,
+            }
+        } else {
+            UserIntent::ChangePin {
+                slot,
+                current_pin: presented,
+                new_pin,
             }
         });
     }
-    {
-        let c = Arc::clone(controller);
-        let pin2_in = sign_pin2_entry.clone();
-        sign_button.connect_clicked(move |btn| {
-            if c.state().phone_signs() {
-                c.handle_intent(UserIntent::SignDocuments { pin2: None });
-                return;
-            }
-            let win = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-            let pin2_v = pin2_in.text();
-            if pin2_v.len() < MIN_PIN2_DIGITS || pin2_v.len() > MAX_PIN2_DIGITS {
-                pin2_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(
-                        w,
-                        &format!(
-                            "PIN 2 must be between {MIN_PIN2_DIGITS} and {MAX_PIN2_DIGITS} digits."
-                        ),
-                    );
-                }
-                return;
-            }
-            if let Some(pin2) = to_pin_bytes(&pin2_v) {
-                c.handle_intent(UserIntent::SignDocuments { pin2: Some(pin2) });
-                pin2_in.set_text("");
+
+    /// Applies one snapshot of the controller's state.
+    fn apply(&self, state: &UiState) {
+        self.applying.set(true);
+        *self.last.borrow_mut() = state.clone();
+        self.window.set_title(Some(&state.window_title));
+
+        let line = IdentityLine::derive(state);
+        let content = WindowContent::derive(state);
+        let entered = self.content.replace(Some(content)) != Some(content);
+
+        // The header bar's one control.
+        let opens_pin_codes = window::toolbar_opens_pin_codes(state);
+        self.pin_codes_button.set_visible(opens_pin_codes);
+        self.remote_switch.set_visible(!opens_pin_codes);
+        self.remote_switch.set_active(state.remote_use);
+        self.remote_switch
+            .update_property(&[gtk4::accessible::Property::Description(
+                if state.remote_use {
+                    window::REMOTE_ON
+                } else {
+                    window::REMOTE_OFF
+                },
+            )]);
+
+        // The identity line, absent while a form replaces it.
+        let replaced = matches!(
+            content,
+            WindowContent::CardAccessNumber(_) | WindowContent::Activation
+        );
+        let text = line.text();
+        self.identity.set_label(&text);
+        self.identity.set_visible(!replaced && !text.is_empty());
+        if line.is_holder() || line.is_warning() {
+            self.identity.remove_css_class("dim-label");
+        } else {
+            self.identity.add_css_class("dim-label");
+        }
+        if line.is_warning() {
+            self.identity.add_css_class("warning");
+        } else {
+            self.identity.remove_css_class("warning");
+        }
+
+        // The pairing prompt.
+        self.prompt
+            .set_visible(content == WindowContent::PairingPrompt);
+        let running = state.pairing.is_some();
+        self.pairing_boxes.entry.set_sensitive(!running);
+        self.pairing_spinner.set_visible(running);
+        self.pairing_spinner.set_spinning(running);
+        if self.pairing_running.replace(running) && !running {
+            self.pairing_boxes.clear();
+            self.pairing_boxes
+                .set_refused(!state.status_message.is_empty());
+        }
+        if entered && content == WindowContent::PairingPrompt {
+            self.pairing_boxes.clear();
+            self.pairing_boxes.entry.grab_focus();
+        }
+
+        // The card access number.
+        let can_request = match content {
+            WindowContent::CardAccessNumber(request) => Some(request),
+            _ => None,
+        };
+        self.can.set_visible(can_request.is_some());
+        if entered && can_request.is_some() {
+            self.can_boxes.clear();
+            self.can_boxes
+                .set_refused(can_request == Some(CanRequest::Refused));
+            self.can_boxes.entry.grab_focus();
+        }
+
+        // The activation form.
+        self.activation
+            .container
+            .set_visible(content == WindowContent::Activation);
+        if entered && content == WindowContent::Activation {
+            self.activation.code.grab_focus();
+        }
+
+        // The documents.
+        self.documents
+            .set_visible(content == WindowContent::Documents);
+        self.apply_pile(state);
+        let pile = !state.pdf_documents.is_empty();
+        self.signing.set_visible(pile);
+        let every_one_a_pdf = SignFormat::shared(&state.pdf_documents) == SignFormat::Pades;
+        self.separately.set_sensitive(every_one_a_pdf);
+        self.package.set_sensitive(every_one_a_pdf);
+        match state.sign_format {
+            SignFormat::Pades => self.separately.set_active(true),
+            SignFormat::AsicE => self.package.set_active(true),
+        }
+        self.pin2_row.set_visible(window::asks_pin2_here(state));
+        let signing = state.busy && pile;
+        self.sign_spinner.set_visible(signing);
+        self.sign_spinner.set_spinning(signing);
+        self.update_sign_button();
+
+        // The outcome of the last action.
+        let result = state.sign_result.clone().unwrap_or_default();
+        self.result.set_label(&result);
+        self.result
+            .set_visible(!result.is_empty() && matches!(content, WindowContent::Documents));
+        self.error.set_label(&state.status_message);
+        self.error.set_visible(!state.status_message.is_empty());
+
+        self.apply_pin_codes(state, opens_pin_codes);
+        self.applying.set(false);
+    }
+
+    /// Lists the pile, or shows the invitation while it is empty.
+    fn apply_pile(&self, state: &UiState) {
+        let pile = !state.pdf_documents.is_empty();
+        self.invitation.set_visible(!pile);
+        self.pile.set_visible(pile);
+        self.pile_footer.set_visible(pile);
+        if *self.shown_pile.borrow() == state.pdf_documents {
+            return;
+        }
+        self.shown_pile.replace(state.pdf_documents.clone());
+        while let Some(row) = self.pile_list.first_child() {
+            self.pile_list.remove(&row);
+        }
+        for document in &state.pdf_documents {
+            let file_name = document.file_name().map_or_else(
+                || document.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let row = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Horizontal)
+                .spacing(8)
+                .margin_top(4)
+                .margin_bottom(4)
+                .build();
+            let label = gtk4::Label::builder()
+                .label(&file_name)
+                .halign(gtk4::Align::Start)
+                .hexpand(true)
+                .ellipsize(gtk4::pango::EllipsizeMode::Middle)
+                .tooltip_text(document.display().to_string())
+                .build();
+            let remove = gtk4::Button::from_icon_name(REMOVE_ICON);
+            remove.add_css_class("flat");
+            remove.add_css_class("circular");
+            let remove_name = window::remove_document(&file_name);
+            remove.set_tooltip_text(Some(&remove_name));
+            name(&remove, &remove_name);
+            let controller = Arc::clone(&self.controller);
+            let path = document.clone();
+            remove.connect_clicked(move |_| {
+                controller.handle_intent(UserIntent::RemoveDocument(path.clone()));
+            });
+            row.append(&label);
+            row.append(&remove);
+            self.pile_list.append(&row);
+        }
+    }
+
+    /// Updates the PIN codes window, opens it by itself once per card
+    /// when a code is below the retry floor, and closes it when the card
+    /// leaves.
+    fn apply_pin_codes(&self, state: &UiState, card_here: bool) {
+        let pin = &self.pin_codes;
+        if !card_here {
+            self.opened_for_card.set(false);
+            pin.window.set_visible(false);
+            return;
+        }
+        let recovery = Recovery::derive(state);
+        if recovery.is_some() {
+            self.pin_codes_button.add_css_class("error");
+            self.pin_codes_button
+                .update_property(&[gtk4::accessible::Property::Description(
+                    window::PIN_NEEDS_RESET,
+                )]);
+        } else {
+            self.pin_codes_button.remove_css_class("error");
+            self.pin_codes_button
+                .update_property(&[gtk4::accessible::Property::Description("")]);
+        }
+        let sentences = recovery.map(Recovery::sentences);
+        for (index, label) in pin.recovery.iter().enumerate() {
+            let text = sentences.map(|pair| pair[index]).unwrap_or_default();
+            label.set_label(text);
+            label.set_visible(!text.is_empty());
+            if matches!(
+                recovery,
+                Some(Recovery::UseOtherSoftware | Recovery::Unrecoverable)
+            ) {
+                label.add_css_class("error");
             } else {
-                pin2_in.set_text("");
-                if let Some(ref w) = win {
-                    show_alert(w, "PIN 2 contains invalid characters.");
-                }
+                label.remove_css_class("error");
             }
-        });
-    }
+        }
 
-    (
-        scrolled,
-        SignWidgets {
-            doc_list,
-            add_doc_button,
-            remove_doc_button,
-            clear_doc_button,
-            btn_format_pades,
-            btn_format_asice,
-            sign_pin2_entry,
-            sign_button,
-            sign_result_banner,
-            sign_result_label,
-            last_pdf_documents: RefCell::new(Vec::new()),
-        },
-    )
+        let tasks = Recovery::tasks(recovery);
+        for (task, button) in &pin.task_buttons {
+            button.set_visible(tasks.contains(task));
+        }
+        pin.tasks.set_visible(!tasks.is_empty());
+        pin.form.set_visible(!tasks.is_empty());
+        if !tasks.contains(&pin.task.get()) {
+            let initial = Recovery::initial_task(recovery);
+            if let Some((_, button)) = pin.task_buttons.iter().find(|(task, _)| *task == initial) {
+                button.set_active(true);
+            }
+            self.show_pin_task(initial);
+        }
+        self.update_pin_action();
+
+        let entries = window::attempts_below_full(state);
+        while let Some(child) = pin.attempts_entries.first_child() {
+            pin.attempts_entries.remove(&child);
+        }
+        for entry in &entries {
+            let item = gtk4::Box::builder()
+                .orientation(gtk4::Orientation::Horizontal)
+                .spacing(4)
+                .build();
+            let text = gtk4::Label::new(Some(&entry.text));
+            item.append(&text);
+            if entry.below_floor {
+                item.add_css_class("error");
+                item.append(&gtk4::Image::from_icon_name(BELOW_FLOOR_ICON));
+            }
+            pin.attempts_entries.append(&item);
+        }
+        pin.attempts.set_visible(!entries.is_empty());
+        pin.error.set_label(&state.status_message);
+        pin.error.set_visible(!state.status_message.is_empty());
+
+        if recovery.is_some() && !self.opened_for_card.replace(true) {
+            pin.window.present();
+        }
+    }
 }
 
-fn build_phone_page(controller: &Arc<RefineIdController>) -> (gtk4::ScrolledWindow, PhoneWidgets) {
-    let scrolled = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vscrollbar_policy(gtk4::PolicyType::Automatic)
-        .build();
-
-    let page = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(24)
-        .margin_bottom(20)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
-
-    // 1. Unbonded Pairing Card (6-Box Entry)
-    let reader_card = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(16)
-        .halign(gtk4::Align::Center)
-        .build();
-    reader_card.add_css_class("apple-card");
-    reader_card.set_width_request(540);
-
-    let phone_icon = gtk4::Image::from_icon_name("network-wireless-symbolic");
-    phone_icon.set_pixel_size(48);
-    phone_icon.set_halign(gtk4::Align::Center);
-    reader_card.append(&phone_icon);
-
-    let pair_title = gtk4::Label::builder()
-        .label("Pairing code")
-        .halign(gtk4::Align::Center)
-        .build();
-    pair_title.add_css_class("apple-card-title");
-    reader_card.append(&pair_title);
-
-    let code_boxes = CodeBoxes::new();
-    reader_card.append(code_boxes.container());
-
-    let pair_status_label = gtk4::Label::builder()
-        .label("")
-        .halign(gtk4::Align::Center)
-        .build();
-    pair_status_label.add_css_class("apple-card-subtitle");
-    reader_card.append(&pair_status_label);
-
-    page.append(&reader_card);
-
-    // 2. Bonded Phone Card
-    let phone_card = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(16)
-        .build();
-    phone_card.add_css_class("apple-card");
-
-    let paired_icon = gtk4::Image::from_icon_name("phone-symbolic");
-    paired_icon.set_pixel_size(36);
-
-    let phone_info = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(4)
-        .hexpand(true)
-        .build();
-    let phone_name_label = gtk4::Label::builder()
-        .label("")
-        .halign(gtk4::Align::Start)
-        .build();
-    phone_name_label.add_css_class("apple-card-title");
-    let phone_state_pill = gtk4::Label::builder().build();
-    phone_state_pill.add_css_class("status-pill");
-    phone_state_pill.add_css_class("status-pill-gray");
-    phone_state_pill.set_halign(gtk4::Align::Start);
-    phone_info.append(&phone_name_label);
-    phone_info.append(&phone_state_pill);
-
-    let forget_phone_button = gtk4::Button::builder().label("Forget Phone").build();
-    forget_phone_button.add_css_class("apple-destructive-button");
-
-    phone_card.append(&paired_icon);
-    phone_card.append(&phone_info);
-    phone_card.append(&forget_phone_button);
-    phone_card.set_visible(false);
-
-    page.append(&phone_card);
-    scrolled.set_child(Some(&page));
-
-    // Wiring pairing input
-    {
-        let c = Arc::clone(controller);
-        let cb = code_boxes.clone();
-        let last_submitted = Rc::new(RefCell::new(None::<String>));
-        code_boxes.entry.connect_changed(move |entry| {
-            let filtered = filter_pairing_code(&entry.text());
-            if filtered != entry.text().as_str() {
-                entry.set_text(&filtered);
-                entry.set_position(filtered.chars().count() as i32);
-                return;
-            }
-            cb.render(&filtered);
-            if filtered.len() == PAIRING_CODE_LEN {
-                let mut last = last_submitted.borrow_mut();
-                if last.as_deref() != Some(&filtered) {
-                    *last = Some(filtered.clone());
-                    c.handle_intent(UserIntent::StartPairing { code: filtered });
-                }
-            } else {
-                *last_submitted.borrow_mut() = None;
-            }
-        });
+fn build_activation(controller: &Arc<RefineIdController>) -> ActivationWidgets {
+    let container = column();
+    let heading = text_label(window::CARD_ACTIVATION);
+    heading.add_css_class("heading");
+    container.append(&heading);
+    let code = pin_field(window::ACTIVATION_PIN);
+    container.append(&form_row(&text_label(window::ACTIVATION_PIN), &code));
+    let pin1 = [
+        pin_field(window::NEW_PIN_1),
+        pin_field(window::NEW_PIN_1_AGAIN),
+    ];
+    let pin2 = [
+        pin_field(window::NEW_PIN_2),
+        pin_field(window::NEW_PIN_2_AGAIN),
+    ];
+    for (entry, text) in pin1.iter().chain(&pin2).zip([
+        window::NEW_PIN_1,
+        window::NEW_PIN_1_AGAIN,
+        window::NEW_PIN_2,
+        window::NEW_PIN_2_AGAIN,
+    ]) {
+        container.append(&form_row(&text_label(text), entry));
     }
+    let button = gtk4::Button::with_label(window::ACTIVATE_CARD);
+    button.add_css_class("suggested-action");
+    button.set_halign(gtk4::Align::End);
+    container.append(&button);
 
-    // Wiring forget phone
-    {
-        let c = Arc::clone(controller);
-        forget_phone_button.connect_clicked(move |_| {
-            c.handle_intent(UserIntent::ForgetPhone);
-        });
+    let entries: Vec<gtk4::PasswordEntry> = std::iter::once(code.clone())
+        .chain(pin1.clone())
+        .chain(pin2.clone())
+        .collect();
+    let filled = {
+        let entries = entries.clone();
+        move || {
+            let text: Vec<String> = entries.iter().map(|e| e.text().to_string()).collect();
+            activation_complete(&text[0], [&text[1], &text[2]], [&text[3], &text[4]])
+        }
+    };
+    let filled = Rc::new(filled);
+    for entry in &entries {
+        let filled = Rc::clone(&filled);
+        let button = button.clone();
+        entry.connect_changed(move |_| button.set_sensitive(filled()));
     }
-
-    (
-        scrolled,
-        PhoneWidgets {
-            reader_card,
-            code_boxes,
-            pair_status_label,
-            phone_card,
-            phone_name_label,
-            phone_state_pill,
-            forget_phone_button,
-        },
-    )
+    button.set_sensitive(false);
+    let controller = Arc::clone(controller);
+    button.connect_clicked(move |_| {
+        if controller.state().busy {
+            return;
+        }
+        let text: Vec<String> = entries.iter().map(|e| e.text().to_string()).collect();
+        for entry in &entries {
+            entry.set_text("");
+        }
+        if !activation_complete(&text[0], [&text[1], &text[2]], [&text[3], &text[4]]) {
+            return;
+        }
+        if let (Some(activation_code), Some(new_pin1), Some(new_pin2)) = (
+            to_pin_bytes(&text[0]),
+            to_pin_bytes(&text[1]),
+            to_pin_bytes(&text[3]),
+        ) {
+            controller.handle_intent(UserIntent::ActivateCard {
+                activation_code,
+                new_pin1,
+                new_pin2,
+            });
+        }
+    });
+    ActivationWidgets { container, code }
 }
 
-fn build_status_bar() -> (gtk4::Box, StatusBarWidgets) {
-    let bar = gtk4::Box::builder()
+fn build_pin_codes(parent: &gtk4::Window) -> PinCodesWidgets {
+    let window = gtk4::Window::builder()
+        .title(window::PIN_CODES)
+        .transient_for(parent)
+        .default_width(WINDOW_WIDTH)
+        .build();
+    let root = column();
+    root.set_margin_top(PADDING);
+    root.set_margin_start(PADDING);
+    root.set_margin_end(PADDING);
+    root.set_margin_bottom(SPACING);
+
+    let recovery = [text_label(""), text_label("")];
+    for label in &recovery {
+        label.set_visible(false);
+        root.append(label);
+    }
+
+    let tasks = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
-        .spacing(12)
+        .halign(gtk4::Align::Center)
         .build();
-    bar.add_css_class("bottom-bar");
+    tasks.add_css_class("linked");
+    let mut task_buttons: Vec<(PinTask, gtk4::ToggleButton)> = Vec::new();
+    for task in PinTask::ALL {
+        let button = gtk4::ToggleButton::with_label(task.name());
+        if let Some((_, first)) = task_buttons.first() {
+            button.set_group(Some(first));
+        }
+        tasks.append(&button);
+        task_buttons.push((task, button));
+    }
+    if let Some((_, first)) = task_buttons.first() {
+        first.set_active(true);
+    }
+    root.append(&tasks);
 
-    let spacer = gtk4::Box::builder().hexpand(true).build();
+    let form = column();
+    let fields = PinTask::ChangePin1.fields();
+    let field_labels = fields.map(text_label);
+    let entries = fields.map(pin_field);
+    for (label, entry) in field_labels.iter().zip(&entries) {
+        form.append(&form_row(label, entry));
+    }
+    let action = gtk4::Button::with_label(PinTask::ChangePin1.action());
+    action.add_css_class("suggested-action");
+    action.set_halign(gtk4::Align::End);
+    action.set_sensitive(false);
+    form.append(&action);
+    root.append(&form);
 
-    let status_label = gtk4::Label::builder()
-        .label("")
-        .halign(gtk4::Align::End)
+    let error = text_label("");
+    error.add_css_class("error");
+    error.set_visible(false);
+    root.append(&error);
+
+    let attempts = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(SPACING)
         .build();
-    status_label.add_css_class("apple-card-subtitle");
+    let attempts_label = gtk4::Label::new(Some(window::ATTEMPTS_LEFT));
+    attempts_label.add_css_class("dim-label");
+    attempts.append(&attempts_label);
+    let attempts_entries = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(SPACING)
+        .build();
+    attempts.append(&attempts_entries);
+    attempts.set_visible(false);
+    root.append(&attempts);
 
-    let spinner = gtk4::Spinner::builder().build();
-    spinner.set_visible(false);
-
-    bar.append(&spacer);
-    bar.append(&status_label);
-    bar.append(&spinner);
-
-    (
-        bar,
-        StatusBarWidgets {
-            status_label,
-            spinner,
-        },
-    )
+    window.set_child(Some(&root));
+    PinCodesWidgets {
+        window,
+        recovery,
+        tasks,
+        task_buttons,
+        form,
+        field_labels,
+        entries,
+        action,
+        attempts,
+        attempts_entries,
+        error,
+        task: Cell::new(PinTask::ChangePin1),
+    }
 }
 
 /// Holds `chooser` until it answers. GTK keeps no reference to a native
@@ -2504,127 +1235,54 @@ fn keep_until_response(chooser: &gtk4::FileChooserNative) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use refineid_lib_core::apdu::status_word::PinRetries;
 
     #[test]
-    fn test_filter_digits() {
-        assert_eq!(filter_digits("123456", 6), "123456");
-        assert_eq!(filter_digits("12a34b567", 6), "123456");
-        assert_eq!(filter_digits("abc", 6), "");
-        assert_eq!(filter_digits("123", 6), "123");
-        assert_eq!(filter_digits("1234567890", 4), "1234");
+    fn a_typed_code_keeps_its_code_characters() {
+        assert_eq!(pairing_code("7KX4M9"), "7KX4M9");
+        assert_eq!(pairing_code("7kx4m9"), "7KX4M9");
+        assert_eq!(pairing_code("7-K-X-4-M-9"), "7KX4M9");
+        assert_eq!(pairing_code("7KX4M9ZZZZ"), "7KX4M9");
+        assert_eq!(pairing_code("!@#$%^&* "), "");
+        assert_eq!(access_number("12a34b567"), "123456");
     }
 
+    /// The window in process, where a display is available: the states
+    /// the controller reports lay out as the Mac app's window.
     #[test]
-    fn test_filter_pairing_code() {
-        assert_eq!(filter_pairing_code("7KX4M9"), "7KX4M9");
-        assert_eq!(filter_pairing_code("7kx4m9"), "7KX4M9");
-        assert_eq!(filter_pairing_code("7-K-X-4-M-9"), "7KX4M9");
-        assert_eq!(filter_pairing_code("7KX4M9ZZZZ"), "7KX4M9");
-        assert_eq!(filter_pairing_code("ILOUilou"), ""); // I, L, O, U are excluded by Crockford Base32
-        assert_eq!(filter_pairing_code("!@#$%^&* "), "");
-    }
-
-    #[test]
-    fn test_format_pin_status() {
-        let retries5 = PinRetries::from_nibble(5).expect("valid nibble");
-        let retries4 = PinRetries::from_nibble(4).expect("valid nibble");
-        let retries3 = PinRetries::from_nibble(3).expect("valid nibble");
-        let retries2 = PinRetries::from_nibble(2).expect("valid nibble");
-        let retries1 = PinRetries::from_nibble(1).expect("valid nibble");
-
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::Remaining(retries5)), None),
-            (String::new(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::Remaining(retries5)), Some(false)),
-            ("Factory value".to_string(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::Remaining(retries4)), Some(false)),
-            ("4 / 5 • Factory value".to_string(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::Remaining(retries3)), None),
-            ("3 / 5".to_string(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::Remaining(retries2)), None),
-            ("2 / 5".to_string(), "status-pill-red")
-        );
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::Remaining(retries1)), None),
-            ("1 / 5".to_string(), "status-pill-red")
-        );
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::Locked), None),
-            ("Blocked".to_string(), "status-pill-red")
-        );
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::Verified), None),
-            (String::new(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::NoInfo), None),
-            ("No retry count".to_string(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_pin_status(Some(&PinStatus::Other(0x6984)), None),
-            ("Status 6984".to_string(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_pin_status(None, None),
-            (String::new(), "status-pill-gray")
-        );
-    }
-
-    #[test]
-    fn test_format_puk_status() {
-        let retries5 = PinRetries::from_nibble(5).expect("valid nibble");
-        let retries3 = PinRetries::from_nibble(3).expect("valid nibble");
-        let retries2 = PinRetries::from_nibble(2).expect("valid nibble");
-
-        assert_eq!(
-            format_puk_status(Some(&PukStatus::Remaining(retries5))),
-            (String::new(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_puk_status(Some(&PukStatus::Remaining(retries3))),
-            ("3 remaining".to_string(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_puk_status(Some(&PukStatus::Remaining(retries2))),
-            ("2 remaining".to_string(), "status-pill-red")
-        );
-        assert_eq!(
-            format_puk_status(Some(&PukStatus::Locked)),
-            ("Blocked".to_string(), "status-pill-red")
-        );
-        assert_eq!(
-            format_puk_status(Some(&PukStatus::Invalidated)),
-            ("Invalidated".to_string(), "status-pill-red")
-        );
-        assert_eq!(
-            format_puk_status(Some(&PukStatus::NoInfo)),
-            ("No count".to_string(), "status-pill-gray")
-        );
-        assert_eq!(
-            format_puk_status(Some(&PukStatus::Other(0x6a80))),
-            ("Status 6A80".to_string(), "status-pill-gray")
-        );
-        assert_eq!(format_puk_status(None), (String::new(), "status-pill-gray"));
-    }
-
-    #[test]
-    fn test_texture_from_rgba() {
-        let empty = RgbaImageBuffer::new(0, 0, Vec::new()).expect("valid 0x0 buffer");
-        assert!(texture_from_rgba(&empty).is_none());
-
-        // GTK Texture creation requires an active GDK backend/display or returns a Texture
-        let valid = RgbaImageBuffer::new(2, 2, vec![255u8; 16]).expect("valid 2x2 buffer");
-        if gdk::Display::default().is_some() {
-            assert!(texture_from_rgba(&valid).is_some());
+    fn the_window_lays_out_each_state() {
+        if gtk4::init().is_err() {
+            return;
         }
+        let controller = RefineIdController::new(|_| {});
+        let ui = Ui::build(&controller);
+
+        let mut state = UiState::default();
+        ui.apply(&state);
+        assert_eq!(ui.identity.label(), window::CONNECT_READER);
+        assert!(!ui.documents.get_visible());
+        assert!(!ui.prompt.get_visible());
+        assert!(ui.remote_switch.get_visible());
+        assert!(!ui.remote_switch.is_active());
+
+        state.remote_use = true;
+        ui.apply(&state);
+        assert!(ui.prompt.get_visible());
+        assert!(ui.remote_switch.is_active());
+
+        state.pdf_documents = vec![PathBuf::from("/documents/report.pdf")];
+        ui.apply(&state);
+        assert!(ui.documents.get_visible());
+        assert!(ui.signing.get_visible());
+        assert!(!ui.prompt.get_visible());
+        assert!(!ui.sign.is_sensitive());
+
+        state.can_request = Some(CanRequest::Needed);
+        ui.apply(&state);
+        assert!(ui.can.get_visible());
+        assert!(!ui.documents.get_visible());
+        assert!(!ui.identity.get_visible());
+
+        ui.pairing_boxes.entry.set_text("7kx4");
+        assert_eq!(ui.pairing_boxes.labels[1].label(), "K");
     }
 }

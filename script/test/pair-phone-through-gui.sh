@@ -16,8 +16,9 @@
 # Pairs a Unix host's RefineID with an iPhone through both applications,
 # with nobody typing: the phone, on USB to the Mac this runs on, is
 # launched in the mode that prints its pairing code; the host's window
-# is opened on the Phone tab and the code is typed into its boxes; the
-# host forgets its phone first, since the boxes show only then; the new
+# is opened with remote use on (--pair) and the code is typed into the
+# pairing prompt's boxes; the host forgets its phone first, since the
+# prompt shows only while no phone is paired; the new
 # pairing, which is then the host's one phone, and the certificate read
 # through the phone are then checked on the host.
 #
@@ -74,7 +75,7 @@ host_sh() {
     ssh -o BatchMode=yes "$host" sh -s
 }
 
-# Opens the host's window on the Phone tab and types the code; fails
+# Opens the host's window with the pairing prompt and types the code; fails
 # when the old window does not go or the new one does not come.
 host_type_code() {
     host_sh <<EOS
@@ -104,7 +105,7 @@ refineid phone 2>/dev/null
 EOS
 }
 
-# Forgets the host's phone, so that the window shows the code boxes.
+# Forgets the host's phone, so that the window shows the pairing prompt.
 host_forget() {
     host_sh <<'EOS'
 refineid phone unpair >/dev/null 2>&1 || true

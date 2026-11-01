@@ -21,9 +21,9 @@ things:
 - **`librefineid_pkcs11.so`** -- PKCS#11 v2.40 module (read-only,
   sign-only) for Firefox/NSS card login, and for OpenSSL / GnuTLS /
   OpenSSH through p11-kit.
-- **`refineid-gui`** -- desktop GUI: PIN activation, PIN
-  change, PUK unblock, viewing the card's portrait and signature
-  images, and PDF document signing. (See [GUI Architecture](doc/gui-architecture.md)).
+- **`refineid-gui`** -- desktop GUI in one window: whose card is in
+  use, document signing, card activation, PIN change and PUK reset,
+  and pairing the phone. (See [GUI Architecture](doc/gui-architecture.md)).
 
 Project stage: beta. The CLI, the PKCS#11 Firefox/NSS card login, and
 the reproducible NixOS install are proven against real FINEID
@@ -90,7 +90,7 @@ find target -type d -name "incremental" -prune -exec rm -rf {} +
 | [refineid-client](crates/refineid-client/) | Client library and the `refineid` CLI. |
 | [refineid-dev-errors](crates/refineid-dev-errors/) | Debug builds only: every reported failure to the system log (`journalctl -t refineid`, `/var/log/messages`) and the GUI's Errors window. Release builds compile none of it. |
 | [refineid-pkcs11](crates/refineid-pkcs11/) | PKCS#11 v2.40 cdylib for Firefox/NSS card login. |
-| [refineid-gui](crates/refineid-gui/) | Desktop GUI (Slint): PIN management, portrait/signature, document signing. |
+| [refineid-gui](crates/refineid-gui/) | Desktop GUI (GTK 4 or FLTK): document signing, PIN management, phone pairing. |
 
 ## Maintainer
 
