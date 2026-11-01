@@ -60,6 +60,7 @@ pub mod document_verify;
 pub mod events;
 pub mod exit_status;
 pub mod http;
+pub mod phone_sign;
 pub mod pin_source;
 pub mod reader_keyboard;
 #[cfg(test)]
