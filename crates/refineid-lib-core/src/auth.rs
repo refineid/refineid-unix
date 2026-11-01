@@ -47,6 +47,7 @@ pub use refineid_auth::{
 use crate::apdu::iso7816::ApduClass;
 use crate::apdu::status_word::{PinRetries, StatusWord};
 use crate::pin::PinBytes;
+use crate::pkcs15::Pkcs15Ops as _;
 use crate::transport::{CardTransport, TransportDispatchError};
 use crate::x509::DateTime;
 
@@ -181,7 +182,7 @@ impl PinSlot {
 /// trusting any printed sample: a VERIFY status probe against an
 /// absent reference answers `SW=6A88` without touching any retry
 /// counter, so the probe costs one command and no risk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PinReferenceScheme {
     /// FINEID S1 v4.2 §3.5.2 numbering -- the citizen cards.
     Citizen,
@@ -200,6 +201,13 @@ impl PinReferenceScheme {
             (Self::Organizational, PinSlot::Pin1) => PIN1_REFERENCE_ORGANIZATIONAL,
             (Self::Organizational, PinSlot::Pin2) => PIN2_REFERENCE_ORGANIZATIONAL,
         }
+    }
+
+    /// `true` when `slot` under this numbering is the PIN 2 local to
+    /// DF.ESIGN: the organizational card's qualified-signature PIN.
+    #[must_use]
+    pub const fn gates_esign_directory(self, slot: PinSlot) -> bool {
+        matches!((self, slot), (Self::Organizational, PinSlot::Pin2))
     }
 
     /// The unblock credential's own reference under this numbering.
@@ -593,6 +601,13 @@ pub trait PinOps: CardTransport {
     /// burning a retry, but the caller has then spent the typed PIN
     /// for nothing.
     ///
+    /// The organizational qualified-signature key and the PIN 2 that
+    /// gates it live in DF.ESIGN, which must be current at VERIFY and
+    /// through the MSE:Set and PSO:CDS that follow. PIN 2 under the
+    /// organizational numbering therefore selects DF.ESIGN first; when
+    /// the card refuses that SELECT the PIN is not presented and its
+    /// refusal returns as [`VerifyOutcome::Other`].
+    ///
     /// # Errors
     /// As [`Self::verify_pin`].
     fn verify_pin_with_scheme(
@@ -604,6 +619,14 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
+        if scheme.gates_esign_directory(slot) {
+            let entered = self
+                .select_esign_directory()
+                .map_err(AuthError::Transport)?;
+            if !entered.is_success() {
+                return Ok(VerifyOutcome::Other(entered.as_u16()));
+            }
+        }
         let mut block = credential_block(
             scheme,
             slot.min_length(),
@@ -1280,6 +1303,7 @@ mod tests {
 
     use super::*;
     use crate::atr::{Atr, AtrError, MINIMAL_DIRECT_ATR};
+    use crate::pkcs15::esign_wire;
     use crate::transport::{CommandApdu, ResponseApdu, TransportOutcome};
 
     struct MockTx {
@@ -1607,10 +1631,68 @@ mod tests {
             TYPED_LENGTH,
         ];
         expected.extend_from_slice(b"123456");
-        let mut tx = MockTx {
-            expected,
-            response: ok(),
-            seen: false,
+        let mut script = esign_entry();
+        script.push((expected, ok()));
+        let mut tx = SteppedTx { script, cursor: 0 };
+        let outcome = tx
+            .verify_pin_with_scheme(
+                PinSlot::Pin2,
+                PinReferenceScheme::Organizational,
+                pb(b"123456"),
+            )
+            .expect("organizational PIN2 verify succeeds");
+        assert_eq!(outcome, VerifyOutcome::Ok);
+        assert_eq!(tx.cursor, tx.script.len());
+    }
+
+    /// The SELECTs that make DF.ESIGN current when the card answers
+    /// to its name: MF, then DF.ESIGN by name.
+    fn esign_entry() -> Vec<(Vec<u8>, ResponseApdu)> {
+        vec![
+            (esign_wire::select_mf().into_bytes(), ok()),
+            (esign_wire::select_esign_by_name().into_bytes(), ok()),
+        ]
+    }
+
+    /// SW2: file or application not found (with SW1 `6A`).
+    const SW2_FILE_NOT_FOUND: u8 = 0x82;
+
+    fn organizational_pin2_verify(pin: &[u8]) -> CommandApdu {
+        let mut verify = vec![
+            PLAIN_CLASS,
+            VERIFY_INSTRUCTION,
+            VERIFY_MODE,
+            PIN2_REFERENCE_ORGANIZATIONAL,
+            lc(pin.len()),
+        ];
+        verify.extend_from_slice(pin);
+        CommandApdu::new(verify)
+    }
+
+    #[test]
+    fn organizational_pin2_verify_falls_back_to_the_esign_identifier() {
+        // A card that refuses the name and the child-DF form reaches
+        // DF.ESIGN as any file by identifier before PIN 2 goes out.
+        let refused = sw(SW1_WRONG_PARAMETERS, SW2_FILE_NOT_FOUND);
+        let mut tx = SteppedTx {
+            script: vec![
+                (esign_wire::select_mf().into_bytes(), ok()),
+                (
+                    esign_wire::select_esign_by_name().into_bytes(),
+                    refused.clone(),
+                ),
+                (
+                    crate::pkcs15::child_df_select_attempts(crate::pkcs15::DF_ESIGN_FID)
+                        .into_iter()
+                        .next()
+                        .expect("child-DF variant")
+                        .into_bytes(),
+                    refused,
+                ),
+                (esign_wire::select_esign_any_by_fid().into_bytes(), ok()),
+                (organizational_pin2_verify(b"123456").into_bytes(), ok()),
+            ],
+            cursor: 0,
         };
         let outcome = tx
             .verify_pin_with_scheme(
@@ -1619,6 +1701,62 @@ mod tests {
                 pb(b"123456"),
             )
             .expect("organizational PIN2 verify succeeds");
+        assert_eq!(outcome, VerifyOutcome::Ok);
+        assert_eq!(tx.cursor, tx.script.len());
+    }
+
+    #[test]
+    fn organizational_pin2_is_not_presented_outside_esign() {
+        // Every DF.ESIGN variant refused: the PIN never reaches the
+        // card and the refusal comes back as the outcome.
+        let refused = sw(SW1_WRONG_PARAMETERS, SW2_FILE_NOT_FOUND);
+        let mut script = vec![
+            (esign_wire::select_mf().into_bytes(), ok()),
+            (
+                esign_wire::select_esign_by_name().into_bytes(),
+                refused.clone(),
+            ),
+        ];
+        for variant in crate::pkcs15::child_df_select_attempts(crate::pkcs15::DF_ESIGN_FID) {
+            script.push((variant.into_bytes(), refused.clone()));
+        }
+        let mut tx = SteppedTx { script, cursor: 0 };
+        let outcome = tx
+            .verify_pin_with_scheme(
+                PinSlot::Pin2,
+                PinReferenceScheme::Organizational,
+                pb(b"123456"),
+            )
+            .expect("a refused SELECT is an outcome, not a transport error");
+        assert_eq!(
+            outcome,
+            VerifyOutcome::Other(StatusWord::FileNotFound.as_u16())
+        );
+        assert_eq!(tx.cursor, tx.script.len());
+    }
+
+    #[test]
+    fn citizen_pin2_verify_selects_nothing() {
+        let mut expected = vec![
+            PLAIN_CLASS,
+            VERIFY_INSTRUCTION,
+            VERIFY_MODE,
+            PIN2_REFERENCE_PKCS15,
+            lc(PIN2_STORED_LENGTH),
+        ];
+        expected.extend_from_slice(b"123456");
+        expected.resize(
+            expected.len() + PIN2_STORED_LENGTH - b"123456".len(),
+            PIN_PAD_BYTE,
+        );
+        let mut tx = MockTx {
+            expected,
+            response: ok(),
+            seen: false,
+        };
+        let outcome = tx
+            .verify_pin_with_scheme(PinSlot::Pin2, PinReferenceScheme::Citizen, pb(b"123456"))
+            .expect("citizen PIN2 verify succeeds");
         assert_eq!(outcome, VerifyOutcome::Ok);
         assert!(tx.seen);
     }
@@ -1758,16 +1896,18 @@ mod tests {
                 lc(TWELVE_DIGITS.len()),
             ];
             expected.extend_from_slice(TWELVE_DIGITS);
-            let mut tx = MockTx {
-                expected,
-                response: ok(),
-                seen: false,
+            let mut script = if slot == PinSlot::Pin2 {
+                esign_entry()
+            } else {
+                Vec::new()
             };
+            script.push((expected, ok()));
+            let mut tx = SteppedTx { script, cursor: 0 };
             let outcome = tx
                 .verify_pin_with_scheme(slot, PinReferenceScheme::Organizational, pb(TWELVE_DIGITS))
                 .expect("twelve-digit organization PIN verifies");
             assert_eq!(outcome, VerifyOutcome::Ok);
-            assert!(tx.seen);
+            assert_eq!(tx.cursor, tx.script.len());
         }
     }
 

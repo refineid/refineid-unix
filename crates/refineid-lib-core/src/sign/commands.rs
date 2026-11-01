@@ -1017,7 +1017,7 @@ impl PsoComputeDigitalSignature {
         out.push(lc);
         out.extend_from_slice(hash);
         out.push(le);
-        CommandApdu::new(out).allow_wrong_le_retry()
+        CommandApdu::new(out)
     }
 }
 
@@ -1025,6 +1025,7 @@ impl PsoComputeDigitalSignature {
 mod tests {
 
     use super::*;
+    use crate::auth::PinReferenceScheme;
 
     #[test]
     fn signature_alg_ref_sha256_rsa_pkcs1_is_42h() {
@@ -1155,7 +1156,7 @@ mod tests {
             class: ApduClass::ChainedFirst,
             template: MseSetTemplate::DigitalSignature {
                 alg_ref: SignatureAlgRef::SHA256_RSA_PKCS1_V1_5,
-                key_ref: KeyRef::Sign,
+                key_ref: KeyRef::Sign(PinReferenceScheme::Citizen),
             },
         }
         .into_apdu();
