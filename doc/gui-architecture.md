@@ -194,6 +194,10 @@ In accordance with [RAPP Transport and Discovery Hierarchy Specification](https:
 5. **One Phone per Computer**: The requester keeps one usable pairing. Pairing a phone forgets every earlier pairing: a forgotten pairing serves nothing, tells its phone on the session that holds it or as the first message of the next session, and then loses its key (RAPP v26.10.29 section 4.6). Forgotten pairings are not shown. The Phone tab shows the paired phone's row with a trash icon that forgets it, or the code boxes while no phone is paired.
 6. **The Local Card Wins**: With a card in a local reader and a phone paired, the local card is the card in use; the phone's card is used while no local card is present.
 7. **Tab Order**: Identity, PINs, Sign, Phone; the window opens on Identity, or on Phone with the code boxes focused when launched with `--pair`.
+8. **No Explaining Text**: No caption, subtitle or placeholder explains or restates what the window shows.
+9. **No Standards Names**: No control or label names a standard, regulation or acronym for one (ETSI, eIDAS, QES, PAdES, ASiC-E, CAdES, XAdES, ISO); the signing methods are "Separately (PDF)" and "As a package".
+10. **Result and Errors Only**: The happy path shows the result and nothing else; a value outside its normal state says so in words ("None", "Blocked", "Factory value"), never a blank or a colour alone.
+11. **Red for Errors Only**: Red and orange mark errors and a credential below its served floor; every other state is neutral grey.
 
 ### Phase 1: Unify with Core & Bring in RAPP with CPace PAKE
 - Update `Cargo.toml` to depend on modular `refineid-core` components (`refineid-rapp`, `refineid-sign`, `refineid-emrtd`, `refineid-pcsc`).

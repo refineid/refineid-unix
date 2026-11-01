@@ -106,7 +106,8 @@ jobs:
           envs: CORE_REVISION
           prepare: |
             pkg install -y curl git pkgconf cmake ninja evdev-proto \
-              pcsc-lite libccid p11-kit nss gtk4 gtk3 pango cairo fontconfig \
+              pcsc-lite libccid p11-kit nss xdg-desktop-portal-gtk \
+              gtk4 gtk3 pango cairo fontconfig \
               wayland libxkbcommon dbus mesa-libs libX11 libXext libXinerama \
               libXcursor libXrender libXfixes libXft libXi libXrandr
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
