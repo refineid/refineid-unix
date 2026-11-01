@@ -537,7 +537,6 @@ mod tests {
             additional_inputs: Vec::new(),
             signing_time: SIGNING_TIME,
             metadata: SignatureMetadata::default(),
-            expected_serial: None,
             archive: false,
             long_term: false,
             timestamp_authorities: Vec::new(),
