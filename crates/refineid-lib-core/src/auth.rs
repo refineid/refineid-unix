@@ -100,18 +100,6 @@ pub const PIN1_MIN_LENGTH: usize = 4;
 /// Minimum PIN2 length per FINEID S1 v4.2 §3.5.2: 6 digits.
 pub const PIN2_MIN_LENGTH: usize = 6;
 
-/// Organization-card typed-length ceiling for every credential.
-///
-/// FINEID S4-2 v4.0 §4.3 caps PIN AUTH, PIN SIG and PIN PUK at
-/// eight characters. The card stores each credential at its typed
-/// length -- its EF.AOD publishes no padding, and FINEID S1 v3.0
-/// §3.5.1.1 requires the entered length to equal the stored one,
-/// so a padded block fails the comparison and spends a retry.
-pub const ORGANIZATIONAL_PIN_MAX_LENGTH: usize = 8;
-
-/// Organization-card credential floor (S4-2 v4.0 §4.3: 04 Min).
-pub const ORGANIZATIONAL_PIN_MIN_LENGTH: usize = 4;
-
 /// PUK stored-length: 12 bytes, padded with [`PIN_PAD_BYTE`].
 ///
 /// The PUK uses the same 12-byte padded slot as the PIN1 / PIN2
@@ -795,16 +783,12 @@ pub trait PinOps: CardTransport {
                 // its own object first, then the reset carries only
                 // the new PIN (Idemia organizational cards
                 // specification §4.1.6, P1 02).
-                let mut code_block = credential_block(
-                    scheme,
-                    ORGANIZATIONAL_PIN_MIN_LENGTH,
-                    ORGANIZATIONAL_PIN_MAX_LENGTH,
-                    puk.as_bytes(),
-                )?;
+                let mut code_block =
+                    credential_block(scheme, PUK_MIN_LENGTH, PUK_MAX_LENGTH, puk.as_bytes())?;
                 let mut new_block = credential_block(
                     scheme,
                     target.min_length(),
-                    ORGANIZATIONAL_PIN_MAX_LENGTH,
+                    target.stored_length(),
                     new_pin.as_bytes(),
                 )?;
                 let verify = commands::VerifyPuk {
@@ -1203,7 +1187,8 @@ pub const fn classify_change_pin_sw(sw: StatusWord) -> ChangePinOutcome {
 // `pin_status` is a method on [`PinOps`]. See the trait definition
 // above.
 
-/// One credential's wire block under `scheme`.
+/// One credential's wire block under `scheme`, for a typed length in
+/// `[minimum, stored]`.
 ///
 /// The citizen card compares a block padded to the stored length
 /// with [`PIN_PAD_BYTE`]; the organization card compares the typed
@@ -1216,9 +1201,9 @@ fn credential_block<TE>(
     stored: usize,
     ascii: &[u8],
 ) -> Result<Vec<u8>, AuthError<TE>> {
+    PinPolicyCheck::validate_ascii(ascii, minimum, stored)?;
     match scheme {
         PinReferenceScheme::Citizen => {
-            PinPolicyCheck::validate_ascii(ascii, minimum, stored)?;
             let mut padded = vec![PIN_PAD_BYTE; stored];
             #[expect(
                 clippy::indexing_slicing,
@@ -1227,10 +1212,7 @@ fn credential_block<TE>(
             padded[..ascii.len()].copy_from_slice(ascii);
             Ok(padded)
         }
-        PinReferenceScheme::Organizational => {
-            PinPolicyCheck::validate_ascii(ascii, minimum, ORGANIZATIONAL_PIN_MAX_LENGTH)?;
-            Ok(ascii.to_vec())
-        }
+        PinReferenceScheme::Organizational => Ok(ascii.to_vec()),
     }
 }
 
@@ -1750,6 +1732,117 @@ mod tests {
             }
         );
         assert_eq!(tx.cursor, tx.script.len());
+    }
+
+    /// Twelve synthetic digits: the longest organization PIN.
+    const TWELVE_DIGITS: &[u8; PIN1_STORED_LENGTH] = b"123456789012";
+    /// Thirteen synthetic digits: one past the longest PIN.
+    const THIRTEEN_DIGITS: &[u8] = b"1234567890123";
+
+    /// Lc of a block of `len` bytes.
+    fn lc(len: usize) -> u8 {
+        u8::try_from(len).expect("short-form Lc")
+    }
+
+    #[test]
+    fn organizational_verify_sends_twelve_bare_digits_for_both_pins() {
+        for (slot, reference) in [
+            (PinSlot::Pin1, PIN1_REFERENCE_ORGANIZATIONAL),
+            (PinSlot::Pin2, PIN2_REFERENCE_ORGANIZATIONAL),
+        ] {
+            let mut expected = vec![
+                PLAIN_CLASS,
+                VERIFY_INSTRUCTION,
+                VERIFY_MODE,
+                reference,
+                lc(TWELVE_DIGITS.len()),
+            ];
+            expected.extend_from_slice(TWELVE_DIGITS);
+            let mut tx = MockTx {
+                expected,
+                response: ok(),
+                seen: false,
+            };
+            let outcome = tx
+                .verify_pin_with_scheme(slot, PinReferenceScheme::Organizational, pb(TWELVE_DIGITS))
+                .expect("twelve-digit organization PIN verifies");
+            assert_eq!(outcome, VerifyOutcome::Ok);
+            assert!(tx.seen);
+        }
+    }
+
+    #[test]
+    fn organizational_change_sends_twelve_bare_digits() {
+        const CHANGE_REFERENCE_DATA_INSTRUCTION: u8 = 0x24;
+        const REPLACE_MODE: u8 = 0x00;
+        let mut expected = vec![
+            PLAIN_CLASS,
+            CHANGE_REFERENCE_DATA_INSTRUCTION,
+            REPLACE_MODE,
+            PIN2_REFERENCE_ORGANIZATIONAL,
+            lc(TWELVE_DIGITS.len().saturating_mul(2)),
+        ];
+        expected.extend_from_slice(TWELVE_DIGITS);
+        expected.extend_from_slice(TWELVE_DIGITS);
+        let mut tx = MockTx {
+            expected,
+            response: ok(),
+            seen: false,
+        };
+        let outcome = tx
+            .change_pin_with_scheme(
+                PinSlot::Pin2,
+                PinReferenceScheme::Organizational,
+                pb(TWELVE_DIGITS),
+                pb(TWELVE_DIGITS),
+            )
+            .expect("twelve-digit organization change succeeds");
+        assert_eq!(outcome, ChangePinOutcome::Ok);
+        assert!(tx.seen);
+    }
+
+    #[test]
+    fn organizational_unblock_sends_twelve_bare_digits() {
+        const RESET_RETRY_COUNTER_INSTRUCTION: u8 = 0x2C;
+        const NEW_REFERENCE_DATA_MODE: u8 = 0x02;
+        let mut verify_step = vec![
+            PLAIN_CLASS,
+            VERIFY_INSTRUCTION,
+            VERIFY_MODE,
+            PUK_REFERENCE_ORGANIZATIONAL,
+            lc(TWELVE_DIGITS.len()),
+        ];
+        verify_step.extend_from_slice(TWELVE_DIGITS);
+        let mut reset_step = vec![
+            PLAIN_CLASS,
+            RESET_RETRY_COUNTER_INSTRUCTION,
+            NEW_REFERENCE_DATA_MODE,
+            PIN1_REFERENCE_ORGANIZATIONAL,
+            lc(TWELVE_DIGITS.len()),
+        ];
+        reset_step.extend_from_slice(TWELVE_DIGITS);
+        let mut tx = SteppedTx {
+            script: vec![(verify_step, ok()), (reset_step, ok())],
+            cursor: 0,
+        };
+        let outcome = tx
+            .reset_retry_counter_with_scheme(
+                PinSlot::Pin1,
+                PinReferenceScheme::Organizational,
+                pb(TWELVE_DIGITS),
+                pb(TWELVE_DIGITS),
+            )
+            .expect("twelve-digit organization unblock succeeds");
+        assert_eq!(outcome, UnblockOutcome::Ok);
+        assert_eq!(tx.cursor, tx.script.len());
+    }
+
+    #[test]
+    fn thirteen_digits_are_refused_before_any_command() {
+        assert!(
+            PinBytes::new(THIRTEEN_DIGITS.to_vec()).is_err(),
+            "no PIN value, so no command, past twelve digits"
+        );
     }
 
     #[test]
