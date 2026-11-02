@@ -25,7 +25,7 @@ use crate::card_sign::SignSlot;
 /// prints. The man page refineid(1) carries the same facts.
 pub const HELP: &str = "\
 usage: refineid card sign-auth | sign-qualified --in PATH --out PATH
-                [--save-cert PATH] [--reader SUBSTR] [--can NNNNNN]
+                [--save-cert PATH] [--reader SUBSTR]
 
 Raw signature over a file: sign-auth with PIN1 and the authentication
 key, sign-qualified with PIN2 and the qualified-signature key. The
@@ -35,13 +35,11 @@ Prints nothing on success; -v shows each step.
   --out P        output file for the raw signature
   --save-cert P  also write the signing certificate's DER
   --reader S     narrow to readers whose name contains S
-  --can NNNNNN   CAN from the card front; required on the contactless
-                 interface, prompted on a terminal when needed
+On the contactless interface, prompts for the CAN.
 ";
 
 /// Parsed `card sign-{auth,qualified} --in PATH --out PATH
-/// [--save-cert PATH] [--reader SUBSTR] [--can NNNNNN]`
-/// arguments.
+/// [--save-cert PATH] [--reader SUBSTR]` arguments.
 ///
 /// `slot` is set by the dispatcher at parse time: which
 /// subcommand fired (`sign-auth` vs `sign-qualified`) is the
@@ -67,12 +65,6 @@ pub struct SignArgs {
     /// present; the picker errors out rather than guess. Tier 0
     /// `String`; presentational input to `ReaderFilter::new`.
     pub reader_filter: Option<String>,
-    /// Optional Card Access Number (`--can NNNNNN`) for signing
-    /// over the contactless interface, where the card seals
-    /// PKCS#15 behind PACE. Left `None` on the contact
-    /// interface; when the seal is hit without it, `run` prompts
-    /// on a TTY and retries.
-    pub can: Option<Can>,
 }
 
 impl SignArgs {
@@ -86,7 +78,6 @@ impl SignArgs {
             output,
             save_cert,
             reader_filter,
-            can,
         } = self;
         let (sub, env_var) = match slot {
             SignSlot::Auth => (VerbTag::CardSignAuth, "REFINEID_PIN1"),
@@ -112,7 +103,7 @@ impl SignArgs {
                 SignSlot::Qualified => crate::card_sign::sign_qualified_first(backend, options),
             }
         };
-        let mut result = run_once(can);
+        let mut result = run_once(None);
         // Contactless card and no CAN yet: the card told us
         // PKCS#15 is sealed behind PACE. Prompt (TTY only) and
         // retry once. The PIN has not been asked for and nothing
@@ -188,7 +179,6 @@ impl SignArgs {
         let mut output: Option<PathBuf> = None;
         let mut save_cert: Option<PathBuf> = None;
         let mut reader_filter: Option<String> = None;
-        let mut can_raw: Option<String> = None;
         let tokens = argv.into_vec();
         let mut iter = tokens.iter();
         while let Some(arg) = iter.next() {
@@ -219,12 +209,6 @@ impl SignArgs {
                     })?;
                     reader_filter = Some(value.clone());
                 }
-                "--can" => {
-                    let value = iter
-                        .next()
-                        .ok_or(ArgParseError::MissingValue { cmd, flag: "--can" })?;
-                    can_raw = Some(value.clone());
-                }
                 other => {
                     return Err(ArgParseError::Unexpected {
                         cmd,
@@ -241,26 +225,12 @@ impl SignArgs {
             cmd,
             name: "--out PATH",
         })?;
-        // Optional here, unlike `card emrtd`: the contact
-        // interface needs no CAN at all, and on contactless the
-        // run loop prompts when the card reports the PACE seal.
-        let can = can_raw
-            .map(|raw| {
-                Can::new(&raw).map_err(|e| ArgParseError::BadValue {
-                    cmd,
-                    flag: "--can",
-                    value: raw.clone(),
-                    reason: format!("{e}"),
-                })
-            })
-            .transpose()?;
         Ok(Self {
             slot,
             input,
             output,
             save_cert,
             reader_filter,
-            can,
         })
     }
 }
@@ -315,32 +285,17 @@ mod tests {
         check(&a.slot, &SignSlot::Qualified, "slot")
     }
 
-    /// `--can` is optional: the contact interface needs none, and
-    /// on contactless `run` prompts when the card reports the
-    /// PACE seal. Absent must parse to `None`, not a failure.
+    /// The CAN is never an argument; on contactless `run` prompts
+    /// for it when the card reports the PACE seal.
     #[test]
-    fn can_absent_is_none() -> TestResult {
-        let a = SignArgs::parse(SignSlot::Auth, argv(&["--in", "/tmp/i", "--out", "/tmp/o"]))?;
-        check(&a.can, &None, "can")
-    }
-
-    #[test]
-    fn can_parsed_when_supplied() -> TestResult {
-        let a = SignArgs::parse(
-            SignSlot::Auth,
-            argv(&["--in", "/tmp/i", "--out", "/tmp/o", "--can", "123456"]),
-        )?;
-        check_true(a.can.is_some(), "can parsed")
-    }
-
-    /// A malformed CAN is rejected at parse time, before any
-    /// card contact -- same boundary as `card emrtd`.
-    #[test]
-    fn bad_can_rejected_at_parse() -> TestResult {
+    fn can_is_not_an_argument() -> TestResult {
         let r = SignArgs::parse(
             SignSlot::Auth,
-            argv(&["--in", "/tmp/i", "--out", "/tmp/o", "--can", "12x456"]),
+            argv(&["--in", "/tmp/i", "--out", "/tmp/o", "--can", "123456"]),
         );
-        check_true(r.is_err(), "malformed CAN rejected")
+        check_true(
+            matches!(&r, Err(ArgParseError::Unexpected { got, .. }) if got == "--can"),
+            "Unexpected(--can)",
+        )
     }
 }

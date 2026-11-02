@@ -84,12 +84,6 @@ const READER: Opt = Opt {
     summary: "narrow to readers whose name contains S",
     value: Value::Text("substring"),
 };
-/// The option that gives the CAN, shared by the card commands.
-const CAN: Opt = Opt {
-    flag: "--can",
-    summary: "CAN from the card front",
-    value: Value::Text("six digits"),
-};
 /// The PIN number a pin command takes.
 const PIN_NUMBER: Positional = Positional {
     name: "PIN",
@@ -115,7 +109,6 @@ pub const fn arguments(tag: VerbTag) -> Arguments {
                     value: Value::None,
                 },
                 READER,
-                CAN,
                 Opt {
                     flag: "--no-can",
                     summary: "skip the eMRTD section",
@@ -141,7 +134,6 @@ pub const fn arguments(tag: VerbTag) -> Arguments {
         VerbTag::CardEmrtd => Arguments {
             positionals: &[],
             options: &[
-                CAN,
                 Opt {
                     flag: "--save-face",
                     summary: "face image",
@@ -174,7 +166,6 @@ pub const fn arguments(tag: VerbTag) -> Arguments {
                     value: Value::File,
                 },
                 READER,
-                CAN,
             ],
         },
         VerbTag::CardDecryptAuth => Arguments {
@@ -240,7 +231,7 @@ pub const fn arguments(tag: VerbTag) -> Arguments {
         },
         VerbTag::PinChange => Arguments {
             positionals: &[PIN_NUMBER],
-            options: &[READER, CAN],
+            options: &[READER],
         },
         VerbTag::PinUnblock => Arguments {
             positionals: &[PIN_NUMBER],
@@ -286,7 +277,6 @@ pub const fn arguments(tag: VerbTag) -> Arguments {
                     value: Value::Text("text"),
                 },
                 READER,
-                CAN,
                 Opt {
                     flag: "--timestamp",
                     summary: "timestamp authority URL or named set",

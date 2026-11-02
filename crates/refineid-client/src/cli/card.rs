@@ -23,43 +23,23 @@ use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 /// What `refineid card help`
 /// prints. The man page refineid(1) carries the same facts.
 pub const HELP: &str = "\
-usage: refineid card [--offline] [--reader SUBSTR] [--can NNNNNN | --no-can]
+usage: refineid card [--offline] [--reader SUBSTR] [--no-can]
                      [--crl-file PATH] [--save-cert DIR] [--remote]
 
 Per-card readout: certificates, chain walk and revocation, PIN retry
-counters, and with --can the eMRTD section. With no card in a reader,
+counters, and with the CAN the eMRTD section. With no card in a reader,
 reads the card through the paired phone.
   --offline        skip every network fetch
   --reader S       narrow to readers whose name contains S
-  --can NNNNNN     CAN from the card front; enables eMRTD
   --no-can         skip the eMRTD section (no prompt)
   --crl-file P     use a pre-fetched CRL instead of HTTP fetch
   --save-cert DIR  write each slot's DER to DIR
   --remote         read the card through the paired phone only
-Without --can or --no-can on a terminal, prompts for the CAN
-(empty = skip).
+Without --no-can on a terminal, prompts for the CAN (empty = skip).
 ";
 
-/// CAN selection mode at the argv layer.
-///
-/// `--can NNNNNN` / `--no-can` / neither is a closed three-way
-/// state, modelled as an enum so the mutual-exclusion rule
-/// holds at the type level rather than via a runtime check on
-/// two parallel `Option<String> + bool` flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CardCanArg {
-    /// `--can NNNNNN` -- explicit, already parse-validated
-    /// into a typed [`Can`].
-    Explicit(Can),
-    /// `--no-can` -- explicit "skip the eMRTD section".
-    Skip,
-    /// Neither flag supplied -- the handler chooses (TTY
-    /// prompt on interactive invocations; skip otherwise).
-    Default,
-}
-
-/// Parsed `card [--offline] [--reader SUBSTR] [--can NNNNNN |
-/// --no-can] [--crl-file PATH] [--save-cert DIR]` arguments.
+/// Parsed `card [--offline] [--reader SUBSTR] [--no-can]
+/// [--crl-file PATH] [--save-cert DIR]` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardArgs {
     /// Optional reader-name substring (`--reader SUBSTR`).
@@ -68,9 +48,9 @@ pub struct CardArgs {
     /// When `true`, suppress every network fetch (CRL + OCSP +
     /// AIA caIssuers). Set by `--offline`.
     pub offline: bool,
-    /// CAN handling: typed value (`--can NNNNNN`), prompt
-    /// interactively, or skip (`--no-can`).
-    pub can: CardCanArg,
+    /// Skip the eMRTD section without prompting for the CAN
+    /// (`--no-can`).
+    pub no_can: bool,
     /// Pre-fetched CRL file (`--crl-file PATH`); replaces the
     /// CRL fetch step.
     pub crl_file: Option<PathBuf>,
@@ -103,7 +83,7 @@ impl CardArgs {
         let Self {
             reader_filter,
             offline,
-            can,
+            no_can,
             crl_file,
             save_cert_dir,
             remote,
@@ -113,13 +93,12 @@ impl CardArgs {
             return Self::run_remote_card_check(verbose);
         }
 
-        // Resolve the typed CardCanArg into Option<Can>:
-        // Explicit wins, Skip = None, Default falls back to a
-        // TTY prompt (interactive use) or None (piped / non-TTY).
-        let can: Option<Can> = match can {
-            CardCanArg::Explicit(c) => Some(c),
-            CardCanArg::Skip => None,
-            CardCanArg::Default => super::util::prompt_can_if_tty(),
+        // The CAN comes only from the no-echo terminal prompt;
+        // `--no-can` or a non-terminal stdin skips the eMRTD section.
+        let can: Option<Can> = if no_can {
+            None
+        } else {
+            super::util::prompt_can_if_tty()
         };
         let backend = refineid_lib_pcsc::PcscBackend;
         let options = crate::card_check::CardCheckOptions {
@@ -250,14 +229,10 @@ impl CardArgs {
     /// # Errors
     /// [`ArgParseError`] for any shape violation, including:
     ///
-    /// - `--can` value rejected by [`Can::new`].
-    /// - `--can` and `--no-can` both supplied (Conflict).
-    /// - Empty `--can` value (also a Conflict-with-skip case in
-    ///   the original CLI; reported as `BadValue` here).
+    /// - a missing flag value or an unknown argument.
     pub fn parse(argv: RemainingArgv) -> Result<Self, ArgParseError> {
         let mut reader_filter: Option<String> = None;
         let mut offline = false;
-        let mut can_explicit: Option<Can> = None;
         let mut no_can = false;
         let mut crl_file: Option<PathBuf> = None;
         let mut save_cert_dir: Option<PathBuf> = None;
@@ -274,27 +249,6 @@ impl CardArgs {
                     reader_filter = Some(value.clone());
                 }
                 "--offline" => offline = true,
-                "--can" => {
-                    let value = iter.next().ok_or(ArgParseError::MissingValue {
-                        cmd: VerbTag::CardCheck,
-                        flag: "--can",
-                    })?;
-                    if value.is_empty() {
-                        return Err(ArgParseError::BadValue {
-                            cmd: VerbTag::CardCheck,
-                            flag: "--can",
-                            value: value.clone(),
-                            reason: "empty (use --no-can to skip)".to_owned(),
-                        });
-                    }
-                    let parsed = Can::new(value).map_err(|e| ArgParseError::BadValue {
-                        cmd: VerbTag::CardCheck,
-                        flag: "--can",
-                        value: value.clone(),
-                        reason: format!("{e}"),
-                    })?;
-                    can_explicit = Some(parsed);
-                }
                 "--no-can" => no_can = true,
                 "--crl-file" => {
                     let value = iter.next().ok_or(ArgParseError::MissingValue {
@@ -319,22 +273,10 @@ impl CardArgs {
                 }
             }
         }
-        let can = match (can_explicit, no_can) {
-            (Some(_), true) => {
-                return Err(ArgParseError::Conflict {
-                    cmd: VerbTag::CardCheck,
-                    a: "--can",
-                    b: "--no-can",
-                });
-            }
-            (Some(c), false) => CardCanArg::Explicit(c),
-            (None, true) => CardCanArg::Skip,
-            (None, false) => CardCanArg::Default,
-        };
         Ok(Self {
             reader_filter,
             offline,
-            can,
+            no_can,
             crl_file,
             save_cert_dir,
             remote,
@@ -353,7 +295,7 @@ mod tests {
         let a = CardArgs::parse(argv(&[]))?;
         check_true(!a.offline, "offline=false")?;
         check_true(a.reader_filter.is_none(), "reader_filter=None")?;
-        check(&a.can, &CardCanArg::Default, "can")?;
+        check_true(!a.no_can, "no_can=false")?;
         Ok(())
     }
 
@@ -366,47 +308,7 @@ mod tests {
     #[test]
     fn no_can_sets_skip() -> TestResult {
         let a = CardArgs::parse(argv(&["--no-can"]))?;
-        check(&a.can, &CardCanArg::Skip, "can")
-    }
-
-    #[test]
-    fn can_value_validates_via_can_newtype() -> TestResult {
-        let a = CardArgs::parse(argv(&["--can", "123456"]))?;
-        check_true(matches!(a.can, CardCanArg::Explicit(_)), "can=Explicit(_)")
-    }
-
-    #[test]
-    fn malformed_can_rejected() -> TestResult {
-        let r = CardArgs::parse(argv(&["--can", "12"]));
-        check_true(
-            matches!(r, Err(ArgParseError::BadValue { flag: "--can", .. })),
-            "BadValue(--can)",
-        )
-    }
-
-    #[test]
-    fn empty_can_rejected() -> TestResult {
-        let r = CardArgs::parse(argv(&["--can", ""]));
-        check_true(
-            matches!(r, Err(ArgParseError::BadValue { flag: "--can", .. })),
-            "BadValue(--can)",
-        )
-    }
-
-    #[test]
-    fn can_and_no_can_conflict() -> TestResult {
-        let r = CardArgs::parse(argv(&["--can", "123456", "--no-can"]));
-        check_true(
-            matches!(
-                r,
-                Err(ArgParseError::Conflict {
-                    a: "--can",
-                    b: "--no-can",
-                    ..
-                })
-            ),
-            "Conflict(--can,--no-can)",
-        )
+        check_true(a.no_can, "no_can=true")
     }
 
     #[test]

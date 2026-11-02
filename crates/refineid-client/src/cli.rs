@@ -23,8 +23,8 @@
 //!    -> Result<Self, ArgParseError>` validates flag /
 //!    positional shape (no duplicates, no missing values, no
 //!    unknown flags) and wraps each value in its typed
-//!    counterpart where one exists (`Can` for `--can`, `Sha256`
-//!    for digests, `PinManageSlot` for slot enums, ...).
+//!    counterpart where one exists (`Sha256` for digests,
+//!    `PinManageSlot` for slot enums, ...).
 //!    Variant-pair parsers (sign-auth vs sign-qualified) take
 //!    the slot as a first argument; `pin change 1|2` and its
 //!    kin parse the slot from a positional argument. Either

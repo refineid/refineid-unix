@@ -35,8 +35,8 @@
 //! on-card root + PIN probes still print. `--crl-file PATH`
 //! replaces the CRL fetch with a pre-fetched file.
 //!
-//! When a CAN is supplied (either via `--can NNNNNN` or via
-//! the interactive prompt that the bare-command CLI runs), the
+//! When a CAN is supplied (through the no-echo terminal prompt
+//! that the bare-command CLI runs), the
 //! eMRTD application is also opened: MRZ, face / signature
 //! images, EF.SOD, DG14 / DG15 metadata, Active Authentication
 //! and Chip Authentication round-trip outcomes, document
@@ -178,10 +178,10 @@ pub struct CardCheckReport {
     pub pin1_changed: Option<bool>,
     /// Same as [`pin1_changed`](Self::pin1_changed) for PIN2.
     pub pin2_changed: Option<bool>,
-    /// `Some` when --can was supplied and the eMRTD reads
+    /// `Some` when a CAN was supplied and the eMRTD reads
     /// completed.
     pub emrtd: Option<EmrtdPersonalData>,
-    /// `Some` when --can was supplied but the eMRTD read failed
+    /// `Some` when a CAN was supplied but the eMRTD read failed
     /// (`BadCan`, SM glitch, parse error). The report still
     /// ships so the rest of the per-card data is visible.
     pub emrtd_error: Option<String>,
@@ -367,8 +367,8 @@ impl fmt::Display for CardCheckError {
             Self::NeedCan => write!(
                 f,
                 "contactless card: everything on this card is sealed behind \
-                 PACE; pass --can NNNNNN (six digits printed on the card \
-                 front) so the readout can open a secure channel"
+                 PACE; enter the CAN printed on the front of a personal \
+                 card so the readout can open a secure channel"
             ),
             Self::BadCan => write!(f, "PACE failed: the CAN did not match the card"),
             Self::Pace(s) => write!(f, "PACE: {s}"),
@@ -1519,7 +1519,7 @@ impl CardCheckReport {
             }
             (None, Some(err)) => {
                 writeln!(f)?;
-                writeln!(f, "eMRTD (read via PACE / --can):")?;
+                writeln!(f, "eMRTD (read via PACE):")?;
                 writeln!(f, "FAILED: {err}")
             }
             (None, None) => Ok(()),
@@ -1666,7 +1666,7 @@ impl CardCheckHelpers {
     /// that order; called once from [`CardCheckReport::fmt_emrtd_block`]
     /// when an `EmrtdPersonalData` is present.
     fn write_emrtd_section(f: &mut fmt::Formatter<'_>, emrtd: &EmrtdPersonalData) -> fmt::Result {
-        writeln!(f, "eMRTD (read via PACE / --can):")?;
+        writeln!(f, "eMRTD (read via PACE):")?;
         Self::write_emrtd_mrz(f, emrtd)?;
         Self::write_emrtd_images(f, emrtd)?;
         Self::write_emrtd_security(f, emrtd)

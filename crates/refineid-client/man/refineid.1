@@ -139,27 +139,21 @@ spelled like it.
 .Cm card
 .Op Fl -offline
 .Op Fl -reader Ar substr
-.Op Fl -can Ar can | Fl -no-can
+.Op Fl -no-can
 .Op Fl -crl-file Ar path
 .Op Fl -save-cert Ar dir
 .Op Fl -remote
 .Xc
 Per-card readout: certificates, chain walk and revocation, PIN retry
-counters, and with
-.Fl -can
-the eMRTD section.
+counters, and with the CAN the eMRTD section.
 With no card in a reader, reads the card through the paired phone.
 Without
-.Fl -can
-or
 .Fl -no-can
 on a terminal, prompts for the CAN; an empty answer skips the eMRTD
 section.
 .Bl -tag -width Ds
 .It Fl -offline
 Skip every network fetch.
-.It Fl -can Ar can
-The card access number printed on the card front; enables eMRTD.
 .It Fl -no-can
 Skip the eMRTD section without a prompt.
 .It Fl -crl-file Ar path
@@ -201,15 +195,10 @@ Run on a card whose PIN already looks activated.
 .Cm pin change
 .Cm 1 | 2
 .Op Fl -reader Ar substr
-.Op Fl -can Ar can
 .Xc
 Rotate PIN 1, the authentication PIN, or PIN 2, the qualified-signature
 PIN.
 Prompts for the current PIN, then the new PIN twice.
-.Bl -tag -width Ds
-.It Fl -can Ar can
-The card access number; needed on the contactless interface.
-.El
 .It Xo
 .Cm pin unblock
 .Cm 1 | 2
@@ -227,7 +216,6 @@ bricks the card.
 .Op Fl -reason Ar text
 .Op Fl -location Ar text
 .Op Fl -reader Ar substr
-.Op Fl -can Ar can
 .Op Fl -no-stamp
 .Op Fl -timestamp Ar url ...
 .Xc
@@ -286,8 +274,6 @@ The key to sign with; qualified by default.
 The PAdES /Reason.
 .It Fl -location Ar text
 The PAdES /Location.
-.It Fl -can Ar can
-The card access number; required on the contactless interface.
 .It Fl -timestamp Ar url
 An RFC 3161 timestamp authority URL, or a named set.
 The default is
@@ -470,17 +456,15 @@ phone, offline certificate tools and the reader itself.
 .Bl -tag -width Ds
 .It Xo
 .Cm card emrtd
-.Fl -can Ar can
 .Op Fl -save-face Ar path
 .Op Fl -save-signature Ar path
 .Op Fl -reader Ar substr
 .Xc
-eMRTD file extraction: the same read as
-.Cm card Fl -can ,
+eMRTD file extraction: the same read as the eMRTD section of
+.Cm card ,
 plus options that write artefacts to disk.
+Prompts for the CAN.
 .Bl -tag -width Ds
-.It Fl -can Ar can
-The card access number printed on the card front.
 .It Fl -save-face Ar path
 Write the face image.
 .It Fl -save-signature Ar path
@@ -495,7 +479,6 @@ Narrow to readers whose name contains
 .Fl -out Ar path
 .Op Fl -save-cert Ar path
 .Op Fl -reader Ar substr
-.Op Fl -can Ar can
 .Xc
 Raw signature over a file:
 .Cm sign-auth
@@ -510,10 +493,8 @@ The input file.
 The output file for the raw signature.
 .It Fl -save-cert Ar path
 Also write the signing certificate's DER.
-.It Fl -can Ar can
-The card access number; required on the contactless interface and
-prompted for on a terminal when needed.
 .El
+On the contactless interface, prompts for the CAN.
 .It Xo
 .Cm card decrypt-auth
 .Fl -in Ar path

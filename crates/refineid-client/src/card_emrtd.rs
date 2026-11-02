@@ -12,8 +12,8 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! `refineid card emrtd --can <CAN>`: run PACE with the
-//! card-printed CAN, drive the eMRTD personal-data read, and
+//! `refineid card emrtd`: run PACE with the card-printed CAN
+//! entered at the terminal prompt, drive the eMRTD personal-data read, and
 //! print the parsed MRZ + face-image metadata as text.
 //!
 //! Flow: `PcscBackend` opens the card, lib-core's

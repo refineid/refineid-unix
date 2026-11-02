@@ -121,14 +121,16 @@ Canonical DVV sources:
 - suomi: *kortin pääsykoodi*; svenska: *kortets åtkomstkod*. An
   access code, which is what a Card Access Number is - not a
   "käyttönumero"/"användningsnummer", which would name usage.
-- 6 digits, **printed on the card front**, **not secret**.
+- 6 digits, **printed on the front of a personal card**, and a
+  **secret** like the PINs. On an organisation card PIN 1 or PIN 2
+  opens PACE instead.
 - Used to set up the PACE secure channel before reading the
   eMRTD application. The CAN is the bearer of the operator's
   intent to physically possess the card; an attacker who can
   see the card front can read it too.
-- refineid surfaces the CAN as a normal argv option
-  (`--can NNNNNN`) -- not subject to the no-PIN-in-argv rule,
-  precisely because it isn't secret.
+- The CAN is a secret handled like the PINs: refineid reads it only
+  from the no-echo terminal prompt, never from argv or the
+  environment, and never displays, logs or sends it.
 
 ## Naming rules
 

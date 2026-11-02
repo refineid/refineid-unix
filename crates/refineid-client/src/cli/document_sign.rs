@@ -47,7 +47,7 @@ use crate::phone_sign::SigningSource;
 pub const HELP: &str = "\
 usage: refineid document sign FILE [FILE ...] [--format F] [--out PATH]
                 [--slot S] [--reason T] [--location T] [--reader SUBSTR]
-                [--can NNNNNN] [--no-stamp] [--timestamp U ...]
+                [--no-stamp] [--timestamp U ...]
 
 Sign FILE into a format a counterparty can open. Several PDFs are
 signed one by one, each with its own seal; any other set, or a
@@ -71,8 +71,6 @@ typed on the phone. Prints nothing on success; -v shows each step.
   --reason T    PAdES /Reason
   --location T  PAdES /Location
   --reader S    narrow to readers whose name contains S
-  --can NNNNNN  CAN from the card front; required on the contactless
-                interface
   --no-stamp    no red seal asking the reader to check the
                 document's electronic signature; the signature
                 stays invisible
@@ -94,7 +92,7 @@ const OPTION_PREFIX: &str = "--";
 
 /// Parsed `document sign FILE [FILE ...] [--format F] [--out PATH]
 /// [--slot auth|qualified] [--reason TEXT] [--location TEXT]
-/// [--reader SUBSTR] [--can NNNNNN]`.
+/// [--reader SUBSTR]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentSignArgs {
     /// Which format to produce (`--format`). Without it, PDFs are
@@ -125,8 +123,6 @@ pub struct DocumentSignArgs {
     pub location: Option<String>,
     /// Optional substring match against reader names (`--reader`).
     pub reader_filter: Option<String>,
-    /// Card Access Number for contactless (`--can`).
-    pub can: Option<Can>,
     /// Add an archive timestamp over the finished document: level
     /// LTA. Set for the formats whose archive construction exists.
     ///
@@ -170,7 +166,6 @@ impl DocumentSignArgs {
             reason,
             location,
             reader_filter,
-            can,
             timestamp_authorities,
             long_term,
             archive,
@@ -212,9 +207,9 @@ impl DocumentSignArgs {
             archive,
         };
         // The phone signs only with its card's qualified key, and only
-        // when no reader here holds a card; a reader or a CAN on the
-        // command line names a reader.
-        let phone = (slot == SignSlot::Qualified && reader_filter.is_none() && can.is_none())
+        // when no reader here holds a card; a reader on the command line
+        // names a reader.
+        let phone = (slot == SignSlot::Qualified && reader_filter.is_none())
             .then(crate::phone_sign::current_source);
         if let Some(SigningSource::Phone(pair_id)) = phone {
             return sign_on_phone(cmd, verbose, pair_id, jobs, &request, &level).into();
@@ -238,7 +233,9 @@ impl DocumentSignArgs {
         });
 
         let backend = refineid_pcsc::PcscBackend;
-        let mut can = can;
+        // The CAN is asked for at the terminal when a contactless card
+        // first reports the PACE seal, then kept for the rest of the run.
+        let mut can: Option<Can> = None;
         let mut worst = ExitStatus::Ok;
         for job in jobs {
             let mut inputs = job.inputs;
@@ -308,7 +305,6 @@ impl DocumentSignArgs {
         let mut reason: Option<String> = None;
         let mut location: Option<String> = None;
         let mut reader_filter: Option<String> = None;
-        let mut can_raw: Option<String> = None;
         let mut timestamp_authorities: Vec<String> = Vec::new();
         let mut no_stamp = false;
 
@@ -326,7 +322,6 @@ impl DocumentSignArgs {
                 "--reason" => reason = Some(value_for("--reason")?.clone()),
                 "--location" => location = Some(value_for("--location")?.clone()),
                 "--reader" => reader_filter = Some(value_for("--reader")?.clone()),
-                "--can" => can_raw = Some(value_for("--can")?.clone()),
                 "--timestamp" => {
                     let value = value_for("--timestamp")?.clone();
                     for url in expand_authority(&value)? {
@@ -357,7 +352,6 @@ impl DocumentSignArgs {
             reason,
             location,
             reader_filter,
-            can_raw,
             timestamp_authorities,
             no_stamp,
         )
@@ -380,7 +374,6 @@ impl DocumentSignArgs {
         reason: Option<String>,
         location: Option<String>,
         reader_filter: Option<String>,
-        can_raw: Option<String>,
         mut timestamp_authorities: Vec<String>,
         no_stamp: bool,
     ) -> Result<Self, ArgParseError> {
@@ -425,16 +418,6 @@ impl DocumentSignArgs {
             }
         };
         let (long_term, archive) = levels_for(format);
-        let can = can_raw
-            .map(|raw| {
-                Can::new(&raw).map_err(|e| ArgParseError::BadValue {
-                    cmd: CMD,
-                    flag: "--can",
-                    value: raw.clone(),
-                    reason: format!("{e}"),
-                })
-            })
-            .transpose()?;
 
         Ok(Self {
             format,
@@ -444,7 +427,6 @@ impl DocumentSignArgs {
             reason,
             location,
             reader_filter,
-            can,
             archive,
             long_term,
             timestamp_authorities,

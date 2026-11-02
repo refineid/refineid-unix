@@ -29,7 +29,8 @@ use refineid_pace::{Can, UnvalidatedCan};
 /// `None` only if core would refuse digits this crate accepted.
 #[must_use]
 pub fn can(can: &refineid_lib_core::can::Can) -> Option<Can> {
-    Can::reconstruct(UnvalidatedCan::from_owned_text(can.as_str().to_owned())).ok()
+    let digits = String::from_utf8(can.as_bytes().to_vec()).ok()?;
+    Can::reconstruct(UnvalidatedCan::from_owned_text(digits)).ok()
 }
 
 /// The same card serial as core's type, rendered as core renders a
