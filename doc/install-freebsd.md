@@ -225,13 +225,17 @@ RefineID provides a local loopback mTLS proxy bridge (`refineid-mtls-proxy`):
    `packaging/konqueror/refineid-mtls-proxy.desktop` installed to `~/.config/autostart/`
    starts the proxy bridge on KDE login.
 
-Build and install the bridge components:
+Build, initialize the local bridge CA, and install the bridge components:
 
 ```sh
 cd packaging/konqueror
+make ca
 make
 make install
 ```
+
+See [packaging/konqueror/README.md](../packaging/konqueror/README.md) for detailed
+architecture notes and instructions on patching `webenginepart`.
 
 OpenSSH and OpenSSL reach the module through p11-kit when it is
 registered there, which the browsers no longer need:

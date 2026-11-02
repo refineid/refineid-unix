@@ -1,6 +1,8 @@
 # Makefile for RefineID Konqueror mTLS Bridge components on FreeBSD
 CXX ?= c++
 PREFIX ?= /usr/local
+CADIR ?= $(DESTDIR)$(PREFIX)/etc/refineid/ca
+CERTSDIR ?= $(DESTDIR)$(PREFIX)/share/certs
 
 OPENSSL_INCS ?= -I$(PREFIX)/include
 OPENSSL_LIBS ?= -L$(PREFIX)/lib -lssl -lcrypto -lpthread
@@ -15,6 +17,29 @@ refineid-mtls-proxy: refineid_mtls_proxy.cpp
 
 refineid-ask-pin: refineid_ask_pin.cpp
 	$(CXX) -O2 -fPIC $(QT6_INCS) $(QT6_LIBS) refineid_ask_pin.cpp -o refineid-ask-pin
+
+ca:
+	install -d $(CADIR)
+	@if [ ! -f $(CADIR)/ca.key ]; then \
+		echo "Generating RefineID Local Bridge CA..."; \
+		openssl req -x509 -new -newkey rsa:4096 -nodes \
+			-keyout $(CADIR)/ca.key -out $(CADIR)/ca.crt -days 3650 \
+			-subj "/CN=RefineID Local Bridge CA/O=RefineID/C=FI"; \
+		chmod 600 $(CADIR)/ca.key; \
+	fi
+	@if [ ! -f $(CADIR)/server.key ]; then \
+		echo "Generating server key and certificate..."; \
+		openssl genrsa -out $(CADIR)/server.key 2048; \
+		openssl req -new -key $(CADIR)/server.key -out $(CADIR)/server.csr -config cert.cnf; \
+		openssl x509 -req -in $(CADIR)/server.csr -CA $(CADIR)/ca.crt -CAkey $(CADIR)/ca.key \
+			-CAcreateserial -out $(CADIR)/server.crt -days 3650 -extfile cert.cnf -extensions v3_req; \
+		chmod 644 $(CADIR)/server.key; \
+	fi
+	@if [ -d $(CERTSDIR) ]; then \
+		echo "Installing CA to $(CERTSDIR)/refineid-ca.pem..."; \
+		cp $(CADIR)/ca.crt $(CERTSDIR)/refineid-ca.pem; \
+		if command -v certctl >/dev/null 2>&1; then certctl rehash; fi; \
+	fi
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)/bin
