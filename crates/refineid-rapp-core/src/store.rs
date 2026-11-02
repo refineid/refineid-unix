@@ -2,11 +2,11 @@
 //!
 //! A pairing record is the engine's [`PairRecord`] -- the pair keys,
 //! `pair_id`, the granted profiles and their `grants_hash`, whether the
-//! peer confirmed its storage (RAPP v26.10.29 section 4.3 item 4), when
+//! peer confirmed its storage (RAPP v26.11.2 section 4.3 item 4), when
 //! this computer's user forgot it or it expired (section 4.6 items 2 and
-//! 5), and its latest session time (item 5) -- with what this
-//! computer keeps beside it: the phone's labels and the cached
-//! authentication certificate. Operations leave nothing here: an operation
+//! 5), its latest session time (item 5) and the phone's display name
+//! (section 4.3 item 4) -- with what this computer keeps beside it: the
+//! phone's platform label and the cached authentication certificate. Operations leave nothing here: an operation
 //! lives and ends inside its session (section 8.1), and a session that
 //! fails before authentication changes nothing stored (section 10.1 item
 //! 1).
@@ -19,17 +19,19 @@
 //! contains a credential value, a card identifier, or message plaintext.
 
 pub use refineid_rapp::PairingState;
-use refineid_rapp::{ActivePairing, EndpointRole, PairRecord, SweepError, SweepOutcome};
+use refineid_rapp::{
+    ActivePairing, DisplayName, EndpointRole, PairRecord, RecordStoreError, SweepOutcome,
+};
 
 use crate::ids::PairId;
 use crate::persistence::frame_pairing_record;
 
-/// What a phone introduced itself as in `pairing.hello` (section 7.1):
-/// labels for display, not identities.
+/// What a phone introduced itself as in `pairing.hello` (section 4.3
+/// item 3): labels for display, not identities.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerIntroduction {
-    /// The phone's display label.
-    pub display_name: String,
+    /// The phone's display name.
+    pub display_name: DisplayName,
     /// The phone's platform label.
     pub platform: String,
 }
@@ -47,7 +49,7 @@ pub enum RecordError {
 /// One stored pairing.
 pub struct PairingRecord {
     pairing: PairRecord,
-    peer: PeerIntroduction,
+    platform: String,
     auth_cert: Option<Vec<u8>>,
 }
 
@@ -62,18 +64,19 @@ impl core::fmt::Debug for PairingRecord {
 }
 
 impl PairingRecord {
-    /// The record of the requester's half of `pairing`, introduced by
-    /// `peer`, with no cached certificate.
+    /// The record of the requester's half of `pairing`, whose phone named
+    /// its platform `platform`, with no cached certificate. The phone's
+    /// display name is the engine record's.
     ///
     /// # Errors
     /// [`RecordError::NotRequester`] for a custodian's record.
-    pub fn new(pairing: PairRecord, peer: PeerIntroduction) -> Result<Self, RecordError> {
+    pub fn new(pairing: PairRecord, platform: String) -> Result<Self, RecordError> {
         if pairing.role() != EndpointRole::Requester {
             return Err(RecordError::NotRequester);
         }
         Ok(Self {
             pairing,
-            peer,
+            platform,
             auth_cert: None,
         })
     }
@@ -91,7 +94,7 @@ impl PairingRecord {
     }
 
     /// Where the stored pairing stands in the pairing machine of RAPP
-    /// v26.10.29: awaiting the peer's storage confirmation
+    /// v26.11.2: awaiting the peer's storage confirmation
     /// ([`PairingState::StorageConfirming`]), usable
     /// ([`PairingState::PairedDisconnected`]), or forgotten and keeping
     /// its key for the close ([`PairingState::Revoking`]).
@@ -106,10 +109,16 @@ impl PairingRecord {
         }
     }
 
-    /// What the phone introduced itself as.
+    /// The name the phone last sent for itself (section 4.3 item 4).
     #[must_use]
-    pub const fn peer(&self) -> &PeerIntroduction {
-        &self.peer
+    pub const fn peer_display_name(&self) -> &DisplayName {
+        self.pairing.peer_display_name()
+    }
+
+    /// The platform the phone named in its `pairing.hello`.
+    #[must_use]
+    pub fn peer_platform(&self) -> &str {
+        &self.platform
     }
 
     /// The cached DER authentication certificate, if read.
@@ -127,7 +136,7 @@ impl PairingRecord {
     pub fn confirmed(self, active: ActivePairing) -> Result<Self, RecordError> {
         let Self {
             pairing,
-            peer,
+            platform,
             auth_cert,
         } = self;
         let pairing = active
@@ -135,7 +144,7 @@ impl PairingRecord {
             .map_err(|_| RecordError::PairMismatch)?;
         Ok(Self {
             pairing,
-            peer,
+            platform,
             auth_cert,
         })
     }
@@ -158,23 +167,49 @@ impl PairingRecord {
     /// `Ok`; with nothing to change, `write` is not called.
     ///
     /// # Errors
-    /// [`SweepError::Store`] with `write`'s error, or with
+    /// [`RecordStoreError::Store`] with `write`'s error, or with
     /// [`StoreError::WriteRefused`] for a record that does not frame, and
-    /// [`SweepError::Encoding`] when the engine's record does not encode;
-    /// the record is unchanged.
+    /// [`RecordStoreError::Encoding`] when the engine's record does not
+    /// encode; the record is unchanged.
     pub fn sweep(
         &mut self,
         now_ms: u64,
         session_established: bool,
         write: impl FnOnce(&[u8]) -> Result<(), StoreError>,
-    ) -> Result<SweepOutcome, SweepError<StoreError>> {
+    ) -> Result<SweepOutcome, RecordStoreError<StoreError>> {
         let Self {
             pairing,
-            peer,
+            platform,
             auth_cert,
         } = self;
         pairing.sweep(now_ms, session_established, |encoded| {
-            let blob = frame_pairing_record(encoded.as_bytes(), peer, auth_cert.as_deref())
+            let blob = frame_pairing_record(encoded.as_bytes(), platform, auth_cert.as_deref())
+                .map_err(|_| StoreError::WriteRefused)?;
+            write(&blob)
+        })
+    }
+
+    /// Keeps `name`, the display name the phone sent in `session.ready`,
+    /// as the record's (section 4.3 item 4): the engine's
+    /// [`PairRecord::record_peer_display_name`]. A different name is
+    /// handed to `write` as the whole stored record and taken into this
+    /// one only once `write` returned `Ok` (`Ok(true)`); an equal one
+    /// writes nothing (`Ok(false)`).
+    ///
+    /// # Errors
+    /// As [`Self::sweep`]; the record keeps its old name.
+    pub fn rename_peer(
+        &mut self,
+        name: &DisplayName,
+        write: impl FnOnce(&[u8]) -> Result<(), StoreError>,
+    ) -> Result<bool, RecordStoreError<StoreError>> {
+        let Self {
+            pairing,
+            platform,
+            auth_cert,
+        } = self;
+        pairing.record_peer_display_name(name, |encoded| {
+            let blob = frame_pairing_record(encoded.as_bytes(), platform, auth_cert.as_deref())
                 .map_err(|_| StoreError::WriteRefused)?;
             write(&blob)
         })
@@ -247,16 +282,30 @@ pub trait PairingStore {
     ///
     /// # Errors
     ///
-    /// [`SweepError::Store`] with [`StoreError::Unknown`] when no record
-    /// exists, and as [`PairingRecord::sweep`]; a refused write leaves the
-    /// record as the store last held it durably, and the next sweep repeats
-    /// the step.
+    /// [`RecordStoreError::Store`] with [`StoreError::Unknown`] when no
+    /// record exists, and as [`PairingRecord::sweep`]; a refused write
+    /// leaves the record as the store last held it durably, and the next
+    /// sweep repeats the step.
     fn sweep(
         &mut self,
         pair_id: PairId,
         now_ms: u64,
         session_established: bool,
-    ) -> Result<SweepOutcome, SweepError<StoreError>>;
+    ) -> Result<SweepOutcome, RecordStoreError<StoreError>>;
+
+    /// One record's new peer display name (section 4.3 item 4), as
+    /// [`PairingRecord::rename_peer`] on the record as the store durably
+    /// holds it now: the new name is written before it is taken.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::sweep`]; a refused write keeps the old name, and the next
+    /// session tries again.
+    fn rename_peer(
+        &mut self,
+        pair_id: PairId,
+        name: &DisplayName,
+    ) -> Result<bool, RecordStoreError<StoreError>>;
 
     /// Every stored pairing, newest first.
     fn pair_ids(&self) -> Vec<PairId>;
@@ -315,12 +364,24 @@ impl PairingStore for MemoryPairingStore {
         pair_id: PairId,
         now_ms: u64,
         session_established: bool,
-    ) -> Result<SweepOutcome, SweepError<StoreError>> {
+    ) -> Result<SweepOutcome, RecordStoreError<StoreError>> {
         self.records
             .iter_mut()
             .find(|entry| entry.pair_id() == pair_id)
-            .ok_or(SweepError::Store(StoreError::Unknown))?
+            .ok_or(RecordStoreError::Store(StoreError::Unknown))?
             .sweep(now_ms, session_established, |_| Ok(()))
+    }
+
+    fn rename_peer(
+        &mut self,
+        pair_id: PairId,
+        name: &DisplayName,
+    ) -> Result<bool, RecordStoreError<StoreError>> {
+        self.records
+            .iter_mut()
+            .find(|entry| entry.pair_id() == pair_id)
+            .ok_or(RecordStoreError::Store(StoreError::Unknown))?
+            .rename_peer(name, |_| Ok(()))
     }
 
     fn pair_ids(&self) -> Vec<PairId> {
@@ -336,21 +397,24 @@ impl PairingStore for MemoryPairingStore {
 #[cfg(test)]
 pub(crate) mod fixtures {
     use refineid_rapp::{
-        EndpointRole, PairRecord, ProfileName, compute_grants_hash, generate_pair_key_material,
+        DisplayName, EndpointRole, PairRecord, ProfileName, compute_grants_hash,
+        generate_pair_key_material,
     };
 
-    use super::{PairingRecord, PeerIntroduction};
+    use super::PairingRecord;
     use crate::ids::PairId;
 
     /// When the fixtures' pairings were made.
     pub(crate) const CREATED_AT_MS: u64 = 1_700_000_000_000;
 
-    /// The phone every fixture is paired with.
-    pub(crate) fn phone() -> PeerIntroduction {
-        PeerIntroduction {
-            display_name: "Alpha Phone".into(),
-            platform: "iOS".into(),
-        }
+    /// The name of the phone every fixture is paired with.
+    pub(crate) const PHONE_NAME: &str = "Alpha Phone";
+    /// The platform of the phone every fixture is paired with.
+    pub(crate) const PHONE_PLATFORM: &str = "iOS";
+
+    /// The phone's display name.
+    pub(crate) fn phone_name() -> DisplayName {
+        DisplayName::parse(PHONE_NAME.to_owned()).expect("a valid name")
     }
 
     /// A confirmed requester record of `pair_id` granting `profiles`, with
@@ -369,6 +433,7 @@ pub(crate) mod fixtures {
                     *peer.public_key(),
                     grants_hash,
                     profiles,
+                    phone_name(),
                     CREATED_AT_MS,
                 )
             })
@@ -377,8 +442,11 @@ pub(crate) mod fixtures {
 
     /// A usable record of `pair_id` granting card status.
     pub(crate) fn record(pair_id: PairId) -> PairingRecord {
-        PairingRecord::new(pair_record(pair_id, vec![ProfileName::CardStatus]), phone())
-            .expect("a requester record")
+        PairingRecord::new(
+            pair_record(pair_id, vec![ProfileName::CardStatus]),
+            PHONE_PLATFORM.to_owned(),
+        )
+        .expect("a requester record")
     }
 }
 
@@ -388,9 +456,9 @@ pub(crate) mod fixtures {
     reason = "test fixtures are constructed to be infallible"
 )]
 mod tests {
-    use refineid_rapp::{EndpointRole, PairRecord, PairingState, ProfileName};
+    use refineid_rapp::{DisplayName, EndpointRole, PairRecord, PairingState, ProfileName};
 
-    use super::fixtures::{CREATED_AT_MS, phone, record};
+    use super::fixtures::{CREATED_AT_MS, PHONE_PLATFORM, phone_name, record};
     use super::{MemoryPairingStore, PairingRecord, PairingStore, RecordError, StoreError};
     use crate::ids::PairId;
 
@@ -400,6 +468,8 @@ mod tests {
     const FORGOTTEN_AT_MS: u64 = 1_800_000_000_000;
     /// A synthetic authentication certificate.
     const CERTIFICATE: &[u8] = b"synthetic authentication certificate";
+    /// The phone's name after its user renamed it.
+    const RENAMED_PHONE: &str = "Beta Phone";
 
     #[test]
     fn records_update_into_their_successor_and_go_with_their_key() {
@@ -444,14 +514,39 @@ mod tests {
                     *peer.public_key(),
                     grants_hash,
                     profiles,
+                    phone_name(),
                     CREATED_AT_MS,
                 )
             })
             .unwrap();
         assert_eq!(
-            PairingRecord::new(custodian, phone()).err(),
+            PairingRecord::new(custodian, PHONE_PLATFORM.to_owned()).err(),
             Some(RecordError::NotRequester)
         );
+    }
+
+    #[test]
+    fn a_new_phone_name_replaces_the_stored_one_and_an_equal_one_writes_nothing() {
+        let mut store = MemoryPairingStore::new();
+        let pair_id = PairId::from_array(PAIR_ID);
+        store.insert(record(pair_id)).unwrap();
+        assert_eq!(store.rename_peer(pair_id, &phone_name()), Ok(false));
+        let renamed = DisplayName::parse(RENAMED_PHONE.to_owned()).unwrap();
+        assert_eq!(store.rename_peer(pair_id, &renamed), Ok(true));
+        assert_eq!(store.get(pair_id).unwrap().peer_display_name(), &renamed);
+        assert_eq!(store.get(pair_id).unwrap().peer_platform(), PHONE_PLATFORM);
+    }
+
+    #[test]
+    fn a_record_refuses_a_name_that_fails_to_store_and_keeps_the_old_one() {
+        let mut entry = record(PairId::from_array(PAIR_ID));
+        let renamed = DisplayName::parse(RENAMED_PHONE.to_owned()).unwrap();
+        assert!(
+            entry
+                .rename_peer(&renamed, |_| Err(StoreError::WriteRefused))
+                .is_err()
+        );
+        assert_eq!(entry.peer_display_name(), &phone_name());
     }
 
     #[test]

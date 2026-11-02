@@ -19,8 +19,9 @@
 //! never asks for, holds or sends a PIN. `refineid_doc_sign::remote`
 //! builds, checks and finishes the documents; this module carries its
 //! two calls over the paired phone's session: `read_certificate` with
-//! kind `signature`, then `sign_document` for one document or
-//! `batch_sign_documents` for several (RAPP v26.10.29 section 9.3).
+//! kind `signature`, then `sign_document` for one document, with the
+//! files of a package as `contained_files`, or `batch_sign_documents`
+//! for several single documents (RAPP v26.11.2 section 9.3).
 //!
 //! A card in a reader attached to this computer outranks the phone:
 //! [`choose_source`] picks the phone only when no reader holds a card.
@@ -38,7 +39,8 @@ use refineid_rapp_core::engine::{AdmissionError, OperationOutcome};
 use refineid_rapp_core::ids::PairId;
 use refineid_rapp_core::message::ResultError;
 use refineid_rapp_core::operations::{
-    CardKeyProfile, CardOperation, CardOperationResult, CertificateKind, SignatureAlgorithm,
+    CardKeyProfile, CardOperation, CardOperationResult, CertificateKind, ContainedFiles,
+    SignatureAlgorithm,
 };
 use refineid_rapp_core::profiles::ProfileName;
 use refineid_rapp_core::remote::{PairSummary, RemoteError, RemoteReader, RemoteSession};
@@ -204,7 +206,8 @@ impl<Link: PhoneLink> RemoteSigner for PhoneSigner<Link> {
         batch: &PhoneSigningBatch,
     ) -> Result<Vec<UnvalidatedPhoneSignature>, PhoneRefusal> {
         let several = batch.documents().len() > 1;
-        match (several, self.run(&operation_for(batch))?) {
+        let operation = operation_for(batch).ok_or(PhoneRefusal::PhoneFailed)?;
+        match (several, self.run(&operation)?) {
             (false, CardOperationResult::Signature(signature)) => {
                 Ok(vec![UnvalidatedPhoneSignature::from_bytes(signature)])
             }
@@ -225,19 +228,35 @@ impl<Link: PhoneLink> RemoteSigner for PhoneSigner<Link> {
 }
 
 /// The RAPP operation that signs `batch`: `sign_document` for one
-/// document, `batch_sign_documents` for several, with the batch's key
-/// profile, algorithm, names and digests unchanged and in order.
-fn operation_for(batch: &PhoneSigningBatch) -> CardOperation {
+/// document, with a package's files as `contained_files` in container
+/// order, `batch_sign_documents` for several single documents, with the
+/// batch's key profile, algorithm, names and digests unchanged and in
+/// order. `None` for a package among several documents, which RAPP
+/// v26.11.2 section 9.3 does not carry, or a package whose files RAPP
+/// refuses to name.
+fn operation_for(batch: &PhoneSigningBatch) -> Option<CardOperation> {
     let key_profile = key_profile(batch.key_profile());
     let algorithm = algorithm(batch.algorithm());
     match batch.documents() {
-        [document] => CardOperation::SignDocument {
+        [document] => Some(CardOperation::SignDocument {
             document_name: document.name().as_str().to_owned(),
+            contained_files: document
+                .contained_files()
+                .map(|files| ContainedFiles::reconstruct(files.names().to_vec()))
+                .transpose()
+                .ok()?,
             key_profile,
             algorithm,
             digest: document.digest().to_vec(),
-        },
-        documents => CardOperation::BatchSignDocuments {
+        }),
+        documents
+            if documents
+                .iter()
+                .any(|document| document.contained_files().is_some()) =>
+        {
+            None
+        }
+        documents => Some(CardOperation::BatchSignDocuments {
             document_names: documents
                 .iter()
                 .map(|document| document.name().as_str().to_owned())
@@ -248,7 +267,7 @@ fn operation_for(batch: &PhoneSigningBatch) -> CardOperation {
                 .iter()
                 .map(|document| document.digest().to_vec())
                 .collect(),
-        },
+        }),
     }
 }
 
@@ -593,12 +612,13 @@ mod tests {
                 phone.seen.get(1),
                 Some(CardOperation::SignDocument {
                     document_name,
+                    contained_files: None,
                     key_profile: CardKeyProfile::EcdsaP384,
                     algorithm: SignatureAlgorithm::EcdsaSha384,
                     ..
                 }) if document_name == "report.pdf"
             ),
-            "one sign_document naming the file",
+            "one sign_document naming the file, listing no files",
         )
     }
 
@@ -630,6 +650,68 @@ mod tests {
             "names in order",
         )?;
         check(&digests.len(), &names.len(), "one digest per document")
+    }
+
+    /// One `ASiC-E` package in `dir` over the files `names`, in order.
+    fn package(dir: &TempDir, names: &[&str]) -> Result<PhoneSignOptions, std::io::Error> {
+        let mut inputs = names
+            .iter()
+            .map(|name| dir.write(name, name.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let input = inputs.remove(0);
+        Ok(PhoneSignOptions {
+            input,
+            output: SignOutput::At(dir.path().join(format!("signed-{}.asice", names.len()))),
+            document: DocumentRequest {
+                additional_inputs: inputs,
+                ..request(Format::AsicEXades)
+            },
+        })
+    }
+
+    #[test]
+    fn a_package_is_one_sign_document_listing_its_files_in_order() -> TestResult {
+        let dir = TempDir::new("phone-package")?;
+        let names = ["minutes.txt", "budget.csv", "appendix.pdf"];
+        let documents = vec![package(&dir, &names)?];
+        let written = outputs(&documents);
+        let mut phone = ScriptedPhone::new(Answer::Sign);
+        let outcomes = sign_over(&mut phone, documents).map_err(|f| f.to_string())?;
+        check_true(outcomes.iter().all(Result::is_ok), "the package signed")?;
+        check_true(written.iter().all(|path| path.exists()), "written")?;
+        check(&phone.seen.len(), &2, "one certificate read, one signing")?;
+        let Some(CardOperation::SignDocument {
+            contained_files: Some(files),
+            ..
+        }) = phone.seen.get(1)
+        else {
+            return Err("no sign_document with contained_files".into());
+        };
+        check(
+            &files.names().to_vec(),
+            &names.map(str::to_owned).to_vec(),
+            "the files in container order",
+        )
+    }
+
+    #[test]
+    fn a_package_among_several_documents_never_reaches_the_phone() -> TestResult {
+        let dir = TempDir::new("phone-package-batch")?;
+        let documents = vec![
+            pdf(&dir, "report.pdf")?,
+            package(&dir, &["minutes.txt", "budget.csv"])?,
+        ];
+        let written = outputs(&documents);
+        let mut phone = ScriptedPhone::new(Answer::Sign);
+        let Err(failure) = sign_over(&mut phone, documents) else {
+            return Err("a package was signed in a batch".into());
+        };
+        check_true(
+            matches!(failure.kind, SignErrorKind::PackageInBatch),
+            "refused as a package in a batch",
+        )?;
+        check_true(phone.seen.is_empty(), "nothing asked of the phone")?;
+        check_true(!written.iter().any(|path| path.exists()), "nothing written")
     }
 
     #[test]

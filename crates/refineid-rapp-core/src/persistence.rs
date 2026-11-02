@@ -3,8 +3,8 @@
 //! A durable [`PairingStore`](crate::store::PairingStore) -- here the
 //! owner-only [`FilePairingStore`](crate::file_store::FilePairingStore) --
 //! needs the record's bytes. The engine's half of the record, with the pair
-//! keys, the grants, the storage confirmation, the time it was forgotten and
-//! its latest session time, travels in the engine's own encoding
+//! keys, the grants, the peer's display name, the storage confirmation, the
+//! time it was forgotten and its latest session time, travels in the engine's own encoding
 //! ([`refineid_rapp::encode_pair_record`]);
 //! this module frames it with what the workstation keeps beside it, in a
 //! versioned, length-framed encoding with no external serde surface.
@@ -21,21 +21,23 @@ use refineid_rapp::{
 };
 use zeroize::Zeroizing;
 
-use crate::store::{PairingRecord, PeerIntroduction, RecordError};
+use crate::store::{PairingRecord, RecordError};
 
 /// Format tag identifying a `RefineID` pairing-record blob.
 pub(crate) const PAIRING_BLOB_MAGIC: &[u8] = b"RAPP-pair-record";
 
 /// The one encoding revision this build reads and writes. Records of earlier
 /// revisions belong to earlier protocol versions and are re-paired.
-pub(crate) const PAIRING_BLOB_VERSION: u8 = 10;
+pub(crate) const PAIRING_BLOB_VERSION: u8 = 11;
 
 /// The engine's pair record format this revision frames. A new engine
 /// format takes a new revision, so that records of the old one read as
 /// superseded.
-const FRAMED_PAIR_RECORD_FORMAT: u64 = 7;
+const FRAMED_PAIR_RECORD_FORMAT: (u16, u16, u16) = (26, 11, 2);
 const _: () = assert!(
-    FRAMED_PAIR_RECORD_FORMAT == refineid_rapp::PAIR_RECORD_FORMAT_VERSION,
+    FRAMED_PAIR_RECORD_FORMAT.0 == refineid_rapp::PAIR_RECORD_FORMAT_VERSION.0
+        && FRAMED_PAIR_RECORD_FORMAT.1 == refineid_rapp::PAIR_RECORD_FORMAT_VERSION.1
+        && FRAMED_PAIR_RECORD_FORMAT.2 == refineid_rapp::PAIR_RECORD_FORMAT_VERSION.2,
     "a new engine pair record format needs a new PAIRING_BLOB_VERSION"
 );
 
@@ -111,7 +113,11 @@ pub fn encode_pairing_record(
     record: &PairingRecord,
 ) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
     let pairing = encode_pair_record(record.pairing()).map_err(PairingCodecError::Pairing)?;
-    frame_pairing_record(pairing.as_bytes(), record.peer(), record.auth_cert())
+    frame_pairing_record(
+        pairing.as_bytes(),
+        record.peer_platform(),
+        record.auth_cert(),
+    )
 }
 
 /// Frames `pairing`, the engine's encoded record, with what the workstation
@@ -122,7 +128,7 @@ pub fn encode_pairing_record(
 /// holds.
 pub(crate) fn frame_pairing_record(
     pairing: &[u8],
-    peer: &PeerIntroduction,
+    platform: &str,
     auth_cert: Option<&[u8]>,
 ) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
     let size = PAIRING_BLOB_MAGIC.len()
@@ -130,9 +136,7 @@ pub(crate) fn frame_pairing_record(
         + LENGTH_PREFIX_BYTES
         + pairing.len()
         + LENGTH_PREFIX_BYTES
-        + peer.display_name.len()
-        + LENGTH_PREFIX_BYTES
-        + peer.platform.len()
+        + platform.len()
         + OPTIONAL_FLAG_BYTES
         + auth_cert
             .map(|cert| LENGTH_PREFIX_BYTES + cert.len())
@@ -143,8 +147,7 @@ pub(crate) fn frame_pairing_record(
     out.extend_from_slice(PAIRING_BLOB_MAGIC);
     out.push(PAIRING_BLOB_VERSION);
     put_bytes(&mut out, pairing)?;
-    put_bytes(&mut out, peer.display_name.as_bytes())?;
-    put_bytes(&mut out, peer.platform.as_bytes())?;
+    put_bytes(&mut out, platform.as_bytes())?;
     match auth_cert {
         Some(cert) => {
             out.push(PRESENT);
@@ -185,17 +188,14 @@ pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecE
     }
     let pairing = EncodedPairRecord::from_stored(reader.take_length_prefixed()?.to_vec());
     let pairing = decode_pair_record(&pairing).map_err(PairingCodecError::Pairing)?;
-    let peer = PeerIntroduction {
-        display_name: reader.take_text()?,
-        platform: reader.take_text()?,
-    };
+    let platform = reader.take_text()?;
     let auth_cert = match reader.take_u8()? {
         ABSENT => None,
         PRESENT => Some(reader.take_length_prefixed()?.to_vec()),
         _ => return Err(PairingCodecError::InvalidFlag),
     };
     reader.finish()?;
-    Ok(PairingRecord::new(pairing, peer)
+    Ok(PairingRecord::new(pairing, platform)
         .map_err(PairingCodecError::Record)?
         .with_auth_cert(auth_cert))
 }
@@ -278,8 +278,8 @@ mod tests {
         encode_pairing_record, is_superseded,
     };
     use crate::ids::PairId;
-    use crate::store::fixtures::{pair_record, phone};
-    use crate::store::{PairingRecord, PeerIntroduction};
+    use crate::store::PairingRecord;
+    use crate::store::fixtures::{PHONE_PLATFORM, pair_record};
 
     /// A synthetic pair identifier.
     const PAIR_ID: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-7";
@@ -302,10 +302,7 @@ mod tests {
                 PairId::from_array(PAIR_ID),
                 vec![ProfileName::Authentication, ProfileName::DocumentSigning],
             ),
-            PeerIntroduction {
-                display_name: "Holder's Phone".into(),
-                platform: "iOS".into(),
-            },
+            PHONE_PLATFORM.to_owned(),
         )
         .unwrap()
         .with_auth_cert(Some(CERTIFICATE.to_vec()))
@@ -332,7 +329,8 @@ mod tests {
             left.pairing().last_session_at_ms(),
             right.pairing().last_session_at_ms()
         );
-        assert_eq!(left.peer(), right.peer());
+        assert_eq!(left.peer_display_name(), right.peer_display_name());
+        assert_eq!(left.peer_platform(), right.peer_platform());
         assert_eq!(left.auth_cert(), right.auth_cert());
     }
 
@@ -348,7 +346,7 @@ mod tests {
     fn the_encoder_sizes_its_buffer_once() {
         let bare = PairingRecord::new(
             pair_record(PairId::from_array(PAIR_ID), vec![ProfileName::CardStatus]),
-            phone(),
+            PHONE_PLATFORM.to_owned(),
         )
         .unwrap();
         for record in [sample(), sample().forgotten(FORGOTTEN_AT_MS), bare] {

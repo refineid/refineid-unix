@@ -143,8 +143,6 @@ pub const READING: &str = "Reading information\u{2026}";
 /// The line for a card in a reader here that could not be read, drawn
 /// in orange.
 pub const CARD_NOT_READY: &str = "Remove the card from the reader for a moment.";
-/// "Connecting to the phone…"
-pub const CONNECTING_TO_PHONE: &str = "Connecting to the phone\u{2026}";
 /// "Insert the card into the phone's card reader."
 pub const INSERT_INTO_PHONE_READER: &str = "Insert the card into the phone's card reader.";
 /// The suffix of a holder served by the paired phone.
@@ -258,13 +256,12 @@ pub enum IdentityLine {
     /// A card in a reader here that stayed unread after the inspection
     /// settled.
     CardNotReady,
-    /// Remote use on, no card here and no phone paired: the line is the
-    /// pairing prompt.
+    /// Remote use on, no card here and no phone card shown: the line is
+    /// the pairing prompt, exactly as with no phone paired (RAPP v26.11.2
+    /// section 4.7).
     PairPhone,
     /// The phone, by name, said it forgot this computer.
     PhoneForgot(String),
-    /// A paired phone that offers no holder yet.
-    ConnectingToPhone,
     /// The holder of the card the paired phone serves.
     PhoneHolder(String),
     /// The paired phone reports no card in its card reader.
@@ -274,8 +271,8 @@ pub enum IdentityLine {
 impl IdentityLine {
     /// The line for `state`. A card here overrides the paired phone;
     /// with remote use off the line speaks of the readers here alone;
-    /// otherwise the paired phone's line stands, and with no phone paired
-    /// the line asks for a pairing code.
+    /// otherwise the paired phone's card stands, and with none shown the
+    /// line asks for a pairing code and says nothing of the phone.
     #[must_use]
     pub fn derive(state: &UiState) -> Self {
         let selected = state.selected_card.and_then(|index| state.cards.get(index));
@@ -308,7 +305,7 @@ impl IdentityLine {
             Some(card) if card.source == CardSource::Phone => {
                 Self::PhoneHolder(card.display_name())
             }
-            _ => Self::ConnectingToPhone,
+            _ => Self::PairPhone,
         }
     }
 
@@ -324,7 +321,6 @@ impl IdentityLine {
             Self::LocalHolder(name) => name.clone(),
             Self::PairPhone => String::new(),
             Self::PhoneForgot(phone) => phone_forgot(phone),
-            Self::ConnectingToPhone => CONNECTING_TO_PHONE.to_owned(),
             Self::PhoneHolder(name) => format!("{name} {VIA_PHONE}"),
             Self::PhoneReaderEmpty => INSERT_INTO_PHONE_READER.to_owned(),
         }
@@ -362,7 +358,7 @@ pub enum WindowContent {
 impl WindowContent {
     /// The content for `state`, the first that holds: a contactless card
     /// asking for its number, a card waiting to be taken into use, the
-    /// pairing prompt while remote use is on with no phone paired and
+    /// pairing prompt while remote use is on with no phone card shown and
     /// nothing else to show, the documents while an identity is
     /// available or documents wait.
     #[must_use]
@@ -802,10 +798,12 @@ mod tests {
         );
         assert_eq!(WindowContent::derive(&state), WindowContent::PairingPrompt);
 
+        // A paired phone whose card is not shown is not shown either: the
+        // code entry is offered as with none paired.
         state.phone = Some(phone());
         state.phone_that_forgot = None;
-        assert_eq!(IdentityLine::derive(&state).text(), CONNECTING_TO_PHONE);
-        assert_eq!(WindowContent::derive(&state), WindowContent::LineOnly);
+        assert_eq!(IdentityLine::derive(&state), IdentityLine::PairPhone);
+        assert_eq!(WindowContent::derive(&state), WindowContent::PairingPrompt);
 
         state.cards = vec![card(CardSource::Phone)];
         state.selected_card = Some(0);

@@ -3,7 +3,7 @@
 //!
 //! The custodian here is test scaffolding, not a product: the real
 //! custodians are the holder's phones. It speaks the exact wire of RAPP
-//! v26.10.29 so the requester is exercised end to end - code pairing
+//! v26.11.2 so the requester is exercised end to end - code pairing
 //! through `CPace` KC2 and `Noise_XXpsk3` with grant agreement, `Noise_KK`
 //! sessions opened by the custodian's `session.ready`, card reports with
 //! the certificate fingerprint, operations and their results, the
@@ -27,16 +27,16 @@ use refineid_rapp::{
     BinaryFrame, CPACE_ATTEMPT_WINDOW_MS, CardInspection, CardKeyProfile as KeyProfile,
     CardOperation, CardOperationResult, CardPresence, CardReader, CardStatusMessage,
     CertificateFingerprint, CloseReason, CpaceKc2Responder, DEFAULT_OPERATION_LIFETIME_MS,
-    EndpointRole, EstablishedSessionRuntime, LIVENESS_CHALLENGE_SIZE,
+    DisplayName, EndpointRole, EstablishedSessionRuntime, LIVENESS_CHALLENGE_SIZE,
     LIVENESS_PING_AFTER_SILENCE_MS, OFFER_ID_SIZE, OfferId, OperationId, OperationRequest,
     OperationResultMessage, PAIRING_BUSY_RETRY_AFTER_MIN_MS, PAIRING_CANDIDATES_MAX,
     PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, PairingBusy, PairingCode, PairingHandshake,
     PairingOffer, PairingState, PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage,
     ProxyDispatch, ProxyFailure, ProxyOperationEngine, QUIT_WITHDRAWAL_BOUND_MS,
-    REVOCATION_NOTICE_MS, ResultError, RuntimePoll, RuntimeReceive, SESSION_READY_NONCE_SIZE,
-    SessionHandshake, SignatureAlgorithm, SweepError, SweepOutcome, TransportProfile, TypedMessage,
-    UserApproval, decode_pair_record, encode_pair_record, generate_pair_key_material,
-    standard_pairing_context_v2,
+    REVOCATION_ATTEMPT_BOUND_MS, RecordStoreError, RequesterSessionEnd, ResultError, RuntimePoll,
+    RuntimeReceive, SESSION_READY_NONCE_SIZE, SessionHandshake, SignatureAlgorithm, SweepOutcome,
+    TransportProfile, TypedMessage, UserApproval, decode_pair_record, encode_pair_record,
+    generate_pair_key_material, standard_pairing_context_v2,
 };
 use refineid_rapp_core::engine::{
     AdmissionError, OpenedConnection, OperationOutcome, PairingCandidateSource, PairingConnection,
@@ -61,6 +61,10 @@ const SESSION_START_MS: u64 = 1_000_000;
 const SHOWN_CODE: &str = "7KX4M9";
 /// The name the scripted custodian introduces itself with.
 const CUSTODIAN_NAME: &str = "Phone";
+/// The name the scripted custodian sends after its user renamed it.
+const RENAMED_CUSTODIAN: &str = "Renamed Phone";
+/// The name the requester under test gives itself.
+const WORKSTATION_NAME: &str = "Linux - workstation";
 /// The name a phone introduces itself with when its system hands the app
 /// only the device type.
 const DEVICE_TYPE_NAME: &str = "iPhone";
@@ -185,11 +189,22 @@ impl PairingStore for HaltingStore {
         pair_id: PairId,
         now_ms: u64,
         session_established: bool,
-    ) -> Result<SweepOutcome, SweepError<StoreError>> {
+    ) -> Result<SweepOutcome, RecordStoreError<StoreError>> {
         if self.halted {
-            return Err(SweepError::Store(StoreError::WriteRefused));
+            return Err(RecordStoreError::Store(StoreError::WriteRefused));
         }
         self.inner.sweep(pair_id, now_ms, session_established)
+    }
+
+    fn rename_peer(
+        &mut self,
+        pair_id: PairId,
+        name: &DisplayName,
+    ) -> Result<bool, RecordStoreError<StoreError>> {
+        if self.halted {
+            return Err(RecordStoreError::Store(StoreError::WriteRefused));
+        }
+        self.inner.rename_peer(pair_id, name)
     }
 
     fn pair_ids(&self) -> Vec<PairId> {
@@ -230,11 +245,16 @@ fn record_files(directory: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>
 fn requester_over<Store: PairingStore>(store: Store) -> Requester<Store> {
     Requester::new(
         RequesterConfig {
-            display_name: "Workstation".into(),
+            display_name: name(WORKSTATION_NAME),
             platform: "Linux".into(),
         },
         store,
     )
+}
+
+/// `text` as a display name.
+fn name(text: &str) -> DisplayName {
+    DisplayName::parse(text.to_owned()).unwrap()
 }
 
 /// A registered consequential operation for the authentication tests.
@@ -345,7 +365,7 @@ fn proxy_pair_serving<T: FrameTransport>(
     let hello = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
     confirmation.receive_hello(&hello, now_ms).unwrap();
     let proxy_hello = confirmation
-        .send_hello(display_name.into(), "iOS".into())
+        .send_hello(name(display_name), "iOS".into())
         .unwrap();
     transport.send_frame(proxy_hello.as_bytes()).unwrap();
     let requester_confirmation =
@@ -373,6 +393,9 @@ struct Custodian<T: FrameTransport> {
     runtime: EstablishedSessionRuntime,
     operations: ProxyOperationEngine,
     transport: T,
+    /// The requester's close in place of its `session.hello`, already
+    /// echoed.
+    first_close: Option<CloseReason>,
 }
 
 impl<T: FrameTransport> Custodian<T> {
@@ -382,7 +405,9 @@ impl<T: FrameTransport> Custodian<T> {
     }
 
     fn report_card(&mut self, status: CardStatusMessage) {
-        self.send(&ProxyOperationEngine::report_card_status(status));
+        if self.first_close.is_none() {
+            self.send(&ProxyOperationEngine::report_card_status(status));
+        }
     }
 
     /// The next frame from the requester, opened by the runtime.
@@ -403,11 +428,20 @@ impl<T: FrameTransport> Custodian<T> {
         }
     }
 
-    /// The requester's close, answering pings until it arrives.
+    /// The requester's close, answering pings until it arrives, and
+    /// answered with its echo (section 7.1 item 7).
     fn receive_close(&mut self) -> CloseReason {
+        if let Some(reason) = self.first_close.take() {
+            return reason;
+        }
         loop {
             match self.receive() {
-                RuntimeReceive::PeerClosed(reason) => return reason,
+                RuntimeReceive::PeerClosed { reason, echo } => {
+                    if let Some(echo) = echo {
+                        let _ = self.transport.send_frame(echo.as_bytes());
+                    }
+                    return reason;
+                }
                 RuntimeReceive::Send(pong) => self.transport.send_frame(pong.as_bytes()).unwrap(),
                 RuntimeReceive::LivenessConfirmed | RuntimeReceive::IgnoredStalePong => {}
                 other => panic!("expected the requester's close, got {other:?}"),
@@ -481,23 +515,51 @@ impl<T: FrameTransport> Custodian<T> {
 
 /// Accepts one session as the custodian: the `Noise_KK` handshake, then
 /// `session.ready`, the custodian's first message (section 7.1 item 5).
-fn custodian_session<T: FrameTransport>(record: &PairRecord, mut transport: T) -> Custodian<T> {
+fn custodian_session<T: FrameTransport>(record: &PairRecord, transport: T) -> Custodian<T> {
+    custodian_session_named(record, transport, CUSTODIAN_NAME)
+}
+
+/// As [`custodian_session`], the custodian naming itself `display_name`
+/// in its `session.ready`.
+fn custodian_session_named<T: FrameTransport>(
+    record: &PairRecord,
+    mut transport: T,
+    display_name: &str,
+) -> Custodian<T> {
     let mut handshake = SessionHandshake::begin_proxy(record, TransportProfile::Stream).unwrap();
     let m1 = BinaryFrame::reconstruct(transport.receive_frame().unwrap()).unwrap();
     handshake.read_message(&m1).unwrap();
     let m2 = handshake.write_message().unwrap();
     transport.send_frame(m2.as_bytes()).unwrap();
     let mut authentication = handshake.into_authentication().unwrap();
-    let ready = authentication.send_ready(READY_NONCE).unwrap();
+    let ready = authentication
+        .send_ready(READY_NONCE, &name(display_name))
+        .unwrap();
     transport.send_frame(ready.as_bytes()).unwrap();
-    Custodian {
+    let mut custodian = Custodian {
         runtime: EstablishedSessionRuntime::new(
             authentication.into_established().unwrap(),
             SESSION_START_MS,
         ),
         operations: ProxyOperationEngine::new(record.serving_profiles().to_vec()),
         transport,
+        first_close: None,
+    };
+    // The requester's first message: its `session.hello`, or the close of
+    // a pairing it forgot (section 7.1 item 6), which is echoed.
+    match custodian.receive() {
+        RuntimeReceive::Message(TypedMessage::SessionHello(hello)) => {
+            assert_eq!(hello.display_name.as_str(), WORKSTATION_NAME);
+        }
+        RuntimeReceive::PeerClosed { reason, echo } => {
+            if let Some(echo) = echo {
+                let _ = custodian.transport.send_frame(echo.as_bytes());
+            }
+            custodian.first_close = Some(reason);
+        }
+        other => panic!("expected the requester's hello, got {other:?}"),
     }
+    custodian
 }
 
 /// As [`custodian_session`], reporting the card at once (section 8.4).
@@ -519,7 +581,7 @@ fn paired<Store: PairingStore>(
             "7k x4-m9",
             &mut OpenedConnection::new(requester_transport),
             |peer, _requested| {
-                assert_eq!(peer.display_name, CUSTODIAN_NAME);
+                assert_eq!(peer.display_name.as_str(), CUSTODIAN_NAME);
                 Some(granted.to_vec())
             },
         )
@@ -560,7 +622,7 @@ fn pairing_stores_matching_records_on_both_sides() {
     let record = requester.store().get(pair_id).unwrap();
     assert_eq!(record.pairing().profiles(), granted);
     assert_eq!(record.state(), PairingState::PairedDisconnected);
-    assert_eq!(record.peer().display_name, CUSTODIAN_NAME);
+    assert_eq!(record.peer_display_name().as_str(), CUSTODIAN_NAME);
 }
 
 #[test]
@@ -583,7 +645,7 @@ fn a_phone_is_listed_under_the_name_it_gave_inside_the_pairing_channel() {
             SHOWN_CODE,
             &mut OpenedConnection::new(requester_transport),
             |peer, requested| {
-                assert_eq!(peer.display_name, DEVICE_TYPE_NAME);
+                assert_eq!(peer.display_name.as_str(), DEVICE_TYPE_NAME);
                 Some(requested.to_vec())
             },
         )
@@ -592,7 +654,7 @@ fn a_phone_is_listed_under_the_name_it_gave_inside_the_pairing_channel() {
     // The listed name is the one from the authenticated exchange alone;
     // nothing a discovery record names stands in for it.
     let reader = RemoteReader::with_store(
-        "Workstation",
+        name(WORKSTATION_NAME),
         "Linux",
         FilePairingStore::open_without_sweep(&directory).unwrap(),
     );
@@ -635,7 +697,7 @@ fn a_custodian_that_never_confirms_its_storage_leaves_no_record() {
 fn an_unconfirmed_record_found_at_start_up_is_revoked() {
     let mut requester = Requester::new(
         RequesterConfig {
-            display_name: "Workstation".into(),
+            display_name: name(WORKSTATION_NAME),
             platform: "Linux".into(),
         },
         HaltingStore::default(),
@@ -816,11 +878,13 @@ fn a_pairing_forgotten_while_disconnected_tells_the_phone_first_and_loses_its_ke
         let mut custodian = custodian_with_card(&proxy_pairing, proxy_transport);
         assert_eq!(custodian.receive_close(), CloseReason::PairingRevoked);
     });
-    requester
-        .send_revocation_notice(pair_id, requester_transport)
-        .unwrap();
+    // The phone echoes the close (section 7.1 item 7).
+    assert_eq!(
+        requester.send_revocation_notice(pair_id, requester_transport, Instant::now() + DEADLINE),
+        Ok(true)
+    );
     proxy.join().unwrap();
-    // Section 4.6 item 3: the key is destroyed once the close is sent.
+    // Section 4.6 item 3: the key is destroyed once the echo arrived.
     assert!(requester.store().get(pair_id).is_err());
 }
 
@@ -912,13 +976,13 @@ fn a_session_handshake_that_fails_changes_nothing_stored() {
 }
 
 #[test]
-fn a_forgotten_pairing_untold_for_thirty_days_loses_its_key() {
+fn a_forgotten_pairing_untold_within_its_attempt_loses_its_key() {
     let mut requester = test_requester();
     let granted = [ProfileName::CardStatus];
     let (pair_id, _proxy) = paired(&mut requester, &granted);
     let forgotten_at = current_time_ms();
     requester.forget(pair_id, forgotten_at).unwrap();
-    let window = REVOCATION_NOTICE_MS;
+    let window = REVOCATION_ATTEMPT_BOUND_MS;
     assert_eq!(
         requester.expire_revocation_notices(forgotten_at + window - 1),
         0
@@ -1012,15 +1076,13 @@ fn a_pairing_without_a_session_for_thirty_days_expires_silently() {
         requester.expire_idle_pairings(created + PAIRING_IDLE_EXPIRY_MS),
         Ok(1)
     );
-    // Section 4.6 item 5: the pairing is revoked, serves nothing, and keeps
-    // its key only for the close of a later session.
-    let record = requester.store().get(pair_id).unwrap();
-    assert_eq!(record.state(), PairingState::Revoking);
-    assert!(record.pairing().serving_profiles().is_empty());
+    // Section 4.6 items 5 and 6: the pairing is revoked and its key
+    // destroyed at once; nothing is sent.
+    assert!(requester.store().get(pair_id).is_err());
     let (unused, _other) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     assert!(matches!(
         requester.connect(pair_id, unused),
-        Err(SessionError::NotPaired(PairingState::Revoking))
+        Err(SessionError::UnknownPairing)
     ));
 }
 
@@ -1109,15 +1171,7 @@ fn an_idle_sweep_the_store_refused_is_repeated_by_the_next() {
     );
     requester.store_mut().halted = false;
     assert_eq!(requester.expire_idle_pairings(expiry), Ok(1));
-    assert_eq!(
-        requester
-            .store()
-            .get(pair_id)
-            .unwrap()
-            .pairing()
-            .forgotten_at_ms(),
-        Some(expiry)
-    );
+    assert!(requester.store().get(pair_id).is_err());
 }
 
 #[test]
@@ -1305,7 +1359,7 @@ fn a_refusal_moves_on_to_the_phone_that_shows_the_code() {
     let mut requester = test_requester();
     let (mut custodians, threads) = scripted(vec![refusing(), accepting()]);
     let outcome = requester.pair_with_code(SHOWN_CODE, &mut custodians, |peer, requested| {
-        assert_eq!(peer.display_name, CUSTODIAN_NAME);
+        assert_eq!(peer.display_name.as_str(), CUSTODIAN_NAME);
         Some(requested.to_vec())
     });
     join(threads);
@@ -2024,4 +2078,87 @@ fn stream_pairing_and_session_route_only_by_their_preambles() {
         outcome,
         OperationOutcome::Completed(CardOperationResult::Certificate(CERTIFICATE.to_vec()))
     );
+}
+
+#[test]
+fn the_phones_new_name_replaces_the_stored_one_at_the_next_session() {
+    let mut requester = test_requester();
+    let (pair_id, proxy_pairing) = paired(&mut requester, &[ProfileName::CardStatus]);
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut custodian =
+            custodian_session_named(&proxy_pairing, proxy_transport, RENAMED_CUSTODIAN);
+        custodian.report_card(present(CERTIFICATE));
+        assert_eq!(custodian.receive_close(), CloseReason::Complete);
+    });
+    let mut session = requester.connect(pair_id, requester_transport).unwrap();
+    assert_eq!(
+        requester
+            .store()
+            .get(pair_id)
+            .unwrap()
+            .peer_display_name()
+            .as_str(),
+        RENAMED_CUSTODIAN
+    );
+    requester.disconnect(&mut session, CloseReason::Complete);
+    proxy.join().unwrap();
+}
+
+#[test]
+fn the_phones_close_is_echoed_and_card_unavailable_withdraws_the_identity() {
+    let mut requester = test_requester();
+    let (pair_id, proxy_pairing) = paired(&mut requester, &[ProfileName::CardStatus]);
+    let (mut session, proxy) =
+        connected(&mut requester, pair_id, proxy_pairing, |mut custodian| {
+            let notice = custodian
+                .runtime
+                .close_with_reason(CloseReason::CardUnavailable)
+                .unwrap();
+            custodian.transport.send_frame(notice.as_bytes()).unwrap();
+            // The requester answers with the same reason (section 7.1 item
+            // 7), and the custodian's wait ends.
+            assert!(matches!(
+                custodian.receive(),
+                RuntimeReceive::CloseAcknowledged {
+                    reason: CloseReason::CardUnavailable,
+                    crossing: false,
+                }
+            ));
+        });
+    assert_eq!(
+        requester.service(&mut session, DEADLINE),
+        Err(SessionError::ClosedByPeer(CloseReason::CardUnavailable))
+    );
+    proxy.join().unwrap();
+    assert_eq!(
+        session.end().and_then(SessionEnd::treatment),
+        Some(RequesterSessionEnd::Withdrawn)
+    );
+    // A withdrawal keeps the pairing.
+    assert!(requester.store().get(pair_id).is_ok());
+}
+
+#[test]
+fn this_computers_close_waits_for_the_phones_echo() {
+    let mut requester = test_requester();
+    let (pair_id, proxy_pairing) = paired(&mut requester, &[ProfileName::CardStatus]);
+    let (echoed, echo_sent) = std::sync::mpsc::channel();
+    let (mut session, proxy) = connected(
+        &mut requester,
+        pair_id,
+        proxy_pairing,
+        move |mut custodian| {
+            assert_eq!(custodian.receive_close(), CloseReason::ServiceWithdrawn);
+            echoed.send(()).unwrap();
+        },
+    );
+    let started = Instant::now();
+    requester.disconnect(&mut session, CloseReason::ServiceWithdrawn);
+    echo_sent.recv().unwrap();
+    proxy.join().unwrap();
+    assert!(started.elapsed() < QUIT_BOUND);
+    assert_eq!(session.end(), Some(SessionEnd::LocalClose));
+    assert_eq!(session.end().and_then(SessionEnd::treatment), None);
+    assert!(requester.store().get(pair_id).is_ok());
 }

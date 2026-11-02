@@ -15,9 +15,11 @@
 //! The paired phone as a token source.
 //!
 //! One thread holds the session to the phone: it reads the pairing
-//! record another program keeps, dials while the record is usable, and
-//! keeps the session open, answering the phone's pings and reading its
-//! card reports (RAPP v26.10.29 sections 8.3 and 8.4). The slot's token is
+//! record another program keeps, looks for the phone while the record is
+//! usable, dials as the view of the phone says (RAPP v26.11.2 section 8.3:
+//! when the phone appears, when the browser asks with no session open,
+//! and within the redial window after a loss), and keeps the session open,
+//! answering the phone's pings and reading its card reports (section 8.4). The slot's token is
 //! the authentication certificate the record caches, confirmed against
 //! the fingerprint the phone reports for its card and read from the card
 //! afresh when the record lacks it or the phone serves another card. The
@@ -26,11 +28,15 @@
 //! at once when the pairing goes or a session reports another card
 //! (section 8.4 item 3). A signature asked for by the browser is handed to
 //! that thread and answered on the same session, dialing for one when
-//! none is open; that is the one thing the phone does. A pairing forgotten
-//! on this computer is told to the phone by that thread, on the session it
-//! holds or on the next one (section 4.6). The thread sweeps the pairings
-//! for idle expiry when it starts and daily (section 4.6 item 5); a pairing
-//! that expires takes its slot with it, silently.
+//! none is open; that is the one thing the phone does. A phone that
+//! withdrew, or closed with `card_unavailable`, takes the token at once
+//! and is not dialed until it announces itself again (section 4.5 item 6);
+//! a request meanwhile is refused at once. A pairing forgotten on this
+//! computer while the thread holds its session is told to the phone on
+//! that session (section 4.6 item 1); the program that forgot it makes the
+//! attempt otherwise. The thread sweeps the pairings for idle expiry when
+//! it starts and daily (section 4.6 item 5); a pairing that expires takes
+//! its slot with it, silently.
 //!
 //! The host finalizes the module when its user quits it or unloads the
 //! module, and that is this computer's withdrawal (section 4.5 item 8):
@@ -51,7 +57,7 @@ use refineid_pkcs11::remote::{
     RemoteOffer, RemoteSignError, RemoteTokenSource, SessionCertificate,
 };
 use refineid_pkcs11::slot_kind::RemoteSlotId;
-use refineid_rapp::{IDENTITY_OFFER_GRACE_MS, ResultError};
+use refineid_rapp::{IDENTITY_OFFER_GRACE_MS, RequesterSessionEnd, ResultError};
 use refineid_rapp_core::engine::{IDLE_SWEEP_INTERVAL, OperationOutcome, Withdrawal};
 use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::ids::{CertificateFingerprint, PairId};
@@ -62,13 +68,18 @@ use refineid_rapp_core::remote::{
     PairSummary, RemoteError, RemoteReader, RemoteSession, local_host_name,
 };
 use refineid_rapp_core::store::PairingState;
+use refineid_rapp_core::view::{ConsumerAnswer, CustodianView};
 use refineid_remote::{DisplayText, RemoteKeyProfile, RemoteSignatureAlgorithm, SignatureRequest};
 
-/// How long one dial browses for the phone and waits for its card.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long one dial browses for the phone beyond its first round: none,
+/// so a dial tries the phones in sight once.
+const DIAL_BROWSE: Duration = Duration::ZERO;
 
-/// The pause after a dial that found no phone or no card.
-const REDIAL_PAUSE: Duration = Duration::from_secs(10);
+/// The pause between looks for the phone while no session is held.
+const LOOK_PAUSE: Duration = Duration::from_secs(1);
+
+/// The pause while a card in a reader here suspends remote use.
+const SUSPENDED_PAUSE: Duration = Duration::from_secs(10);
 
 /// The pause while another program holds the phone session.
 const BUSY_PAUSE: Duration = Duration::from_secs(5);
@@ -82,8 +93,9 @@ const UNPAIRED_PAUSE: Duration = Duration::from_secs(3);
 const SERVICE_STEP: Duration = Duration::from_millis(250);
 
 /// Between readings of the record another program keeps, which may have
-/// forgotten the held pairing.
-const RECORD_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// forgotten the held pairing: well within the revocation attempt's bound,
+/// so the close leaves on the held session.
+const RECORD_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long the token stands on a confirmed certificate while no session
 /// reports the card present (section 8.4 item 3).
@@ -422,7 +434,7 @@ impl RemoteTokenSource for PhoneSource {
         }
     }
 
-    /// This computer withdraws (RAPP v26.10.29 section 4.5 item 8): the
+    /// This computer withdraws (RAPP v26.11.2 section 4.5 item 8): the
     /// thread writes the `service_withdrawn` close of its open session
     /// within a quarter of the quit bound and ends; a dial in progress ends
     /// at its next step without a notice.
@@ -506,25 +518,30 @@ fn computer_context() -> DisplayText {
 }
 
 /// The session thread over the pairing store in `store`: read the record,
-/// dial, read the certificate, hold, answer.
+/// look for the phone, dial as the view says, read the certificate, hold,
+/// answer.
 fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
     let mut idle_swept: Option<Instant> = None;
+    // The view of the phone, and the pairing it belongs to.
+    let mut view = CustodianView::new();
+    let mut viewed: Option<PairId> = None;
     while !shared.stopped() {
-        // A pairing that expires is no longer usable: the round below
-        // finds no phone and the slot goes. A refused store is swept again
-        // on the next round.
+        // A pairing that expires is gone: the round below finds no phone
+        // and the slot goes. A refused store is swept again on the next
+        // round.
         if idle_swept.is_none_or(|at| at.elapsed() >= IDLE_SWEEP_INTERVAL)
             && expire_idle_pairings(store)
         {
             idle_swept = Some(Instant::now());
         }
-        // A connected card reader with a card overrides RAPP.
-        // When a physical card is present in an attached reader, withdraw the phone slot.
+        // A connected card reader with a card overrides RAPP: remote use
+        // is suspended, and resumes with a fresh look when the card goes.
         if refineid_lib_pcsc::presence_signature()
             .is_ok_and(|sig| sig.iter().any(|(_, present)| *present))
         {
             unpaired(shared, requests);
-            pause(shared, REDIAL_PAUSE);
+            viewed = None;
+            pause(shared, SUSPENDED_PAUSE);
             continue;
         }
 
@@ -538,13 +555,18 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
         };
         let Some(phone) = reader.phone() else {
             unpaired(shared, requests);
-            reader.deliver_revocation_notices();
+            viewed = None;
             continue;
         };
         let Some(slot) = slot_id(&phone) else {
             unpaired(shared, requests);
+            viewed = None;
             continue;
         };
+        if viewed != Some(phone.pair_id) {
+            view = CustodianView::new();
+            viewed = Some(phone.pair_id);
+        }
         // The slot stands while the pairing does, and so does its token,
         // on the certificate a session confirmed, for the grace without a
         // session: a browser that asks before the session is open is given
@@ -558,32 +580,78 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
             phone.auth_cert.clone(),
             Instant::now(),
         );
-        // A phone this computer forgot is told so on a session of its own
-        // when it is in sight (section 4.6 item 2).
-        reader.deliver_revocation_notices();
-        // A request that woke the pause has this dial; one that arrives
-        // during the dial makes a failed dial try once more at once,
-        // and the pause follows only when no request arrived.
-        shared.wanted.store(false, Ordering::Release);
-        match reader.dial_session(phone.pair_id, DIAL_TIMEOUT) {
+        if !dial_due(shared, requests, &reader, &phone, &mut view) {
+            pause(shared, LOOK_PAUSE);
+            continue;
+        }
+        match reader.dial_session(phone.pair_id, DIAL_BROWSE) {
             Ok(session) => {
-                match hold(shared, requests, store, &mut reader, session, &phone, slot) {
+                view.dial_succeeded();
+                let held = hold(shared, requests, store, &mut reader, session, &phone, slot);
+                match held.after {
                     After::Grace => shared.token(|offering| offering.unconfirmed(Instant::now())),
                     After::Withdraw => shared.token(Offering::withdrawn),
                 }
+                match held.end {
+                    Some(end) => view.session_ended(end, Instant::now()),
+                    None => view.closed_here(),
+                }
             }
-            Err(RemoteError::Busy) => pause(shared, BUSY_PAUSE),
-            // The phone announced that it stopped serving: its presence
-            // goes at once (section 4.5 item 6).
-            Err(RemoteError::Withdrawn) => {
-                shared.token(Offering::withdrawn);
-                pause(shared, REDIAL_PAUSE);
+            // Another program here holds the phone: a dial that ended
+            // before `session.ready`, redialed within the window.
+            Err(RemoteError::Busy) => {
+                view.dial_failed(Instant::now());
+                pause(shared, BUSY_PAUSE);
             }
-            Err(_) if shared.wanted() => {}
-            Err(_) => pause(shared, REDIAL_PAUSE),
+            Err(error) => match error.session_end() {
+                // The phone forgot this computer, stopped serving or can
+                // serve no card: its presence goes at once (sections 4.5
+                // item 6 and 4.6 item 4).
+                Some(end @ (RequesterSessionEnd::Revoked | RequesterSessionEnd::Withdrawn)) => {
+                    shared.token(Offering::withdrawn);
+                    view.session_ended(end, Instant::now());
+                }
+                Some(RequesterSessionEnd::Violation) => {
+                    view.session_ended(RequesterSessionEnd::Violation, Instant::now());
+                }
+                Some(RequesterSessionEnd::Loss) | None => view.dial_failed(Instant::now()),
+            },
         }
     }
     shared.withdraw_slot();
+}
+
+/// One look for the phone, and whether a dial follows it (section 8.3): the
+/// phone appeared, a redial within the window is due, or the browser asked
+/// with no session open. A phone that withdrew takes the token at once,
+/// and a request meanwhile is refused at once (section 4.5 item 6).
+fn dial_due(
+    shared: &Shared,
+    requests: &Receiver<SignRequest>,
+    reader: &RemoteReader,
+    phone: &PairSummary,
+    view: &mut CustodianView,
+) -> bool {
+    let appeared = match reader.look(phone.pair_id) {
+        Ok(instances) => view.looked(instances),
+        Err(RemoteError::Withdrawn) => {
+            view.withdrawal_seen();
+            shared.token(Offering::withdrawn);
+            false
+        }
+        Err(_) => false,
+    };
+    let redial = view.redial_due(Instant::now());
+    // A request that woke the pause has this dial; one that arrives during
+    // the dial asks for the next.
+    let wanted = shared.wanted.swap(false, Ordering::AcqRel);
+    let asked = wanted && view.consumer_request() == ConsumerAnswer::Dial;
+    if wanted && !asked {
+        while let Ok(request) = requests.try_recv() {
+            refuse(&request, RemoteSignError::Withdrawn);
+        }
+    }
+    appeared || redial || asked
 }
 
 /// Sweeps the pairings in `store` for idle expiry (section 4.6 item 5);
@@ -608,6 +676,14 @@ fn unpaired(shared: &Shared, requests: &Receiver<SignRequest>) {
 fn refuse(request: &SignRequest, error: RemoteSignError) {
     refineid_dev_errors::report!(Pkcs11, "signature request failed", error);
     let _ = request.reply.send(Err(error));
+}
+
+/// How a held session ended: what the token does, and how the session's
+/// end is treated (section 4.5 item 6), `None` for a close this computer
+/// sent for its own reasons.
+struct Held {
+    after: After,
+    end: Option<RequesterSessionEnd>,
 }
 
 /// What the token does once a held session has ended.
@@ -675,7 +751,7 @@ fn hold(
     mut session: RemoteSession,
     phone: &PairSummary,
     slot: RemoteSlotId,
-) -> After {
+) -> Held {
     let mut confirmed: Option<Confirmed> = None;
     // The card a confirmation was last tried for: a failed read is not
     // tried again until the phone reports a card anew.
@@ -684,7 +760,10 @@ fn hold(
     loop {
         if shared.stopped() {
             reader.withdraw_session(session);
-            return After::Grace;
+            return Held {
+                after: After::Grace,
+                end: None,
+            };
         }
         let event = card_event(
             session.card_fingerprint(),
@@ -721,8 +800,9 @@ fn hold(
                         }
                         Err(error) => {
                             if let Some(after) = ended_by(&error) {
+                                let end = session.end_treatment();
                                 reader.close_session(session);
-                                return after;
+                                return Held { after, end };
                             }
                         }
                     }
@@ -772,7 +852,10 @@ fn hold(
                             refuse(&request, RemoteSignError::Ambiguous);
                             let _ = reader.forget_auth_cert(phone.pair_id);
                             reader.close_session(session);
-                            return After::Withdraw;
+                            return Held {
+                                after: After::Withdraw,
+                                end: None,
+                            };
                         }
                         // A check that cannot run says nothing of the
                         // card: the request is refused and the cache kept.
@@ -785,12 +868,20 @@ fn hold(
                                 // The phone stopped serving or forgot this
                                 // computer: its presence goes at once.
                                 RemoteSignError::Withdrawn => {
+                                    let end = session.end_treatment();
                                     reader.close_session(session);
-                                    return After::Withdraw;
+                                    return Held {
+                                        after: After::Withdraw,
+                                        end,
+                                    };
                                 }
                                 RemoteSignError::Unreachable => {
+                                    let end = session.end_treatment();
                                     reader.close_session(session);
-                                    return After::Grace;
+                                    return Held {
+                                        after: After::Grace,
+                                        end,
+                                    };
                                 }
                                 _ => {}
                             }
@@ -802,7 +893,10 @@ fn hold(
             // Only the module's stop drops the request channel.
             Err(RecvTimeoutError::Disconnected) => {
                 reader.withdraw_session(session);
-                return After::Grace;
+                return Held {
+                    after: After::Grace,
+                    end: None,
+                };
             }
         }
         if record_checked.elapsed() >= RECORD_CHECK_INTERVAL {
@@ -811,20 +905,37 @@ fn hold(
                 HeldRecord::Usable | HeldRecord::Unreadable => {}
                 HeldRecord::Forgotten => {
                     reader.revoke_in_session(session);
-                    return After::Withdraw;
+                    return Held {
+                        after: After::Withdraw,
+                        end: Some(RequesterSessionEnd::Revoked),
+                    };
                 }
                 HeldRecord::Gone => {
                     reader.close_session(session);
-                    return After::Withdraw;
+                    return Held {
+                        after: After::Withdraw,
+                        end: None,
+                    };
                 }
             }
         }
         match reader.service(&mut session, SERVICE_STEP) {
             Ok(()) => {}
-            // The phone forgot this computer or stopped serving: the
-            // token goes at once (sections 4.6 item 4 and 4.5 item 6).
-            Err(RemoteError::RevokedByPhone | RemoteError::Withdrawn) => return After::Withdraw,
-            Err(_) => return After::Grace,
+            // The phone forgot this computer, stopped serving or can serve
+            // no card: the token goes at once (sections 4.6 item 4 and 4.5
+            // item 6).
+            Err(RemoteError::RevokedByPhone | RemoteError::Withdrawn) => {
+                return Held {
+                    after: After::Withdraw,
+                    end: session.end_treatment(),
+                };
+            }
+            Err(_) => {
+                return Held {
+                    after: After::Grace,
+                    end: session.end_treatment(),
+                };
+            }
         }
     }
 }
@@ -835,7 +946,8 @@ enum HeldRecord {
     /// The record still names the pairing as usable.
     Usable,
     /// This computer's user forgot the pairing, or a new pairing
-    /// superseded it (RAPP v26.10.29 section 4.6): the phone is told.
+    /// superseded it (RAPP v26.11.2 section 4.6 item 6): the phone is told
+    /// on the held session.
     Forgotten,
     /// The store reads but holds no usable record of the pairing: the
     /// record is gone or no longer decodes. That is no forget, so the
@@ -1025,13 +1137,13 @@ fn pause(shared: &Shared, duration: Duration) {
 mod tests {
     use super::*;
     use refineid_rapp::{
-        EndpointRole, PAIR_ID_SIZE, PAIRING_IDLE_EXPIRY_MS, PairRecord, ProfileName,
+        DisplayName, EndpointRole, PAIR_ID_SIZE, PAIRING_IDLE_EXPIRY_MS, PairRecord, ProfileName,
         compute_grants_hash, generate_pair_key_material,
     };
     use refineid_rapp_core::engine::current_time_ms;
     use refineid_rapp_core::remote::CardRequest;
     use refineid_rapp_core::session_lock::{SessionLock, session_lock_path};
-    use refineid_rapp_core::store::{PairingRecord, PairingStore as _, PeerIntroduction};
+    use refineid_rapp_core::store::{PairingRecord, PairingStore as _};
 
     const DIGEST_SHA384_LEN: usize = 48;
 
@@ -1415,20 +1527,17 @@ mod tests {
                     *peer.public_key(),
                     grants_hash,
                     profiles,
+                    DisplayName::parse("Alpha Phone".to_owned()).expect("a valid name"),
                     LONG_AGO_MS,
                 )
             })
             .expect("a valid record");
-        let phone = PeerIntroduction {
-            display_name: "Alpha Phone".to_owned(),
-            platform: "iOS".to_owned(),
-        };
-        PairingRecord::new(pairing, phone).expect("a requester record")
+        PairingRecord::new(pairing, "iOS".to_owned()).expect("a requester record")
     }
 
-    /// The state of [`PAIR_ID`] in `store`, once it reads as `state` or
-    /// [`SWEEP_WAIT`] passed.
-    fn state_within_wait(store: &Path, state: PairingState) -> Option<PairingState> {
+    /// The state of [`PAIR_ID`] in `store`, once it reads as `state`, `None`
+    /// for no record, or [`SWEEP_WAIT`] passed.
+    fn state_within_wait(store: &Path, state: Option<PairingState>) -> Option<PairingState> {
         let deadline = Instant::now() + SWEEP_WAIT;
         loop {
             let read = FilePairingStore::open_without_sweep(store)
@@ -1439,7 +1548,7 @@ mod tests {
                         .ok()
                         .map(PairingRecord::state)
                 });
-            if read == Some(state) || Instant::now() >= deadline {
+            if read == state || Instant::now() >= deadline {
                 return read;
             }
             thread::sleep(SWEEP_LOOK);
@@ -1498,11 +1607,8 @@ mod tests {
         let _ = source.offered();
         assert!(source.worker.lock().expect("worker").is_some());
         // The thread swept the test's store at its start: the pairing idle
-        // past the limit expired there.
-        assert_eq!(
-            state_within_wait(&store, PairingState::Revoking),
-            Some(PairingState::Revoking)
-        );
+        // past the limit expired there, its record gone with its key.
+        assert_eq!(state_within_wait(&store, None), None);
         let run = source.shared.withdrawal();
         source.stop();
         // The run withdrew; the next one starts with its own withdrawal

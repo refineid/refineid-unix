@@ -3,5 +3,5 @@
 pub use refineid_rapp::{
     CardInspection, CardKeyProfile, CardKeyProfile as KeyProfile, CardOperation,
     CardOperationError, CardOperationError as OperationError, CardOperationResult, CertificateKind,
-    CredentialKind, OperationRequest, SignatureAlgorithm,
+    ContainedFiles, CredentialKind, OperationRequest, SignatureAlgorithm,
 };
