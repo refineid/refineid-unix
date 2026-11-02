@@ -1,11 +1,13 @@
-//! The requester engine: the workstation side of RAPP v26.10.29.
+//! The requester engine: the workstation side of RAPP v26.11.2.
 //!
 //! The engine drives pairing, sessions, and operations through the
 //! canonical protocol boundaries of `refineid_rapp`: the tries of a typed
 //! code across the custodians in pairing mode (section 4.2), the session
-//! handshake and the custodian's `session.ready` (section 7.1 item 5), the
-//! liveness rule of section 8.3, the requester operation engine of section
-//! 8, and the revocation and idle expiry of section 4.6. Nothing of an
+//! handshake, the custodian's `session.ready` and this computer's
+//! `session.hello` (section 7.1 items 5 and 6), the acknowledged close of
+//! item 7, the liveness rule of section 8.3, the requester operation
+//! engine of section 8, and the revocation and idle expiry of section
+//! 4.6. Nothing of an
 //! operation outlives its session: a lost result is asked for again as a new
 //! operation.
 //!
@@ -27,12 +29,13 @@ use crate::operations::{CardOperation, CardOperationResult, OperationError};
 use crate::store::{PairingRecord, PairingStore, PeerIntroduction, RecordError, StoreError};
 use crate::transport::{BinaryFrame, FrameTransport, TransportError};
 use refineid_rapp::{
-    ActivePairing, EndpointRole, EstablishedSessionRuntime, ExplicitUserIntent, NextCandidate,
-    NextEndpoint, OperationRequest, OperationViolation, PairingCandidates, PairingCode,
-    PairingHandshake, PairingSecret, PairingState, PairingStorage, PingChallenge, ProfileName,
-    ReadyOutcome, RequesterDispatch, RequesterEngineError, RequesterOperationEngine, RuntimePoll,
-    RuntimeReceive, SessionAuthentication, SessionHandshake, SweepError, SweepOutcome,
-    TransportProfile, generate_pair_key_material,
+    ActivePairing, CloseEcho, DisplayName, EndpointRole, EstablishedSessionRuntime,
+    ExplicitUserIntent, NextCandidate, NextEndpoint, OperationRequest, OperationViolation,
+    PairingCandidates, PairingCode, PairingHandshake, PairingSecret, PairingState, PairingStorage,
+    PingChallenge, ProfileName, ReadyOutcome, RecordStoreError, RequesterDispatch,
+    RequesterEngineError, RequesterOperationEngine, RequesterSessionEnd, RuntimePoll,
+    RuntimeReceive, SessionAuthentication, SessionHandshake, SweepOutcome, TransportProfile,
+    generate_pair_key_material,
 };
 
 /// How long one receive waits before the liveness clock is read again: a
@@ -40,9 +43,9 @@ use refineid_rapp::{
 /// within one tick of that.
 const LIVENESS_TICK: Duration = Duration::from_secs(1);
 
-/// How long a revocation close waits for the phone to close its side, so
-/// the phone reads the close before this side's socket goes.
-const CLOSE_LINGER: Duration = Duration::from_secs(2);
+/// How long a close sent on an open session waits for the phone's echo
+/// (section 7.1 item 7, `quit_withdrawal_bound_ms`).
+const CLOSE_ECHO_WAIT: Duration = Duration::from_millis(refineid_rapp::QUIT_WITHDRAWAL_BOUND_MS);
 
 /// How many times a wait on an open session looks for this computer's
 /// withdrawal within the quit bound.
@@ -58,11 +61,11 @@ const WITHDRAWAL_POLL: Duration =
 const SECONDS_PER_DAY: u64 = 86_400;
 
 /// How often a program that runs sweeps its pairings for idle expiry, and
-/// notes the time of a session it holds open: once a day (RAPP v26.10.29
+/// notes the time of a session it holds open: once a day (RAPP v26.11.2
 /// section 4.6 item 5).
 pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(SECONDS_PER_DAY);
 
-/// This computer's withdrawal from remote use (RAPP v26.10.29 section 4.5
+/// This computer's withdrawal from remote use (RAPP v26.11.2 section 4.5
 /// item 8), raised once from any thread. A requester that follows it closes
 /// its open session with `service_withdrawn` within a quarter of
 /// `QUIT_WITHDRAWAL_BOUND_MS` of the raise, whatever the session waits for,
@@ -89,17 +92,18 @@ impl Withdrawal {
     }
 }
 
-/// Local labels sent inside `pairing.hello`. Labels, not identities.
+/// Local labels sent inside `pairing.hello`, and the name again in every
+/// `session.hello` (section 4.3 items 3 and 4). Labels, not identities.
 #[derive(Clone, Debug)]
 pub struct RequesterConfig {
-    /// The display label shown on the proxy.
-    pub display_name: String,
-    /// The platform label shown on the proxy.
+    /// The name the phone shows for this computer.
+    pub display_name: DisplayName,
+    /// The platform label shown on the phone.
     pub platform: String,
 }
 
 /// Uniform bytes drawn for the `CPace` initiator's scalar (RAPP
-/// v26.10.29 section 6.1.1: 64 uniform bytes reduced modulo the group
+/// v26.11.2 section 6.1.1: 64 uniform bytes reduced modulo the group
 /// order).
 const CPACE_SCALAR_ENTROPY_BYTES: usize = 64;
 
@@ -174,7 +178,7 @@ impl core::fmt::Display for PairingError {
 
 impl core::error::Error for PairingError {}
 
-/// Why a typed code paired with no custodian (RAPP v26.10.29 section 4.2,
+/// Why a typed code paired with no custodian (RAPP v26.11.2 section 4.2,
 /// "Trying Each Custodian in Pairing Mode").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairingSearchError {
@@ -207,7 +211,7 @@ impl core::error::Error for PairingSearchError {}
 /// Where a requester finds the custodians a typed code is tried with.
 ///
 /// A source names the endpoints it finds in pairing mode and opens a
-/// pairing connection to one (RAPP v26.10.29 section 4.2, "Trying Each
+/// pairing connection to one (RAPP v26.11.2 section 4.2, "Trying Each
 /// Custodian in Pairing Mode").
 pub trait PairingCandidateSource {
     /// How the source names an endpoint it found.
@@ -228,7 +232,7 @@ pub trait PairingCandidateSource {
 }
 
 /// What a custodian in pairing mode answered on a pairing connection
-/// (RAPP v26.10.29 section 4.2, "Bootstrap Read Flow" item 3).
+/// (RAPP v26.11.2 section 4.2, "Bootstrap Read Flow" item 3).
 #[derive(Debug)]
 pub enum PairingConnection<Transport> {
     /// The custodian serves its offer: `CPace` may run on the connection.
@@ -373,7 +377,7 @@ impl core::fmt::Display for AdmissionError {
 
 impl core::error::Error for AdmissionError {}
 
-/// How a finished operation ended (RAPP v26.10.29 section 8).
+/// How a finished operation ended (RAPP v26.11.2 section 8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationOutcome {
     /// The result arrived and answers the request.
@@ -406,6 +410,23 @@ pub enum SessionEnd {
     /// The phone's authenticated traffic violated the protocol; the
     /// session closed with `protocol_violation`.
     Violation,
+}
+
+impl SessionEnd {
+    /// How this computer treats a session that ended so (section 4.5 item
+    /// 6, "How a session ends"); `None` for a close this computer sent for
+    /// its own reasons.
+    #[must_use]
+    pub const fn treatment(self) -> Option<RequesterSessionEnd> {
+        match self {
+            Self::LocalClose => None,
+            Self::PeerClose(reason) => Some(RequesterSessionEnd::of_received_close(Some(reason))),
+            Self::TransportLoss | Self::IntegrityFailure => {
+                Some(RequesterSessionEnd::of_received_close(None))
+            }
+            Self::Violation => Some(RequesterSessionEnd::of_detected_violation()),
+        }
+    }
 }
 
 /// One healthy session: its transport, its runtime with the liveness
@@ -476,12 +497,40 @@ impl<Transport: FrameTransport> Session<Transport> {
         self.established.store(false, Ordering::Release);
     }
 
-    /// Delivers a sealed close, best effort, and finishes the session.
-    fn close_with(&mut self, notice: Option<BinaryFrame>, end: SessionEnd) {
-        if let Some(notice) = notice {
-            let _ = self.transport.send_frame(notice.as_bytes());
+    /// Delivers a sealed close, best effort, waits for its echo within
+    /// [`CLOSE_ECHO_WAIT`] (section 7.1 item 7), and finishes the session
+    /// as `end`, or as the phone's own close when one crossed it. Returns
+    /// the reason of a crossing close, which the caller acts on.
+    fn close_with(&mut self, notice: Option<BinaryFrame>, end: SessionEnd) -> Option<CloseReason> {
+        let sent =
+            notice.is_some_and(|notice| self.transport.send_frame(notice.as_bytes()).is_ok());
+        let crossing = if sent { self.await_echo() } else { None };
+        self.finish(crossing.map_or(end, SessionEnd::PeerClose));
+        crossing
+    }
+
+    /// Reads the phone's frames until the echo of this side's close
+    /// arrives or [`CLOSE_ECHO_WAIT`] passes, ignoring everything but a
+    /// close; never answers it. Returns the reason of a close that
+    /// crossed this side's.
+    fn await_echo(&mut self) -> Option<CloseReason> {
+        let deadline = Instant::now() + CLOSE_ECHO_WAIT;
+        while self.runtime.awaits_close_echo() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || self.transport.set_receive_deadline(remaining).is_err() {
+                return None;
+            }
+            let frame = BinaryFrame::reconstruct(self.transport.receive_frame().ok()?).ok()?;
+            let now_ms = self.clock_ms();
+            match self.runtime.receive(&frame, now_ms) {
+                Ok(RuntimeReceive::CloseAcknowledged { reason, crossing }) => {
+                    return crossing.then_some(reason);
+                }
+                Ok(RuntimeReceive::IgnoredWhileClosing) => {}
+                _ => return None,
+            }
         }
-        self.finish(end);
+        None
     }
 }
 
@@ -541,7 +590,7 @@ impl<Store: PairingStore> Requester<Store> {
     }
 
     /// Pairs with the custodian showing `code`, trying in turn each
-    /// custodian `source` finds in pairing mode (RAPP v26.10.29 sections 3,
+    /// custodian `source` finds in pairing mode (RAPP v26.11.2 sections 3,
     /// 4.2 and 6), and returns the pairing with the endpoint it was made
     /// on.
     ///
@@ -869,7 +918,8 @@ impl<Store: PairingStore> Requester<Store> {
         let (pair_record, storage) = confirmation
             .into_storage(now_ms)
             .map_err(|_| PairingError::Channel)?;
-        let local_record = PairingRecord::new(pair_record, intro).map_err(PairingError::Record)?;
+        let local_record =
+            PairingRecord::new(pair_record, intro.platform).map_err(PairingError::Record)?;
         confirmation_deadline.check()?;
         self.store
             .insert(local_record)
@@ -962,15 +1012,27 @@ impl<Store: PairingStore> Requester<Store> {
         let first = transport.receive_frame().map_err(SessionError::Transport)?;
         let first = BinaryFrame::reconstruct(first)
             .map_err(|_| SessionError::Transport(TransportError::Failed))?;
-        match authentication.receive_ready(&first, current_time_ms()) {
-            Ok(ReadyOutcome::Verified) => {}
-            Ok(ReadyOutcome::PeerClosed(reason)) => {
+        let custodian_name = match authentication.receive_ready(&first, current_time_ms()) {
+            Ok(ReadyOutcome::Verified { custodian_name }) => custodian_name,
+            Ok(ReadyOutcome::PeerClosed { reason, echo }) => {
+                if let Some(echo) = echo {
+                    let _ = transport.send_frame(echo.as_bytes());
+                }
                 self.apply_peer_close_reason(pair_id, reason);
                 return Err(SessionError::ClosedByPeer(reason));
             }
             Ok(ReadyOutcome::ViolationClosed { notice, .. }) => {
-                if let Some(notice) = notice {
-                    let _ = transport.send_frame(notice.as_bytes());
+                if let Some(notice) = notice
+                    && transport.send_frame(notice.as_bytes()).is_ok()
+                {
+                    let crossing = await_close_echo(
+                        &mut authentication,
+                        &mut transport,
+                        Instant::now() + CLOSE_ECHO_WAIT,
+                    );
+                    if let Some(reason) = crossing {
+                        self.apply_peer_close_reason(pair_id, reason);
+                    }
                 }
                 return Err(SessionError::Violation);
             }
@@ -978,7 +1040,19 @@ impl<Store: PairingStore> Requester<Store> {
                 return Err(SessionError::Transport(TransportError::Failed));
             }
             Err(_) => return Err(SessionError::EngineFault),
+        };
+        // The phone's current name replaces the stored one; a store that
+        // refuses keeps the old name, and the next session tries again
+        // (section 4.3 item 4).
+        if let Err(error) = self.store.rename_peer(pair_id, &custodian_name) {
+            refineid_dev_errors::report!(Rapp, "phone name not stored", error);
         }
+        let hello = authentication
+            .send_hello(&self.config.display_name)
+            .map_err(|_| SessionError::EngineFault)?;
+        transport
+            .send_frame(hello.as_bytes())
+            .map_err(SessionError::Transport)?;
         let endpoint = authentication
             .into_established()
             .map_err(|_| SessionError::EngineFault)?;
@@ -1030,22 +1104,22 @@ impl<Store: PairingStore> Requester<Store> {
     }
 
     /// Tells the custodian that this computer forgot the pairing (section
-    /// 4.6 item 2): completes the session handshake, sends `session.close`
-    /// with reason `pairing_revoked` as the session's first message, and
-    /// destroys the pairing's key. No card session starts.
+    /// 4.6 items 2 and 6): completes the session handshake, sends
+    /// `session.close` with reason `pairing_revoked` as the session's first
+    /// message, waits for the custodian's echo until `deadline` (section
+    /// 7.1 item 7), and destroys the pairing's key. No card session starts.
+    /// Returns whether the echo arrived.
     ///
     /// # Errors
     /// [`SessionError`] on an unknown pairing, one that was not forgotten,
-    /// a failed handshake, transport loss, or this computer's withdrawal;
-    /// the key is kept for a later session.
+    /// a failed handshake or transport loss before the close was sent; the
+    /// key stays until the attempt's bound passes.
     pub fn send_revocation_notice<Transport: FrameTransport>(
         &mut self,
         pair_id: PairId,
         mut transport: Transport,
-    ) -> Result<(), SessionError> {
-        if self.withdrawn() {
-            return Err(SessionError::WithdrawnHere);
-        }
+        deadline: Instant,
+    ) -> Result<bool, SessionError> {
         let record = self
             .store
             .get(pair_id)
@@ -1060,9 +1134,9 @@ impl<Store: PairingStore> Requester<Store> {
         transport
             .send_frame(notice.as_bytes())
             .map_err(SessionError::Transport)?;
-        linger(&mut transport);
+        let echo = await_close_echo(&mut authentication, &mut transport, deadline);
         let _ = self.store.remove(pair_id);
-        Ok(())
+        Ok(echo.is_some())
     }
 
     /// Runs the `Noise_KK` handshake for `pair_id` as initiator and enters
@@ -1192,16 +1266,18 @@ impl<Store: PairingStore> Requester<Store> {
             return;
         }
         let notice = session.runtime.close_with_reason(reason).ok();
-        session.close_with(notice, SessionEnd::LocalClose);
+        if let Some(crossing) = session.close_with(notice, SessionEnd::LocalClose) {
+            self.apply_peer_close_reason(session.pair_id, crossing);
+        }
         self.note_end(session);
     }
 
     /// Tells the custodian on `session` that this computer forgot the
-    /// pairing (section 4.6 item 1): sends `session.close` with reason
-    /// `pairing_revoked` and closes the session. Once the close is sent,
-    /// the key of a record the store durably holds as forgotten is
-    /// destroyed (item 3); a session that already ended leaves the record
-    /// for the next session's notice.
+    /// pairing (section 4.6 items 1 and 6): sends `session.close` with
+    /// reason `pairing_revoked`, waits at most the quit bound for the
+    /// echo, and closes the session; the key of a record the store durably
+    /// holds as forgotten is then destroyed (item 3). A session that
+    /// already ended leaves the record to the attempt's bound.
     pub fn revoke_in_session<Transport: FrameTransport>(
         &mut self,
         session: &mut Session<Transport>,
@@ -1209,14 +1285,12 @@ impl<Store: PairingStore> Requester<Store> {
         if session.end.is_some() {
             return;
         }
-        let sent = session
+        let notice = session
             .runtime
             .close_with_reason(CloseReason::PairingRevoked)
-            .is_ok_and(|notice| session.transport.send_frame(notice.as_bytes()).is_ok());
-        if sent {
-            linger(&mut session.transport);
-        }
-        session.finish(SessionEnd::LocalClose);
+            .ok();
+        let sent = notice.is_some();
+        let _ = session.close_with(notice, SessionEnd::LocalClose);
         self.note_end(session);
         if sent {
             let _ = self.store.update(session.pair_id, &mut |record| {
@@ -1363,7 +1437,10 @@ impl<Store: PairingStore> Requester<Store> {
                 Ok(None)
             }
             RuntimeReceive::LivenessConfirmed | RuntimeReceive::IgnoredStalePong => Ok(None),
-            RuntimeReceive::PeerClosed(reason) => {
+            RuntimeReceive::PeerClosed { reason, echo } => {
+                if let Some(echo) = echo {
+                    let _ = session.transport.send_frame(echo.as_bytes());
+                }
                 session.finish(SessionEnd::PeerClose(reason));
                 self.apply_peer_close_reason(session.pair_id, reason);
                 Err(SessionError::ClosedByPeer(reason))
@@ -1373,15 +1450,35 @@ impl<Store: PairingStore> Requester<Store> {
                 Err(SessionError::Transport(TransportError::Failed))
             }
             RuntimeReceive::ViolationClosed { notice, .. } => {
-                session.close_with(notice, SessionEnd::Violation);
-                Err(SessionError::Violation)
+                self.close_for_violation(session, notice)
             }
-            RuntimeReceive::Message(message) => Self::dispatch(session, message),
+            // This side waits for no echo outside a close it sent, and the
+            // close it sent finished the session.
+            RuntimeReceive::CloseAcknowledged { .. } | RuntimeReceive::IgnoredWhileClosing => {
+                session.finish(SessionEnd::LocalClose);
+                Err(SessionError::EngineFault)
+            }
+            RuntimeReceive::Message(message) => self.dispatch(session, message),
         }
+    }
+
+    /// Closes `session` for the phone's authenticated protocol violation
+    /// with `notice`, the sealed `protocol_violation` close, and waits for
+    /// its echo; the pairing stays (section 10.1 item 2).
+    fn close_for_violation<Transport: FrameTransport>(
+        &mut self,
+        session: &mut Session<Transport>,
+        notice: Option<BinaryFrame>,
+    ) -> Result<Option<RequesterDispatch>, SessionError> {
+        if let Some(crossing) = session.close_with(notice, SessionEnd::Violation) {
+            self.apply_peer_close_reason(session.pair_id, crossing);
+        }
+        Err(SessionError::Violation)
     }
 
     /// Hands one authenticated message to the session's operation engine.
     fn dispatch<Transport: FrameTransport>(
+        &mut self,
         session: &mut Session<Transport>,
         message: refineid_rapp::TypedMessage,
     ) -> Result<Option<RequesterDispatch>, SessionError> {
@@ -1396,8 +1493,7 @@ impl<Store: PairingStore> Requester<Store> {
                     .runtime
                     .close_with_reason(CloseReason::ProtocolViolation)
                     .ok();
-                session.close_with(notice, SessionEnd::Violation);
-                Err(SessionError::Violation)
+                self.close_for_violation(session, notice)
             }
             Ok(dispatch) => Ok(Some(dispatch)),
             Err(RequesterEngineError::AuthenticatedProtocolViolation(violation)) => {
@@ -1408,8 +1504,7 @@ impl<Store: PairingStore> Requester<Store> {
                     RuntimeReceive::ViolationClosed { notice, .. } => notice,
                     _ => None,
                 };
-                session.close_with(notice, SessionEnd::Violation);
-                Err(SessionError::Violation)
+                self.close_for_violation(session, notice)
             }
             Err(_) => {
                 session.finish(SessionEnd::Violation);
@@ -1488,9 +1583,8 @@ impl<Store: PairingStore> Requester<Store> {
     /// Sweeps every stored pairing for idle expiry at `now_ms`, the wall
     /// clock (section 4.6 item 5). A pairing in a session this engine holds
     /// has the time noted; any other that had no session for
-    /// [`refineid_rapp::PAIRING_IDLE_EXPIRY_MS`] expires: it serves nothing
-    /// from then on and keeps its key only for the close of items 2 to 4.
-    /// Nothing is sent. A session another program on this computer holds
+    /// [`refineid_rapp::PAIRING_IDLE_EXPIRY_MS`] expires, and its key and
+    /// record are destroyed at once (item 6). Nothing is sent. A session another program on this computer holds
     /// is not seen here; that program notes its time daily. Returns how
     /// many expired.
     ///
@@ -1504,12 +1598,19 @@ impl<Store: PairingStore> Requester<Store> {
         for pair_id in self.store.pair_ids() {
             let established = self.in_session(pair_id);
             match self.store.sweep(pair_id, now_ms, established) {
-                Ok(SweepOutcome::Expired) => expired += 1,
+                Ok(SweepOutcome::Expired) => {
+                    expired += 1;
+                    // An expired pairing sends nothing: no revocation
+                    // attempt follows it.
+                    if let Err(error) = self.store.remove(pair_id) {
+                        refused = Some(error);
+                    }
+                }
                 Ok(SweepOutcome::Recorded | SweepOutcome::Kept) => {}
                 // Another program removed the record meanwhile.
-                Err(SweepError::Store(StoreError::Unknown)) => {}
-                Err(SweepError::Store(error)) => refused = Some(error),
-                Err(SweepError::Encoding(_)) => refused = Some(StoreError::WriteRefused),
+                Err(RecordStoreError::Store(StoreError::Unknown)) => {}
+                Err(RecordStoreError::Store(error)) => refused = Some(error),
+                Err(RecordStoreError::Encoding(_)) => refused = Some(StoreError::WriteRefused),
             }
         }
         refused.map_or(Ok(expired), Err)
@@ -1548,14 +1649,27 @@ impl<Store: PairingStore> Requester<Store> {
     }
 }
 
-/// Waits up to [`CLOSE_LINGER`] for the peer to close its side after a
-/// close this side sent, discarding whatever it still sends.
-fn linger<Transport: FrameTransport>(transport: &mut Transport) {
-    if transport.set_receive_deadline(CLOSE_LINGER).is_err() {
-        return;
+/// Reads the phone's frames on `authentication`, a session that sent its
+/// close in place of `session.hello`, until the echo arrives or `deadline`
+/// passes, ignoring everything but a close (section 7.1 item 7). Returns
+/// the echo's reason, or `None` when no close arrived.
+fn await_close_echo<Transport: FrameTransport>(
+    authentication: &mut SessionAuthentication,
+    transport: &mut Transport,
+    deadline: Instant,
+) -> Option<CloseReason> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || transport.set_receive_deadline(remaining).is_err() {
+            return None;
+        }
+        let frame = BinaryFrame::reconstruct(transport.receive_frame().ok()?).ok()?;
+        match authentication.receive_close_echo(&frame, current_time_ms()) {
+            Ok(CloseEcho::Acknowledged { reason, .. }) => return Some(reason),
+            Ok(CloseEcho::Ignored) => {}
+            Ok(CloseEcho::Closed) | Err(_) => return None,
+        }
     }
-    let deadline = Instant::now() + CLOSE_LINGER;
-    while Instant::now() < deadline && transport.receive_frame().is_ok() {}
 }
 
 /// A monotonic deadline for one post-PAKE pairing phase (section 3.3).

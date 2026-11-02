@@ -18,7 +18,7 @@ use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
-use refineid_rapp::{SweepError, SweepOutcome};
+use refineid_rapp::{DisplayName, RecordStoreError, SweepOutcome};
 use zeroize::Zeroizing;
 
 use crate::ids::PairId;
@@ -239,6 +239,39 @@ fn delete_record(directory: &Path, pair_id: PairId) -> Result<(), StoreError> {
     Ok(())
 }
 
+impl FilePairingStore {
+    /// Applies `change` to `pair_id`'s record as the disk holds it now,
+    /// handing it the writer of the whole record: another program may have
+    /// rewritten the file since this store read it, and a record the disk
+    /// no longer holds readably is gone.
+    fn change_in_place<Outcome>(
+        &mut self,
+        pair_id: PairId,
+        change: impl FnOnce(
+            &mut PairingRecord,
+            &dyn Fn(&[u8]) -> Result<(), StoreError>,
+        ) -> Result<Outcome, RecordStoreError<StoreError>>,
+    ) -> Result<Outcome, RecordStoreError<StoreError>> {
+        let unknown = RecordStoreError::Store(StoreError::Unknown);
+        let position = self
+            .records
+            .iter()
+            .position(|entry| entry.pair_id() == pair_id)
+            .ok_or(unknown)?;
+        let Some(mut current) = read_record(&self.directory, pair_id) else {
+            self.records.remove(position);
+            return Err(unknown);
+        };
+        let directory = &self.directory;
+        let outcome = change(&mut current, &|blob| write_blob(directory, pair_id, blob));
+        // Changed or refused, `current` is what the disk holds.
+        if let Some(entry) = self.records.get_mut(position) {
+            *entry = current;
+        }
+        outcome
+    }
+}
+
 impl PairingStore for FilePairingStore {
     fn insert(&mut self, record: PairingRecord) -> Result<(), StoreError> {
         write_record(&self.directory, &record)?;
@@ -299,28 +332,18 @@ impl PairingStore for FilePairingStore {
         pair_id: PairId,
         now_ms: u64,
         session_established: bool,
-    ) -> Result<SweepOutcome, SweepError<StoreError>> {
-        let unknown = SweepError::Store(StoreError::Unknown);
-        let position = self
-            .records
-            .iter()
-            .position(|entry| entry.pair_id() == pair_id)
-            .ok_or(unknown)?;
-        // As in `update`: the sweep applies to the record as the disk holds
-        // it now, and a record the disk no longer holds readably is gone.
-        let Some(mut current) = read_record(&self.directory, pair_id) else {
-            self.records.remove(position);
-            return Err(unknown);
-        };
-        let directory = &self.directory;
-        let outcome = current.sweep(now_ms, session_established, |blob| {
-            write_blob(directory, pair_id, blob)
-        });
-        // Swept or refused, `current` is what the disk holds.
-        if let Some(entry) = self.records.get_mut(position) {
-            *entry = current;
-        }
-        outcome
+    ) -> Result<SweepOutcome, RecordStoreError<StoreError>> {
+        self.change_in_place(pair_id, |current, write| {
+            current.sweep(now_ms, session_established, write)
+        })
+    }
+
+    fn rename_peer(
+        &mut self,
+        pair_id: PairId,
+        name: &DisplayName,
+    ) -> Result<bool, RecordStoreError<StoreError>> {
+        self.change_in_place(pair_id, |current, write| current.rename_peer(name, write))
     }
 
     fn pair_ids(&self) -> Vec<PairId> {
@@ -341,7 +364,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use refineid_rapp::{
-        PAIRING_IDLE_EXPIRY_MS, PairingState, SweepError, SweepOutcome, decode_pair_record,
+        PAIRING_IDLE_EXPIRY_MS, PairingState, RecordStoreError, SweepOutcome, decode_pair_record,
         encode_pair_record,
     };
 
@@ -557,7 +580,7 @@ mod tests {
         );
         assert_eq!(
             store.sweep(pair_id, IDLE_LIMIT_AT_MS, false),
-            Err(SweepError::Store(StoreError::WriteRefused))
+            Err(RecordStoreError::Store(StoreError::WriteRefused))
         );
         assert_eq!(
             store.get(pair_id).unwrap().state(),
@@ -606,7 +629,7 @@ mod tests {
         std::fs::remove_file(path_for(&directory, pair_id)).unwrap();
         assert_eq!(
             stale.sweep(pair_id, IDLE_LIMIT_AT_MS, false),
-            Err(SweepError::Store(StoreError::Unknown))
+            Err(RecordStoreError::Store(StoreError::Unknown))
         );
         assert!(stale.pair_ids().is_empty());
         std::fs::remove_dir_all(&directory).unwrap();

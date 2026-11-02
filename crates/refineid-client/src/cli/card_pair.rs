@@ -272,17 +272,19 @@ impl UnpairArgs {
             eprintln!("unpair: no phone paired");
             return ExitStatus::RuntimeFailure.into();
         };
-        if let Err(e) = reader.forget() {
-            eprintln!("unpair: cannot forget {}: {e}", phone.peer_display_name);
-            return ExitStatus::RuntimeFailure.into();
-        }
-        let told = reader.deliver_revocation_notices() > 0;
+        let told = match reader.forget() {
+            Ok(told) => told,
+            Err(e) => {
+                eprintln!("unpair: cannot forget {}: {e}", phone.peer_display_name);
+                return ExitStatus::RuntimeFailure.into();
+            }
+        };
         if verbose {
             if told {
                 println!("Forgot {}; the phone was told.", phone.peer_display_name);
             } else {
                 println!(
-                    "Forgot {}; the phone is told when this computer next reaches it.",
+                    "Forgot {}; the phone was not reached.",
                     phone.peer_display_name
                 );
             }

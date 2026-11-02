@@ -1,7 +1,7 @@
 # GUI Architecture & Modernization: Modular Driver Framework
 
 - **Document Version**: `26.9.28.1`
-- **Protocol Wire Version**: `26.10.29`
+- **Protocol Wire Version**: `26.11.2`
 - **Status**: Implemented (Tier 1: GTK 4; Tier 2: FLTK)
 - **Date**: 2026-09-28
 - **Implemented**: the GTK 4 driver (`refineid-gui-gtk4`, GTK 4.6 or later) is the Tier 1 backend and the FLTK driver (`refineid-gui-fltk`) the Tier 2 backend; both lay out the one window of section 4.4.
@@ -83,7 +83,7 @@ RefineID maintains a unified core repository (`refineid-core`) providing authori
 Under this modernization:
 1. **Elimination of In-Tree Duplication**: Deprecate `crates/refineid-lib-core` in `refineid-unix` in favor of consuming canonical modular crates from `refineid-core`:
    - `refineid-auth`
-   - `refineid-rapp` (CPace KC2 over Ristretto255, `Noise_XXpsk3` pairing and `Noise_KK` sessions with SHA-512, wire format v26.10.29), driven by the in-workspace `crates/refineid-rapp-core` requester
+   - `refineid-rapp` (CPace KC2 over Ristretto255, `Noise_XXpsk3` pairing and `Noise_KK` sessions with SHA-512, wire format v26.11.2), driven by the in-workspace `crates/refineid-rapp-core` requester
    - `refineid-sign` (PAdES, CAdES, ASiC-E)
    - `refineid-emrtd` (ICAO Doc 9303 LDS1 portrait and signature parsing)
    - `refineid-pcsc` and `refineid-pkcs11`
@@ -117,7 +117,7 @@ Drawing directly from HCI User Interface Management System (UIMS) literature (Ha
 │   • Background PC/SC SCardGetStatusChange listener thread   │
 │   • Weak PIN validation & policy constraints (4-12 digits)  │
 │   • Secret zeroization (ZeroizeOnDrop)                      │
-│   • RAPP CPace pairing controller (wire v26.10.29)           │
+│   • RAPP CPace pairing controller (wire v26.11.2)           │
 │   • Async signing dispatch queue                            │
 └───────────────┬─────────────────────────────▲───────────────┘
                 │                             │
@@ -187,16 +187,17 @@ pub trait UiDriver: Send + 'static {
 
 In accordance with [RAPP Transport and Discovery Hierarchy Specification](https://github.com/refineid/refineid-core/blob/main/doc/protocols/rapp-transport-and-discovery-hierarchy.md):
 1. **Local Card Reader Default**: Out of the box, the controller interfaces exclusively with local smart cards via `pcscd`. No background radio polling, mDNS queries, or network sockets are active.
-2. **The Switch Is the Pairing**: The header bar's remote-use switch is on while a phone is paired. Turning it off forgets the phone at once, with no question; turning it on with no phone paired shows the pairing prompt. When the phone forgets this computer, the switch turns off. `--pair` opens the window with the switch on.
-3. **Outbound Discovery**: The workstation browses for phones only while a pairing ceremony runs, and dials the paired phone only while the pairing is usable. The card served by the phone is listed only then.
+2. **The Switch Is the Pairing**: Only the user's click moves the header bar's remote-use switch, and its position is stored beside the pairing records and restored at every launch. Turning it off forgets the phone at once, with no question, and makes one attempt of at most 10 seconds to tell the phone (RAPP v26.11.2 section 4.6 item 6); turning it on offers the pairing prompt. A pairing that ends without the user's word, because the phone forgot this computer or 30 days passed without a session, leaves the switch on and offers the pairing prompt. `--pair` opens the window with the switch on.
+3. **Outbound Discovery**: With the switch off nothing is browsed or dialed, the revocation attempt aside. With it on, the workstation browses for phones in pairing mode only while a code is tried, and looks for the paired phone while the pairing is usable; it dials the phone only when the phone appears, when a program asks for its card, or within 120 seconds of a lost session (RAPP v26.11.2 section 8.3), and never while the phone is withdrawn. Dialing is never shown.
 4. **Values and Controls Only**: The window shows the identity line, controls, and the text a failed action needs. There is no card selector, no refresh button and no card presence badge: the identity line is the card.
-5. **One Phone per Computer**: The requester keeps one usable pairing. Pairing a phone forgets every earlier pairing: a forgotten pairing serves nothing, tells its phone on the session that holds it or as the first message of the next session, and then loses its key (RAPP v26.10.29 section 4.6). Forgotten pairings are not shown.
+5. **One Phone per Computer**: The requester keeps one usable pairing. Pairing a phone forgets every earlier pairing: a forgotten pairing serves nothing, tells its phone on the session that holds it or in one attempt of at most 10 seconds, and loses its key when the phone echoes the close or the attempt ends (RAPP v26.11.2 section 4.6 item 6). Forgotten pairings are not shown.
 6. **The Local Card Wins**: With a card in a local reader and a phone paired, the local card is the card in use; the phone's card is used while no local card is present.
 7. **No Explaining Text**: No caption, subtitle or placeholder explains or restates what the window shows.
 8. **No Standards Names**: No control or label names a standard, regulation or acronym for one (ETSI, eIDAS, QES, PAdES, ASiC-E, CAdES, XAdES, ISO); the signing methods are "Separately (PDF)" and "As a package".
 9. **Result and Errors Only**: The happy path shows the result and nothing else. A counter at its try limit is not listed.
 10. **Red for Errors Only**: Red marks errors and a credential below the retry floor, beside a mark; every other state is neutral grey.
 11. **No Confirmation Dialogs**: A chosen action happens.
+12. **This Computer's Name**: The workstation names itself to the phone `<operating system> - <host name>`, as "Linux - example-host", "FreeBSD - example-host" or "OpenBSD - example-host", shortened to 256 bytes at a character boundary, and sends it again at the start of every session; the phone's name is refreshed in the pairing record at every session (RAPP v26.11.2 section 4.3 items 3 and 4).
 
 ### 4.4 The One Window
 
@@ -205,8 +206,8 @@ The window follows the Mac app's (`refineid-apple`, `Documentation/design/macos.
 1. **The identity line**, the first that holds:
    - a card in a reader here: its holder's name, "Reading information…" until it is read, or "Remove the card from the reader for a moment." in orange when the reads repeated while the card settled did not read it;
    - remote use off: "Connect a card reader." with no reader, "Insert the card into the reader." with empty readers;
-   - remote use on, no phone paired: "*phone* forgot this computer" when the phone said so, then the pairing prompt;
-   - a paired phone: "Insert the card into the phone's card reader." when it reports no card there, "*HOLDER NAME* (via phone)" while it serves a card, "Connecting to the phone…" otherwise.
+   - remote use on, a paired phone: "Insert the card into the phone's card reader." when it reports no card there, "*HOLDER NAME* (via phone)" while it serves a card;
+   - remote use on otherwise: "*phone* forgot this computer" when the phone said so, then the pairing prompt. A paired phone whose card is not shown is not shown either, and nothing says why (RAPP v26.11.2 section 4.7).
 
    The holder's name is the authentication certificate's common name without its identifier; on an organisation card the organisation the subject names follows verbatim after a comma ("Juutilainen Denis, Testiorganisaatio Oy").
 
@@ -222,7 +223,7 @@ The header bar holds one control at its right: the remote-use switch ("Remote Ac
 ### Phase 1: Unify with Core & Bring in RAPP with CPace PAKE
 - Update `Cargo.toml` to depend on modular `refineid-core` components (`refineid-rapp`, `refineid-sign`, `refineid-emrtd`, `refineid-pcsc`).
 - Replace in-tree `crates/refineid-lib-core/src/rapp` with `refineid-rapp` through `crates/refineid-rapp-core` (done).
-- Standardize on CPace KC2, `Noise_XXpsk3_25519_ChaChaPoly_SHA512`, `Noise_KK_25519_ChaChaPoly_SHA512`, and wire protocol v26.10.29: the phone shows the pairing code, serves its random offer after the pairing preamble, and the workstation types the code.
+- Standardize on CPace KC2, `Noise_XXpsk3_25519_ChaChaPoly_SHA512`, `Noise_KK_25519_ChaChaPoly_SHA512`, and wire protocol v26.11.2: the phone shows the pairing code, serves its random offer after the pairing preamble, and the workstation types the code.
 - Verify interoperability tests pass against canonical vectors.
 
 ### Phase 2: Design `refineid-gui-core` (Headless Dialogue Layer)

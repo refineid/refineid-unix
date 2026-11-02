@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use refineid_client::card_check::{CardCheckError, CardCheckReport};
 use refineid_client::card_pin::{
@@ -37,8 +37,11 @@ use refineid_lib_core::pin::{
 use refineid_rapp_core::engine::{OperationOutcome, PairingSearchError};
 use refineid_rapp_core::ids::PairId;
 
+use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
 use refineid_rapp_core::remote::{CardRequest, RemoteError, RemoteReader};
+use refineid_rapp_core::remote_use;
+use refineid_rapp_core::view::CustodianView;
 
 use crate::model::{
     CanRequest, CardSource, ManagedCard, PairedPhone, RappPairingState, ReaderPresence, SignFormat,
@@ -98,6 +101,9 @@ pub struct RefineIdController {
     last_signature: Mutex<Vec<(String, bool)>>,
     presence_stop: AtomicBool,
     inspection_in_flight: AtomicBool,
+    /// Where the remote-use switch's position is stored; `None` when no
+    /// per-user directory resolves, and the switch then lasts the run.
+    switch_directory: Option<PathBuf>,
     on_state_change: Box<dyn Fn(&UiState) + Send + Sync + 'static>,
 }
 
@@ -111,8 +117,20 @@ impl std::fmt::Debug for RefineIdController {
 
 impl RefineIdController {
     /// Create a new controller with the specified state change callback.
+    /// The remote-use switch stands as its holder last left it.
     pub fn new(on_state_change: impl Fn(&UiState) + Send + Sync + 'static) -> Arc<Self> {
-        let initial_state = UiState::default();
+        Self::with_switch_directory(FilePairingStore::default_directory(), on_state_change)
+    }
+
+    /// As [`Self::new`], the switch stored in `switch_directory`.
+    fn with_switch_directory(
+        switch_directory: Option<PathBuf>,
+        on_state_change: impl Fn(&UiState) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        let initial_state = UiState {
+            remote_use: switch_directory.as_deref().is_some_and(remote_use::is_on),
+            ..UiState::default()
+        };
         on_state_change(&initial_state);
 
         Arc::new(Self {
@@ -121,6 +139,7 @@ impl RefineIdController {
             last_signature: Mutex::new(Vec::new()),
             presence_stop: AtomicBool::new(false),
             inspection_in_flight: AtomicBool::new(false),
+            switch_directory,
             on_state_change: Box::new(on_state_change),
         })
     }
@@ -161,42 +180,64 @@ impl RefineIdController {
         });
     }
 
-    /// Keeps the paired phone's line true while the GUI holds no session: at each
-    /// round it tells a phone this computer forgot, when that phone is in
-    /// sight (RAPP v26.10.29 section 4.6 item 2); browses for the paired
-    /// phone's record; reads the authentication certificate when none is
-    /// cached yet and the phone is on the network; and re-reads the
-    /// pairing record, which another program on this computer may have
-    /// rewritten.
+    /// Keeps the paired phone's line true while the GUI holds no session:
+    /// while remote use is on, at each round it looks for the paired
+    /// phone's record, reads the authentication certificate when none is
+    /// cached yet and the phone appears (RAPP v26.11.2 section 8.3), and
+    /// re-reads the pairing record, which another program on this computer
+    /// may have rewritten. Nothing is dialed on a timer.
     ///
     /// When a physical card reader with an inserted card is connected, the local
     /// card reader overrides RAPP completely, and phone polling is suppressed.
     fn run_phone_watch(self: &Arc<Self>) {
+        let mut view = CustodianView::new();
         while !self.presence_stop.load(Ordering::Acquire) {
             let local_card_present = self.state().has_local_card
                 || refineid_lib_pcsc::presence_signature()
                     .is_ok_and(|sig| sig.iter().any(|(_, present)| *present));
 
-            // The round stands aside while the user pairs or while a local card is connected.
-            if !local_card_present && self.state().pairing.is_none() {
+            // The round stands aside while remote use is off, while the
+            // user pairs, and while a local card is connected.
+            let state = self.state();
+            if state.remote_use && !local_card_present && state.pairing.is_none() {
                 self.refresh_phones();
                 let phone = self
                     .state()
                     .phone
                     .as_ref()
                     .map(|phone| (phone.pair_id, phone.name.clone(), phone.certificate_cached));
-                if let Ok(mut reader) = RemoteReader::open_local() {
-                    reader.deliver_revocation_notices();
-                    if let Some((pair_id, name, certificate_cached)) = phone {
-                        let seen = reader.observe(pair_id);
-                        if !certificate_cached && seen == Ok(true) {
-                            let read = reader.refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT);
-                            self.note_phone_read(&name, read.as_ref().err());
+                if let (Ok(mut reader), Some((pair_id, name, certificate_cached))) =
+                    (RemoteReader::open_local(), phone)
+                {
+                    let appeared = match reader.look(pair_id) {
+                        Ok(instances) => view.looked(instances),
+                        Err(RemoteError::Withdrawn) => {
+                            view.withdrawal_seen();
+                            false
                         }
-                        if seen != Ok(false) {
-                            self.refresh_phones();
+                        Err(_) => false,
+                    };
+                    let redial = view.redial_due(Instant::now());
+                    if (appeared || redial) && !certificate_cached {
+                        match reader.refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT) {
+                            // The read's session is closed: the next read
+                            // follows the next appearance.
+                            Ok(_) => view.closed_here(),
+                            Err(error) => {
+                                match (error.session_end(), &error) {
+                                    (Some(end), _) => view.session_ended(end, Instant::now()),
+                                    // The phone answered and holds no card:
+                                    // its next appearance is read again.
+                                    (None, RemoteError::CardAbsent(_)) => view.closed_here(),
+                                    (None, _) => view.dial_failed(Instant::now()),
+                                }
+                                self.note_phone_read(&name, Some(&error));
+                            }
                         }
                     }
+                    self.refresh_phones();
+                } else {
+                    view = CustodianView::new();
                 }
                 self.refresh_cards();
             }
@@ -236,8 +277,9 @@ impl RefineIdController {
         }
     }
 
-    /// Reads the paired phone from the store. Remote use is on while a
-    /// phone is paired, and turns off when the last pairing ends.
+    /// Reads the paired phone from the store. A pairing that ends without
+    /// the user's word leaves the switch as it stands (RAPP transport and
+    /// discovery hierarchy specification section 5.2).
     pub fn refresh_phones(&self) {
         let phone = RemoteReader::open_local()
             .ok()
@@ -245,20 +287,24 @@ impl RefineIdController {
             .and_then(|summary| PairedPhone::from_summary(&summary));
         self.update_state(|state| {
             if phone.is_some() {
-                state.remote_use = true;
                 state.phone_that_forgot = None;
             } else if state.phone.is_some() {
-                state.remote_use = false;
                 state.phone_reader_empty = false;
             }
             state.phone = phone;
         });
     }
 
-    /// Turns remote use on, which shows the pairing prompt while no phone
-    /// is paired, or off, which forgets the paired phone at once.
+    /// Turns remote use on, which offers the pairing prompt while no phone
+    /// card is shown, or off, which forgets the paired phone at once. Only
+    /// the user's click moves the switch, and its position is stored.
     fn set_remote_use(self: &Arc<Self>, on: bool) {
         self.update_state(|state| state.remote_use = on);
+        if let Some(directory) = &self.switch_directory
+            && let Err(error) = remote_use::store(directory, on)
+        {
+            refineid_dev_errors::report!(Gui, "remote-use switch not stored", error);
+        }
         if !on && self.has_usable_phone() {
             self.forget_phone();
         }
@@ -284,22 +330,35 @@ impl RefineIdController {
         self.state().phone.is_some()
     }
 
+    /// Forgets the paired phone: it goes from the window at once, and the
+    /// one bounded attempt to tell it (RAPP v26.11.2 section 4.6 item 6)
+    /// runs in the background.
     fn forget_phone(self: &Arc<Self>) {
-        let name = self
+        let Some((pair_id, name)) = self
             .state()
             .phone
             .as_ref()
-            .map(|phone| phone.name.clone())
-            .unwrap_or_default();
-        let outcome = RemoteReader::open_local().and_then(|mut reader| reader.forget());
+            .map(|phone| (phone.pair_id, phone.name.clone()))
+        else {
+            return;
+        };
         self.update_state(|state| {
-            state.status_message = match &outcome {
-                Ok(()) => String::new(),
-                Err(error) => format!("Could not forget {name}: {error}"),
-            };
+            state.phone = None;
+            state.phone_reader_empty = false;
         });
-        self.refresh_phones();
         self.refresh_cards();
+        let controller = Arc::clone(self);
+        thread::spawn(move || {
+            let outcome =
+                RemoteReader::open_local().and_then(|mut reader| reader.forget_and_tell(pair_id));
+            if let Err(error) = outcome {
+                controller.update_state(|state| {
+                    state.status_message = format!("Could not forget {name}: {error}");
+                });
+            }
+            controller.refresh_phones();
+            controller.refresh_cards();
+        });
     }
 
     /// Replaces the listed cards and selects the card in use: a card in a
@@ -966,7 +1025,7 @@ impl RefineIdController {
         });
     }
 
-    /// Pairs with the phone showing `code` (RAPP v26.10.29: the phone shows
+    /// Pairs with the phone showing `code` (RAPP v26.11.2: the phone shows
     /// the code and this workstation types it). One ceremony runs at a time.
     fn start_pairing(self: &Arc<Self>, code: &str) {
         if self.state().pairing.is_some() {
@@ -1050,13 +1109,17 @@ fn pairing_failure_line(error: &RemoteError) -> String {
     }
 }
 
-/// The status line after a pairing: nothing when the card was read or
-/// when the identity line says what stands in the way (no card at the
-/// phone, the phone forgot this computer), otherwise the failure.
+/// The status line after a pairing: nothing when the card was read, when
+/// the identity line says what stands in the way (no card at the phone,
+/// the phone forgot this computer), or when the phone stopped serving,
+/// which is never shown (RAPP v26.11.2 section 4.7); otherwise the
+/// failure.
 fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String {
     match read_error {
-        None | Some(RemoteError::CardAbsent(_) | RemoteError::RevokedByPhone) => String::new(),
-        Some(RemoteError::Withdrawn) => format!("{phone} turned remote card access off"),
+        None
+        | Some(RemoteError::CardAbsent(_) | RemoteError::RevokedByPhone | RemoteError::Withdrawn) => {
+            String::new()
+        }
         Some(RemoteError::Outcome(outcome))
             if matches!(**outcome, OperationOutcome::Cancelled(_)) =>
         {
@@ -1556,12 +1619,24 @@ mod tests {
     }
 
     #[test]
-    fn remote_use_turns_on_without_a_phone() {
-        let controller = RefineIdController::new(|_| {});
+    fn remote_use_turns_on_without_a_phone_and_keeps_its_position() {
+        let directory = std::env::temp_dir().join(format!(
+            "refineid-gui-switch-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let controller = RefineIdController::with_switch_directory(Some(directory.clone()), |_| {});
+        assert!(!controller.state().remote_use);
         controller.handle_intent(UserIntent::SetRemoteUse(true));
         assert!(controller.state().remote_use);
+        // A later launch restores the switch as it was left.
+        let relaunched = RefineIdController::with_switch_directory(Some(directory.clone()), |_| {});
+        assert!(relaunched.state().remote_use);
         controller.handle_intent(UserIntent::SetRemoteUse(false));
         assert!(!controller.state().remote_use);
+        let relaunched = RefineIdController::with_switch_directory(Some(directory.clone()), |_| {});
+        assert!(!relaunched.state().remote_use);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
