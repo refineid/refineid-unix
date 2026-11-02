@@ -33,9 +33,11 @@ pub(crate) const PAIRING_BLOB_VERSION: u8 = 11;
 /// The engine's pair record format this revision frames. A new engine
 /// format takes a new revision, so that records of the old one read as
 /// superseded.
-const FRAMED_PAIR_RECORD_FORMAT: u64 = 8;
+const FRAMED_PAIR_RECORD_FORMAT: (u16, u16, u16) = (26, 11, 2);
 const _: () = assert!(
-    FRAMED_PAIR_RECORD_FORMAT == refineid_rapp::PAIR_RECORD_FORMAT_VERSION,
+    FRAMED_PAIR_RECORD_FORMAT.0 == refineid_rapp::PAIR_RECORD_FORMAT_VERSION.0
+        && FRAMED_PAIR_RECORD_FORMAT.1 == refineid_rapp::PAIR_RECORD_FORMAT_VERSION.1
+        && FRAMED_PAIR_RECORD_FORMAT.2 == refineid_rapp::PAIR_RECORD_FORMAT_VERSION.2,
     "a new engine pair record format needs a new PAIRING_BLOB_VERSION"
 );
 
