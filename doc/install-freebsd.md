@@ -138,6 +138,8 @@ every rebuild.
 
 ## 6. Browsers
 
+### Firefox and Chromium
+
 Neither browser is configured by the user. The module is installed on a
 stable path, and `script/install-desktop.sh` (section 5) installs the
 two things the browsers need: a Firefox enterprise policy naming the
@@ -163,6 +165,17 @@ program reading that database then see the card. Reinstall the module
 copy after every rebuild; the policy and the autostart entry need no
 change.
 
+For Chromium to offer the citizen certificate during TLS authentication,
+NSS requires that the issuing CA certificates be present in `~/.pki/nssdb`
+with client certificate trust flags (`CT,C,C`):
+
+```sh
+certutil -A -d sql:$HOME/.pki/nssdb -n "DVV Gov. Root CA - G3 ECC" \
+    -t "CT,C,C" -i /path/to/dvv-gov-root-ca-g3-ecc.der
+certutil -A -d sql:$HOME/.pki/nssdb -n "DVV Citizen Certificates - G4E" \
+    -t "CT,C,C" -i /path/to/dvvcqc4ec.crt
+```
+
 In Firefox the module appears under "RefineID" in Settings > Privacy &
 Security > Security Devices, with the reader as one slot and the paired
 phone (section 7) as another, "RefineID Remote" with the phone's name.
@@ -177,6 +190,48 @@ phone's card. Without a card nothing is offered and nothing is asked.
 One program on the computer holds the phone session at a time: while a
 browser holds it, `refineid card` and the desktop application report
 the phone as in use.
+
+### Konqueror (KDE Plasma / WebEnginePart)
+
+Konqueror uses KDE's `webenginepart`, backed by QtWebEngine. On FreeBSD,
+QtWebEngine is built without NSS client certificate support (`use_nss_certs=false`),
+and its internal `QWebEngineClientCertificateStore` mandates that client
+private keys be exported to PEM (`QSslKey::toPem()`). Because hardware smart cards
+strictly prohibit private key extraction, QtWebEngine cannot natively complete
+mTLS handshakes with PKCS#11 tokens.
+
+To support Konqueror on FreeBSD without upstream QtWebEngine architectural changes,
+RefineID provides a local loopback mTLS proxy bridge (`refineid-mtls-proxy`):
+
+1. **Proxy Daemon (`refineid-mtls-proxy`)**:
+   Runs as a user daemon listening on `127.0.0.1:18443`. It intercepts HTTPS `CONNECT`
+   tunnels for card authentication domains (`card.refineid.fi`, `*.suomi.fi`,
+   `*.dvv.fi`, etc.), while transparently forwarding other traffic.
+2. **Upstream Smart Card Authentication**:
+   The proxy terminates upstream TLS using OpenSSL 3 and `openssl-pkcs11provider`
+   via `/usr/local/lib/p11-kit-proxy.so` (backed by `librefineid_pkcs11.so`). When the
+   card's authentication private key is accessed, the proxy prompts for PIN 1
+   via `refineid-ask-pin` (a native Qt modal dialog that displays over the desktop
+   session without logging or leaking the PIN).
+3. **Local Bridge CA**:
+   Downstream connections to Konqueror are secured using a locally generated CA
+   installed into FreeBSD system trust (`/usr/local/share/certs/refineid-ca.pem`
+   with `certctl rehash`).
+4. **Konqueror Integration**:
+   Konqueror's `webenginepart` is patched (`packaging/konqueror/webenginepart-mtls-bridge.patch`)
+   to probe `127.0.0.1:18443` on startup, automatically routing requests through
+   the proxy, and trusting the local bridge CA.
+5. **Autostart**:
+   `packaging/konqueror/refineid-mtls-proxy.desktop` installed to `~/.config/autostart/`
+   starts the proxy bridge on KDE login.
+
+Build and install the bridge components:
+
+```sh
+cd packaging/konqueror
+make
+make install
+```
 
 OpenSSH and OpenSSL reach the module through p11-kit when it is
 registered there, which the browsers no longer need:

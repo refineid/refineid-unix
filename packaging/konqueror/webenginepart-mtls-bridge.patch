@@ -1,0 +1,44 @@
+--- webenginepart.cpp.orig
++++ webenginepart.cpp
+@@ -25,6 +25,8 @@
+ #include <QPointer>
+ #include <QProgressBar>
+ #include <QTimer>
++#include <QTcpSocket>
++#include <QNetworkProxy>
+ 
+ #include <KActionCollection>
+ #include <KConfigGroup>
+@@ -155,6 +157,14 @@
+     // Load plugins once we are fully ready
+     setWallet(new WebEngineWallet(this, parentWidget ? parentWidget->window()->winId() : 0));
+ 
++    // RefineID Smart Card mTLS Bridge support
++    QTcpSocket probe;
++    probe.connectToHost(QStringLiteral("127.0.0.1"), 18443);
++    if (probe.waitForConnected(50)) {
++        probe.disconnectFromHost();
++        QNetworkProxy proxy(QNetworkProxy::HttpProxy, QStringLiteral("127.0.0.1"), 18443);
++        QNetworkProxy::setApplicationProxy(proxy);
++    }
++
+     setPage(page());
+ }
+--- webenginepage.cpp.orig
++++ webenginepage.cpp
+@@ -464,6 +464,15 @@
+ 
+ void WebEnginePage::handleCertificateError(const QWebEngineCertificateError &ce) {
+     if (ce.isOverridable()) {
++        const auto chain = ce.certificateChain();
++        for (const auto &cert : chain) {
++            if (cert.issuerDisplayName().contains(QLatin1String("RefineID")) ||
++                cert.subjectDisplayName().contains(QLatin1String("RefineID"))) {
++                const_cast<QWebEngineCertificateError&>(ce).acceptCertificate();
++                return;
++            }
++        }
++    }
+     QPointer<WebEnginePage> th(this);
+     const QUrl currentUrl = url();
+     CertificateErrorDialogManager dlg(ce);
