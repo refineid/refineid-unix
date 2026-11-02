@@ -20,18 +20,15 @@ use crate::card_pin::PinManageSlot;
 /// What `refineid pin change help` prints. The man page
 /// refineid(1) carries the same facts.
 pub const HELP: &str = "\
-usage: refineid pin change 1|2 [--reader SUBSTR] [--can NNNNNN]
+usage: refineid pin change 1|2 [--reader SUBSTR]
 
 Rotate PIN 1 (authentication) or PIN 2 (qualified signature). Prompts
 for the current PIN, then the new PIN twice.
 Prints nothing on success; -v shows each step.
   --reader S    narrow to readers whose name contains S
-  --can NNNNNN  CAN from the card front; needed on the contactless
-                interface
 ";
 
-/// Parsed `pin change 1|2 [--reader SUBSTR] [--can NNNNNN]`
-/// arguments.
+/// Parsed `pin change 1|2 [--reader SUBSTR]` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangePinArgs {
     /// Which PIN slot to rotate: the `1|2` argument.
@@ -39,9 +36,6 @@ pub struct ChangePinArgs {
     /// Optional reader-name substring (`--reader SUBSTR`).
     /// Tier 0 `String`; presentational input to `ReaderFilter`.
     pub reader_filter: Option<String>,
-    /// `--can NNNNNN`: opens the PACE channel when the card is
-    /// on the contactless interface. Omit on contact.
-    pub can: Option<refineid_lib_core::can::Can>,
 }
 
 impl ChangePinArgs {
@@ -53,7 +47,6 @@ impl ChangePinArgs {
         let Self {
             slot,
             reader_filter,
-            can: _,
         } = self;
         let cmd = match slot {
             PinManageSlot::Pin1 => "pin change 1",
@@ -154,7 +147,6 @@ impl ChangePinArgs {
         let cmd = VerbTag::PinChange;
         let mut slot: Option<PinManageSlot> = None;
         let mut reader_filter: Option<String> = None;
-        let mut can: Option<refineid_lib_core::can::Can> = None;
         let tokens = argv.into_vec();
         let mut iter = tokens.iter();
         while let Some(arg) = iter.next() {
@@ -165,20 +157,6 @@ impl ChangePinArgs {
                         flag: "--reader",
                     })?;
                     reader_filter = Some(value.clone());
-                }
-                "--can" => {
-                    let value = iter
-                        .next()
-                        .ok_or(ArgParseError::MissingValue { cmd, flag: "--can" })?;
-                    let parsed = refineid_lib_core::can::Can::new(value).map_err(|e| {
-                        ArgParseError::BadValue {
-                            cmd,
-                            flag: "--can",
-                            value: value.clone(),
-                            reason: format!("{e}"),
-                        }
-                    })?;
-                    can = Some(parsed);
                 }
                 other => match super::util::pin_number(other) {
                     Some(number) if slot.is_none() => slot = Some(number),
@@ -198,7 +176,6 @@ impl ChangePinArgs {
         Ok(Self {
             slot,
             reader_filter,
-            can,
         })
     }
 }

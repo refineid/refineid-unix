@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn card_emrtd_wins_over_card_catch_all() -> TestResult {
-        let sub = parse_argv(&argv(&["refineid", "card", "emrtd", "--can", "123456"]))?;
+        let sub = parse_argv(&argv(&["refineid", "card", "emrtd"]))?;
         check(&sub.tag(), &VerbTag::CardEmrtd, "tag")
     }
 
@@ -667,7 +667,7 @@ mod tests {
     fn each_card_verb_has_a_dispatch() -> TestResult {
         // Each verb with the minimum argv it needs to parse.
         for (verb, extra, expected) in [
-            ("emrtd", vec!["--can", "123456"], VerbTag::CardEmrtd),
+            ("emrtd", vec![], VerbTag::CardEmrtd),
             (
                 "sign-auth",
                 vec!["--in", "/i", "--out", "/o"],
@@ -809,7 +809,7 @@ mod tests {
                 VerbTag::Verify,
             ),
             (vec!["r", "k"], VerbTag::ReaderKeyboard),
-            (vec!["card", "em", "--can", "123456"], VerbTag::CardEmrtd),
+            (vec!["card", "em"], VerbTag::CardEmrtd),
             (
                 vec!["card", "sign-a", "--in", "/i", "--out", "/o"],
                 VerbTag::CardSignAuth,
@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn malformed_args_surface_as_args_error() -> TestResult {
-        let r = parse_argv(&argv(&["refineid", "card", "emrtd", "--can", "abc"]));
+        let r = parse_argv(&argv(&["refineid", "card", "emrtd", "--save-face"]));
         check_true(matches!(r, Err(ParseError::Args(_))), "Args(_)")
     }
 

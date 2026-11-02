@@ -165,7 +165,9 @@ pub(super) fn reader_pick_exit(cmd: &str, err: &ReaderPickError) -> ExitCode {
     reader_pick_status(err).into()
 }
 
-/// Interactive, masked CAN prompt with TTY detection.
+/// Interactive CAN prompt with TTY detection. The CAN is a secret
+/// like the PINs: the terminal echoes nothing, not even a mark per
+/// digit, and an error never repeats what was typed.
 ///
 /// Returns `Some(can)` when the operator typed 6 digits and
 /// pressed Enter; returns `None` when stdin isn't a TTY (no
@@ -189,13 +191,7 @@ pub fn prompt_can_if_tty() -> Option<Can> {
     let mut tries_left: u32 = CAN_PROMPT_MAX_TRIES;
     while tries_left > 0 {
         tries_left = tries_left.saturating_sub(1);
-        let config = rpassword::ConfigBuilder::new()
-            .password_feedback_mask('*')
-            .build();
-        let entered = match rpassword::prompt_password_with_config(
-            "CAN (6 digits, printed on card front, or Enter to skip): ",
-            config,
-        ) {
+        let entered = match rpassword::prompt_password("CAN: ") {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("CAN prompt failed: {error}");
@@ -212,7 +208,7 @@ pub fn prompt_can_if_tty() -> Option<Can> {
             }
         }
     }
-    eprintln!("CAN: too many bad entries; skipping eMRTD section");
+    eprintln!("CAN: too many bad entries");
     None
 }
 

@@ -16,36 +16,26 @@
 
 use std::path::PathBuf;
 
-use refineid_lib_core::can::Can;
-
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 
 /// What `refineid card emrtd help`
 /// prints. The man page refineid(1) carries the same facts.
 pub const HELP: &str = "\
-usage: refineid card emrtd --can NNNNNN [--save-face PATH]
-                           [--save-signature PATH] [--reader SUBSTR]
+usage: refineid card emrtd [--save-face PATH] [--save-signature PATH]
+                           [--reader SUBSTR]
 
-eMRTD file extraction: the same read as `card --can`, plus flags that
-write artefacts to disk.
-  --can NNNNNN        CAN from the card front
+eMRTD file extraction: the same read as the eMRTD section of `card`,
+plus flags that write artefacts to disk. Prompts for the CAN.
   --save-face P       face image
   --save-signature P  displayed-signature image
   --reader S          narrow to readers whose name contains S
 ";
 
-/// Parsed `card emrtd --can NNNNNN [--save-face PATH]
-/// [--save-signature PATH] [--reader SUBSTR]` arguments.
-///
-/// `can` is the typed [`Can`] -- the 6-digit value is
-/// validated at this trust boundary via `Can::new`, so the
-/// emrtd action never sees an out-of-shape CAN.
+/// Parsed `card emrtd [--save-face PATH] [--save-signature PATH]
+/// [--reader SUBSTR]` arguments. The CAN is not an argument: it is
+/// read from the terminal when the verb runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmrtdArgs {
-    /// Six-digit Card Access Number from the card front
-    /// (`--can NNNNNN`). Already validated by `Can::new` at
-    /// parse time.
-    pub can: Can,
     /// Optional path to save DG2 face image (`--save-face PATH`).
     pub save_face: Option<PathBuf>,
     /// Optional path to save DG7 displayed signature image
@@ -62,11 +52,14 @@ impl EmrtdArgs {
     #[must_use]
     pub fn run(self) -> std::process::ExitCode {
         let Self {
-            can,
             save_face,
             save_signature,
             reader_filter,
         } = self;
+        let Some(can) = super::util::prompt_can_if_tty() else {
+            eprintln!("card emrtd: needs the CAN, entered at the terminal prompt");
+            return crate::exit_status::ExitStatus::BadInvocation.into();
+        };
         let backend = refineid_lib_pcsc::PcscBackend;
         let options = crate::card_emrtd::EmrtdReadOptions {
             can,
@@ -92,11 +85,9 @@ impl EmrtdArgs {
     /// Parse the post-subcommand argv slice.
     ///
     /// # Errors
-    /// [`ArgParseError`] for any shape violation, including
-    /// missing required `--can` or a CAN value that doesn't
-    /// pass `Can::new`.
+    /// [`ArgParseError`] for a missing flag value or an unknown
+    /// argument.
     pub fn parse(argv: RemainingArgv) -> Result<Self, ArgParseError> {
-        let mut can_raw: Option<String> = None;
         let mut save_face: Option<PathBuf> = None;
         let mut save_signature: Option<PathBuf> = None;
         let mut reader_filter: Option<String> = None;
@@ -104,13 +95,6 @@ impl EmrtdArgs {
         let mut iter = tokens.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
-                "--can" => {
-                    let value = iter.next().ok_or(ArgParseError::MissingValue {
-                        cmd: VerbTag::CardEmrtd,
-                        flag: "--can",
-                    })?;
-                    can_raw = Some(value.clone());
-                }
                 "--save-face" => {
                     let value = iter.next().ok_or(ArgParseError::MissingValue {
                         cmd: VerbTag::CardEmrtd,
@@ -140,18 +124,7 @@ impl EmrtdArgs {
                 }
             }
         }
-        let can_raw = can_raw.ok_or(ArgParseError::Required {
-            cmd: VerbTag::CardEmrtd,
-            name: "--can NNNNNN",
-        })?;
-        let can = Can::new(&can_raw).map_err(|e| ArgParseError::BadValue {
-            cmd: VerbTag::CardEmrtd,
-            flag: "--can",
-            value: can_raw,
-            reason: format!("{e}"),
-        })?;
         Ok(Self {
-            can,
             save_face,
             save_signature,
             reader_filter,
@@ -166,42 +139,24 @@ mod tests {
     use crate::test_util::{TestResult, check, check_true};
 
     #[test]
-    fn parses_can_only() -> TestResult {
-        let a = EmrtdArgs::parse(argv(&["--can", "123456"]))?;
+    fn parses_no_arguments() -> TestResult {
+        let a = EmrtdArgs::parse(argv(&[]))?;
         check_true(a.save_face.is_none(), "save_face=None")?;
         check_true(a.save_signature.is_none(), "save_signature=None")
-        // SPECIMEN-TRAVEL CAN is 797449; pick a generic in-shape value
-        // for the unit test.
     }
 
     #[test]
-    fn missing_can_rejected() -> TestResult {
-        let r = EmrtdArgs::parse(argv(&[]));
+    fn can_is_not_an_argument() -> TestResult {
+        let r = EmrtdArgs::parse(argv(&["--can", "123456"]));
         check_true(
-            matches!(r, Err(ArgParseError::Required { name, .. }) if name == "--can NNNNNN"),
-            "Required(--can NNNNNN)",
-        )
-    }
-
-    #[test]
-    fn malformed_can_rejected() -> TestResult {
-        let r = EmrtdArgs::parse(argv(&["--can", "abc"]));
-        check_true(
-            matches!(r, Err(ArgParseError::BadValue { flag: "--can", .. })),
-            "BadValue(--can)",
+            matches!(&r, Err(ArgParseError::Unexpected { got, .. }) if got == "--can"),
+            "Unexpected(--can)",
         )
     }
 
     #[test]
     fn save_paths_recorded() -> TestResult {
-        let a = EmrtdArgs::parse(argv(&[
-            "--can",
-            "123456",
-            "--save-face",
-            "/f",
-            "--save-signature",
-            "/s",
-        ]))?;
+        let a = EmrtdArgs::parse(argv(&["--save-face", "/f", "--save-signature", "/s"]))?;
         check(&a.save_face, &Some(PathBuf::from("/f")), "save_face")?;
         check(
             &a.save_signature,

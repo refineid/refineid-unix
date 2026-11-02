@@ -149,6 +149,9 @@ fn form_row(label: &gtk4::Label, field: &impl IsA<gtk4::Widget>) -> gtk4::Box {
     row
 }
 
+/// What a typed character of a secret code shows until it is revealed.
+const HIDDEN_CHARACTER: &str = "\u{2022}";
+
 /// The six-box code entry: one box per character, typed into a hidden
 /// entry that carries the field's accessible name.
 #[derive(Clone)]
@@ -157,6 +160,10 @@ struct CodeBoxes {
     frames: Vec<gtk4::Frame>,
     labels: Vec<gtk4::Label>,
     entry: gtk4::Entry,
+    /// The eye beside a secret code's boxes.
+    reveal: gtk4::ToggleButton,
+    /// Whether typed characters show as dots until the eye is pressed.
+    secret: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl CodeBoxes {
@@ -215,6 +222,11 @@ impl CodeBoxes {
             frames,
             labels,
             entry,
+            reveal: gtk4::ToggleButton::builder()
+                .icon_name("view-reveal-symbolic")
+                .valign(gtk4::Align::Center)
+                .build(),
+            secret: std::rc::Rc::new(std::cell::Cell::new(false)),
         };
         let shown = boxes.clone();
         boxes.entry.connect_changed(move |entry| {
@@ -239,13 +251,37 @@ impl CodeBoxes {
         boxes
     }
 
+    /// Shows each typed character as a dot until the eye beside the
+    /// boxes, named `label`, is pressed.
+    fn hide_until_revealed(self, label: &str) -> Self {
+        name(&self.reveal, label);
+        self.reveal.set_tooltip_text(Some(label));
+        let shown = self.clone();
+        self.reveal.connect_toggled(move |_| {
+            shown.render();
+            shown.entry.grab_focus();
+        });
+        self.container.append(&self.reveal);
+        self.secret.set(true);
+        self.render();
+        self
+    }
+
     /// Draws the typed characters into the boxes; the box the next one
     /// lands in carries the accent while the entry has focus.
     fn render(&self) {
         let typed: Vec<char> = self.entry.text().chars().collect();
         let focused = self.entry.has_focus();
+        let hidden = self.secret.get() && !self.reveal.is_active();
         for (index, (frame, label)) in self.frames.iter().zip(&self.labels).enumerate() {
-            label.set_label(&typed.get(index).map(char::to_string).unwrap_or_default());
+            let shown = typed.get(index).map(|character| {
+                if hidden {
+                    HIDDEN_CHARACTER.to_owned()
+                } else {
+                    character.to_string()
+                }
+            });
+            label.set_label(&shown.unwrap_or_default());
             if focused && index == typed.len() {
                 frame.add_css_class("active");
             } else {
@@ -492,7 +528,8 @@ impl Ui {
                     can_controller.handle_intent(UserIntent::EnterCan(number));
                 }
             },
-        );
+        )
+        .hide_until_revealed(window::SHOW_CAN);
         can.append(&can_boxes.container);
         root.append(&can);
 

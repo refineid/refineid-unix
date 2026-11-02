@@ -160,6 +160,8 @@ pub const CONNECTING_TO_PHONE_PROGRESS: &str = "Connecting to the phone";
 pub const CARD_ACCESS_NUMBER: &str = "Card Access Number (CAN)";
 /// The caption beside the card access number boxes.
 pub const CAN_CAPTION: &str = "CAN";
+/// The accessible name of the eye that reveals the typed CAN.
+pub const SHOW_CAN: &str = "Show CAN";
 /// The remote-use switch's name and tooltip.
 pub const REMOTE_ACCESS: &str = "Remote Access";
 /// The remote-use switch's value while off.

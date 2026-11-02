@@ -96,7 +96,6 @@ _refineid_card() {
     emrtd)
       shift words; (( CURRENT-- ))
       _arguments \
-        '--can[CAN from the card front]:six digits' \
         '--save-face[face image]:file:_files' \
         '--save-signature[displayed-signature image]:file:_files' \
         '--reader[narrow to readers whose name contains S]:substring'
@@ -107,8 +106,7 @@ _refineid_card() {
         '--in[input file]:file:_files' \
         '--out[output file for the raw signature]:file:_files' \
         '--save-cert[also write the signing certificate'\''s DER]:file:_files' \
-        '--reader[narrow to readers whose name contains S]:substring' \
-        '--can[CAN from the card front]:six digits'
+        '--reader[narrow to readers whose name contains S]:substring'
       ;;
     sign-qualified)
       shift words; (( CURRENT-- ))
@@ -116,8 +114,7 @@ _refineid_card() {
         '--in[input file]:file:_files' \
         '--out[output file for the raw signature]:file:_files' \
         '--save-cert[also write the signing certificate'\''s DER]:file:_files' \
-        '--reader[narrow to readers whose name contains S]:substring' \
-        '--can[CAN from the card front]:six digits'
+        '--reader[narrow to readers whose name contains S]:substring'
       ;;
     decrypt-auth)
       shift words; (( CURRENT-- ))
@@ -145,7 +142,6 @@ _refineid_card() {
       _arguments \
         '--offline[skip every network fetch]' \
         '--reader[narrow to readers whose name contains S]:substring' \
-        '--can[CAN from the card front]:six digits' \
         '--no-can[skip the eMRTD section]' \
         '--crl-file[use a pre-fetched CRL]:file:_files' \
         '--save-cert[write each slot'\''s DER to a directory]:directory:_files -/' \
@@ -180,8 +176,7 @@ _refineid_pin() {
       shift words; (( CURRENT-- ))
       _arguments \
         '1:PIN:(1 2)' \
-        '--reader[narrow to readers whose name contains S]:substring' \
-        '--can[CAN from the card front]:six digits'
+        '--reader[narrow to readers whose name contains S]:substring'
       ;;
     unblock)
       shift words; (( CURRENT-- ))
@@ -216,7 +211,6 @@ _refineid_document() {
         '--reason[PAdES /Reason]:text' \
         '--location[PAdES /Location]:text' \
         '--reader[narrow to readers whose name contains S]:substring' \
-        '--can[CAN from the card front]:six digits' \
         '--timestamp[timestamp authority URL or named set]:url:_urls' \
         '--no-stamp[no visible seal on the PDF]'
       ;;
