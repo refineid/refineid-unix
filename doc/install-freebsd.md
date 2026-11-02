@@ -25,6 +25,12 @@ and add the user to the `video` group. Without `xdg-desktop-portal-gtk`
 the desktop portal has no file chooser and the GUI's file dialogs do not
 open.
 
+For KDE Plasma 6 or GNOME 47, install `plasma6-plasma` or `gnome` (along
+with `gnome-terminal`), and ensure `procfs` and `fdescfs` are mounted in
+`/etc/fstab` (`proc /proc procfs rw 0 0` and `fdesc /dev/fd fdescfs rw 0 0`).
+Leave `user-session` unset in `/usr/local/etc/lightdm/lightdm.conf` so the
+login greeter allows selecting the session.
+
 ## 2. Smart-card daemon
 
 ```sh
@@ -36,15 +42,31 @@ service pcscd start
 With polkit enabled, a client outside a logind seat gets "Service not
 available"; FreeBSD has no logind, so polkit is disabled.
 
-An ACS reader needs the ACS driver. With the generic CCID bundle in
-place pcscd binds the ACR39U to libccid and the reader never finishes
-initialising, so move the bundle aside; other CCID readers need it back:
+An ACS reader needs the ACS driver (`acsccid`). With the generic CCID bundle
+in place, `pcscd` binds the ACR39U to `libccid` and the reader never finishes
+initialising. However, moving `ifd-ccid.bundle` aside breaks all non-ACS card
+readers (e.g. Alcor Micro, Realtek, generic EMV chips).
+
+To make both ACS readers and generic CCID readers work simultaneously, keep
+both bundles active in `/usr/local/lib/pcsc/drivers/` and remove the
+conflicting ACS vendor entries (`0x072F`) from `ifd-ccid.bundle`'s `Info.plist`:
 
 ```sh
-mkdir -p /usr/local/lib/pcsc/drivers-disabled
-mv /usr/local/lib/pcsc/drivers/ifd-ccid.bundle /usr/local/lib/pcsc/drivers-disabled/
+python3 -c '
+import plistlib
+p = "/usr/local/lib/pcsc/drivers/ifd-ccid.bundle/Contents/Info.plist"
+with open(p, "rb") as f:
+    d = plistlib.load(f)
+keep = [(v, pr, n) for v, pr, n in zip(d["ifdVendorID"], d["ifdProductID"], d["ifdFriendlyName"]) if v.lower() != "0x072f"]
+d["ifdVendorID"], d["ifdProductID"], d["ifdFriendlyName"] = [list(x) for x in zip(*keep)]
+with open(p, "wb") as f:
+    plistlib.dump(d, f)
+'
 service pcscd restart
 ```
+
+`ifd-acsccid.bundle` then serves ACS readers while `ifd-ccid.bundle` serves all
+other CCID readers.
 
 `pcsc_scan -r` lists the reader. If `service pcscd restart` answers
 "already running?" after a crash, stop it, remove `/var/run/pcscd.pid`,
