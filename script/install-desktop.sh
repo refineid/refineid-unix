@@ -117,7 +117,12 @@ else
     AUTOSTART_DIR="$DESTDIR/etc/xdg/autostart"
 fi
 install -d "$POLICY_DIR" "$DESTDIR$PREFIX/libexec/refineid" "$AUTOSTART_DIR"
-printf '{ "policies": { "SecurityDevices": { "RefineID": "%s" } } }\n' "$MODULE" \
+install -m 644 crates/refineid-client/trust-anchors/dvv-gov-root-ca-g3-ecc.der \
+    crates/refineid-client/trust-anchors/dvv-gov-root-ca-g3-rsa.der \
+    "$POLICY_DIR/"
+INSTALLED_POLICY_DIR="${POLICY_DIR#"$DESTDIR"}"
+printf '{\n  "policies": {\n    "SecurityDevices": {\n      "RefineID": "%s"\n    },\n    "Certificates": {\n      "Install": [\n        "%s/dvv-gov-root-ca-g3-ecc.der",\n        "%s/dvv-gov-root-ca-g3-rsa.der"\n      ]\n    }\n  }\n}\n' \
+    "$MODULE" "$INSTALLED_POLICY_DIR" "$INSTALLED_POLICY_DIR" \
     > "$POLICY_DIR/policies.json"
 # OpenBSD confines both browsers with unveil(2); the module in the main
 # process reads and locks the phone pairings under the user's

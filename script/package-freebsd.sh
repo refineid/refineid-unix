@@ -91,7 +91,11 @@ install -m 755 target/release/librefineid_pkcs11.so "$STAGE$MODULE"
 
 printf 'module: %s\ncritical: no\ntrust-policy: no\n' "$MODULE" \
     > "$ROOT/share/p11-kit/modules/refineid.module"
-printf '{ "policies": { "SecurityDevices": { "RefineID": "%s" } } }\n' "$MODULE" \
+install -m 644 crates/refineid-client/trust-anchors/dvv-gov-root-ca-g3-ecc.der \
+    crates/refineid-client/trust-anchors/dvv-gov-root-ca-g3-rsa.der \
+    "$ROOT/lib/firefox/distribution/"
+printf '{\n  "policies": {\n    "SecurityDevices": {\n      "RefineID": "%s"\n    },\n    "Certificates": {\n      "Install": [\n        "%s/lib/firefox/distribution/dvv-gov-root-ca-g3-ecc.der",\n        "%s/lib/firefox/distribution/dvv-gov-root-ca-g3-rsa.der"\n      ]\n    }\n  }\n}\n' \
+    "$MODULE" "$PREFIX" "$PREFIX" \
     > "$ROOT/lib/firefox/distribution/policies.json"
 sed "s|@MODULE@|$MODULE|" packaging/refineid-browser-token > "$STAGE$TOKEN"
 chmod 755 "$STAGE$TOKEN"
