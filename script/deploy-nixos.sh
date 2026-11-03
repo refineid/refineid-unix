@@ -96,6 +96,10 @@ tarball-ttl = 0" nixos-rebuild switch; else NIX_CONFIG="experimental-features = 
 tarball-ttl = 0" nix-shell -p git --run "nixos-rebuild switch"; fi'
 run_cmd_sudo "$REBUILD_CMD"
 
+# Reload udev and re-trigger USB add events so pcscd daemon user gains access to attached readers
+echo "-> Refreshing udev rules and USB smart-card device permissions..."
+run_cmd_sudo 'udevadm control --reload && udevadm trigger --action=add --subsystem-match=usb && systemctl restart pcscd.socket pcscd.service 2>/dev/null || true'
+
 # Allow unit reloads to settle
 sleep 2
 
@@ -140,6 +144,11 @@ if [ "$PCSCD_STATUS" != "active" ]; then
     exit 1
 fi
 echo "   pcscd status: active"
+CARD_REPORT="$(run_cmd '/run/current-system/sw/bin/refineid card 2>&1' || true)"
+if echo "$CARD_REPORT" | grep -q "^reader:"; then
+    DETECTED_READER="$(echo "$CARD_REPORT" | grep "^reader:" | head -n1)"
+    echo "   $DETECTED_READER"
+fi
 
 # 8. Verify Firefox PKCS#11 enterprise policy
 echo "-> Verifying Firefox PKCS#11 enterprise policy..."
