@@ -2,6 +2,12 @@
   "policies": {
     "SecurityDevices": {
       "FINEID": "/usr/lib/librefineid_pkcs11.so"
+    },
+    "Certificates": {
+      "Install": [
+        "/etc/firefox/policies/dvv-gov-root-ca-g3-ecc.der",
+        "/etc/firefox/policies/dvv-gov-root-ca-g3-rsa.der"
+      ]
     }
   }
 }
