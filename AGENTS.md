@@ -67,6 +67,16 @@
   the layout, the script and the task lifecycle.
 - Merge the pull request after mandatory local verification and review pass,
   then remove the worktree and branch and fast-forward `main`.
+- Clean worktrees at the start and end of every task: run
+  `script/agent-housekeeping.sh --clean` before creating your worktree and
+  again before finishing. It removes only worktrees whose branch is merged
+  into main, whose tree is clean, that hold no unpushed commits, and that
+  have been idle for over a day; everything else is left alone. If your own
+  branch just merged and is too fresh for `--clean` to take, remove it
+  yourself once its tree is clean and pushed, then delete the branch and
+  fast-forward local main. If your pull request is still open when you
+  finish, leave the worktree in place — a later start-clean reaps it after
+  merge. Verify with `git worktree list`.
 
 ## Command line
 
