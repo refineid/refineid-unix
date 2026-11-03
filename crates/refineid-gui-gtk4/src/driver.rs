@@ -22,7 +22,7 @@ use refineid_gui_core::model::{CanRequest, SignFormat, UiState, UserIntent};
 use refineid_gui_core::window::{
     self, IdentityLine, PinTask, Recovery, WindowContent, activation_complete, digits_only,
 };
-use refineid_lib_core::can::{CAN_DIGITS, Can};
+use refineid_lib_core::can::{CAN_MAX_DIGITS, CAN_MIN_DIGITS, Can};
 use refineid_lib_core::pin::PinBytes;
 use refineid_rapp_core::offer::{
     PAIRING_CODE_GROUP_SIZE, PAIRING_CODE_LENGTH, pairing_code_character,
@@ -77,9 +77,9 @@ fn pairing_code(typed: &str) -> String {
         .collect()
 }
 
-/// Keeps the digits of `typed`, up to the access number's length.
+/// Keeps the digits of `typed`, up to the access number's maximum length.
 fn access_number(typed: &str) -> String {
-    digits_only(typed, CAN_DIGITS)
+    digits_only(typed, CAN_MAX_DIGITS)
 }
 
 /// A field's digit limit, shared with the handler that enforces it.
@@ -229,6 +229,9 @@ impl CodeBoxes {
             secret: std::rc::Rc::new(std::cell::Cell::new(false)),
         };
         let shown = boxes.clone();
+        let on_complete = std::rc::Rc::new(on_complete);
+        let on_complete_enter = std::rc::Rc::clone(&on_complete);
+        let shown_enter = boxes.clone();
         boxes.entry.connect_changed(move |entry| {
             let kept = filter(&entry.text());
             if kept != entry.text().as_str() {
@@ -240,6 +243,14 @@ impl CodeBoxes {
             shown.render();
             if kept.chars().count() == length {
                 on_complete(kept);
+            }
+        });
+        boxes.entry.connect_activate(move |entry| {
+            let kept = filter(&entry.text());
+            if kept.chars().count() >= CAN_MIN_DIGITS {
+                on_complete_enter(kept);
+            } else {
+                shown_enter.set_refused(true);
             }
         });
         let focused = boxes.clone();
@@ -518,7 +529,7 @@ impl Ui {
         let can = column();
         let can_controller = Arc::clone(controller);
         let can_boxes = CodeBoxes::new(
-            CAN_DIGITS,
+            CAN_MAX_DIGITS,
             None,
             window::CARD_ACCESS_NUMBER,
             Some(window::CAN_CAPTION),
@@ -1338,7 +1349,7 @@ mod tests {
         assert_eq!(pairing_code("7-K-X-4-M-9"), "7KX4M9");
         assert_eq!(pairing_code("7KX4M9ZZZZ"), "7KX4M9");
         assert_eq!(pairing_code("!@#$%^&* "), "");
-        assert_eq!(access_number("12a34b567"), "123456");
+        assert_eq!(access_number("12a34b567"), "1234567");
     }
 
     /// The window in process, where a display is available: the states
