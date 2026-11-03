@@ -501,8 +501,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        // Two writes can land in one filesystem timestamp tick, hiding
-        // which record is newer; stamp the true order in explicitly.
+        // Timestamps can tie within one tick; stamp the order in explicitly.
         let now = SystemTime::now();
         stamp(
             &directory,
@@ -527,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn records_with_tied_timestamps_reopen_in_identifier_order() {
+    fn records_with_tied_timestamps_reopen_in_descending_identifier_order() {
         let directory = scratch();
         {
             let mut store = FilePairingStore::open(&directory).unwrap();
