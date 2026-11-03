@@ -83,8 +83,28 @@ sudo apt purge refineid
 
 ## 2. NixOS
 
-See [doc/install-nixos.md](doc/install-nixos.md) for full instructions.
-Adding `programs.refineid.enable = true;` configures everything system-wide.
+### 2a. Automated Deployment
+Deploy and verify RefineID on a target NixOS system (locally or over SSH, defaults to `root@nixos`):
+```sh
+script/deploy-nixos.sh [TARGET]
+# or: make deploy-nixos [TARGET=root@nixos]
+```
+The script automatically configures `/etc/nixos/configuration.nix` if RefineID is not yet enabled, rebuilds the system, verifies the CLI, GUI, and `pcscd` daemon, and checks the Firefox enterprise policy.
+
+### 2b. Declarative Configuration
+Add the flake module and enable RefineID in `/etc/nixos/configuration.nix`:
+```nix
+  imports = [
+    ./hardware-configuration.nix
+    ((builtins.getFlake "github:refineid/refineid-unix").nixosModules.default)
+  ];
+  programs.refineid.enable = true;
+```
+Then rebuild:
+```sh
+sudo nixos-rebuild switch
+```
+See [doc/install-nixos.md](doc/install-nixos.md) for complete instructions, flake configurations, card login, and troubleshooting.
 
 ---
 

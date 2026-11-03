@@ -2,7 +2,7 @@
 
 CARGO ?= cargo
 
-.PHONY: default help build check clean distclean package-deb install-deb
+.PHONY: default help build check clean distclean package-deb install-deb deploy-nixos
 
 default: build
 
@@ -12,6 +12,7 @@ help:
 	@echo "  make check        -> build + test + clippy + fmt gate"
 	@echo "  make package-deb  -> build Debian/Ubuntu (.deb) packages"
 	@echo "  make install-deb  -> package and install .deb via native package manager"
+	@echo "  make deploy-nixos -> deploy to NixOS target (TARGET=root@nixos)"
 	@echo "  make clean        -> remove build artifacts"
 	@echo "  make distclean    -> remove build artifacts and distribution archives"
 	@echo ""
@@ -31,6 +32,9 @@ package-deb:
 install-deb:
 	./script/package-deb.sh --install
 
+deploy-nixos:
+	./script/deploy-nixos.sh $(TARGET)
+
 check:
 	./script/check.sh
 
@@ -40,4 +44,3 @@ clean:
 
 distclean: clean
 	rm -rf refineid-*.tar*
-

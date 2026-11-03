@@ -14,9 +14,11 @@
 # permissions and limitations under the License.
 
 # Automated NixOS deployment and install verification for RefineID.
-# Rebuilds the target NixOS system to the latest revision, verifies the
-# installation, terminates stale running GUI processes, and verifies that
-# desktop panels have reloaded their menu caches.
+# Configures RefineID in /etc/nixos/configuration.nix if not yet enabled,
+# rebuilds the target NixOS system to the latest revision, verifies the
+# installation (binaries, pcscd daemon, Firefox policy), terminates stale
+# running GUI processes, and verifies that desktop panels have reloaded
+# their menu caches.
 #
 # Usage:
 #   script/deploy-nixos.sh [TARGET]
@@ -66,24 +68,42 @@ run_cmd() {
     fi
 }
 
+run_cmd_sudo() {
+    if [ "$TARGET" = "local" ]; then
+        sudo sh -c "$1"
+    else
+        run_cmd "$1"
+    fi
+}
+
 echo "== Deploying RefineID to NixOS ($TARGET) =="
 
-# 1. Trigger NixOS rebuild with zero tarball TTL to fetch latest git revision
-echo "-> Rebuilding NixOS system..."
-if [ "$TARGET" = "local" ]; then
-    sudo NIX_CONFIG="tarball-ttl = 0" nixos-rebuild switch
-else
-    ssh $SSH_OPTS "$TARGET" 'NIX_CONFIG="tarball-ttl = 0" nixos-rebuild switch'
+# 1. Check if RefineID is already configured in /etc/nixos/configuration.nix
+HAS_REFINEID="$(run_cmd 'grep -s "programs\.refineid\.enable" /etc/nixos/configuration.nix || true')"
+if [ -z "$HAS_REFINEID" ]; then
+    if run_cmd '[ -f /etc/nixos/configuration.nix ]'; then
+        echo "-> RefineID not configured in /etc/nixos/configuration.nix; setting up automatically..."
+        run_cmd_sudo 'sed -i -e "s|^\(\s*\)\./hardware-configuration\.nix|&\n\1((builtins.getFlake \"github:refineid/refineid-unix\").nixosModules.default)|" -e "s|^}\$|  programs.git.enable = true;\n  programs.refineid.enable = true;\n  nix.settings = { experimental-features = [ \"nix-command\" \"flakes\" ]; keep-outputs = true; };\n}|" /etc/nixos/configuration.nix'
+    else
+        echo "   Notice: /etc/nixos/configuration.nix not found; skipping automatic configuration edit"
+    fi
 fi
+
+# 2. Trigger NixOS rebuild with zero tarball TTL to fetch latest git revision
+echo "-> Rebuilding NixOS system..."
+REBUILD_CMD='if command -v git >/dev/null 2>&1; then NIX_CONFIG="experimental-features = nix-command flakes
+tarball-ttl = 0" nixos-rebuild switch; else NIX_CONFIG="experimental-features = nix-command flakes
+tarball-ttl = 0" nix-shell -p git --run "nixos-rebuild switch"; fi'
+run_cmd_sudo "$REBUILD_CMD"
 
 # Allow unit reloads to settle
 sleep 2
 
-# 2. Terminate any stale running refineid-gui process so old memory instances are cleared
+# 3. Terminate any stale running refineid-gui process so old memory instances are cleared
 echo "-> Checking for stale running refineid-gui processes..."
-run_cmd 'pkill -f "[r]efineid-gui" 2>/dev/null || true'
+run_cmd_sudo 'pkill -f "[r]efineid-gui" 2>/dev/null || true'
 
-# 3. Verify desktop entry
+# 4. Verify desktop entry
 echo "-> Verifying /run/current-system/sw/share/applications/refineid.desktop..."
 DESKTOP_EXEC="$(run_cmd 'grep "^Exec=" /run/current-system/sw/share/applications/refineid.desktop 2>/dev/null || true')"
 if [ "$DESKTOP_EXEC" != "Exec=refineid-gui" ]; then
@@ -91,7 +111,7 @@ if [ "$DESKTOP_EXEC" != "Exec=refineid-gui" ]; then
     exit 1
 fi
 
-# 4. Verify binary in system PATH
+# 5. Verify binary in system PATH
 echo "-> Verifying /run/current-system/sw/bin/refineid-gui..."
 BIN_TARGET="$(run_cmd 'readlink -f /run/current-system/sw/bin/refineid-gui 2>/dev/null || true')"
 if [ -z "$BIN_TARGET" ]; then
@@ -100,7 +120,7 @@ if [ -z "$BIN_TARGET" ]; then
 fi
 echo "   Binary resolves to: $BIN_TARGET"
 
-# 5. Check the version: `refineid --version` prints "refineid YY.M.D.B"
+# 6. Check the version: `refineid --version` prints "refineid YY.M.D.B"
 echo "-> Checking the installed version starts with $EXPECTED_VERSION..."
 FOUND_VER="$(run_cmd '/run/current-system/sw/bin/refineid --version 2>&1' || true)"
 case "$FOUND_VER" in
@@ -112,7 +132,32 @@ case "$FOUND_VER" in
         ;;
 esac
 
-# 6. Verify and refresh running desktop panels
+# 7. Verify pcscd smart-card service is active
+echo "-> Verifying pcscd smart-card service is active..."
+PCSCD_STATUS="$(run_cmd 'systemctl is-active pcscd.socket 2>/dev/null || systemctl is-active pcscd 2>/dev/null || true')"
+if [ "$PCSCD_STATUS" != "active" ]; then
+    echo "FAIL: pcscd is not active (status: '$PCSCD_STATUS')" >&2
+    exit 1
+fi
+echo "   pcscd status: active"
+
+# 8. Verify Firefox PKCS#11 enterprise policy
+echo "-> Verifying Firefox PKCS#11 enterprise policy..."
+FIREFOX_POLICY="$(run_cmd 'grep -s "RefineID" /etc/firefox/policies/policies.json || true')"
+if [ -n "$FIREFOX_POLICY" ]; then
+    echo "   Firefox enterprise policy verified: RefineID registered"
+else
+    echo "   Notice: Firefox policy not detected at /etc/firefox/policies/policies.json"
+fi
+
+# 9. Check running browser sessions and advise restart
+echo "-> Checking running browser sessions..."
+RUNNING_FIREFOX="$(run_cmd 'pgrep -f "firefox" 2>/dev/null || true')"
+if [ -n "$RUNNING_FIREFOX" ]; then
+    echo "   Notice: Firefox is currently running. Restart Firefox for RefineID smart-card login to take effect."
+fi
+
+# 10. Verify and refresh running desktop panels
 echo "-> Verifying running desktop panels..."
 run_cmd '
 for session_pid in $(pgrep -f "[x]fce4-session" 2>/dev/null || true); do

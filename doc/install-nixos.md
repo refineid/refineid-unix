@@ -16,10 +16,22 @@ build compiles everything: the dependency build is kept in the local
 Nix store and reused, so following the repository rebuilds just the
 RefineID crates.
 
-## Fresh machine, one command
+## Automated deployment
 
-On a fresh NixOS install, as root, this adds RefineID to
-`/etc/nixos/configuration.nix` and builds it:
+For automated installation, updates, and verification (locally or over SSH):
+
+```sh
+script/deploy-nixos.sh [TARGET]
+# or: make deploy-nixos [TARGET=root@nixos]
+```
+
+`TARGET` defaults to `root@nixos` if reachable via SSH, or `local` if running directly on a NixOS host.
+
+If RefineID is not yet configured in `/etc/nixos/configuration.nix`, `deploy-nixos.sh` automatically adds the RefineID flake module and enables `programs.refineid.enable = true`. It then triggers the rebuild, verifies the CLI, GUI, and `pcscd` smart-card service, verifies the Firefox enterprise policy, and refreshes desktop panels.
+
+## Fresh machine, one command (direct console)
+
+When standing directly at a fresh NixOS machine's root console without this repository checked out:
 
 ```sh
 sed -i -e "s|^\(\s*\)\./hardware-configuration\.nix|&\n\1((builtins.getFlake \"github:refineid/refineid-unix\").nixosModules.default)|" -e "s|^}\$|  programs.git.enable = true;\n  programs.refineid.enable = true;\n  nix.settings = { experimental-features = [ \"nix-command\" \"flakes\" ]; keep-outputs = true; };\n}|" /etc/nixos/configuration.nix && NIX_CONFIG="experimental-features = nix-command flakes" nix-shell -p git --run "nixos-rebuild switch"
@@ -173,7 +185,9 @@ sudo NIX_CONFIG="experimental-features = nix-command flakes" nixos-rebuild switc
 - Firefox card login configured automatically through the
   `SecurityDevices` enterprise policy **when Firefox is enabled with
   `programs.firefox.enable = true`**. Insert the card, open a
-  card-login service, pick the certificate, enter PIN 1. Set
+  card-login service, pick the certificate, enter PIN 1. If Firefox was
+  already running during installation or rebuild, restart Firefox so it
+  reads the new enterprise policy. Set
   `programs.refineid.firefoxIntegration = false` to opt out.
 - Chromium card login: the autostart entry
   `/etc/xdg/autostart/refineid-browser-token.desktop` registers the
