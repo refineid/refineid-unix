@@ -3,7 +3,9 @@
 RefineID publishes signed package repositories at `https://pkg.refineid.fi`,
 one path per distribution: `/ubuntu` for Ubuntu 26.04 LTS (amd64, arm64)
 and `/freebsd` for FreeBSD 15 (amd64). `/debian` is reserved for Debian.
-A new release arrives through `apt upgrade` and `pkg upgrade`.
+A new release arrives through `apt update && apt upgrade` and
+`pkg upgrade`. Official Debian and Ubuntu archives and a FreeBSD port
+are later goals, not this plan.
 
 ## Install
 

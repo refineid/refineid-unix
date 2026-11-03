@@ -20,7 +20,7 @@ Citations are BibTeX keys in [`references.md`](references.md).
   each and fits a screen; `refineid <command> help` shows a command's
   options; the man page refineid(1) carries the detail, split into the
   same two sections. No command prints a banner or its version
-  unasked; `-V` does that.
+  unasked; `-V` does that. There is no info page.
 - **Quiet on success.** An operation prints nothing when it works and
   reports its steps with `-v`. The exit status tells success from
   failure, so `&&` and `||` compose.

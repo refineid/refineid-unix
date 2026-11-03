@@ -132,6 +132,18 @@ Canonical DVV sources:
   from the no-echo terminal prompt, never from argv or the
   environment, and never displays, logs or sends it.
 
+## Pairing
+
+Pairing is *yhdistäminen*, and its code is the *yhdistämiskoodi*.
+*Paritus*, *pariliitos* and *laitepari* are not used. A pairing the
+holder breaks is a broken pairing (*rikottu yhdistäminen*), never a
+*paritus*.
+
+## Revocation
+
+Revocation-list evidence is labelled *sulkulista*; a revoked state is
+*mitätöity* and its time the *mitätöintiaika*.
+
 ## Naming rules
 
 ### Personal Identity Code (PIC)

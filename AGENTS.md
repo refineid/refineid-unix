@@ -33,6 +33,8 @@
   No `Co-authored-by` / `Signed-off-by` / `Reviewed-by`
   or any AI-naming trailer; subject + body only. 
 - ASCII only in source, UTF-8 only where required.
+- New files carry `Copyright 2026 Petri Koistinen` with no email address
+  and HTTPS license URLs.
 - No Magic Codes - define everything (see [Types and numbers](#types-and-numbers)).
 - Commit often when compiles and lint is clean.
 - Push when feature is ready.
@@ -42,6 +44,10 @@
   workspace; pre-push runs the complete local build, test, Clippy, and rustdoc
   floor. GitHub Nix builds are available manually and run weekly for both
   x86_64 and arm64 coverage; they do not replace local hooks.
+- Rust follows the latest stable release (`rust-toolchain.toml` selects the
+  stable channel); never pin a release.
+- RefineID git dependencies track `refineid-core` main, never a pinned
+  revision; refresh them instead of freezing.
 - Verify from specifications, don't wild guess.
   `doc/references.md` indexes which one governs what.
   Cite what a source proves, and say what it does not.
@@ -49,6 +55,14 @@
 - When stuck, research with fellow AI available.
 - If something is not working, it is by default a bug in code,
   not a feature of the platform.
+
+## Rules live here, not in an agent's memory
+
+Every rule, decision and finding an agent should remember lives in this
+repository, never only in an agent's memory: a design rule in `doc/`, a
+defect in an issue, a working rule in this file. This file states each
+rule in a line and points to the reading behind it; the readings live
+in `doc/`, not here.
 
 ## Worktree policy
 
@@ -103,7 +117,8 @@
 
 - Comments explain what the code does now and the constraints it honors.
   Past bugs, previous implementations, and explanations of what a fix changed
-  belong in commit messages, not source comments.
+  belong in commit messages, not source comments. No measurement dates
+  in comments.
 
 ## Commits and integration
 
@@ -213,6 +228,8 @@ record for RAPP and its applications.
   ones (EU eIDAS), from trusted lists at runtime. No certificates or
   fingerprints are shipped in the software.
 - No pinning or other trust policy is added without the owner's decision.
+- Describe what the code does and cite the source; ask the owner before
+  changing trust behavior.
 
 ## Independent review
 

@@ -39,6 +39,11 @@ machine-checkable.
 5. **Normative beats persuasive.** Never cite a paper for a claim a
    specification settles. If both are cited, the specification governs
    and the paper is context.
+6. **Read before stating.** A stated finding comes from text actually
+   read: the abstract, the full text, or a named secondary source. A
+   DOI typed from memory is checked against Crossref or the publisher
+   before it is written down. `last_verified` means the claim was
+   checked, not the URL alone.
 
 ## Normative specifications
 

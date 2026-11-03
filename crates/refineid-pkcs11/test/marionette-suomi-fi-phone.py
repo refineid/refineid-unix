@@ -4,7 +4,9 @@ Drive Firefox to log in to Suomi.fi through the paired phone's token.
 
 The module is the one Firefox loads from its policy, in the user's own
 profile; the phone verifies PIN 1, so no PIN is typed here. The
-certificate chooser is accepted when it appears.
+certificate chooser is accepted when it appears. Never set
+security.default_personal_cert to Select Automatically for automation:
+the test drives the real dialog in the real profile.
 
 Usage:
   ./crates/refineid-pkcs11/test/marionette-suomi-fi-phone.py [start-url]
