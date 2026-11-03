@@ -60,7 +60,8 @@ enum Sweep {
 #[derive(Debug)]
 pub struct FilePairingStore {
     directory: PathBuf,
-    /// Loaded records, oldest first.
+    /// Loaded records, oldest first, identifier order breaking
+    /// timestamp ties.
     records: Vec<PairingRecord>,
 }
 
@@ -136,7 +137,7 @@ impl FilePairingStore {
                 .ok();
             loaded.push((modified, record));
         }
-        loaded.sort_by_key(|(modified, _)| *modified);
+        loaded.sort_by_key(|(modified, record)| (*modified, record.pair_id()));
         Ok(Self {
             directory: directory.to_path_buf(),
             records: loaded.into_iter().map(|(_, record)| record).collect(),
@@ -369,7 +370,8 @@ mod tests {
     };
 
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     use super::{
         APPLICATION_DIRECTORY, CONFIG_DIRECTORY, FilePairingStore, HOME, SNAP_USER_COMMON,
@@ -401,6 +403,19 @@ mod tests {
     const DIRECTORY_MODE: u32 = 0o700;
     /// The mode of each record file.
     const FILE_MODE: u32 = 0o600;
+    /// How far apart the recency test stamps its record files: wider
+    /// than any filesystem timestamp tick.
+    const STAMP_GAP_SECS: u64 = 3_600;
+
+    /// Stamps `pair_id`'s record file in `directory` with `modified`.
+    fn stamp(directory: &Path, pair_id: PairId, modified: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path_for(directory, pair_id))
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
 
     fn scratch() -> PathBuf {
         let suffix = getrandom::u64().unwrap();
@@ -486,6 +501,15 @@ mod tests {
                 })
                 .unwrap();
         }
+        // Two writes can land in one filesystem timestamp tick, hiding
+        // which record is newer; stamp the true order in explicitly.
+        let now = SystemTime::now();
+        stamp(
+            &directory,
+            PairId::from_array(SECOND),
+            now - Duration::from_secs(STAMP_GAP_SECS),
+        );
+        stamp(&directory, PairId::from_array(FIRST), now);
         let store = FilePairingStore::open(&directory).unwrap();
         assert_eq!(
             store.pair_ids(),
@@ -499,6 +523,25 @@ mod tests {
             let mode = entry.unwrap().metadata().unwrap().permissions().mode();
             assert_eq!(mode & PERMISSION_BITS, FILE_MODE);
         }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn records_with_tied_timestamps_reopen_in_identifier_order() {
+        let directory = scratch();
+        {
+            let mut store = FilePairingStore::open(&directory).unwrap();
+            store.insert(record(PairId::from_array(SECOND))).unwrap();
+            store.insert(record(PairId::from_array(FIRST))).unwrap();
+        }
+        let stamped = SystemTime::now();
+        stamp(&directory, PairId::from_array(FIRST), stamped);
+        stamp(&directory, PairId::from_array(SECOND), stamped);
+        let store = FilePairingStore::open(&directory).unwrap();
+        assert_eq!(
+            store.pair_ids(),
+            [PairId::from_array(SECOND), PairId::from_array(FIRST)]
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
