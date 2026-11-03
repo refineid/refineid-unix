@@ -198,6 +198,7 @@ In accordance with [RAPP Transport and Discovery Hierarchy Specification](https:
 10. **Red for Errors Only**: Red marks errors and a credential below the retry floor, beside a mark; every other state is neutral grey.
 11. **No Confirmation Dialogs**: A chosen action happens.
 12. **This Computer's Name**: The workstation names itself to the phone `<operating system> - <host name>`, as "Linux - example-host", "FreeBSD - example-host" or "OpenBSD - example-host", shortened to 256 bytes at a character boundary, and sends it again at the start of every session; the phone's name is refreshed in the pairing record at every session (RAPP v26.11.2 section 4.3 items 3 and 4).
+13. **No Recovery Buttons**: No paused state waits for a resume; back-offs stay silent and clear themselves.
 
 ### 4.4 The One Window
 
