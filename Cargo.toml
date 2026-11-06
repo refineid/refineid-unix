@@ -18,7 +18,7 @@ members = [
 # YY.M.D, the UTC day the code last changed, stamped by the pre-commit
 # hook (script/version-stamp.sh). refineid_lib_core::VERSION appends the
 # build number B for the project version YY.M.D.B.
-version = "26.11.3"
+version = "26.11.6"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Petri Koistinen"]
@@ -78,6 +78,11 @@ tokio = { version = "1", default-features = false, features = ["net", "rt", "tim
 # Socket options std cannot set before bind: the mDNS browse shares the
 # mDNS port with the system responder. Already in-tree through tokio.
 socket2 = { version = "0.6", features = ["all"] }
+
+# The uname system call without unsafe code or a child process: the
+# host name the phone lists this computer by. Already in the lock file
+# through tempfile.
+rustix = { version = "1", default-features = false, features = ["system"] }
 
 # Random generation for session-local secrets.
 getrandom = "0.4"
