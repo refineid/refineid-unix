@@ -385,19 +385,7 @@ impl PinActivateHelpers {
     /// source of truth; the CLI shell honours it for the
     /// process exit code.
     fn activate_outcome_status(report: &ActivateReport) -> ExitStatus {
-        let all_ok = match report.target {
-            ActivationTarget::Both => matches!(
-                (&report.pin1_outcome, &report.pin2_outcome),
-                (Some(UnblockOutcome::Ok), Some(UnblockOutcome::Ok))
-            ),
-            ActivationTarget::One(PinManageSlot::Pin1) => {
-                matches!(report.pin1_outcome, Some(UnblockOutcome::Ok))
-            }
-            ActivationTarget::One(PinManageSlot::Pin2) => {
-                matches!(report.pin2_outcome, Some(UnblockOutcome::Ok))
-            }
-        };
-        if all_ok {
+        if report.all_set() {
             return ExitStatus::Ok;
         }
         match (&report.pin1_outcome, &report.pin2_outcome) {

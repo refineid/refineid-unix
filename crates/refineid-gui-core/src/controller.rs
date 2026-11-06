@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use refineid_client::card_check::{CardCheckError, CardCheckReport};
 use refineid_client::card_pin::{
-    ActivateOptions, ChangePinOptions, PinManageSlot, UnblockPinOptions,
+    ActivateOptions, ActivateReport, ChangePinOptions, PinManageSlot, UnblockPinOptions,
 };
 use refineid_doc_sign::service::{DEFAULT_TIMESTAMP_AUTHORITY, SignOutput};
 use refineid_doc_sign::signed_name::PendingSignedName;
@@ -651,7 +651,24 @@ impl RefineIdController {
             controller.update_state(|s| {
                 s.busy = false;
                 s.status_message = match res {
-                    Ok(_) => String::new(),
+                    Ok(report) if report.all_set() => String::new(),
+                    Ok(report) => {
+                        match activation_rejection(&report) {
+                            Some((_, outcome)) => {
+                                refineid_dev_errors::report!(
+                                    Gui,
+                                    "card activation rejected",
+                                    outcome
+                                );
+                            }
+                            None => refineid_dev_errors::report!(
+                                Gui,
+                                "card activation incomplete",
+                                "no PIN rejected"
+                            ),
+                        }
+                        activation_incomplete_line(&report)
+                    }
                     Err(err) => format!("Card activation failed: {err}"),
                 };
             });
@@ -1135,6 +1152,34 @@ fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String
     }
 }
 
+/// The first PIN whose setup the card rejected during an activation,
+/// with the card's answer; `None` when the card rejected none.
+fn activation_rejection(report: &ActivateReport) -> Option<(PinManageSlot, UnblockOutcome)> {
+    [
+        (PinManageSlot::Pin1, report.pin1_outcome),
+        (PinManageSlot::Pin2, report.pin2_outcome),
+    ]
+    .into_iter()
+    .find_map(|(slot, outcome)| {
+        outcome
+            .filter(|outcome| *outcome != UnblockOutcome::Ok)
+            .map(|outcome| (slot, outcome))
+    })
+}
+
+/// The status line after an activation that did not set every PIN: the
+/// PIN the card rejected and its answer, which carries the tries left,
+/// else the pre-flight refusal of a card that looks activated.
+fn activation_incomplete_line(report: &ActivateReport) -> String {
+    match activation_rejection(report) {
+        Some((slot, outcome)) => format!("{} activation rejected: {outcome:?}", slot.label()),
+        None if report.preflight.looks_activated() => {
+            "Card activation refused: the card looks already activated.".into()
+        }
+        None => "Card activation incomplete.".into(),
+    }
+}
+
 /// Whether an inspection agrees with the presence signature: the readers
 /// that report a card are exactly `readers`, the readers a card was read
 /// in.
@@ -1278,6 +1323,8 @@ fn phone_card(dev_name: &str, serial: TokenSerial, identity: CredentialIdentity)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refineid_client::card_pin::{ActivatePreflightOutcome, ActivationTarget};
+    use refineid_lib_core::apdu::status_word::PinRetries;
     use refineid_lib_core::auth::PinStatus;
     use refineid_rapp_core::message::ResultError;
 
@@ -1637,6 +1684,91 @@ mod tests {
         let relaunched = RefineIdController::with_switch_directory(Some(directory.clone()), |_| {});
         assert!(!relaunched.state().remote_use);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// An activation report on both PINs with the given outcomes.
+    fn activation_report(
+        preflight: ActivatePreflightOutcome,
+        pin1_outcome: Option<UnblockOutcome>,
+        pin2_outcome: Option<UnblockOutcome>,
+    ) -> ActivateReport {
+        ActivateReport {
+            reader: "Synthetic Card Reader".into(),
+            target: ActivationTarget::Both,
+            other_looks_unactivated: false,
+            preflight,
+            pin1_outcome,
+            pin2_outcome,
+        }
+    }
+
+    #[test]
+    fn an_activation_the_card_rejected_is_reported_with_its_answer() {
+        /// Tries left after a wrong activation PIN.
+        const TRIES_LEFT: u8 = 3;
+        /// A status word outside the modeled set.
+        const UNMODELED_SW: u16 = 0x6F00;
+        let unactivated = ActivatePreflightOutcome::LooksUnactivated {
+            pin1: None,
+            pin2: None,
+        };
+        let retries_left =
+            PinRetries::from_nibble(TRIES_LEFT).unwrap_or_else(|| panic!("tries fit a nibble"));
+        let wrong = UnblockOutcome::WrongPuk { retries_left };
+        let ok = Some(UnblockOutcome::Ok);
+
+        let set = activation_report(unactivated, ok, ok);
+        assert!(set.all_set());
+
+        for (pin1, pin2, slot, outcome) in [
+            (Some(wrong), None, PinManageSlot::Pin1, wrong),
+            (ok, Some(wrong), PinManageSlot::Pin2, wrong),
+            (
+                Some(UnblockOutcome::PukLocked),
+                None,
+                PinManageSlot::Pin1,
+                UnblockOutcome::PukLocked,
+            ),
+            (
+                ok,
+                Some(UnblockOutcome::Other(UNMODELED_SW)),
+                PinManageSlot::Pin2,
+                UnblockOutcome::Other(UNMODELED_SW),
+            ),
+        ] {
+            let report = activation_report(unactivated, pin1, pin2);
+            assert!(!report.all_set());
+            assert_eq!(activation_rejection(&report), Some((slot, outcome)));
+            assert_eq!(
+                activation_incomplete_line(&report),
+                format!("{} activation rejected: {outcome:?}", slot.label())
+            );
+        }
+        let wrong_line =
+            activation_incomplete_line(&activation_report(unactivated, Some(wrong), None));
+        assert!(wrong_line.contains(&format!("{retries_left:?}")));
+
+        let refused = activation_report(
+            ActivatePreflightOutcome::LooksActivated {
+                pin1: None,
+                pin2: None,
+            },
+            None,
+            None,
+        );
+        assert!(!refused.all_set());
+        assert_eq!(activation_rejection(&refused), None);
+        assert_eq!(
+            activation_incomplete_line(&refused),
+            "Card activation refused: the card looks already activated."
+        );
+
+        let unattempted = activation_report(unactivated, ok, None);
+        assert!(!unattempted.all_set());
+        assert_eq!(
+            activation_incomplete_line(&unattempted),
+            "Card activation incomplete."
+        );
     }
 
     #[test]

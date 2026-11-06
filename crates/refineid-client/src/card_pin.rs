@@ -1084,6 +1084,27 @@ pub struct ActivateReport {
     pub pin2_outcome: Option<UnblockOutcome>,
 }
 
+impl ActivateReport {
+    /// `true` when the card set every PIN in [`Self::target`]. A
+    /// pre-flight refusal, a PIN the card rejected and a PIN left
+    /// unattempted all read `false`.
+    #[must_use]
+    pub const fn all_set(&self) -> bool {
+        match self.target {
+            ActivationTarget::Both => matches!(
+                (self.pin1_outcome, self.pin2_outcome),
+                (Some(UnblockOutcome::Ok), Some(UnblockOutcome::Ok))
+            ),
+            ActivationTarget::One(PinManageSlot::Pin1) => {
+                matches!(self.pin1_outcome, Some(UnblockOutcome::Ok))
+            }
+            ActivationTarget::One(PinManageSlot::Pin2) => {
+                matches!(self.pin2_outcome, Some(UnblockOutcome::Ok))
+            }
+        }
+    }
+}
+
 /// What the PIN preflight saw before any modification was
 /// attempted. Informational on success; the source of the refusal
 /// otherwise.
@@ -1981,9 +2002,9 @@ mod activate_tests {
     use refineid_lib_core::auth::{ActivationScheme, PIN_TRY_LIMIT, PinReferenceScheme};
 
     use super::{
-        ActivatePreflightOutcome, ActivationTarget, CardPinError, ChangePinOutcome, PinManageSlot,
-        PinStatus, SlotProbe, UnblockOutcome, activation_continues_after_pin1, change_to_unblock,
-        classify_preflight,
+        ActivatePreflightOutcome, ActivateReport, ActivationTarget, CardPinError, ChangePinOutcome,
+        PinManageSlot, PinStatus, SlotProbe, UnblockOutcome, activation_continues_after_pin1,
+        change_to_unblock, classify_preflight,
     };
     use crate::test_util::{TestResult, check_true};
     use refineid_lib_core::pin::ActivationPinSeven;
@@ -2258,6 +2279,60 @@ mod activate_tests {
             ),
             "Other -> Other",
         )
+    }
+
+    /// `all_set` holds exactly when every targeted PIN's outcome is
+    /// `Ok`, for each target and every pairing of per-PIN outcomes:
+    /// set, refused with tries left, locked, invalidated, an
+    /// unmodelled status word, and not attempted.
+    #[test]
+    fn activation_is_complete_only_when_every_targeted_pin_is_set() -> TestResult {
+        /// A status word outside the modeled set.
+        const UNMODELED_SW: u16 = 0x6F00;
+        /// Tries left after a wrong activation PIN.
+        const TRIES_LEFT: u8 = 3;
+        let retries_left =
+            PinRetries::from_nibble(TRIES_LEFT).ok_or("PinRetries::from_nibble(TRIES_LEFT)")?;
+        let outcomes = [
+            Some(UnblockOutcome::Ok),
+            Some(UnblockOutcome::WrongPuk { retries_left }),
+            Some(UnblockOutcome::PukLocked),
+            Some(UnblockOutcome::Invalidated),
+            Some(UnblockOutcome::Other(UNMODELED_SW)),
+            None,
+        ];
+        let set = Some(UnblockOutcome::Ok);
+        for target in [
+            ActivationTarget::Both,
+            ActivationTarget::One(PinManageSlot::Pin1),
+            ActivationTarget::One(PinManageSlot::Pin2),
+        ] {
+            for pin1_outcome in outcomes {
+                for pin2_outcome in outcomes {
+                    let report = ActivateReport {
+                        reader: "Synthetic Card Reader".to_owned(),
+                        target,
+                        other_looks_unactivated: false,
+                        preflight: ActivatePreflightOutcome::LooksUnactivated {
+                            pin1: None,
+                            pin2: None,
+                        },
+                        pin1_outcome,
+                        pin2_outcome,
+                    };
+                    let expected = match target {
+                        ActivationTarget::Both => pin1_outcome == set && pin2_outcome == set,
+                        ActivationTarget::One(PinManageSlot::Pin1) => pin1_outcome == set,
+                        ActivationTarget::One(PinManageSlot::Pin2) => pin2_outcome == set,
+                    };
+                    check_true(
+                        report.all_set() == expected,
+                        "activation is complete only when every targeted PIN is set",
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
