@@ -44,13 +44,14 @@
 //! dial not yet open without a notice, keeps the pairing, and ends before
 //! `C_Finalize` returns.
 
+use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use refineid_lib_core::x509::{DigestCheckError, MessageSignatureAlgorithm, OwnedCert};
 use refineid_pkcs11::remote::{
@@ -517,6 +518,46 @@ fn computer_context() -> DisplayText {
     })
 }
 
+/// What the pairing store directory looked like at one reading: its own
+/// modification time, and each entry's name, length and modification
+/// time. The records are read and parsed anew only when this differs
+/// from the last reading, so a look that finds nothing changed costs one
+/// directory listing and no file reads. A store that cannot be listed has
+/// an empty signature, which differs from any listing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct StoreSignature {
+    /// The directory's modification time, which a record added, removed
+    /// or replaced by rename changes.
+    directory: Option<SystemTime>,
+    /// Each entry's name, length and modification time, in name order.
+    entries: Vec<(OsString, u64, Option<SystemTime>)>,
+}
+
+impl StoreSignature {
+    /// The signature of `store` now.
+    fn of(store: &Path) -> Self {
+        let directory = std::fs::metadata(store)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let mut entries: Vec<_> = std::fs::read_dir(store)
+            .map(|dir| {
+                dir.filter_map(Result::ok)
+                    .map(|entry| {
+                        let metadata = entry.metadata().ok();
+                        (
+                            entry.file_name(),
+                            metadata.as_ref().map_or(0, std::fs::Metadata::len),
+                            metadata.and_then(|metadata| metadata.modified().ok()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort();
+        Self { directory, entries }
+    }
+}
+
 /// The session thread over the pairing store in `store`: read the record,
 /// look for the phone, dial as the view says, read the certificate, hold,
 /// answer.
@@ -525,6 +566,9 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
     // The view of the phone, and the pairing it belongs to.
     let mut view = CustodianView::new();
     let mut viewed: Option<PairId> = None;
+    // The store as last read, and its signature then: read again only
+    // when the directory says something changed.
+    let mut opened: Option<(StoreSignature, RemoteReader)> = None;
     while !shared.stopped() {
         // A pairing that expires is gone: the round below finds no phone
         // and the slot goes. A refused store is swept again on the next
@@ -547,9 +591,13 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
 
         // A store that cannot be read just now says nothing of the
         // pairing: the offering and its grace stand as they are.
-        let Ok(mut reader) = RemoteReader::open_local_without_sweep(store)
-            .map(|reader| reader.following(shared.withdrawal()))
-        else {
+        let signature = StoreSignature::of(store);
+        if opened.as_ref().is_none_or(|(seen, _)| *seen != signature) {
+            opened = RemoteReader::open_local_without_sweep(store)
+                .map(|reader| (signature, reader.following(shared.withdrawal())))
+                .ok();
+        }
+        let Some((_, reader)) = opened.as_mut() else {
             pause(shared, UNPAIRED_PAUSE);
             continue;
         };
@@ -580,14 +628,14 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
             phone.auth_cert.clone(),
             Instant::now(),
         );
-        if !dial_due(shared, requests, &reader, &phone, &mut view) {
+        if !dial_due(shared, requests, reader, &phone, &mut view) {
             pause(shared, LOOK_PAUSE);
             continue;
         }
         match reader.dial_session(phone.pair_id, DIAL_BROWSE) {
             Ok(session) => {
                 view.dial_succeeded();
-                let held = hold(shared, requests, store, &mut reader, session, &phone, slot);
+                let held = hold(shared, requests, store, reader, session, &phone, slot);
                 match held.after {
                     After::Grace => shared.token(|offering| offering.unconfirmed(Instant::now())),
                     After::Withdraw => shared.token(Offering::withdrawn),
@@ -757,6 +805,9 @@ fn hold(
     // tried again until the phone reports a card anew.
     let mut tried: Option<CertificateFingerprint> = None;
     let mut record_checked = Instant::now();
+    // The store as last signed here: empty at first, so the first check
+    // reads the record once, and after that only a changed store does.
+    let mut record_seen = StoreSignature::default();
     loop {
         if shared.stopped() {
             reader.withdraw_session(session);
@@ -901,7 +952,15 @@ fn hold(
         }
         if record_checked.elapsed() >= RECORD_CHECK_INTERVAL {
             record_checked = Instant::now();
-            match held_record(store, phone.pair_id) {
+            let signature = StoreSignature::of(store);
+            let changed = signature != record_seen;
+            record_seen = signature;
+            let record = if changed {
+                held_record(store, phone.pair_id)
+            } else {
+                HeldRecord::Usable
+            };
+            match record {
                 HeldRecord::Usable | HeldRecord::Unreadable => {}
                 HeldRecord::Forgotten => {
                     reader.revoke_in_session(session);
@@ -1500,7 +1559,7 @@ mod tests {
     fn scratch_store() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
+        let nanos = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("a clock after the epoch")
             .as_nanos();
@@ -1508,6 +1567,37 @@ mod tests {
             "refineid-pkcs11-phone-{}-{nanos:x}-{serial}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn the_store_signature_changes_with_the_directory_and_its_entries() {
+        let store = scratch_store();
+        let absent = StoreSignature::of(&store);
+        assert_eq!(absent, StoreSignature::default(), "no store, no signature");
+
+        std::fs::create_dir_all(&store).expect("the store directory");
+        let empty = StoreSignature::of(&store);
+        assert_ne!(empty, absent);
+        assert_eq!(
+            empty,
+            StoreSignature::of(&store),
+            "nothing changed, same signature"
+        );
+
+        let record = store.join("record");
+        std::fs::write(&record, b"one").expect("a record");
+        let one = StoreSignature::of(&store);
+        assert_ne!(one, empty, "an added record changes it");
+        assert_eq!(one, StoreSignature::of(&store));
+
+        std::fs::write(&record, b"longer").expect("the record rewritten");
+        assert_ne!(
+            StoreSignature::of(&store),
+            one,
+            "a rewritten record changes it"
+        );
+
+        std::fs::remove_dir_all(&store).expect("the store removed");
     }
 
     /// A confirmed pairing of [`PAIR_ID`] made at [`LONG_AGO_MS`] that has
