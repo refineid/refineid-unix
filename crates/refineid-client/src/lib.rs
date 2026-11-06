@@ -40,6 +40,11 @@
 // `restriction` group so any future attempt to add a raw
 // print there stays visible.
 
+// PINs read from the environment show in `ps` and reach every child
+// process, so the debug aid never builds without debug assertions.
+#[cfg(all(feature = "pin-env-debug", not(debug_assertions)))]
+compile_error!("the pin-env-debug feature is for debug builds only");
+
 extern crate alloc;
 
 pub mod apdu_trace;

@@ -29,8 +29,9 @@
 #   REFINEID_SUITE_PIN_CHANGE=1  (opt-in) run the PIN1 change cycle
 #                                with guaranteed revert. Needs the
 #                                module built with
-#                                `--features pin-change` and the CLI
-#                                with `--features pin-env-debug`.
+#                                `--features pin-change` and a debug
+#                                CLI built with `--features
+#                                pin-env-debug`, named by REFINEID_CLI.
 #   REFINEID_TEST_PIN1_TMP       temporary PIN1 for the change
 #                                cycle (required if pin-change enabled).
 #   REFINEID_SUITE_INTERACTIVE=1 (opt-in) run the PUK-unblock
