@@ -14,4 +14,13 @@ if [ -n "$stamped" ]; then
     git add Cargo.toml Cargo.lock
 fi
 
+# RefineID's own crates are never pinned: every commit builds the head of
+# refineid-core main. Without the network the lock file keeps its core
+# revision, and the daily track-core-main job moves it later.
+if cargo update --quiet --package refineid-apdu 2>/dev/null; then
+    git add Cargo.lock
+else
+    echo "pre-commit: core main not reachable; the lock file keeps its core revision" >&2
+fi
+
 exec "$REPO_ROOT/script/verify-commit.sh"
