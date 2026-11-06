@@ -33,6 +33,7 @@
 //! pairing stays.
 
 use std::net::SocketAddrV4;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::addresses;
@@ -536,17 +537,20 @@ pub const fn local_platform() -> &'static str {
 }
 
 /// This computer's host name without its domain, as the phone lists it:
-/// what `uname -n` prints, or `RefineID` when the system has no name of
-/// its own.
+/// the node name the `uname` system call reports, or `RefineID` when the
+/// system has no name of its own. Read once per process: the PKCS#11
+/// module runs this inside browsers and PAM, so it spawns no program and
+/// does not ask again on its session thread's every round.
 #[must_use]
 pub fn local_host_name() -> String {
-    let printed = std::process::Command::new("uname")
-        .arg("-n")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
+    static HOST_NAME: OnceLock<String> = OnceLock::new();
+    HOST_NAME.get_or_init(read_host_name).clone()
+}
+
+/// The short host name from `uname`, or `RefineID` for an unset one.
+fn read_host_name() -> String {
+    let system = rustix::system::uname();
+    let printed = system.nodename().to_string_lossy();
     let short = printed.trim().split('.').next().unwrap_or("").trim();
     if short.is_empty()
         || UNSET_HOST_NAMES

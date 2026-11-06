@@ -2164,6 +2164,7 @@ dependencies = [
  "getrandom 0.4.3",
  "refineid-dev-errors",
  "refineid-rapp",
+ "rustix",
  "sha2 0.11.0",
  "socket2",
  "zeroize",
