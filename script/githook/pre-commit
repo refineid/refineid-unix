@@ -5,22 +5,24 @@ set -eu
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-# The workspace version is the UTC day the tree was last committed on.
-# When the day has changed since the stamp, the commit carries a fresh
-# stamp, so no build published from main names an earlier day.
-stamped=$(./script/version-stamp.sh)
-if [ -n "$stamped" ]; then
-    echo "$stamped"
-    git add Cargo.toml Cargo.lock
-fi
-
 # RefineID's own crates are never pinned: every commit builds the head of
 # refineid-core main. Without the network the lock file keeps its core
-# revision, and the daily track-core-main job moves it later.
-if cargo update --quiet --package refineid-apdu 2>/dev/null; then
+# revision, and the daily track-core-main job moves it later. This comes
+# first, so a moved core counts as a code-level change below.
+if cargo update --quiet --package refineid-apdu; then
     git add Cargo.lock
 else
     echo "pre-commit: core main not reachable; the lock file keeps its core revision" >&2
+fi
+
+# The workspace version names the UTC day of the last code-level change.
+# A commit that touches only documentation, workflows or hooks keeps it.
+if git diff --cached --name-only | grep -q -v -E '^(\.github/|script/githook/|doc/|docs/)|\.md$|^LICENSE|^\.gitignore$|^\.editorconfig$'; then
+    stamped=$(./script/version-stamp.sh)
+    if [ -n "$stamped" ]; then
+        echo "$stamped"
+        git add Cargo.toml Cargo.lock
+    fi
 fi
 
 exec "$REPO_ROOT/script/verify-commit.sh"
