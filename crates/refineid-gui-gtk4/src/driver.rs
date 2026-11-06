@@ -163,7 +163,7 @@ struct CodeBoxes {
     /// The eye beside a secret code's boxes.
     reveal: gtk4::ToggleButton,
     /// Whether typed characters show as dots until the eye is pressed.
-    secret: std::rc::Rc<std::cell::Cell<bool>>,
+    secret: Rc<Cell<bool>>,
 }
 
 impl CodeBoxes {
@@ -226,7 +226,7 @@ impl CodeBoxes {
                 .icon_name("view-reveal-symbolic")
                 .valign(gtk4::Align::Center)
                 .build(),
-            secret: std::rc::Rc::new(std::cell::Cell::new(false)),
+            secret: Rc::new(Cell::new(false)),
         };
         let shown = boxes.clone();
         boxes.entry.connect_changed(move |entry| {

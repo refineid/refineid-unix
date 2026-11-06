@@ -9,6 +9,10 @@
 #   * Live OCSP status from http://ocsp.fineid.fi/<ca>
 #   * Revocation date + reason if the cert is revoked
 #
+# A diagnostic, not a revocation check: the OCSP answer is shown
+# without verifying the responder's signature, and each OCSP status
+# line says so.
+#
 # The OCSP responder + CA Issuers + CRL distribution URLs come
 # straight from the cert's X.509v3 extensions; no hardcoded DVV
 # endpoints, so a future FINEID profile change won't silently
@@ -111,6 +115,7 @@ echo
 
 # --- OCSP query (preferred) ------------------------------------------
 ocsp_status_result=""
+UNVERIFIED="(responder signature not verified)"
 if [[ -n "$OCSP_URL" && -n "$CA_URL" ]]; then
     echo "==> OCSP query: $OCSP_URL"
     if curl -sL -o "$TMP/issuer.raw" --connect-timeout 10 "$CA_URL"; then
@@ -138,18 +143,18 @@ if [[ -n "$OCSP_URL" && -n "$CA_URL" ]]; then
             UPDATED=$(grep -m1 "This Update:" "$TMP/ocsp.out" | sed 's/.*This Update: //')
             case "$STATUS" in
                 good)
-                    echo "    Status:        GOOD (as of $UPDATED)"
+                    echo "    Status:        GOOD (as of $UPDATED) $UNVERIFIED"
                     ocsp_status_result="good"
                     ;;
                 revoked)
-                    echo "    Status:        REVOKED"
+                    echo "    Status:        REVOKED $UNVERIFIED"
                     echo "    Revoked at:    $REVTIME"
                     echo "    Reason:        $REVREASON"
                     echo "    Last updated:  $UPDATED"
                     ocsp_status_result="revoked"
                     ;;
                 unknown)
-                    echo "    Status:        UNKNOWN (responder doesn't know this cert)"
+                    echo "    Status:        UNKNOWN (responder doesn't know this cert) $UNVERIFIED"
                     ocsp_status_result="unknown"
                     ;;
                 *)

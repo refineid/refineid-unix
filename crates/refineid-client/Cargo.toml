@@ -37,7 +37,8 @@ tls-rustls = ["https", "refineid-lib-tls/tls-rustls"]
 # automation:
 #   cargo build --features pin-env-debug
 # The gate is compile-time, so a default build has no code path
-# that touches the variables at all.
+# that touches the variables at all. A release build (no debug
+# assertions) with this feature does not compile.
 pin-env-debug = []
 
 [dev-dependencies]
