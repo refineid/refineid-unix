@@ -28,12 +28,13 @@ sudo apt install -y \
   libxrandr-dev \
   pcscd \
   libccid \
-  p11-kit \
-  libsecret-tools
+  p11-kit
 ```
 
-`libsecret-tools` provides `secret-tool`, through which pairing with a phone
-keeps each pairing's private key in the desktop's Secret Service keyring.
+Pairing with a phone keeps each pairing's record, its private key included,
+in one owner-only file (mode `0600`, in a directory created with mode `0700`)
+under `$XDG_CONFIG_HOME/refineid/rapp-pairs`, by default
+`~/.config/refineid/rapp-pairs`. No keyring is used.
 
 **2. Rust Toolchain (Rust 1.95+ required):**
 RefineID uses the Rust 2024 edition and requires Rust 1.95 or newer. If your distribution's packaged `rustc` is older than 1.95 (e.g., Ubuntu 24.04 / 26.04 default packages), install or update Rust via [rustup](https://rustup.rs):
