@@ -9,7 +9,7 @@ cd "$REPO_ROOT"
 # refineid-core main. Without the network the lock file keeps its core
 # revision, and the daily track-core-main job moves it later. This comes
 # first, so a moved core counts as a code-level change below.
-if cargo update --quiet --package refineid-apdu; then
+if ./script/update-core.sh; then
     git add Cargo.lock
 else
     echo "pre-commit: core main not reachable; the lock file keeps its core revision" >&2
