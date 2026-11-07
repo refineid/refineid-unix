@@ -14,8 +14,28 @@
 
 //! `pin unblock 1|2` typed arguments.
 
+use refineid_lib_core::auth::PinStatus;
+
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::card_pin::PinManageSlot;
+
+/// The note printed before the PUK prompt when the target PIN's
+/// counter reads no tries left. Where the PIN changed flag is not
+/// readable a blocked PIN and a never-set PIN read the same, and the
+/// PUK resets either, so the reading is noted, never refused.
+fn no_tries_left_note(label: &str, status: Option<PinStatus>) -> Option<String> {
+    match status? {
+        PinStatus::Remaining(retries) if retries.is_exhausted() => Some(format!(
+            "{label} reads {} tries left, blocked or never set; the PUK resets either.",
+            retries.get()
+        )),
+        PinStatus::Remaining(_)
+        | PinStatus::Verified
+        | PinStatus::NoInfo
+        | PinStatus::Locked
+        | PinStatus::Other(_) => None,
+    }
+}
 
 /// What `refineid pin unblock help` prints. The man page
 /// refineid(1) carries the same facts.
@@ -70,10 +90,15 @@ impl UnblockPinArgs {
                 }
             };
         let ctx = session.into_pin_management_context();
-        // The reset presents the PUK: refuse below its retry floor, or
-        // on a slot that was never set, before prompting.
+        // The reset presents the PUK: refuse below its retry floor before
+        // prompting. The PIN's own counter gates nothing; a reading of no
+        // tries left is noted, since it is blocked or never set.
         match crate::card_pin::probe_unblock_gate_for_cli(backend, &ctx, slot) {
-            Ok(()) => {}
+            Ok(pin_status) => {
+                if let Some(note) = no_tries_left_note(label, pin_status) {
+                    eprintln!("{cmd}: {note}");
+                }
+            }
             Err(e @ crate::card_pin::CardPinError::RetryFloor(_)) => {
                 eprintln!("{cmd}: {e}");
                 return ExitStatus::CardCredentialRejected.into();
@@ -183,9 +208,45 @@ impl UnblockPinArgs {
 
 #[cfg(test)]
 mod tests {
+    use refineid_lib_core::apdu::status_word::PinRetries;
+    use refineid_lib_core::auth::PIN_TRY_LIMIT;
+
     use super::*;
     use crate::cli::argv::fixtures::remaining_argv as argv;
     use crate::test_util::{TestResult, check, check_true};
+
+    /// The `63C0` "0 tries left" answer.
+    const NO_TRIES_LEFT: u8 = 0;
+
+    fn remaining(count: u8) -> Result<PinStatus, &'static str> {
+        PinRetries::from_nibble(count)
+            .map(PinStatus::Remaining)
+            .ok_or("tries fit a nibble")
+    }
+
+    /// Only a counter at no tries left draws the note: the reading a
+    /// blocked and a never-set PIN share.
+    #[test]
+    fn a_pin_at_no_tries_left_is_noted_not_refused() -> TestResult {
+        let label = PinManageSlot::Pin2.label();
+        let note = no_tries_left_note(label, Some(remaining(NO_TRIES_LEFT)?)).unwrap_or_default();
+        check(
+            &note,
+            &"Signature PIN 2 reads 0 tries left, blocked or never set; the PUK resets either."
+                .to_owned(),
+            "note",
+        )?;
+        for status in [
+            None,
+            Some(remaining(PIN_TRY_LIMIT)?),
+            Some(PinStatus::Locked),
+            Some(PinStatus::Verified),
+            Some(PinStatus::NoInfo),
+        ] {
+            check_true(no_tries_left_note(label, status).is_none(), "no note")?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn parses_pin_number() -> TestResult {

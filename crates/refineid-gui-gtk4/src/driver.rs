@@ -1091,10 +1091,7 @@ impl Ui {
             let text = sentences.map(|pair| pair[index]).unwrap_or_default();
             label.set_label(text);
             label.set_visible(!text.is_empty());
-            if matches!(
-                recovery,
-                Some(Recovery::UseOtherSoftware | Recovery::Unrecoverable)
-            ) {
+            if recovery == Some(Recovery::UseOtherSoftware) {
                 label.add_css_class("error");
             } else {
                 label.remove_css_class("error");

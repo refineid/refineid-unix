@@ -399,13 +399,6 @@ impl RefineIdController {
             state.pin2_change_available =
                 is_local && card.pin_change_available(PinSlot::Pin2, card.report.pin2.as_ref());
             state.activation_available = is_local && card.activation_available();
-            let (p1_rec, p2_rec) = if is_local {
-                card.recovery_availability()
-            } else {
-                (false, false)
-            };
-            state.pin1_unblock_available = p1_rec;
-            state.pin2_unblock_available = p2_rec;
             state.unblock_uses_activation_code = is_local
                 && card
                     .activation_context
@@ -440,8 +433,6 @@ impl RefineIdController {
             state.pin2_change_available = false;
             state.activation_available = false;
             state.organization_card = false;
-            state.pin1_unblock_available = false;
-            state.pin2_unblock_available = false;
             state.unblock_uses_activation_code = false;
             state.signature_supported = false;
             state.pin_lengths = None;
@@ -1513,8 +1504,6 @@ mod tests {
         assert!(!state.pin2_change_available);
         assert!(!state.activation_available);
         assert!(!state.organization_card);
-        assert!(!state.pin1_unblock_available);
-        assert!(!state.pin2_unblock_available);
         assert!(!state.unblock_uses_activation_code);
     }
 

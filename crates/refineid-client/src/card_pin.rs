@@ -227,10 +227,11 @@ pub enum CardPinError {
     /// `doc/fineid-card-models.md` for the known set. Expired
     /// models and any non-FINEID smartcard land here.
     CardModelNotSupported(CardClassificationError),
-    /// `pin change` / `pin unblock`: the PIN still awaits
-    /// activation ([`PinReadiness::AwaitsActivation`]). Refineid
-    /// refuses before any modify APDU goes out; the operator runs
-    /// `refineid pin activate` first.
+    /// `pin change`: the PIN reads as awaiting activation
+    /// ([`PinReadiness::AwaitsActivation`]), which without the PIN
+    /// changed flag a blocked PIN reads as too. Refineid refuses before
+    /// any modify APDU goes out; the operator runs `refineid pin
+    /// unblock` or `refineid pin activate`.
     CardLooksUnactivated {
         /// Which PIN slot the probe targeted.
         slot: PinManageSlot,
@@ -281,11 +282,15 @@ impl fmt::Display for CardPinError {
                 let probe_desc = probe
                     .as_ref()
                     .map_or_else(|| "no probe result".to_owned(), |s| format!("{s:?}"));
+                let unblock = match slot {
+                    PinManageSlot::Pin1 => "refineid pin unblock 1",
+                    PinManageSlot::Pin2 => "refineid pin unblock 2",
+                };
                 write!(
                     f,
-                    "{} awaits activation (pin_status probe: {probe_desc}); refusing to send \
-                     a modify APDU to it. Run `refineid pin activate` first to set Basic \
-                     PIN 1 and Signature PIN 2.",
+                    "{} is blocked or never set (pin_status probe: {probe_desc}); refusing to \
+                     send a modify APDU to it. Run `{unblock}` if it was blocked, or \
+                     `refineid pin activate` if it was never set.",
                     slot.label()
                 )
             }
@@ -554,8 +559,8 @@ pub fn establish_card_session(
     })
 }
 
-/// Gate for a change that presents the current PIN: a PIN that awaits
-/// activation is refused, and the change is a PIN attempt, so the retry
+/// Gate for a change that presents the current PIN: a PIN that reads
+/// as awaiting activation, blocked or never set, is refused, and the change is a PIN attempt, so the retry
 /// floor applies; a probe that returned no status is an unreadable
 /// counter.
 fn change_gate(
@@ -570,20 +575,14 @@ fn change_gate(
         .map_err(CardPinError::RetryFloor)
 }
 
-/// Gate for a PUK-driven reset: a PIN that awaits activation is
-/// refused, and the reset presents the PUK, so the retry floor applies
-/// to the PUK's own counter. The target PIN's counter does not gate it:
-/// a PIN at two, one or no tries left, or blocked, passes while the PUK
-/// has five, four or three tries left.
-fn unblock_gate(
-    slot: PinManageSlot,
-    readiness: PinReadiness,
-    probe: Option<PinStatus>,
-    puk: Option<PukStatus>,
-) -> Result<(), CardPinError> {
-    if readiness == PinReadiness::AwaitsActivation {
-        return Err(CardPinError::CardLooksUnactivated { slot, probe });
-    }
+/// Gate for a PUK-driven reset: the reset presents the PUK, so the
+/// retry floor applies to the PUK's own counter and to nothing else.
+/// The target PIN's counter and readiness do not gate it: a PIN at
+/// two, one or no tries left, or blocked, passes while the PUK has
+/// five, four or three tries left. Where the PIN changed flag is not
+/// readable a blocked PIN and a never-set PIN read the same, and the
+/// PUK resets either, so the card answers for the PIN itself.
+fn unblock_gate(puk: Option<PukStatus>) -> Result<(), CardPinError> {
     puk_gate(puk)
 }
 
@@ -649,30 +648,29 @@ pub(crate) fn probe_change_gate_for_cli(
     change_gate(slot, probe.readiness(ctx.activation_scheme()), probe.status)
 }
 
-/// Run the unblock gate (PIN activated, PUK counter at or above the
-/// retry floor) in a read-only session, so the CLI refuses before it
-/// prompts for the PUK.
+/// Run the unblock gate (PUK counter at or above the retry floor) in a
+/// read-only session, so the CLI refuses before it prompts for the PUK.
+/// Returns the target PIN's counter-safe status for the CLI to note; it
+/// gates nothing, since a PIN at no tries left is blocked or never set
+/// and the PUK resets either.
 ///
 /// # Errors
-/// [`CardPinError::RetryFloor`], [`CardPinError::CardLooksUnactivated`],
-/// a card swap, or PC/SC / PKCS#15 failures.
+/// [`CardPinError::RetryFloor`], a card swap, or PC/SC / PKCS#15
+/// failures.
 pub(crate) fn probe_unblock_gate_for_cli(
     backend: PcscBackend,
     ctx: &PinManagementCardContext,
     slot: PinManageSlot,
-) -> Result<(), CardPinError> {
+) -> Result<Option<PinStatus>, CardPinError> {
     let mut transport = backend.open_session(ctx.reader_id(), ReaderAccessCap::Read)?;
     transport
         .select_pkcs15_application()
         .map_err(|error| CardPinError::Pkcs15Select(format!("{error}")))?;
     re_verify_session(&mut transport, ctx.bound_serial())?;
-    let probe = probe_slot(&mut transport, ctx.numbering(), slot.as_pin_slot());
-    unblock_gate(
-        slot,
-        probe.readiness(ctx.activation_scheme()),
-        probe.status,
-        transport.puk_status_with_scheme(ctx.numbering()).ok(),
-    )
+    unblock_gate(transport.puk_status_with_scheme(ctx.numbering()).ok())?;
+    Ok(transport
+        .pin_status_with_scheme(slot.as_pin_slot(), ctx.numbering())
+        .ok())
 }
 
 /// PIN change with the current PIN. Refuses on the retry floor before any
@@ -784,13 +782,7 @@ pub fn unblock_pin_first(
 
     let slot = options.slot.as_pin_slot();
     let numbering = ctx.numbering();
-    let probe = probe_slot(&mut transport, numbering, slot);
-    unblock_gate(
-        options.slot,
-        probe.readiness(ctx.activation_scheme()),
-        probe.status,
-        transport.puk_status_with_scheme(numbering).ok(),
-    )?;
+    unblock_gate(transport.puk_status_with_scheme(numbering).ok())?;
 
     re_verify_session(&mut transport, ctx.bound_serial())?;
 
@@ -1814,8 +1806,7 @@ mod gate_tests {
     const UNMODELED_SW: u16 = 0x6F00;
     /// Both PINs a change or a PUK reset can target.
     const SLOTS: &[PinManageSlot] = &[PinManageSlot::Pin1, PinManageSlot::Pin2];
-    /// Readiness verdicts that let a change or a PUK reset reach the
-    /// retry floor.
+    /// Readiness verdicts that let a change reach the retry floor.
     const NOT_AWAITING: &[PinReadiness] = &[PinReadiness::Activated, PinReadiness::Undecided];
 
     fn remaining(count: u8) -> Result<PinStatus, &'static str> {
@@ -1886,33 +1877,12 @@ mod gate_tests {
             .ok_or("tries fit a nibble")
     }
 
+    /// The PUK gate takes only the PUK's counter: the target PIN's
+    /// counter and readiness are not among its inputs.
     #[test]
-    fn a_puk_reset_is_allowed_at_any_pin_counter_while_the_puk_is_served() -> TestResult {
-        for &slot in SLOTS {
-            for &puk in SERVED {
-                for &count in BELOW_FLOOR.iter().chain(&[NO_TRIES]).chain(SERVED) {
-                    check_true(
-                        unblock_gate(
-                            slot,
-                            PinReadiness::Activated,
-                            Some(remaining(count)?),
-                            Some(puk_remaining(puk)?),
-                        )
-                        .is_ok(),
-                        "PUK reset",
-                    )?;
-                }
-                check_true(
-                    unblock_gate(
-                        slot,
-                        PinReadiness::Activated,
-                        Some(PinStatus::Locked),
-                        Some(puk_remaining(puk)?),
-                    )
-                    .is_ok(),
-                    "blocked",
-                )?;
-            }
+    fn a_puk_reset_is_allowed_while_the_puk_is_served() -> TestResult {
+        for &puk in SERVED {
+            check_true(unblock_gate(Some(puk_remaining(puk)?)).is_ok(), "PUK reset")?;
         }
         Ok(())
     }
@@ -1922,43 +1892,31 @@ mod gate_tests {
 
     #[test]
     fn a_puk_reset_is_refused_at_two_or_one_puk_tries() -> TestResult {
-        for &slot in SLOTS {
-            for &puk in PUK_LAST_TRIES {
-                let refused = unblock_gate(
-                    slot,
-                    PinReadiness::Activated,
-                    Some(PinStatus::Locked),
-                    Some(puk_remaining(puk)?),
-                );
-                check_true(
-                    matches!(refused, Err(CardPinError::RetryFloor(_))),
-                    "below the floor",
-                )?;
-                let text = refused.err().map(|e| e.to_string()).unwrap_or_default();
-                check_true(text.contains("PUK"), "names the PUK")?;
-                check_true(text.contains(&puk.to_string()), "names the tries left")?;
-                check_true(!text.contains("PIN"), "names no other credential")?;
-            }
+        for &puk in PUK_LAST_TRIES {
+            let refused = unblock_gate(Some(puk_remaining(puk)?));
+            check_true(
+                matches!(refused, Err(CardPinError::RetryFloor(_))),
+                "below the floor",
+            )?;
+            let text = refused.err().map(|e| e.to_string()).unwrap_or_default();
+            check_true(text.contains("PUK"), "names the PUK")?;
+            check_true(text.contains(&puk.to_string()), "names the tries left")?;
+            check_true(!text.contains("PIN"), "names no other credential")?;
         }
         Ok(())
     }
 
     #[test]
     fn a_puk_reset_is_refused_on_an_unreadable_puk_counter() -> TestResult {
-        for &slot in SLOTS {
-            for puk in [
-                None,
-                Some(PukStatus::NoInfo),
-                Some(PukStatus::Other(UNMODELED_SW)),
-            ] {
-                check_true(
-                    matches!(
-                        unblock_gate(slot, PinReadiness::Activated, Some(PinStatus::Locked), puk),
-                        Err(CardPinError::RetryFloor(_))
-                    ),
-                    "refused",
-                )?;
-            }
+        for puk in [
+            None,
+            Some(PukStatus::NoInfo),
+            Some(PukStatus::Other(UNMODELED_SW)),
+        ] {
+            check_true(
+                matches!(unblock_gate(puk), Err(CardPinError::RetryFloor(_))),
+                "refused",
+            )?;
         }
         Ok(())
     }
@@ -1968,18 +1926,43 @@ mod gate_tests {
     /// holder's code is a PUK or an activation code is never known.
     #[test]
     fn a_puk_reset_goes_to_the_card_at_no_tries_left_or_blocked() -> TestResult {
-        for &slot in SLOTS {
-            for puk in [
-                Some(puk_remaining(0)?),
-                Some(PukStatus::Locked),
-                Some(PukStatus::Invalidated),
-            ] {
-                check_true(
-                    unblock_gate(slot, PinReadiness::Activated, Some(PinStatus::Locked), puk)
-                        .is_ok(),
-                    "served",
-                )?;
-            }
+        for puk in [
+            Some(puk_remaining(NO_TRIES)?),
+            Some(PukStatus::Locked),
+            Some(PukStatus::Invalidated),
+        ] {
+            check_true(unblock_gate(puk).is_ok(), "served")?;
+        }
+        Ok(())
+    }
+
+    /// Under the organization numbering the PIN changed flag is not
+    /// read, so a PIN at no tries left judges as awaiting activation
+    /// whether it was blocked or never set. The reset ignores that
+    /// judgement: the PUK at five tries passes, at two or one is refused.
+    #[test]
+    fn a_pin_at_no_tries_left_meets_only_the_puk_floor() -> TestResult {
+        let exhausted = remaining(NO_TRIES)?;
+        check_true(
+            PinReadiness::judge(
+                Some(ActivationScheme::ActivationCodeIsPuk),
+                None,
+                Some(exhausted),
+            ) == PinReadiness::AwaitsActivation,
+            "reads as awaiting activation",
+        )?;
+        check_true(
+            unblock_gate(Some(puk_remaining(PIN_TRY_LIMIT)?)).is_ok(),
+            "PUK at the limit passes",
+        )?;
+        for &puk in PUK_LAST_TRIES {
+            check_true(
+                matches!(
+                    unblock_gate(Some(puk_remaining(puk)?)),
+                    Err(CardPinError::RetryFloor(_))
+                ),
+                "PUK on its last tries is refused",
+            )?;
         }
         Ok(())
     }
@@ -2001,10 +1984,10 @@ mod gate_tests {
     }
 
     /// An unactivated §4.6.2 PIN has a full counter and its PIN
-    /// changed flag unchanged: a change and a PUK reset both refuse
-    /// it as awaiting activation.
+    /// changed flag unchanged: a change refuses it, and the refusal
+    /// names the PIN in full and both ways back.
     #[test]
-    fn an_unactivated_preset_pin_is_refused_by_change_and_unblock() -> TestResult {
+    fn an_unactivated_preset_pin_is_refused_by_change() -> TestResult {
         let fresh = remaining(PIN_TRY_LIMIT)?;
         let readiness = PinReadiness::judge(
             Some(ActivationScheme::PresetActivationPin),
@@ -2012,25 +1995,16 @@ mod gate_tests {
             Some(fresh),
         );
         for &slot in SLOTS {
+            let refused = change_gate(slot, readiness, Some(fresh));
             check_true(
-                matches!(
-                    change_gate(slot, readiness, Some(fresh)),
-                    Err(CardPinError::CardLooksUnactivated { .. })
-                ),
+                matches!(refused, Err(CardPinError::CardLooksUnactivated { .. })),
                 "change refused",
             )?;
-            check_true(
-                matches!(
-                    unblock_gate(
-                        slot,
-                        readiness,
-                        Some(fresh),
-                        Some(puk_remaining(PIN_TRY_LIMIT)?)
-                    ),
-                    Err(CardPinError::CardLooksUnactivated { .. })
-                ),
-                "unblock refused",
-            )?;
+            let text = refused.err().map(|e| e.to_string()).unwrap_or_default();
+            check_true(text.starts_with(slot.label()), "names the PIN")?;
+            check_true(text.contains("blocked or never set"), "names the states")?;
+            check_true(text.contains("pin unblock"), "points to the unblock")?;
+            check_true(text.contains("pin activate"), "points to activation")?;
         }
         Ok(())
     }

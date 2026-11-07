@@ -70,8 +70,8 @@ impl ChangePinArgs {
             };
         let ctx = session.into_pin_management_context();
         // A change presents the current PIN, so it is a PIN attempt: refuse
-        // a PIN that awaits activation, or one below the retry floor,
-        // before prompting.
+        // a PIN that reads as blocked or never set, or one below the retry
+        // floor, before prompting.
         match crate::card_pin::probe_change_gate_for_cli(backend, &ctx, slot) {
             Ok(()) => {}
             Err(refusal @ crate::card_pin::CardPinError::RetryFloor(_)) => {
