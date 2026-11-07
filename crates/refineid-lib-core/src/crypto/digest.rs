@@ -30,10 +30,9 @@
 //! - **By-construction hex `Display`.** Logs, reports, and the
 //!   `card.*.signer.fingerprint` field all render lowercase hex without
 //!   a per-site `hex::encode`. `Output<D>` has no such `Display`.
-//! - **`const` pin tables.** `trust_roots.rs` builds `const`
-//!   pinned-root / CSCA / ICAO fingerprint tables via `from_bytes`;
-//!   `Array` / `GenericArray` isn't const-constructible from a literal
-//!   array there.
+//! - **`const` fingerprint tables.** A table of known fingerprints can
+//!   be `const` through `from_bytes`; `Array` / `GenericArray` isn't
+//!   const-constructible from a literal array.
 //!
 //! The bytes themselves are *not* hand-rolled: [`Sha256::of`] /
 //! [`Sha384::of`] delegate to `RustCrypto` `sha2`, whose one-shot
@@ -79,7 +78,7 @@ macro_rules! digest_newtype {
                 Self(buf)
             }
 
-            /// Wrap an existing digest. Used by the `const` pinned-trust
+            /// Wrap an existing digest. Used by `const` fingerprint
             /// tables (and test fixtures) where the bytes are known at
             /// compile time and weren't produced by a live hash call.
             #[inline]

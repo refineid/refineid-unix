@@ -64,10 +64,11 @@ DVV Gov. Root CA - G3 ECC
   5546A52504FBA74F61FFD4890067529ADE3B9C9D07E502592831CCDA9B369FD3
 ```
 
-These are the pinned trust anchors in
-`crates/refineid-client/src/trust_roots.rs::PINNED_ROOT_SHA256`.
-PIN management and activation do not compare the on-card root
-cert (EF.4334) against them.
+RefineID ships neither root (`AGENTS.md`, "Certificates and
+trust"): `refineid card` judges a card's chain against the
+certificate-issuing services the EU trusted lists name, with the
+on-card root (EF.4334) as path material only, and PIN management
+and activation do not compare the on-card root against anything.
 
 ### Intermediate sub-CAs (citizen scope)
 

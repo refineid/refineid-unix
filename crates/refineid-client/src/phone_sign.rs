@@ -560,6 +560,7 @@ mod tests {
             metadata: SignatureMetadata::default(),
             archive: false,
             long_term: false,
+            signer_anchors: Vec::new(),
             timestamp_authorities: Vec::new(),
             timestamp_credentials: None,
         }

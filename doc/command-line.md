@@ -57,6 +57,25 @@ Citations are BibTeX keys in [`references.md`](references.md).
   lists not fetched: nothing can be anchored` beside the unverified
   chain, and the exit status is the indeterminate one, never a crash.
   The thirty days are a choice, not a measurement.
+- **A card's chain is judged against the same lists.** `refineid card`
+  walks each certificate to its issuing CA, the AIA caIssuers
+  certificate or the card's own `EF.4336`, and prints `chain verified:
+  ok` when that issuing CA, or the on-card root that verifiably issued
+  it, is a certificate-issuing service the trusted lists name. The
+  on-card root (`EF.4334`) is path material, never an anchor by
+  itself: the software ships no root (`AGENTS.md`, "Certificates and
+  trust"; owner's decision of 2026-11-07). With no list cached the row
+  reads `skipped (not anchored: trusted lists not fetched)`, a state
+  of this computer and not a failure of the card; `--offline` uses the
+  cached lists as they are and fetches nothing. The card's issuing CA
+  and root are kept under `$XDG_CACHE_HOME/refineid/ca-certificates/`
+  until they expire, the directory refineid-core's PKCS#11 module
+  keeps in the same form, and a signing reads them from the card only
+  when the cache holds none (refineid-core,
+  `doc/security/certificate-custody.md`). A signing that collects
+  long-term material carries those certificates and the lists'
+  certificate-issuing anchors as the chain's permitted ends, and is
+  refused before the card is touched when it has neither.
 - **Secrets at the terminal only.** A PIN is asked once the card is in
   hand, read from the terminal, never from the command line, and
   nothing is echoed while it is typed. When the paired phone signs,

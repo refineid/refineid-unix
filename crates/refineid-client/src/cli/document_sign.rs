@@ -89,6 +89,10 @@ const CMD: VerbTag = VerbTag::DocumentSign;
 
 /// What marks an argument as an option rather than an input path.
 const OPTION_PREFIX: &str = "--";
+/// Why a long-term signing is refused before the card is touched when
+/// no anchor is at hand; the trusted lists' state follows.
+const NO_ANCHOR: &str = "no trust anchor for the signer's chain: no card CA certificate is \
+cached or readable, and the trusted lists are not at hand";
 
 /// Parsed `document sign FILE [FILE ...] [--format F] [--out PATH]
 /// [--slot auth|qualified] [--reason TEXT] [--location TEXT]
@@ -191,16 +195,6 @@ impl DocumentSignArgs {
             ..SignatureMetadata::default()
         };
         let signing_time = signing_time_at(now);
-        let request = |additional_inputs: Vec<PathBuf>| DocumentRequest {
-            format,
-            additional_inputs,
-            signing_time,
-            metadata: metadata.clone(),
-            timestamp_authorities: timestamp_authorities.clone(),
-            timestamp_credentials: None,
-            long_term,
-            archive,
-        };
         let level = Level {
             format,
             long_term,
@@ -211,6 +205,38 @@ impl DocumentSignArgs {
         // names a reader.
         let phone = (slot == SignSlot::Qualified && reader_filter.is_none())
             .then(crate::phone_sign::current_source);
+        // The anchors the long-term material may end at: the card's CA
+        // certificates and the trusted lists' certificate-issuing
+        // anchors, gathered before the reader is opened for signing. A
+        // run that collects material and has none is refused here with
+        // the reason, where core would refuse it without one.
+        // A level-B signature collects none and asks for none.
+        let signer_anchors = if long_term || archive {
+            let anchors = match phone {
+                Some(SigningSource::Phone(_)) => crate::signer_anchors::for_phone(now),
+                Some(SigningSource::Reader) | None => {
+                    crate::signer_anchors::for_card(reader_filter.as_deref(), now)
+                }
+            };
+            if anchors.is_empty() {
+                eprintln!("{cmd}: {NO_ANCHOR}: {}", anchors.lists);
+                return ExitStatus::RuntimeFailure.into();
+            }
+            anchors.ders
+        } else {
+            Vec::new()
+        };
+        let request = |additional_inputs: Vec<PathBuf>| DocumentRequest {
+            format,
+            additional_inputs,
+            signing_time,
+            metadata: metadata.clone(),
+            signer_anchors: signer_anchors.clone(),
+            timestamp_authorities: timestamp_authorities.clone(),
+            timestamp_credentials: None,
+            long_term,
+            archive,
+        };
         if let Some(SigningSource::Phone(pair_id)) = phone {
             return sign_on_phone(cmd, verbose, pair_id, jobs, &request, &level).into();
         }

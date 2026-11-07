@@ -239,8 +239,9 @@ pub enum CardPinError {
         probe: Option<PinStatus>,
     },
     /// The retry floor refused a command that presents the current PIN
-    /// or the PUK: the card reports two, one or no tries left for it, the
-    /// credential blocked, or no readable counter.
+    /// or the PUK: the card reports two or one tries left for it, or no
+    /// readable counter. At no tries left or blocked the command goes
+    /// to the card, which answers for itself.
     RetryFloor(RetryFloorRefusal),
 }
 
@@ -675,7 +676,7 @@ pub(crate) fn probe_unblock_gate_for_cli(
 }
 
 /// PIN change with the current PIN. Refuses on the retry floor before any
-/// modify APDU, so a PIN at two, one or no tries left is never presented.
+/// modify APDU, so a PIN at two or one tries left is never presented.
 pub(crate) fn change_pin_first_for_cli(
     backend: PcscBackend,
     ctx: PinManagementCardContext,
@@ -1806,7 +1807,9 @@ mod gate_tests {
     /// Tries left at which a PIN attempt is served.
     const SERVED: &[u8] = &[5, 4, 3];
     /// Tries left at which a PIN attempt is refused.
-    const BELOW_FLOOR: &[u8] = &[2, 1, 0];
+    const BELOW_FLOOR: &[u8] = &[2, 1];
+    /// A counter only the card can judge: the command goes to it.
+    const NO_TRIES: u8 = 0;
     /// A status word outside the modeled set.
     const UNMODELED_SW: u16 = 0x6F00;
     /// Both PINs a change or a PUK reset can target.
@@ -1841,7 +1844,7 @@ mod gate_tests {
     }
 
     #[test]
-    fn a_change_is_refused_at_two_one_zero_tries_and_blocked() -> TestResult {
+    fn a_change_is_refused_at_two_and_one_tries() -> TestResult {
         for &slot in SLOTS {
             let pin = match slot {
                 PinManageSlot::Pin1 => "PIN 1",
@@ -1858,11 +1861,19 @@ mod gate_tests {
                 check_true(text.contains(&count.to_string()), "names the tries left")?;
                 check_true(text.contains("PUK"), "names the PUK")?;
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_goes_to_the_card_at_no_tries_left_and_blocked() -> TestResult {
+        for &slot in SLOTS {
             check_true(
-                matches!(
-                    change_gate(slot, PinReadiness::Activated, Some(PinStatus::Locked)),
-                    Err(CardPinError::RetryFloor(_))
-                ),
+                change_gate(slot, PinReadiness::Activated, Some(remaining(NO_TRIES)?)).is_ok(),
+                "no tries left",
+            )?;
+            check_true(
+                change_gate(slot, PinReadiness::Activated, Some(PinStatus::Locked)).is_ok(),
                 "blocked",
             )?;
         }
@@ -1879,7 +1890,7 @@ mod gate_tests {
     fn a_puk_reset_is_allowed_at_any_pin_counter_while_the_puk_is_served() -> TestResult {
         for &slot in SLOTS {
             for &puk in SERVED {
-                for &count in BELOW_FLOOR.iter().chain(SERVED) {
+                for &count in BELOW_FLOOR.iter().chain(&[NO_TRIES]).chain(SERVED) {
                     check_true(
                         unblock_gate(
                             slot,

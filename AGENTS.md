@@ -233,7 +233,9 @@ record for RAPP and its applications.
   the trusted lists at runtime, which this client fetches and caches
   (`crates/refineid-client/src/trusted_lists.rs`;
   [doc/command-line.md](doc/command-line.md), "Anchors come from the
-  trusted lists").
+  trusted lists"). The card's issuing CA and root are cached until
+  they expire (`crates/refineid-client/src/ca_certificates.rs`;
+  refineid-core's `doc/security/certificate-custody.md`).
 - No other certificate, fingerprint, pin or trust policy is added
   without the owner's decision (decision 2026-11-07).
 - Describe what the code does and cite the source; ask the owner before

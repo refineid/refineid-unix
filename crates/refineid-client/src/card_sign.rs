@@ -1189,7 +1189,7 @@ mod tests {
         // Pull a real CommonName off a bundled cert rather than
         // constructing one (the field is private to lib-core).
         let cert = OwnedCert::from_der(
-            include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-rsa.der").as_slice(),
+            include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der").as_slice(),
         )
         .map_err(|e| format!("parse anchor: {e}"))?;
         let cn = cert.view().subject.common_name();

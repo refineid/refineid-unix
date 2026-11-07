@@ -48,6 +48,7 @@ compile_error!("the pin-env-debug feature is for debug builds only");
 extern crate alloc;
 
 pub mod apdu_trace;
+pub mod ca_certificates;
 pub mod card_check;
 pub mod card_decrypt;
 pub mod card_emrtd;
@@ -68,10 +69,10 @@ pub mod http;
 pub mod phone_sign;
 pub mod pin_source;
 pub mod reader_keyboard;
+pub mod signer_anchors;
 #[cfg(test)]
 mod test_card;
 pub mod text;
-pub mod trust_roots;
 pub mod trusted_lists;
 pub mod user_agent;
 pub mod verify;
