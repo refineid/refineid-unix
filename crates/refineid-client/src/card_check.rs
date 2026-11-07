@@ -80,8 +80,11 @@ use refineid_lib_core::x509::{
 use refineid_lib_pcsc::{PcscBackend, PcscError};
 use sha1::{Digest as Sha1Digest, Sha1};
 
+use refineid_doc_sign::verification::AnchorRole;
+use refineid_doc_sign::x509::OwnedCert as AnchorCert;
+
 use crate::http;
-use crate::trust_roots::is_pinned_root;
+use crate::trusted_lists::{AnchorSource, Refresh, RunAnchors};
 use crate::user_agent;
 
 /// Hard ceiling on a fetched CRL response body. Real DVV CRLs
@@ -91,6 +94,15 @@ const CRL_MAX_BYTES: usize = 32 * 1024 * 1024;
 const SMALL_HTTP_MAX_BYTES: usize = 64 * 1024;
 /// SHA-1 output width in bytes.
 const SHA1_OUTPUT_LEN: usize = 20;
+/// Why a chain check is skipped when no issuing CA certificate is at
+/// hand.
+const NO_INTERMEDIATE: &str =
+    "no issuing CA certificate: none fetched from AIA caIssuers, none on the card";
+/// Why a chain is reported unanchored when no trusted list is at
+/// hand: a state of this computer, not of the card.
+const NOT_ANCHORED_NO_LISTS: &str = "not anchored: trusted lists not fetched";
+/// Why a chain fails when the lists at hand name nothing on it.
+const NOT_ANCHORED: &str = "not anchored: no certificate on the chain is a certificate-issuing service the trusted lists name";
 
 /// Inputs to one `refineid card` invocation.
 #[derive(Debug, Clone, Default)]
@@ -204,8 +216,8 @@ pub struct CertReport {
     /// integer, up to 20 octets). Tier 1 newtype carrying the
     /// signed-integer-bytes invariant from the BER parser.
     pub serial: refineid_lib_core::identity::CertSerial,
-    /// SHA-256 of the full DER encoding -- the value pinned roots
-    /// are compared against and the value `--save-cert-dir` files
+    /// SHA-256 of the full DER encoding -- the value a published
+    /// fingerprint is compared against and the value `--save-cert-dir` files
     /// are named after.
     pub sha256: Sha256,
     /// `notBefore` field of the `TBSCertificate` per RFC 5280
@@ -250,9 +262,10 @@ pub struct CertReport {
     /// Decoded signature algorithm from the cert's
     /// `signatureAlgorithm` field per RFC 5280 §4.1.1.2.
     pub signature_alg: SignatureAlgorithm,
-    /// Chain-walk outcome (leaf -> AIA intermediate -> on-card
-    /// root). `None` for the root cert itself (no chain to walk)
-    /// or when `--offline` suppresses the AIA fetch.
+    /// Chain-walk outcome: leaf, then the AIA intermediate or the
+    /// on-card issuing CA, judged against the trusted lists'
+    /// certificate-issuing anchors with the on-card root as path
+    /// material. `None` for the root cert itself (no chain to walk).
     pub chain_check: Option<SignatureCheck>,
     /// CRL-based revocation outcome. `None` for the root cert or
     /// when `--offline` suppresses the CRL fetch.
@@ -447,9 +460,23 @@ pub fn check_all(
             })
             .collect();
     }
+    if picks.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The anchors every card's chain is judged against: the trusted
+    // lists' certificate-issuing services, from the cache alone under
+    // `--offline`. No list at hand leaves every chain unanchored, and
+    // the report says so without calling it a failure of the card.
+    let now = options.now.unwrap_or_else(now_date_time);
+    let refresh = if options.offline {
+        Refresh::CacheOnly
+    } else {
+        Refresh::WhenDue
+    };
+    let anchors = crate::trusted_lists::user_anchors(now, refresh);
     let mut out = Vec::with_capacity(picks.len());
     for pick in picks {
-        out.push(check_for_reader(backend, pick, options)?);
+        out.push(check_for_reader(backend, pick, options, now, &anchors)?);
     }
     Ok(out)
 }
@@ -747,6 +774,8 @@ pub(crate) fn check_for_reader(
     backend: PcscBackend,
     pick: FineidReaderPick,
     options: &CardCheckOptions<'_>,
+    now: DateTime,
+    anchors: &RunAnchors,
 ) -> Result<CardCheckReport, CardCheckError> {
     let FineidReaderPick {
         reader_id,
@@ -775,8 +804,6 @@ pub(crate) fn check_for_reader(
         None => None,
     };
 
-    let now = options.now.unwrap_or_else(now_date_time);
-
     let section = open_pkcs15_section(transport, options.can)?;
     let Pkcs15Section {
         token_info,
@@ -796,24 +823,41 @@ pub(crate) fn check_for_reader(
         save_slot_ders(dir, &slot_ders)?;
     }
 
-    let root_der: Option<&CertDer> = slot_ders
-        .iter()
-        .find(|(s, _)| *s == CertSlot::RootCa)
-        .map(|(_, der)| der);
-    let root_trusted: bool =
-        root_der.is_some_and(|der| is_pinned_root(CertSha256::of(der.as_bytes())));
+    let slot_der = |slot: CertSlot| -> Option<&CertDer> {
+        slot_ders
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .map(|(_, der)| der)
+    };
+    let root_der = slot_der(CertSlot::RootCa);
+    let issuing_ca_der = slot_der(CertSlot::IssuingCaEcc);
+    // The card's CA certificates are kept until they expire
+    // (refineid-core, doc/security/certificate-custody.md): what the
+    // card served and the rule admits goes to the per-user cache, so a
+    // signing reads neither from the card again.
+    if let Some(cache) = crate::ca_certificates::CaCache::user() {
+        let admitted = crate::ca_certificates::admit(
+            issuing_ca_der.map(CertDer::as_bytes),
+            root_der.map(CertDer::as_bytes),
+            now,
+        );
+        if let Err(error) = cache.store(&admitted) {
+            let kind = error.kind();
+            refineid_dev_errors::report!(Cli, "CA certificates not cached", kind);
+        }
+    }
     let root_cert_owned: Option<OwnedCert> =
         root_der.and_then(|der| OwnedCert::from_der(der.as_bytes()).ok());
-    let root = root_cert_owned.as_ref().map(|cert| OnCardRoot {
-        cert,
-        trusted: root_trusted,
-    });
+    let issuing_ca_owned: Option<OwnedCert> =
+        issuing_ca_der.and_then(|der| OwnedCert::from_der(der.as_bytes()).ok());
 
     let ctx = VerifyContext {
         offline: options.offline,
         now,
         pre_fetched_crl: pre_fetched_crl.as_deref(),
-        root,
+        root: root_cert_owned.as_ref(),
+        issuing_ca: issuing_ca_owned.as_ref(),
+        anchors,
     };
     let mut certs = Vec::new();
     for (slot, der) in &slot_ders {
@@ -877,15 +921,6 @@ enum AiaIssuerCertStatus {
     Parsed(AiaIssuerCert),
 }
 
-/// Parsed on-card root plus its pinning verdict.
-#[derive(Clone, Copy)]
-struct OnCardRoot<'a> {
-    /// Parsed root certificate read from the card.
-    cert: &'a OwnedCert,
-    /// Whether the root matched the pinned DVV trust anchors.
-    trusted: bool,
-}
-
 /// Per-card verify-time inputs shared across the cert reports.
 ///
 /// Built once at the start of [`check_for_reader`] and threaded
@@ -904,9 +939,27 @@ struct VerifyContext<'a> {
     /// any. Shared so multiple slots issued by the same CA
     /// don't re-parse the CRL.
     pre_fetched_crl: Option<&'a [u8]>,
-    /// Parsed on-card root CA cert (`EF.4334`), when present, plus
-    /// the pinning verdict needed before it can anchor a chain.
-    root: Option<OnCardRoot<'a>>,
+    /// Parsed on-card root CA cert (`EF.4334`), when present: path
+    /// material for the chain walk, an anchor only when the lists
+    /// name it.
+    root: Option<&'a OwnedCert>,
+    /// Parsed on-card issuing CA cert (`EF.4336`), when present: the
+    /// intermediate when no AIA caIssuers certificate was fetched.
+    issuing_ca: Option<&'a OwnedCert>,
+    /// The trusted lists' anchors and where they came from.
+    anchors: &'a RunAnchors,
+}
+
+impl VerifyContext<'_> {
+    /// Whether the certificate `der` is a certificate-issuing anchor
+    /// of the trusted lists at `now`.
+    fn is_anchor(&self, der: &[u8]) -> bool {
+        AnchorCert::from_der(der).is_ok_and(|cert| {
+            self.anchors
+                .anchors
+                .is_anchor(cert.view(), AnchorRole::CertificateIssuing, self.now)
+        })
+    }
 }
 
 use refineid_lib_core::crypto::digest::Sha256 as CertSha256;
@@ -976,8 +1029,6 @@ fn build_cert_report(
 
     let chain_check = if slot == CertSlot::RootCa {
         None
-    } else if ctx.offline {
-        Some(SignatureCheck::Skipped("offline".to_owned()))
     } else {
         Some(run_chain_check(&cert, &issuer_cert, ctx))
     };
@@ -1018,90 +1069,68 @@ fn build_cert_report(
     })
 }
 
-/// Verify the leaf-cert chain to a pinned trust anchor.
+/// Judge the leaf's chain against the trusted lists' anchors.
 ///
-/// FINEID S4-1 v4.2 §4.5 stipulates both the DVV root and the
-/// issuing intermediate sit in the card's MF; this verifier
-/// uses them first. On dual-algorithm cards the on-card root
-/// may use a different signature algorithm than the
-/// intermediate, in which case we fall back to the matching
-/// pinned root from [`crate::trust_roots::PINNED_ROOT_DER`].
+/// FINEID S4-1 v4.2 §4.5 puts the DVV root and the issuing
+/// intermediate in the card's MF, and the Finnish trusted list names
+/// DVV's services by their issuing CA certificates, where the card's
+/// chain starts. The intermediate is the AIA caIssuers certificate
+/// when one was fetched, else whichever on-card CA (`EF.4336`,
+/// `EF.4334`) has the leaf's issuer as its subject: a dual-algorithm
+/// card holds only the ECC issuing CA, which did not issue its RSA
+/// leaves. The chain is anchored when the leaf, the intermediate, or the on-card
+/// root that verifiably issued the intermediate is a
+/// certificate-issuing anchor at `ctx.now`. The on-card root is path
+/// material, never an anchor by itself.
 ///
-/// Returns the most-specific outcome:
-/// `Skipped` when there's no fetched intermediate or the on-
-/// card root isn't pinned, `Failed` when a verify step
-/// returns an error, `Ok` only when every hop verifies and
-/// the terminal anchor is pinned.
+/// Returns `Ok` when every hop verifies and the chain is anchored;
+/// `Skipped` when no trusted list is at hand or no intermediate is,
+/// states of this computer and not of the card; `Failed` when a hop
+/// does not verify, or the lists at hand name nothing on the chain.
 fn run_chain_check(
     leaf: &Certificate<'_>,
     intermediate_cert: &AiaIssuerCertStatus,
     ctx: &VerifyContext<'_>,
 ) -> SignatureCheck {
-    let intermediate_owned = match intermediate_cert {
-        AiaIssuerCertStatus::Parsed(cert) => cert,
-        AiaIssuerCertStatus::Unavailable => {
-            return SignatureCheck::Skipped("no AIA caIssuers cert fetched".to_owned());
+    if ctx.is_anchor(leaf.raw_der) {
+        return SignatureCheck::Ok;
+    }
+    let fetched = match intermediate_cert {
+        AiaIssuerCertStatus::Parsed(cert) => Some(&cert.cert),
+        AiaIssuerCertStatus::Unavailable | AiaIssuerCertStatus::ParseFailed(_) => None,
+    };
+    let issued_the_leaf = |cert: &&OwnedCert| cert.view().subject.as_der() == leaf.issuer.as_der();
+    let on_card = ctx
+        .issuing_ca
+        .filter(issued_the_leaf)
+        .or_else(|| ctx.root.filter(issued_the_leaf));
+    let Some(intermediate_owned) = fetched.or(on_card) else {
+        if matches!(ctx.anchors.source, AnchorSource::Unavailable(_)) {
+            return SignatureCheck::Skipped(NOT_ANCHORED_NO_LISTS.to_owned());
         }
-        AiaIssuerCertStatus::ParseFailed(e) => {
-            return SignatureCheck::Skipped(format!("intermediate parse: {e}"));
-        }
+        return SignatureCheck::Skipped(match intermediate_cert {
+            AiaIssuerCertStatus::ParseFailed(e) => format!("intermediate parse: {e}"),
+            AiaIssuerCertStatus::Unavailable | AiaIssuerCertStatus::Parsed(_) => {
+                NO_INTERMEDIATE.to_owned()
+            }
+        });
     };
     let intermediate = intermediate_owned.view();
     if let Err(e) = leaf.verify_signed_by(intermediate) {
         return SignatureCheck::Failed(format!("leaf -> intermediate: {e}"));
     }
-    // Try the on-card root first; that's the path the spec
-    // intends (S4-1 v4.2 §4.5: "DVV Root certificate and issuing
-    // intermediate CA shall be stored into the FINEID application
-    // on the token"). On dual-algorithm cards where the on-card
-    // root doesn't match the intermediate's signature alg, fall
-    // back to the matching embedded pinned root from
-    // `crate::trust_roots::PINNED_ROOT_DER`.
-    if let Some(root) = ctx.root {
-        match intermediate.verify_signed_by(root.cert.view()) {
-            Ok(()) => {
-                if !root.trusted {
-                    return SignatureCheck::Skipped(
-                        "chain verified, but on-card root is not in PINNED_ROOT_SHA256".to_owned(),
-                    );
-                }
-                return SignatureCheck::Ok;
-            }
-            Err(_e) => {
-                // Fall through to the pinned-root fallback below.
-            }
-        }
+    if ctx.is_anchor(intermediate.raw_der) {
+        return SignatureCheck::Ok;
     }
-    // Pinned-root fallback. Try every embedded DVV root DER
-    // against the intermediate -- the right one verifies, the
-    // wrong one rejects on algorithm mismatch or signature
-    // verify. This covers the S4-1 v4.2 §4.5 case where the
-    // card only stores the primary root and the chain needs
-    // the secondary (other-algorithm) root.
-    for (_label, root_der) in crate::trust_roots::PINNED_ROOT_DER {
-        let Ok(root_owned) = OwnedCert::from_der(root_der) else {
-            continue;
-        };
-        if intermediate.verify_signed_by(root_owned.view()).is_ok() {
-            // Pinned by SHA-256 already: the embedded DER's
-            // fingerprint is in PINNED_ROOT_SHA256 by
-            // construction (tests in trust_roots verify the
-            // pair stays consistent).
-            return SignatureCheck::Ok;
-        }
+    if let Some(root) = ctx.root
+        && intermediate.verify_signed_by(root.view()).is_ok()
+        && ctx.is_anchor(root.view().raw_der)
+    {
+        return SignatureCheck::Ok;
     }
-    if ctx.root.is_none() {
-        SignatureCheck::Skipped(
-            "leaf -> intermediate verified, but no trust anchor matched (on-card root \
-             absent and no pinned root DER matched the intermediate's signature alg)"
-                .to_owned(),
-        )
-    } else {
-        SignatureCheck::Failed(
-            "intermediate -> root: no trust anchor verified (tried on-card root + every pinned \
-             PINNED_ROOT_DER entry)"
-                .to_owned(),
-        )
+    match ctx.anchors.source {
+        AnchorSource::Unavailable(_) => SignatureCheck::Skipped(NOT_ANCHORED_NO_LISTS.to_owned()),
+        AnchorSource::Lists { .. } => SignatureCheck::Failed(NOT_ANCHORED.to_owned()),
     }
 }
 
@@ -2107,14 +2136,18 @@ impl CardCheckHelpers {
 #[cfg(test)]
 mod tests {
     //! Unit tests for the pure policy/orchestration logic in
-    //! `card_check`: trust-anchor pinning (chain walk), CRL
-    //! verdict orchestration, and the human-string renderers.
+    //! `card_check`: the chain walk against trusted-list anchors,
+    //! CRL verdict orchestration, and the human-string renderers.
     //!
     //! No card or network is touched. Certificates and CRLs are
     //! built as DER in-process; the few signature verifications
-    //! that must succeed reuse the real self-signed pinned roots
-    //! (DVV G3 RSA/ECC) shipped in `trust-anchors/`, since a self-signed root verifies against
-    //! itself. Crate-private typed values (`CommonName`,
+    //! that must succeed reuse the public DVV G3 roots and G4E
+    //! issuing CA kept as fixtures in `test-vectors/`, since a
+    //! self-signed root verifies against itself and the G4E
+    //! intermediate verifies under the ECC root. Nothing in
+    //! `test-vectors/` is an anchor of the production code; a
+    //! test names what it anchors on with [`TrustAnchors::new`].
+    //! Crate-private typed values (`CommonName`,
     //! `IsoAlpha2`, `CertSerial`) are obtained by parsing built
     //! certs, exactly as production does -- their constructors are
     //! `pub(crate)` to `refineid-lib-core`.
@@ -2122,14 +2155,17 @@ mod tests {
     //! Tests return [`TestResult`] and propagate through `?` per
     //! the crate-wide no-panic test convention (`test_util`).
 
+    use super::AnchorCert;
     use super::{
         AiaIssuerCert, AiaIssuerCertStatus, CardCheckError, CardCheckHelpers, CheckOutcome,
-        CheckOutcomeSection, SignatureCheck, VerifyContext, days_between, fmt_check_outcome,
-        now_date_time, run_chain_check, verify_crl,
+        CheckOutcomeSection, NO_INTERMEDIATE, NOT_ANCHORED, NOT_ANCHORED_NO_LISTS, SignatureCheck,
+        VerifyContext, days_between, fmt_check_outcome, now_date_time, run_chain_check, verify_crl,
     };
     use crate::test_util::{TestResult, check, check_true};
-    use crate::trust_roots::PINNED_ROOT_DER;
+    use crate::trusted_lists::{AnchorSource, RunAnchors};
     use alloc::fmt;
+    use refineid_doc_sign::verification::trusted_list::TrustedListError;
+    use refineid_doc_sign::verification::{AnchorRole, GrantedPeriod, TrustAnchor, TrustAnchors};
     use refineid_lib_core::aa::AaOutcome;
     use refineid_lib_core::apdu::status_word::PinRetries;
     use refineid_lib_core::auth::{
@@ -2200,20 +2236,13 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum DvvRootNeedle {
-        Rsa,
-        Ecc,
-    }
-
-    impl DvvRootNeedle {
-        const fn as_str(self) -> &'static str {
-            match self {
-                Self::Rsa => "RSA",
-                Self::Ecc => "ECC",
-            }
-        }
-    }
+    /// The public self-signed DVV G3 RSA root.
+    const DVV_ROOT_RSA_DER: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der");
+    /// The public self-signed DVV G3 ECC root.
+    const DVV_ROOT_ECC_DER: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-ecc.der");
+    /// The DVV G4E issuing CA, issued by the ECC root.
+    const DVV_ISSUING_CA_DER: &[u8] =
+        include_bytes!("../test-vectors/fineid-intermediate-01-citizen-g4e.der");
 
     /// Append a DER definite-length octet sequence for `n`.
     /// Handles the short form, one-byte long form, and two-byte
@@ -2353,32 +2382,66 @@ mod tests {
         .ok_or_else(|| "decode UN root PEM".to_owned())
     }
 
-    /// DER of a pinned DVV G3 root whose label contains `needle`.
-    fn dvv_root_der(needle: DvvRootNeedle) -> Result<&'static [u8], String> {
-        PINNED_ROOT_DER
-            .iter()
-            .find(|entry| entry.0.contains(needle.as_str()))
-            .map(|entry| entry.1)
-            .ok_or_else(|| format!("no pinned DVV root labelled with {:?}", needle.as_str()))
+    /// The fixed time of every chain check here.
+    fn fixture_now() -> Result<DateTime, String> {
+        DateTime::new(2026, 6, 1, 0, 0, 0).map_err(|e| format!("now: {e}"))
     }
 
-    /// A `VerifyContext` with the given on-card root state; the
-    /// time is fixed and the CRL slot empty.
-    fn ctx_with_root(
-        root_cert: Option<&OwnedCert>,
-        root_trusted: bool,
-    ) -> Result<VerifyContext<'_>, String> {
-        let now = DateTime::new(2026, 6, 1, 0, 0, 0).map_err(|e| format!("now: {e}"))?;
-        let root = root_cert.map(|cert| super::OnCardRoot {
-            cert,
-            trusted: root_trusted,
-        });
+    /// Anchors trusted for certificate issuing without bound, as from
+    /// lists fetched at the fixture time.
+    fn listed(ders: &[&[u8]]) -> Result<RunAnchors, String> {
+        let anchors = ders
+            .iter()
+            .map(|der| {
+                let cert = AnchorCert::from_der(der).map_err(|e| format!("anchor parse: {e}"))?;
+                TrustAnchor::new(
+                    cert,
+                    AnchorRole::CertificateIssuing,
+                    vec![GrantedPeriod::unbounded()],
+                )
+                .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(RunAnchors {
+            anchors: TrustAnchors::new(anchors),
+            source: AnchorSource::Lists {
+                fetched_at: fixture_now()?,
+                stale: false,
+            },
+        })
+    }
+
+    /// No list at hand: nothing anchors anything.
+    fn unlisted() -> RunAnchors {
+        RunAnchors {
+            anchors: TrustAnchors::default(),
+            source: AnchorSource::Unavailable(TrustedListError::NotFetched),
+        }
+    }
+
+    /// A `VerifyContext` over the given on-card certificates and
+    /// anchors; the time is fixed and the CRL slot empty.
+    fn ctx<'a>(
+        root: Option<&'a OwnedCert>,
+        issuing_ca: Option<&'a OwnedCert>,
+        anchors: &'a RunAnchors,
+    ) -> Result<VerifyContext<'a>, String> {
         Ok(VerifyContext {
             offline: false,
-            now,
+            now: fixture_now()?,
             pre_fetched_crl: None,
             root,
+            issuing_ca,
+            anchors,
         })
+    }
+
+    fn parse(der: &[u8]) -> Result<OwnedCert, String> {
+        OwnedCert::from_der(der).map_err(|e| format!("cert parse: {e}"))
+    }
+
+    fn fetched(der: &[u8]) -> Result<AiaIssuerCertStatus, String> {
+        Ok(AiaIssuerCertStatus::Parsed(AiaIssuerCert::from_der(der)?))
     }
 
     /// Newtype that renders a [`CheckOutcome`] through the
@@ -2391,35 +2454,84 @@ mod tests {
         }
     }
 
-    // ---------- Trust-anchor pinning: the chain walk ----------
+    // ---------- The chain walk against the trusted lists ----------
 
     #[test]
-    fn chain_check_ok_when_pinned_on_card_root_closes_chain() -> TestResult {
-        // Self-signed DVV RSA root used as leaf, intermediate, and
-        // on-card root: every hop verifies and the anchor is pinned.
-        let rsa = dvv_root_der(DvvRootNeedle::Rsa)?;
-        let leaf_owned = OwnedCert::from_der(rsa).map_err(|e| format!("cert parse: {e}"))?;
-        let leaf = leaf_owned.view();
-        let ctx = ctx_with_root(Some(&leaf_owned), true)?;
-        let issuer = AiaIssuerCertStatus::Parsed(AiaIssuerCert::from_der(rsa)?);
+    fn chain_check_ok_when_the_intermediate_is_a_list_anchor() -> TestResult {
+        // The self-signed RSA root as leaf and intermediate: the hop
+        // verifies and the intermediate is what the lists name.
+        let leaf_owned = parse(DVV_ROOT_RSA_DER)?;
+        let anchors = listed(&[DVV_ROOT_RSA_DER])?;
+        let ctx = ctx(None, None, &anchors)?;
         check_true(
-            matches!(run_chain_check(&leaf, &issuer, &ctx), SignatureCheck::Ok),
-            "pinned on-card root closes chain -> Ok",
+            matches!(
+                run_chain_check(&leaf_owned.view(), &fetched(DVV_ROOT_RSA_DER)?, &ctx),
+                SignatureCheck::Ok
+            ),
+            "a listed intermediate anchors the chain",
         )
     }
 
     #[test]
-    fn chain_check_skipped_when_on_card_root_not_pinned() -> TestResult {
-        let rsa = dvv_root_der(DvvRootNeedle::Rsa)?;
-        let leaf_owned = OwnedCert::from_der(rsa).map_err(|e| format!("cert parse: {e}"))?;
-        let leaf = leaf_owned.view();
-        let ctx = ctx_with_root(Some(&leaf_owned), false)?;
-        let issuer = AiaIssuerCertStatus::Parsed(AiaIssuerCert::from_der(rsa)?);
-        let outcome = run_chain_check(&leaf, &issuer, &ctx);
+    fn chain_check_ok_when_the_leaf_itself_is_a_list_anchor() -> TestResult {
+        // The on-card issuing CA slot: the certificate is the anchor,
+        // with no intermediate to fetch.
+        let leaf_owned = parse(DVV_ISSUING_CA_DER)?;
+        let anchors = listed(&[DVV_ISSUING_CA_DER])?;
+        let ctx = ctx(None, None, &anchors)?;
+        check_true(
+            matches!(
+                run_chain_check(&leaf_owned.view(), &AiaIssuerCertStatus::Unavailable, &ctx),
+                SignatureCheck::Ok
+            ),
+            "a listed leaf is anchored by itself",
+        )
+    }
+
+    #[test]
+    fn chain_check_uses_the_on_card_issuing_ca_when_nothing_was_fetched() -> TestResult {
+        // Offline, or no AIA answer: the on-card EF.4336 stands in as
+        // the intermediate. The ECC root plays it, having issued G4E.
+        let leaf_owned = parse(DVV_ISSUING_CA_DER)?;
+        let on_card = parse(DVV_ROOT_ECC_DER)?;
+        let anchors = listed(&[DVV_ROOT_ECC_DER])?;
+        let ctx = ctx(None, Some(&on_card), &anchors)?;
+        check_true(
+            matches!(
+                run_chain_check(&leaf_owned.view(), &AiaIssuerCertStatus::Unavailable, &ctx),
+                SignatureCheck::Ok
+            ),
+            "the on-card issuing CA closes the chain",
+        )
+    }
+
+    #[test]
+    fn an_on_card_issuing_ca_that_did_not_issue_the_leaf_is_no_failure() -> TestResult {
+        // A dual-algorithm card offline: the RSA leaf's issuer is not
+        // the ECC issuing CA on the card, so nothing is checked.
+        let leaf_owned = parse(DVV_ROOT_RSA_DER)?;
+        let on_card = parse(DVV_ISSUING_CA_DER)?;
+        let anchors = listed(&[DVV_ROOT_ECC_DER])?;
+        let ctx = ctx(None, Some(&on_card), &anchors)?;
+        let outcome = run_chain_check(&leaf_owned.view(), &AiaIssuerCertStatus::Unavailable, &ctx);
         if let SignatureCheck::Skipped(why) = &outcome {
-            check_true(
-                why.contains("not in PINNED_ROOT_SHA256"),
-                "names the pin gap",
+            check(why, &NO_INTERMEDIATE.to_owned(), "skipped, not failed")
+        } else {
+            Err(format!("expected Skipped, got {outcome:?}").into())
+        }
+    }
+
+    #[test]
+    fn no_list_and_no_intermediate_blames_the_lists() -> TestResult {
+        let leaf_owned = parse(DVV_ROOT_RSA_DER)?;
+        let anchors = unlisted();
+        let ctx = ctx(None, None, &anchors)?;
+        let outcome = run_chain_check(&leaf_owned.view(), &AiaIssuerCertStatus::Unavailable, &ctx);
+        if let SignatureCheck::Skipped(why) = &outcome {
+            check(
+                why,
+                &NOT_ANCHORED_NO_LISTS.to_owned(),
+                "names the missing lists",
             )
         } else {
             Err(format!("expected Skipped, got {outcome:?}").into())
@@ -2427,17 +2539,16 @@ mod tests {
     }
 
     #[test]
-    fn chain_check_skipped_when_no_intermediate_fetched() -> TestResult {
-        let rsa = dvv_root_der(DvvRootNeedle::Rsa)?;
-        let leaf_owned = OwnedCert::from_der(rsa).map_err(|e| format!("cert parse: {e}"))?;
-        let leaf = leaf_owned.view();
-        let ctx = ctx_with_root(Some(&leaf_owned), true)?;
-        let issuer = AiaIssuerCertStatus::Unavailable;
-        let outcome = run_chain_check(&leaf, &issuer, &ctx);
+    fn chain_check_skipped_when_no_intermediate_is_at_hand() -> TestResult {
+        let leaf_owned = parse(DVV_ISSUING_CA_DER)?;
+        let anchors = listed(&[DVV_ROOT_ECC_DER])?;
+        let ctx = ctx(None, None, &anchors)?;
+        let outcome = run_chain_check(&leaf_owned.view(), &AiaIssuerCertStatus::Unavailable, &ctx);
         if let SignatureCheck::Skipped(why) = &outcome {
-            check_true(
-                why.contains("no AIA caIssuers"),
-                "names the missing intermediate",
+            check(
+                why,
+                &NO_INTERMEDIATE.to_owned(),
+                "names the missing issuing CA",
             )
         } else {
             Err(format!("expected Skipped, got {outcome:?}").into())
@@ -2445,13 +2556,12 @@ mod tests {
     }
 
     #[test]
-    fn chain_check_skipped_when_intermediate_unparseable() -> TestResult {
-        let rsa = dvv_root_der(DvvRootNeedle::Rsa)?;
-        let leaf_owned = OwnedCert::from_der(rsa).map_err(|e| format!("cert parse: {e}"))?;
-        let leaf = leaf_owned.view();
-        let ctx = ctx_with_root(Some(&leaf_owned), true)?;
+    fn chain_check_skipped_when_intermediate_unparseable_and_none_on_card() -> TestResult {
+        let leaf_owned = parse(DVV_ROOT_RSA_DER)?;
+        let anchors = listed(&[DVV_ROOT_ECC_DER])?;
+        let ctx = ctx(None, None, &anchors)?;
         let issuer = AiaIssuerCertStatus::ParseFailed("fixture parse failure".to_owned());
-        let outcome = run_chain_check(&leaf, &issuer, &ctx);
+        let outcome = run_chain_check(&leaf_owned.view(), &issuer, &ctx);
         if let SignatureCheck::Skipped(why) = &outcome {
             check_true(
                 why.contains("intermediate parse"),
@@ -2466,13 +2576,10 @@ mod tests {
     fn chain_check_failed_when_leaf_not_signed_by_intermediate() -> TestResult {
         // RSA root as leaf, ECC root as claimed intermediate: the
         // leaf -> intermediate hop cannot verify.
-        let rsa = dvv_root_der(DvvRootNeedle::Rsa)?;
-        let ecc = dvv_root_der(DvvRootNeedle::Ecc)?;
-        let leaf_owned = OwnedCert::from_der(rsa).map_err(|e| format!("cert parse: {e}"))?;
-        let leaf = leaf_owned.view();
-        let ctx = ctx_with_root(Some(&leaf_owned), true)?;
-        let issuer = AiaIssuerCertStatus::Parsed(AiaIssuerCert::from_der(ecc)?);
-        let outcome = run_chain_check(&leaf, &issuer, &ctx);
+        let leaf_owned = parse(DVV_ROOT_RSA_DER)?;
+        let anchors = listed(&[DVV_ROOT_ECC_DER])?;
+        let ctx = ctx(None, None, &anchors)?;
+        let outcome = run_chain_check(&leaf_owned.view(), &fetched(DVV_ROOT_ECC_DER)?, &ctx);
         if let SignatureCheck::Failed(why) = &outcome {
             check_true(
                 why.contains("leaf -> intermediate"),
@@ -2484,20 +2591,20 @@ mod tests {
     }
 
     #[test]
-    fn chain_check_skipped_when_no_anchor_and_on_card_root_absent() -> TestResult {
-        // Self-signed UN root (not a pinned DVV root) as leaf and
-        // intermediate: leaf -> intermediate verifies, but no
-        // trust anchor matches and there is no on-card root.
+    fn chain_check_skipped_when_no_list_is_at_hand() -> TestResult {
+        // The hop verifies, but with no trusted list fetched nothing
+        // can be anchored: the report blames the lists, not the card.
         let un = un_root_der()?;
-        let leaf_owned = OwnedCert::from_der(&un).map_err(|e| format!("cert parse: {e}"))?;
-        let leaf = leaf_owned.view();
-        let ctx = ctx_with_root(None, false)?;
-        let issuer = AiaIssuerCertStatus::Parsed(AiaIssuerCert::from_der(&un)?);
-        let outcome = run_chain_check(&leaf, &issuer, &ctx);
+        let leaf_owned = parse(&un)?;
+        let root_owned = parse(DVV_ROOT_RSA_DER)?;
+        let anchors = unlisted();
+        let ctx = ctx(Some(&root_owned), None, &anchors)?;
+        let outcome = run_chain_check(&leaf_owned.view(), &fetched(&un)?, &ctx);
         if let SignatureCheck::Skipped(why) = &outcome {
-            check_true(
-                why.contains("no trust anchor matched"),
-                "names the missing anchor (root absent)",
+            check(
+                why,
+                &NOT_ANCHORED_NO_LISTS.to_owned(),
+                "names the missing lists",
             )
         } else {
             Err(format!("expected Skipped, got {outcome:?}").into())
@@ -2505,21 +2612,36 @@ mod tests {
     }
 
     #[test]
-    fn chain_check_failed_when_no_anchor_and_on_card_root_present() -> TestResult {
-        // Same as above but an (irrelevant) on-card root is present
-        // -> the verdict is a hard Failed, not Skipped.
+    fn chain_check_failed_when_the_lists_name_nothing_on_the_chain() -> TestResult {
+        // The hop verifies and lists are at hand, but they name
+        // neither the UN root nor the on-card DVV root: a hard Failed.
         let un = un_root_der()?;
-        let rsa = dvv_root_der(DvvRootNeedle::Rsa)?;
-        let root_owned = OwnedCert::from_der(rsa).map_err(|e| format!("root parse: {e}"))?;
-        let leaf_owned = OwnedCert::from_der(&un).map_err(|e| format!("cert parse: {e}"))?;
-        let leaf = leaf_owned.view();
-        let ctx = ctx_with_root(Some(&root_owned), true)?;
-        let issuer = AiaIssuerCertStatus::Parsed(AiaIssuerCert::from_der(&un)?);
-        let outcome = run_chain_check(&leaf, &issuer, &ctx);
+        let leaf_owned = parse(&un)?;
+        let root_owned = parse(DVV_ROOT_RSA_DER)?;
+        let anchors = listed(&[DVV_ROOT_ECC_DER])?;
+        let ctx = ctx(Some(&root_owned), None, &anchors)?;
+        let outcome = run_chain_check(&leaf_owned.view(), &fetched(&un)?, &ctx);
         if let SignatureCheck::Failed(why) = &outcome {
-            check_true(
-                why.contains("no trust anchor verified"),
-                "names the anchor failure (root present)",
+            check(why, &NOT_ANCHORED.to_owned(), "names the unanchored chain")
+        } else {
+            Err(format!("expected Failed, got {outcome:?}").into())
+        }
+    }
+
+    #[test]
+    fn the_on_card_root_alone_anchors_nothing() -> TestResult {
+        // G4E under the ECC root, both from the card, with lists that
+        // name neither: the on-card root is path material only.
+        let leaf_owned = parse(DVV_ISSUING_CA_DER)?;
+        let root_owned = parse(DVV_ROOT_ECC_DER)?;
+        let anchors = listed(&[DVV_ROOT_RSA_DER])?;
+        let ctx = ctx(Some(&root_owned), Some(&root_owned), &anchors)?;
+        let outcome = run_chain_check(&leaf_owned.view(), &AiaIssuerCertStatus::Unavailable, &ctx);
+        if let SignatureCheck::Failed(why) = &outcome {
+            check(
+                why,
+                &NOT_ANCHORED.to_owned(),
+                "the root anchors nothing by itself",
             )
         } else {
             Err(format!("expected Failed, got {outcome:?}").into())

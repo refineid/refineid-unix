@@ -283,7 +283,7 @@ impl<B: ReaderBackend, S> Card<'_, B, S> {
 /// The only method available in this state is
 /// [`Card::classify_model`] -- ATR matching against the
 /// in-scope FINEID model set. This is a protocol-level signal,
-/// not a trust signal; the pinned-root SHA-256 check is the
+/// not a trust signal; the trust check is the
 /// next stage and lives on Phase 2's `Card<Trusted>`.
 #[derive(Debug, Clone, Copy)]
 pub struct Untrusted;

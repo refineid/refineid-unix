@@ -52,7 +52,7 @@ pub(crate) const TRIES_SERVED: u8 = 5;
 pub(crate) const TRIES_BELOW_FLOOR: u8 = 2;
 /// The certificate the card holds in every slot: the public DVV root,
 /// a real certificate standing in for the card's own.
-pub(crate) const CERTIFICATE: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-rsa.der");
+pub(crate) const CERTIFICATE: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der");
 
 /// The card state a flow test sets up.
 #[derive(Debug, Clone)]

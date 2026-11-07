@@ -32,8 +32,9 @@
 //! [`REFRESH_AFTER`], or the caller asks ([`Refresh::Now`]). A national
 //! list that fails in a refresh keeps its last cached copy; a list of
 //! the lists that fails leaves every cached list in use and the report
-//! says how old they are. With no list at all the anchors are the roots
-//! core still pins, and [`AnchorSource::Unavailable`] says why.
+//! says how old they are. With no list at all there is no anchor, and
+//! [`AnchorSource::Unavailable`] says why: the software ships no root
+//! (AGENTS.md, "Certificates and trust").
 
 use core::time::Duration;
 use std::ffi::OsString;
@@ -43,11 +44,11 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use refineid_doc_sign::uri::Uri;
-use refineid_doc_sign::verification::TrustAnchors;
 use refineid_doc_sign::verification::trusted_list::{
     CachedList, LOTL_LOCATION, NationalList, TrustedListError, TrustedLists, fetch_over_http,
     lotl_signers,
 };
+use refineid_doc_sign::verification::{AnchorRole, TrustAnchors};
 use refineid_doc_sign::x509::{DateTime, OwnedCert};
 use sha2::{Digest as _, Sha256};
 
@@ -107,6 +108,9 @@ pub enum Refresh {
     WhenDue,
     /// Before judging anything, whatever the cache holds.
     Now,
+    /// Never: the cached lists as they are, stale or not, and no
+    /// anchor when there are none. `--offline`.
+    CacheOnly,
 }
 
 /// Where the anchors of one run came from.
@@ -121,8 +125,8 @@ pub enum AnchorSource {
         stale: bool,
     },
     /// No list is at hand: none was ever fetched, or the cache no
-    /// longer reads and the fetch failed as the error says. Only the
-    /// roots core pins anchor anything.
+    /// longer reads and the fetch failed as the error says. Nothing
+    /// anchors anything.
     Unavailable(TrustedListError),
 }
 
@@ -234,8 +238,9 @@ impl ListCache {
 /// reads, one is past its `NextUpdate`, or the cache is older than
 /// [`REFRESH_AFTER`]. A due fetch reads the lists again with `get` and
 /// the cache takes the result; a list of the lists that does not
-/// arrive or read leaves the cached lists in use. Without lists the
-/// anchors are [`TrustAnchors::pinned`].
+/// arrive or read leaves the cached lists in use. Under
+/// [`Refresh::CacheOnly`] nothing is fetched and `get` is never
+/// called. Without lists there is no anchor.
 pub fn run_anchors(
     cache: Option<&ListCache>,
     now: DateTime,
@@ -253,14 +258,18 @@ pub fn run_anchors(
             }
         })
         .flatten();
-    let due = |lists: &TrustedLists| {
-        refresh == Refresh::Now
-            || lists.is_stale(now)
-            || age(lists.fetched_at(), now) > REFRESH_AFTER
-            || read_count(lists) != records.len()
+    let due = |lists: &TrustedLists| match refresh {
+        Refresh::Now => true,
+        Refresh::CacheOnly => false,
+        Refresh::WhenDue => {
+            lists.is_stale(now)
+                || age(lists.fetched_at(), now) > REFRESH_AFTER
+                || read_count(lists) != records.len()
+        }
     };
     let lists = match cached {
         Some(lists) if !due(&lists) => Ok(lists),
+        None if refresh == Refresh::CacheOnly => Err(TrustedListError::NotFetched),
         cached => match fetch(get, now, signers, &records) {
             Ok((lists, fetched)) => {
                 if let Some(cache) = cache
@@ -292,10 +301,24 @@ pub fn run_anchors(
     }
 }
 
-/// The anchors a run has with no list at hand: the roots core pins,
-/// and nothing once it pins none.
+/// The anchors a run has with no list at hand: none. The software
+/// ships no root a chain could end at.
 fn without_lists() -> TrustAnchors {
-    TrustAnchors::pinned()
+    TrustAnchors::default()
+}
+
+/// The DER of every anchor in `anchors` trusted for
+/// [`AnchorRole::CertificateIssuing`] at `now`: what a signing
+/// request's `signer_anchors` takes from the lists.
+#[must_use]
+pub fn certificate_issuing_ders(anchors: &TrustAnchors, now: DateTime) -> Vec<Vec<u8>> {
+    anchors
+        .anchors()
+        .iter()
+        .filter(|anchor| anchor.role() == AnchorRole::CertificateIssuing)
+        .filter(|anchor| anchors.is_anchor(anchor.certificate().view(), anchor.role(), now))
+        .map(|anchor| anchor.certificate().as_der().to_vec())
+        .collect()
 }
 
 /// How long ago `then` was at `now`; nothing when `then` is later.
@@ -349,8 +372,9 @@ fn fetch(
     Ok((lists, records))
 }
 
-/// [`run_anchors`] over the user's cache, the Commission certificates
-/// core pins and this crate's HTTP transport.
+/// [`run_anchors`] over the user's cache, the Official Journal's
+/// list-signing certificates core ships and this crate's HTTP
+/// transport.
 #[must_use]
 pub fn user_anchors(now: DateTime, refresh: Refresh) -> RunAnchors {
     crate::doc_sign_http::install();

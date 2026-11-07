@@ -174,10 +174,15 @@ pub fn sign_pdf(options: PdfSignOptions) -> Result<SignReport, ReaderSignError> 
     let visible_signature = Some(VisibleSignature::verification(
         StampLanguage::for_process_locale(),
     ));
+    let signer_anchors = crate::signer_anchors::for_card(
+        reader_filter.as_deref(),
+        refineid_doc_sign::now_date_time(),
+    );
     let document = pdf_document_request(
         visible_signature,
         timestamp_authority,
         timestamp_credentials,
+        signer_anchors.ders,
     );
     sign_qualified(
         input,
@@ -257,10 +262,15 @@ pub fn sign_asice(options: AsicSignOptions) -> Result<SignReport, ReaderSignErro
         }
         .into());
     }
+    let signer_anchors = crate::signer_anchors::for_card(
+        reader_filter.as_deref(),
+        refineid_doc_sign::now_date_time(),
+    );
     let document = asice_document_request(
         additional_inputs,
         timestamp_authority,
         timestamp_credentials,
+        signer_anchors.ders,
     );
     sign_qualified(
         input,
@@ -292,7 +302,9 @@ pub struct PhoneSignDocument {
 /// through this computer. A PDF is signed as [`sign_pdf`] signs it, any
 /// other format as [`sign_asice`] does, a container over the
 /// document's input and its additional inputs, each bound to the certificate the
-/// phone returns rather than to a displayed serial.
+/// phone returns rather than to a displayed serial. The phone's card is
+/// not in a reader here, so each request's anchors are the cached CA
+/// certificates and the trusted lists' certificate-issuing anchors.
 ///
 /// # Errors
 /// [`PhoneSignFailure`] when nothing was written; once the phone's
@@ -302,6 +314,7 @@ pub fn sign_on_phone(
     documents: Vec<PhoneSignDocument>,
     timestamp_authority: &str,
 ) -> Result<Vec<Result<SignReport, SignErrorKind>>, PhoneSignFailure> {
+    let signer_anchors = crate::signer_anchors::for_phone(refineid_doc_sign::now_date_time()).ders;
     let documents = documents
         .into_iter()
         .map(|document| PhoneSignOptions {
@@ -314,12 +327,14 @@ pub fn sign_on_phone(
                     )),
                     timestamp_authority.to_owned(),
                     None,
+                    signer_anchors.clone(),
                 )
             } else {
                 asice_document_request(
                     document.additional_inputs,
                     timestamp_authority.to_owned(),
                     None,
+                    signer_anchors.clone(),
                 )
             },
         })
@@ -342,11 +357,13 @@ fn signing_time_now() -> SigningTime {
 
 /// An `ASiC-E` with `XAdES` request at level LT: an archive
 /// construction for the format is not implemented, and the format
-/// refuses to pretend.
+/// refuses to pretend. `signer_anchors` is what the long-term
+/// material's path may end at ([`crate::signer_anchors`]).
 fn asice_document_request(
     additional_inputs: Vec<PathBuf>,
     timestamp_authority: String,
     timestamp_credentials: Option<TimestampCredentials>,
+    signer_anchors: Vec<Vec<u8>>,
 ) -> DocumentRequest {
     DocumentRequest {
         format: Format::AsicEXades,
@@ -355,15 +372,19 @@ fn asice_document_request(
         metadata: SignatureMetadata::default(),
         archive: false,
         long_term: true,
+        signer_anchors,
         timestamp_authorities: vec![timestamp_authority],
         timestamp_credentials,
     }
 }
 
+/// A `PAdES` request at level LTA, with `signer_anchors` as for
+/// [`asice_document_request`].
 fn pdf_document_request(
     visible_signature: Option<VisibleSignature>,
     timestamp_authority: String,
     timestamp_credentials: Option<TimestampCredentials>,
+    signer_anchors: Vec<Vec<u8>>,
 ) -> DocumentRequest {
     DocumentRequest {
         format: Format::Pades,
@@ -375,6 +396,7 @@ fn pdf_document_request(
         },
         archive: true,
         long_term: true,
+        signer_anchors,
         timestamp_authorities: vec![timestamp_authority],
         timestamp_credentials,
     }
@@ -472,16 +494,21 @@ mod tests {
         assert!(ensure_displayed_serial(&serial, &serial).is_ok());
     }
 
+    /// A synthetic anchor DER: the request carries it as given.
+    const ANCHOR: &[u8] = b"synthetic-anchor-der";
+
     #[test]
     fn graphical_pdf_signing_requests_qualified_lta() {
         let request = pdf_document_request(
             Some(VisibleSignature::verification(StampLanguage::English)),
             "https://timestamp.sectigo.com/qualified".to_owned(),
             None,
+            vec![ANCHOR.to_vec()],
         );
         assert_eq!(request.format, refineid_doc_sign::document::Format::Pades);
         assert!(request.archive);
         assert!(request.long_term);
+        assert_eq!(request.signer_anchors, [ANCHOR.to_vec()]);
         assert_eq!(
             request.timestamp_authorities,
             ["https://timestamp.sectigo.com/qualified"]
@@ -498,6 +525,7 @@ mod tests {
             None,
             "https://timestamp.sectigo.com/qualified".to_owned(),
             None,
+            Vec::new(),
         );
         assert!(request.metadata.visible_signature.is_none());
     }

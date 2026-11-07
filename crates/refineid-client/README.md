@@ -25,6 +25,9 @@ Client library and the `refineid` command-line tool.
 - `http.rs` -- a deliberately minimal plain-HTTP client for CRL/OCSP fetches
   (payloads are CA-signed; bounded bodies, no redirects).
 - `trusted_lists.rs` -- the EU trusted lists `document verify` anchors on, fetched and cached per user.
-- `trust_roots.rs`, `verify.rs`, `cert_show.rs`, `cert_chain.rs`, `exit_status.rs` (sysexits-style codes),
+- `ca_certificates.rs` -- the card's issuing CA and root, cached until they expire (refineid-core's
+  `doc/security/certificate-custody.md`); `signer_anchors.rs` -- what a signing request's long-term
+  material may end at: those certificates and the trusted lists' certificate-issuing anchors.
+- `verify.rs`, `cert_show.rs`, `cert_chain.rs`, `exit_status.rs` (sysexits-style codes),
   `events.rs`, `apdu_trace.rs`.
 - `bin/refineid.rs` -- the thin CLI entry point.

@@ -306,8 +306,7 @@ enum Reason {
     ProfileNotSupported,
     /// No verified revocation answer speaks for the signer.
     RevocationUnknown,
-    /// No trusted list was at hand, so nothing but a pinned root
-    /// anchors a chain.
+    /// No trusted list was at hand, so nothing anchors a chain.
     NoTrustedLists,
 }
 

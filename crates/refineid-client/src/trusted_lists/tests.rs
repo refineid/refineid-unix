@@ -373,8 +373,8 @@ fn online<'a>(world: &World, calls: &'a Cell<usize>) -> impl FnMut(&Uri) -> Opti
     )
 }
 
-/// How many anchors a run without lists has.
-fn pinned_count() -> usize {
+/// How many anchors a run without lists has: none.
+fn unlisted_count() -> usize {
     without_lists().anchors().len()
 }
 
@@ -523,8 +523,8 @@ fn a_first_run_fetches_and_stores_owner_only_files() -> TestResult {
     )?;
     check(
         &run.anchors.anchors().len(),
-        &(pinned_count() + LISTED_ANCHORS),
-        "the listed CA joins the pinned roots",
+        &(unlisted_count() + LISTED_ANCHORS),
+        "the listed CA is the anchor",
     )?;
     let mode = fs::metadata(dir.path().join(LISTS_DIRECTORY))?
         .permissions()
@@ -577,7 +577,7 @@ fn a_fresh_cache_is_used_without_a_fetch() -> TestResult {
     )?;
     check(
         &run.anchors.anchors().len(),
-        &(pinned_count() + LISTED_ANCHORS),
+        &(unlisted_count() + LISTED_ANCHORS),
         "anchors",
     )
 }
@@ -607,7 +607,7 @@ fn an_overdue_cache_is_used_stale_when_the_fetch_fails() -> TestResult {
     )?;
     check(
         &run.anchors.anchors().len(),
-        &(pinned_count() + LISTED_ANCHORS),
+        &(unlisted_count() + LISTED_ANCHORS),
         "the stale anchors count",
     )?;
     check(&cache.load().len(), &STORED_FILES, "the cache is kept")
@@ -657,7 +657,7 @@ fn no_cache_and_no_network_leaves_the_lists_unavailable() -> TestResult {
         &AnchorSource::Unavailable(TrustedListError::NotFetched),
         "source",
     )?;
-    check(&run.anchors.anchors().len(), &pinned_count(), "anchors")?;
+    check(&run.anchors.anchors().len(), &unlisted_count(), "anchors")?;
     check_true(
         !dir.path().join(LISTS_DIRECTORY).exists(),
         "nothing written",
@@ -699,7 +699,7 @@ fn a_cached_national_list_that_no_longer_reads_is_fetched_again() -> TestResult 
     check(&calls.get(), &FETCHED_ONCE, "a fetch was tried")?;
     check(
         &run.anchors.anchors().len(),
-        &pinned_count(),
+        &unlisted_count(),
         "the national list yields nothing",
     )
 }
@@ -789,7 +789,7 @@ fn a_national_list_that_fails_in_a_refresh_keeps_its_cached_copy() -> TestResult
     check(&calls.get(), &FETCHED_ONCE, "refreshed")?;
     check(
         &run.anchors.anchors().len(),
-        &(pinned_count() + LISTED_ANCHORS),
+        &(unlisted_count() + LISTED_ANCHORS),
         "the cached national list still yields its anchor",
     )?;
     check(
@@ -835,7 +835,7 @@ fn a_list_no_longer_pointed_at_leaves_the_cache() -> TestResult {
     );
     check(
         &run.anchors.anchors().len(),
-        &pinned_count(),
+        &unlisted_count(),
         "no national list",
     )?;
     let loaded = cache.load();
@@ -907,4 +907,60 @@ fn live_lists_fetch_read_and_anchor() -> TestResult {
         matches!(run.source, AnchorSource::Lists { .. }),
         "anchors come from the lists",
     )
+}
+
+#[test]
+fn cache_only_uses_overdue_lists_without_fetching() -> TestResult {
+    let world = World::new();
+    let dir = TempDir::new("trusted-lists-cache-only")?;
+    let cache = ListCache::at(dir.path().join(LISTS_DIRECTORY));
+    let calls = Cell::new(NOT_FETCHED);
+    let _first = run_anchors(
+        Some(&cache),
+        day(FETCHED),
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &calls),
+    );
+    let calls = Cell::new(NOT_FETCHED);
+    let run = run_anchors(
+        Some(&cache),
+        day(OVERDUE),
+        Refresh::CacheOnly,
+        &world.signers()?,
+        offline(&calls),
+    );
+    check(&calls.get(), &NOT_FETCHED, "nothing fetched")?;
+    check(
+        &run.anchors.anchors().len(),
+        &LISTED_ANCHORS,
+        "the cached list's anchor",
+    )?;
+    check(
+        &certificate_issuing_ders(&run.anchors, day(FETCHED)).len(),
+        &LISTED_ANCHORS,
+        "the listed CA as a signer anchor",
+    )
+}
+
+#[test]
+fn cache_only_without_a_cache_fetches_nothing_and_has_no_anchor() -> TestResult {
+    let world = World::new();
+    let dir = TempDir::new("trusted-lists-cache-only-empty")?;
+    let cache = ListCache::at(dir.path().join(LISTS_DIRECTORY));
+    let calls = Cell::new(NOT_FETCHED);
+    let run = run_anchors(
+        Some(&cache),
+        day(FETCHED),
+        Refresh::CacheOnly,
+        &world.signers()?,
+        offline(&calls),
+    );
+    check(&calls.get(), &NOT_FETCHED, "nothing fetched")?;
+    check(
+        &run.source,
+        &AnchorSource::Unavailable(TrustedListError::NotFetched),
+        "source",
+    )?;
+    check_true(run.anchors.anchors().is_empty(), "no anchor")
 }

@@ -278,7 +278,7 @@ const fn validate_field_name(name: &'static str) -> &'static str {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Severity {
     /// Trust assumptions of the deployment are violated. Audit
-    /// chain tamper detected, pinned-root SHA-256 mismatch.
+    /// chain tamper detected.
     /// Never in normal operation.
     Emerg,
     /// Active intervention required. Cryptographic primitive

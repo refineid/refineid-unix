@@ -83,7 +83,7 @@ pub struct CertShowReport {
     pub ca_issuers_urls: Vec<refineid_lib_core::text::Uri>,
     /// SHA-256 of the full DER encoding (recomputed after PEM
     /// decoding when source was PEM). The fingerprint operators
-    /// compare against pinned roots.
+    /// compare against a published fingerprint.
     pub sha256_fingerprint: Sha256,
     /// Signature algorithm OID bytes (the value content of the
     /// `AlgorithmIdentifier`'s OID TLV). Rendered to dotted
@@ -321,12 +321,12 @@ mod tests {
     use crate::test_util::{TempDir, TestResult, check, check_true};
     use refineid_lib_core::x509::KeyUsage;
 
-    // Real, bundled certs (also the production trust anchors).
+    // Real public certificates, kept as test fixtures.
     // `show_cert` reads from a path, so each is staged into a
     // temp file first.
     const ICAO_CSCA_PEM: &[u8] = include_bytes!("../test-vectors/icao-pkd-un-csca-2.pem");
-    const DVV_ROOT_RSA_DER: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-rsa.der");
-    const DVV_ROOT_ECC_DER: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-ecc.der");
+    const DVV_ROOT_RSA_DER: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der");
+    const DVV_ROOT_ECC_DER: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-ecc.der");
 
     #[test]
     fn shows_a_pem_rsa_csca_with_all_fields() -> TestResult {

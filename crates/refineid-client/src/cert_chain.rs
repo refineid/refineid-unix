@@ -643,7 +643,7 @@ mod tests {
     // ../test-vectors/README.md for provenance.
     const DVV_INTERMEDIATE_G4E_DER: &[u8] =
         include_bytes!("../test-vectors/fineid-intermediate-01-citizen-g4e.der");
-    const DVV_ROOT_ECC_DER: &[u8] = include_bytes!("../trust-anchors/dvv-gov-root-ca-g3-ecc.der");
+    const DVV_ROOT_ECC_DER: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-ecc.der");
 
     fn uri(s: &str) -> Result<Uri, Box<dyn core::error::Error>> {
         Uri::parse(s.to_owned()).map_err(|e| format!("uri: {e}").into())

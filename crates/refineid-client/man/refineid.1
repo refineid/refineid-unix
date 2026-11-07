@@ -147,13 +147,24 @@ spelled like it.
 Per-card readout: certificates, chain walk and revocation, PIN retry
 counters, and with the CAN the eMRTD section.
 With no card in a reader, reads the card through the paired phone.
+A certificate's
+.Li chain verified
+row reads
+.Li ok
+when its issuing CA, or the on-card root that issued that CA, is a
+certificate-issuing service the EU trusted lists name; the on-card
+root alone anchors nothing.
+With no list at hand it reads
+.Li skipped (not anchored: trusted lists not fetched) ,
+which is no failure of the card.
 Without
 .Fl -no-can
 on a terminal, prompts for the CAN; an empty answer skips the eMRTD
 section.
 .Bl -tag -width Ds
 .It Fl -offline
-Skip every network fetch.
+Skip every network fetch; the cached trusted lists are used as they
+are.
 .It Fl -no-can
 Skip the eMRTD section without a prompt.
 .It Fl -crl-file Ar path
@@ -236,6 +247,10 @@ and
 .Cm asice-cades ;
 LT, embedded evidence, for the rest.
 There is no lower level.
+The evidence's chain may end at the card's CA certificates, cached or
+read from the card, or at the certificate-issuing services the EU
+trusted lists name; with none of these at hand the signing is refused
+before the card is used.
 .Bl -tag -width Ds
 .It Fl -format Ar format
 .Bl -tag -width "cades-detached" -compact
@@ -648,8 +663,10 @@ English otherwise.
 Locate the pairing store; see
 .Sx FILES .
 .It Ev XDG_CACHE_HOME , HOME
-Locate the trusted-list cache; see
+Locate the trusted-list and CA-certificate caches; see
 .Sx FILES .
+.It Ev REFINEID_CA_CACHE_DIR
+Names the CA-certificate cache directory outright.
 .It Ev REFINEID_CA_BUNDLE
 A CA bundle file for TLS connections, used instead of the system
 bundle.
@@ -698,6 +715,13 @@ next update, then the list as fetched.
 Without
 .Ev XDG_CACHE_HOME ,
 .Pa $HOME/.cache/refineid/trusted-lists/ .
+.It Pa $XDG_CACHE_HOME/refineid/ca-certificates/
+The issuing CA and root a card carries, kept until they expire: one
+owner-only DER file per certificate, named by its SHA-256.
+Without
+.Ev XDG_CACHE_HOME ,
+.Pa $HOME/.cache/refineid/ca-certificates/ .
+A privileged process keeps no such cache.
 .El
 .Sh EXIT STATUS
 .Bl -tag -width Ds

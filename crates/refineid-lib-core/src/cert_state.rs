@@ -30,7 +30,7 @@
 //! 2. [`ParsedCert`] -- X.509 v3 syntax check passed, fields
 //!    extractable. Signature has *not* been verified by anyone.
 //! 3. [`PathValidatedCert`] -- RFC 5280 §6.1 Basic Path
-//!    Validation passed. The cert chains to a pinned trust
+//!    Validation passed. The cert chains to a trust
 //!    anchor. Signatures along the path are verified.
 //! 4. [`RevocationCheckedCert`] -- the leaf and every
 //!    intermediate has been confirmed not on a fresh CRL /
@@ -200,8 +200,7 @@ impl<'a> ParsedCert<'a> {
 
 // ----- Stage 3: PathValidatedCert ---------------------------
 
-/// Cert whose chain has been verified against a pinned trust
-/// anchor.
+/// Cert whose chain has been verified against a trust anchor.
 ///
 /// Carries the anchor's label + SHA-256 so downstream code
 /// can name what proved the chain (audit-log requirement).
@@ -234,9 +233,8 @@ impl<'a> PathValidatedCert<'a> {
         &self.cert
     }
 
-    /// Label of the pinned trust anchor that proved the chain
-    /// (e.g. "DVV CA Generation 3 RSA"). Tier 0 `&'static str`
-    /// from a fixed compile-time set in `crate::trust_roots`.
+    /// Label of the trust anchor that proved the chain, as the
+    /// verifier named it. Tier 0 `&'static str`.
     #[must_use]
     #[inline]
     pub const fn anchor_label(&self) -> &'static str {
@@ -441,7 +439,7 @@ impl<'a, P> PurposeBoundCert<'a, P> {
         self.cert.inner()
     }
 
-    /// Label of the pinned trust anchor that proved the chain
+    /// Label of the trust anchor that proved the chain
     /// (delegated to the wrapped [`PathValidatedCert`]).
     #[must_use]
     #[inline]
