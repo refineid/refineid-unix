@@ -217,7 +217,8 @@ _refineid_document() {
     verify)
       shift words; (( CURRENT-- ))
       _arguments \
-        '*:file:_files'
+        '*:file:_files' \
+        '--refresh-trust[fetch the EU trusted lists first]'
       ;;
   esac
 }

@@ -41,6 +41,22 @@ Citations are BibTeX keys in [`references.md`](references.md).
   now and `signed:` is `-`. An unproven timestamp is listed and
   decides nothing. This is the validation time of ETSI EN 319 102-1
   clauses 5.4 and 5.6.
+- **Anchors come from the trusted lists.** `refineid document verify`
+  anchors a chain on the qualified services the EU trusted lists name
+  ([etsi_ts119612](references.md#etsi_ts119612)), fetched by this
+  client and kept under `$XDG_CACHE_HOME/refineid/trusted-lists/`
+  (`crates/refineid-client/src/trusted_lists.rs`). The cache is used
+  as it is until a list is past its `NextUpdate` or the cache is
+  thirty days old (`REFRESH_AFTER`): TS 119 612 clause 5.3.15 lets an
+  operator announce the next update up to six months ahead, while a
+  withdrawal is published by reissuing the list at once, so a month
+  bounds how long a withdrawal goes unseen; `--refresh-trust` fetches
+  at once. A fetch that fails leaves the cached lists in use, and the
+  `trust-lists:` line under `-v` carries their fetch time and `stale`
+  when one is overdue; with no list at all the record says `trusted
+  lists not fetched: nothing can be anchored` beside the unverified
+  chain, and the exit status is the indeterminate one, never a crash.
+  The thirty days are a choice, not a measurement.
 - **Secrets at the terminal only.** A PIN is asked once the card is in
   hand, read from the terminal, never from the command line, and
   nothing is echoed while it is typed. When the paired phone signs,

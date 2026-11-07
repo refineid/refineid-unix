@@ -226,10 +226,16 @@ record for RAPP and its applications.
 
 ## Certificates and trust
 
-- Certificates come from the card, which carries its own, or, for external
-  ones (EU eIDAS), from trusted lists at runtime. No certificates or
-  fingerprints are shipped in the software.
-- No pinning or other trust policy is added without the owner's decision.
+- The only certificates shipped in RefineID software are the EU
+  Official Journal's list-signing certificates, in refineid-core's
+  document-verification crate; they bootstrap the EU trusted lists.
+- Every other anchor comes from the card when one is present, or from
+  the trusted lists at runtime, which this client fetches and caches
+  (`crates/refineid-client/src/trusted_lists.rs`;
+  [doc/command-line.md](doc/command-line.md), "Anchors come from the
+  trusted lists").
+- No other certificate, fingerprint, pin or trust policy is added
+  without the owner's decision (decision 2026-11-07).
 - Describe what the code does and cite the source; ask the owner before
   changing trust behavior.
 

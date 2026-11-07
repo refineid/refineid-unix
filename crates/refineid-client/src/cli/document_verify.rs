@@ -32,16 +32,20 @@ use refineid_doc_sign::x509::{DateTime, OwnedCert};
 use super::{ArgParseError, argv::RemainingArgv, verb::VerbTag};
 use crate::document_verify::DocumentVerifyError;
 use crate::exit_status::ExitStatus;
+use crate::trusted_lists::Refresh;
 
 /// What `refineid document verify help`
 /// prints. The man page refineid(1) carries the same facts.
 pub const HELP: &str = "\
-usage: refineid document verify FILE [FILE ...]
+usage: refineid document verify [--refresh-trust] FILE [FILE ...]
 
 Verify the signatures of a signed document: a PDF, an ASiC-E or BDOC
-container, or a CMS structure with the document attached. Prints one
-record per signature, records separated by a blank line, each line
-`key: value`:
+container, or a CMS structure with the document attached. The trust
+anchors come from the EU trusted lists, fetched and kept in
+$XDG_CACHE_HOME/refineid/trusted-lists/ and fetched again when one is
+past its next update or the cache is a month old; --refresh-trust
+fetches them first. Prints one record per signature, records
+separated by a blank line, each line `key: value`:
 
   file: the file as named
   signer: the certificate's common name as it reads
@@ -52,11 +56,14 @@ record per signature, records separated by a blank line, each line
     judged as of now
   verdict: valid, indeterminate, not valid, revoked or unsupported
   reason: one line per cause of an indeterminate, not valid or
-    unsupported verdict
+    unsupported verdict; `trusted lists not fetched: nothing can be
+    anchored` when no list is at hand
 
 -v adds intact, signature, chain, claimed, timestamp,
-timestamp-chain, revocation and document-timestamp lines. A file that
-cannot be judged prints file and error.
+timestamp-chain, revocation, document-timestamp and trust-lists
+lines, the last the lists' fetch time, `stale` after it when one is
+past its next update, or `none`. A file that cannot be judged prints
+file and error.
 Exits 70 when any file cannot be judged, else 1 when any signature
 is not valid, revoked or unsupported, else 0.
 ";
@@ -73,11 +80,23 @@ const KEY_SEPARATOR: &str = ": ";
 /// The separator of the certificates on a path.
 const PATH_SEPARATOR: &str = " > ";
 
+/// The option that fetches the trusted lists before judging.
+const REFRESH_TRUST: &str = "--refresh-trust";
+
+/// The value of `trust-lists` when no list was at hand.
+const NO_LISTS: &str = "none";
+
+/// What follows the fetch time of lists one of which is past its next
+/// update.
+const STALE: &str = " stale";
+
 /// Parsed `document verify FILE [FILE ...]` arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentVerifyArgs {
     /// The documents to judge, in command-line order.
     pub inputs: Vec<PathBuf>,
+    /// Whether to fetch the trusted lists before judging.
+    pub refresh_trust: bool,
 }
 
 impl DocumentVerifyArgs {
@@ -86,11 +105,17 @@ impl DocumentVerifyArgs {
     #[must_use]
     pub fn run(self, verbose: bool) -> std::process::ExitCode {
         let now = refineid_doc_sign::now_date_time();
+        let refresh = if self.refresh_trust {
+            Refresh::Now
+        } else {
+            Refresh::WhenDue
+        };
+        let run = crate::trusted_lists::user_anchors(now, refresh);
         let mut outcomes = Vec::new();
         let mut records = Vec::new();
         for path in &self.inputs {
             let file = path.display().to_string();
-            match crate::document_verify::verify_file(path, now) {
+            match crate::document_verify::verify_file(path, &run.anchors, now) {
                 Ok(report) => {
                     records.extend(
                         views(&report)
@@ -113,17 +138,23 @@ impl DocumentVerifyArgs {
         exit_status(&outcomes).into()
     }
 
-    /// Parse the post-subcommand argv slice: every argument is a file.
+    /// Parse the post-subcommand argv slice: every argument but
+    /// `--refresh-trust` is a file.
     ///
     /// # Errors
-    /// [`ArgParseError`] when no file is named or an option is given.
+    /// [`ArgParseError`] when no file is named or another option is
+    /// given.
     pub fn parse(argv: RemainingArgv) -> Result<Self, ArgParseError> {
         let mut inputs = Vec::new();
+        let mut refresh_trust = false;
         for arg in argv.into_vec() {
-            if arg.starts_with("--") {
+            if arg == REFRESH_TRUST {
+                refresh_trust = true;
+            } else if arg.starts_with("--") {
                 return Err(ArgParseError::Unexpected { cmd: CMD, got: arg });
+            } else {
+                inputs.push(PathBuf::from(arg));
             }
-            inputs.push(PathBuf::from(arg));
         }
         if inputs.is_empty() {
             return Err(ArgParseError::Required {
@@ -131,7 +162,10 @@ impl DocumentVerifyArgs {
                 name: "FILE",
             });
         }
-        Ok(Self { inputs })
+        Ok(Self {
+            inputs,
+            refresh_trust,
+        })
     }
 }
 
@@ -196,6 +230,8 @@ enum Key {
     TimestampChain,
     /// One document timestamp covering the signature.
     DocumentTimestamp,
+    /// When the trusted lists the anchors came from were fetched.
+    TrustLists,
 }
 
 impl Key {
@@ -217,6 +253,7 @@ impl Key {
             Self::Timestamp => "timestamp",
             Self::TimestampChain => "timestamp-chain",
             Self::DocumentTimestamp => "document-timestamp",
+            Self::TrustLists => "trust-lists",
         }
     }
 }
@@ -269,6 +306,9 @@ enum Reason {
     ProfileNotSupported,
     /// No verified revocation answer speaks for the signer.
     RevocationUnknown,
+    /// No trusted list was at hand, so nothing but a pinned root
+    /// anchors a chain.
+    NoTrustedLists,
 }
 
 impl Reason {
@@ -283,6 +323,7 @@ impl Reason {
             }
             Self::ProfileNotSupported => "profile not supported",
             Self::RevocationUnknown => "revocation status unknown",
+            Self::NoTrustedLists => "trusted lists not fetched: nothing can be anchored",
         }
     }
 }
@@ -377,16 +418,49 @@ struct Facts {
     revocation: Revocation,
     /// One line per document timestamp covering the signature.
     document_timestamps: Vec<String>,
+    /// When the trusted lists the anchors came from were fetched, and
+    /// whether one is past its next update.
+    lists: ListsAge,
+}
+
+/// The age of the trusted lists a report's anchors came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListsAge {
+    /// When the lists were fetched; `None` when no list was at hand.
+    fetched_at: Option<DateTime>,
+    /// Whether a list is past its next update.
+    stale: bool,
+}
+
+impl ListsAge {
+    /// What `report` says of its anchors' lists.
+    const fn of(report: &DocumentReport) -> Self {
+        Self {
+            fetched_at: report.anchors_fetched_at(),
+            stale: report.anchors_stale(),
+        }
+    }
+
+    /// The `trust-lists` value: the fetch time, ` stale` after it when
+    /// a list is past its next update, or `none`.
+    fn line(self) -> String {
+        self.fetched_at.map_or_else(
+            || NO_LISTS.to_owned(),
+            |fetched_at| format!("{fetched_at}{}", if self.stale { STALE } else { "" }),
+        )
+    }
 }
 
 /// The view of every row of `report`, in document order.
 fn views(report: &DocumentReport) -> Vec<SignatureView> {
     let rows = report.rows();
-    rows.iter().map(|row| view(rows, row)).collect()
+    let lists = ListsAge::of(report);
+    rows.iter().map(|row| view(rows, row, lists)).collect()
 }
 
-/// The view of `row`, one of `rows`.
-fn view(rows: &[SignatureRow], row: &SignatureRow) -> SignatureView {
+/// The view of `row`, one of `rows`, judged under anchors from lists
+/// of age `lists`.
+fn view(rows: &[SignatureRow], row: &SignatureRow, lists: ListsAge) -> SignatureView {
     let countersigns = row.counter_signs().map(|index| {
         rows.get(index)
             .and_then(SignatureRow::signer)
@@ -396,7 +470,7 @@ fn view(rows: &[SignatureRow], row: &SignatureRow) -> SignatureView {
         .signer()
         .map_or_else(|| NONE.to_owned(), |signer| name_or_none(signer.name()));
     let judgement = match row.outcome() {
-        SignatureOutcome::Judged(report) => Judgement::Judged(Box::new(facts(report))),
+        SignatureOutcome::Judged(report) => Judgement::Judged(Box::new(facts(report, lists))),
         SignatureOutcome::Unsupported { .. } => Judgement::Unsupported,
     };
     SignatureView {
@@ -406,8 +480,9 @@ fn view(rows: &[SignatureRow], row: &SignatureRow) -> SignatureView {
     }
 }
 
-/// The facts of a judged signature.
-fn facts(report: &SignatureReport) -> Facts {
+/// The facts of a judged signature, under anchors from lists of age
+/// `lists`.
+fn facts(report: &SignatureReport, lists: ListsAge) -> Facts {
     let timestamps = report
         .timestamps()
         .iter()
@@ -435,6 +510,7 @@ fn facts(report: &SignatureReport) -> Facts {
             .iter()
             .map(|stamped| proven_or_not(stamped.timestamp()))
             .collect(),
+        lists,
     }
 }
 
@@ -507,6 +583,7 @@ impl SignatureView {
         for stamped in &facts.document_timestamps {
             record.line(Key::DocumentTimestamp, stamped);
         }
+        record.line(Key::TrustLists, facts.lists.line());
         record
     }
 }
@@ -532,6 +609,10 @@ impl Facts {
                 };
                 [
                     (self.chained, chain),
+                    (
+                        self.chained || self.lists.fetched_at.is_some(),
+                        Reason::NoTrustedLists,
+                    ),
                     (
                         self.revocation != Revocation::Unavailable,
                         Reason::RevocationUnknown,
@@ -660,6 +741,8 @@ mod tests {
     const ANSWERED: u8 = 11;
     /// The document timestamp day.
     const ARCHIVED: u8 = 12;
+    /// The day the trusted lists were fetched.
+    const FETCHED: u8 = 7;
     /// The path line of the DVV intermediate under its root.
     const DVV_PATH: &str = "DVV Citizen Certificates - G4E > DVV Gov. Root CA - G3 ECC";
 
@@ -682,6 +765,10 @@ mod tests {
             timestamps: vec![(format!("{} proven", at(STAMPED)?), DVV_PATH.to_owned())],
             revocation: Revocation::Good { at: at(ANSWERED)? },
             document_timestamps: Vec::new(),
+            lists: ListsAge {
+                fetched_at: Some(at(FETCHED)?),
+                stale: false,
+            },
         })
     }
 
@@ -991,6 +1078,49 @@ timestamp-chain: -
 revocation: good 2026-06-11T12:00:00Z
 document-timestamp: 2026-06-12T12:00:00Z proven
 document-timestamp: 2026-06-12T12:00:00Z unproven
+trust-lists: 2026-06-07T12:00:00Z
+",
+            "record",
+        )
+    }
+
+    #[test]
+    fn verbose_trust_lists_say_stale_or_none() -> TestResult {
+        let mut facts = valid()?;
+        facts.lists.stale = true;
+        check_true(
+            rendered(&[signed(facts.clone())], true)
+                .contains("\ntrust-lists: 2026-06-07T12:00:00Z stale\n"),
+            "stale",
+        )?;
+        facts.lists = ListsAge {
+            fetched_at: None,
+            stale: false,
+        };
+        check_true(
+            rendered(&[signed(facts)], true).contains("\ntrust-lists: none\n"),
+            "none",
+        )
+    }
+
+    #[test]
+    fn an_unanchored_chain_without_lists_says_nothing_can_be_anchored() -> TestResult {
+        let mut facts = valid()?;
+        facts.verdict = Verdict::Indeterminate;
+        facts.chained = false;
+        facts.lists = ListsAge {
+            fetched_at: None,
+            stale: false,
+        };
+        check(
+            &rendered(&[signed(facts)], false).as_str(),
+            &"\
+file: /documents/a.pdf
+signer: SURNAME GIVEN 12345678X
+signed: 2026-06-10T12:00:00Z
+verdict: indeterminate
+reason: certificate chain unverified
+reason: trusted lists not fetched: nothing can be anchored
 ",
             "record",
         )
@@ -1102,7 +1232,7 @@ document-timestamp: 2026-06-12T12:00:00Z unproven
     }
 
     #[test]
-    fn options_are_refused() -> TestResult {
+    fn other_options_are_refused() -> TestResult {
         check_true(
             matches!(
                 DocumentVerifyArgs::parse(argv(&["--offline", "/documents/a.pdf"])),
@@ -1110,5 +1240,18 @@ document-timestamp: 2026-06-12T12:00:00Z unproven
             ),
             "an option is refused",
         )
+    }
+
+    #[test]
+    fn refresh_trust_is_asked_anywhere_on_the_line() -> TestResult {
+        let args = DocumentVerifyArgs::parse(argv(&["/documents/a.pdf", REFRESH_TRUST]))?;
+        check_true(args.refresh_trust, "asked after the file")?;
+        check(
+            &args.inputs,
+            &vec![PathBuf::from("/documents/a.pdf")],
+            "inputs",
+        )?;
+        let args = DocumentVerifyArgs::parse(argv(&["/documents/a.pdf"]))?;
+        check_true(!args.refresh_trust, "not asked")
     }
 }
