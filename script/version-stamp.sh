@@ -25,7 +25,7 @@ cd "$(dirname "$0")/.."
 
 read -r year month day < <(date -u '+%y %m %d')
 today="$year.$((10#$month)).$((10#$day))"
-old="$(script/version.sh)"
+old="$(script/version.sh --day)"
 
 old_ifs=$IFS
 IFS=.

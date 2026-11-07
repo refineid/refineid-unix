@@ -42,7 +42,14 @@ if [ "$(uname -s)" != "FreeBSD" ]; then
     exit 1
 fi
 
+# One build number for the whole build: the package version is the
+# project version YY.M.D.B (script/version.sh), and the binaries are
+# built with the same B. --skip-build packages the binaries already in
+# target/release; they carry the same B when they were built with the
+# same REFINEID_BUILD_NUMBER.
 VERSION="$(script/version.sh)"
+REFINEID_BUILD_NUMBER="${VERSION##*.}"
+export REFINEID_BUILD_NUMBER
 
 PREFIX="/usr/local"
 RUNTIME_DEPS="pcsc-lite libccid p11-kit nss xdg-desktop-portal-gtk"

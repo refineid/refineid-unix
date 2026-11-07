@@ -111,21 +111,54 @@ the pre-commit hook (`script/version-stamp.sh`) moves it to the commit's
 day, so it changes at most once a day. The build number `B` is the time
 of day of the build as hour * 100 + minute (7 at 00:07, 2105 at 21:05)
 and says how fresh the binary is; `crates/refineid-lib-core/build.rs`
-takes it from the clock on every build, or from `REFINEID_BUILD_NUMBER`
-when set, and nothing in the repository records it. Build numbers tell
-same-day development builds apart: package versions and the Nix store
-path carry the date alone, `script/version.sh` prints it.
+takes it from `REFINEID_BUILD_NUMBER` when set, else from the clock on
+every build, and nothing in the repository records it.
+`script/version.sh` prints the project version by the same rule, and
+`script/version.sh --day` the date alone. The packaging scripts take one
+build number per build: they print the version once and export its `B`
+as `REFINEID_BUILD_NUMBER` to the cargo build, so the binaries, the
+package version and the package file names carry the same `YY.M.D.B`.
+The Nix store path carries the date alone.
+
+Debian and FreeBSD compare each dot-separated run of digits as a number,
+so `26.11.7.905` sorts before `26.11.7.1512`, and both after any
+`26.11.6.B`.
+
+## Release
+
+A release is a stamp, made by hand: a tag `vYY.M.D.HHMM`, where `YY.M.D`
+is the workspace version in `Cargo.toml` and `HHMM` the UTC time of day
+of the stamp, four digits as the clock shows them:
+
+```sh
+tag="v$(script/version.sh --day).$(date -u +%H%M)"
+git tag "$tag"
+git push origin "$tag"
+```
+
+The minute tells releases of one day apart, so a day holds at most one
+release per minute. The tag's minute is the build number of every binary
+and package of the release, without leading zeros: `v26.11.7.0905`
+builds version `26.11.7.905`, and `v26.11.7.1512` builds `26.11.7.1512`.
+Nothing creates a tag on its own, and a push to `main` never publishes.
+
+After the release `v26.11.7.0905`, `apt policy refineid` shows the
+candidate `26.11.7.905` and `pkg rquery '%v' refineid` prints
+`26.11.7.905`; the release assets are `refineid_26.11.7.905_all.deb`,
+`refineid-cli_26.11.7.905_amd64.deb` and their siblings, and
+`refineid-26.11.7.905.pkg`.
 
 ## Pipeline
 
-`.github/workflows/packages.yml` runs on a pushed `v<YY.M.D>` tag, where
-`<YY.M.D>` is the workspace version in `Cargo.toml`, and on a manual run.
+`.github/workflows/packages.yml` runs on a pushed tag and on a manual run.
+A tag must be `vYY.M.D.HHMM` with the workspace version as `YY.M.D` and a
+valid time of day as `HHMM`; any other tag fails the run before a build.
 
 | Job | Runs on | Does |
 | --- | --- | --- |
-| `prepare` | Ubuntu runner | checks that the tag names the workspace version; resolves refineid-core `main` to one commit |
-| `deb` | `ubuntu:26.04` container on an amd64 and an arm64 runner | builds with that core commit, `script/package-deb.sh` |
-| `freebsd` | FreeBSD 15.1 amd64 VM ([vmactions/freebsd-vm](https://github.com/vmactions/freebsd-vm)) | builds with that core commit, `script/package-freebsd.sh` |
+| `prepare` | Ubuntu runner | checks the tag; takes the build number from the tag's minute, or from the clock on a manual run; resolves refineid-core `main` to one commit |
+| `deb` | `ubuntu:26.04` container on an amd64 and an arm64 runner | builds with that core commit and build number, `script/package-deb.sh` |
+| `freebsd` | FreeBSD 15.1 amd64 VM ([vmactions/freebsd-vm](https://github.com/vmactions/freebsd-vm)) | builds with that core commit and build number, `script/package-freebsd.sh` |
 | `release` | Ubuntu runner, tag only | creates the GitHub Release for the tag with every `.deb` and `.pkg`; the notes name the core commit |
 | `repository` | Ubuntu runner and the FreeBSD VM, environment `packages` | collects this run's packages and those of every release, builds the signed repositories with `script/package-repo.sh` and uploads them as the Pages artifact |
 | `deploy` | Ubuntu runner, tag only, environment `github-pages` | deploys the artifact to GitHub Pages |

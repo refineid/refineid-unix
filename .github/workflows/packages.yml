@@ -1,11 +1,15 @@
 name: packages
 
-# A v<YY.M.D> tag, naming the workspace version in Cargo.toml, builds the
-# Ubuntu and FreeBSD packages, attaches them to the tag's GitHub Release,
-# and publishes the signed Ubuntu and FreeBSD repositories, which index the
-# packages of every release, to GitHub Pages.
-# A manual run builds the packages and the signed repositories and keeps
-# them as workflow artifacts; it creates no release and deploys nothing.
+# A v<YY.M.D>.<HHMM> tag, pushed by hand, is a release: <YY.M.D> is the
+# workspace version in Cargo.toml and <HHMM> the UTC minute of the stamp.
+# The minute is the build number of every binary and package of the run,
+# so the release builds the Ubuntu and FreeBSD packages at version
+# YY.M.D.B, attaches them to the tag's GitHub Release, and publishes the
+# signed Ubuntu and FreeBSD repositories, which index the packages of
+# every release, to GitHub Pages.
+# A manual run takes the build number from the clock once, builds the
+# packages and the signed repositories and keeps them as workflow
+# artifacts; it creates no release and deploys nothing.
 # The repository and deploy jobs of tag runs share one concurrency group: a
 # newer run supersedes a pending older one, and every site indexes all
 # releases.
@@ -29,6 +33,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      build-number: ${{ steps.resolve.outputs.build-number }}
       core-revision: ${{ steps.resolve.outputs.core-revision }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,14 +41,25 @@ jobs:
           persist-credentials: false
       - id: resolve
         run: |
-          version="$(script/version.sh)"
-          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not name the workspace version $version"
-            exit 1
+          day="$(script/version.sh --day)"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            stamp='^v([0-9]+\.[0-9]+\.[0-9]+)\.([01][0-9]|2[0-3])([0-5][0-9])$'
+            if ! [[ "$GITHUB_REF_NAME" =~ $stamp ]]; then
+              echo "::error::tag $GITHUB_REF_NAME is not v<YY.M.D>.<HHMM> with HHMM a UTC time of day"
+              exit 1
+            fi
+            if [ "${BASH_REMATCH[1]}" != "$day" ]; then
+              echo "::error::tag $GITHUB_REF_NAME names the day ${BASH_REMATCH[1]}, the workspace version is $day"
+              exit 1
+            fi
+            REFINEID_BUILD_NUMBER="$((10#${BASH_REMATCH[2]}${BASH_REMATCH[3]}))"
+            export REFINEID_BUILD_NUMBER
           fi
+          version="$(script/version.sh)"
           core_revision="$(git ls-remote "$CORE_REPOSITORY" refs/heads/main | cut -f1)"
           [ -n "$core_revision" ]
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build-number=${version##*.}" >> "$GITHUB_OUTPUT"
           echo "core-revision=$core_revision" >> "$GITHUB_OUTPUT"
 
   deb:
@@ -62,6 +78,7 @@ jobs:
     env:
       DEBIAN_FRONTEND: noninteractive
       CORE_REVISION: ${{ needs.prepare.outputs.core-revision }}
+      REFINEID_BUILD_NUMBER: ${{ needs.prepare.outputs.build-number }}
     steps:
       - name: Install build dependencies
         run: |
@@ -96,6 +113,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CORE_REVISION: ${{ needs.prepare.outputs.core-revision }}
+      REFINEID_BUILD_NUMBER: ${{ needs.prepare.outputs.build-number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -103,7 +121,7 @@ jobs:
       - uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
           release: '15.1'
-          envs: CORE_REVISION
+          envs: CORE_REVISION REFINEID_BUILD_NUMBER
           prepare: |
             pkg install -y curl git pkgconf cmake ninja evdev-proto \
               pcsc-lite libccid p11-kit nss xdg-desktop-portal-gtk \

@@ -57,7 +57,14 @@ if ! command -v dpkg-deb >/dev/null 2>&1; then
     exit 1
 fi
 
+# One build number for the whole build: the package version is the
+# project version YY.M.D.B (script/version.sh), and the binaries are
+# built with the same B. --skip-build packages the binaries already in
+# target/release; they carry the same B when they were built with the
+# same REFINEID_BUILD_NUMBER.
 VERSION="$(script/version.sh)"
+REFINEID_BUILD_NUMBER="${VERSION##*.}"
+export REFINEID_BUILD_NUMBER
 
 ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
 MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
