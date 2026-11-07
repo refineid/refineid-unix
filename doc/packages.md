@@ -171,12 +171,13 @@ valid time of day as `HHMM`; any other tag fails the run before a build.
 | `deb` | `ubuntu:26.04` container on an amd64 and an arm64 runner | builds with that core commit and build number, `script/package-deb.sh` |
 | `freebsd` | FreeBSD 15.1 amd64 VM ([vmactions/freebsd-vm](https://github.com/vmactions/freebsd-vm)) | builds with that core commit and build number, `script/package-freebsd.sh` |
 | `release` | Ubuntu runner, tag only | creates the GitHub Release for the tag with every `.deb` and `.pkg`; the notes name the core commit |
-| `repository` | Ubuntu runner and the FreeBSD VM, environment `packages` | collects this run's packages and those of every release, builds the signed repositories with `script/package-repo.sh` and uploads them as the Pages artifact |
-| `deploy` | Ubuntu runner, tag only, environment `github-pages` | deploys the artifact to GitHub Pages |
+| `repository` | Ubuntu runner and the FreeBSD VM, environment `packages` | collects the packages of every release, and of this run on a tag, builds the signed repositories with `script/package-repo.sh`, writes the front page with `script/package-site.sh` and uploads the site as the Pages artifact |
+| `deploy` | Ubuntu runner, environment `github-pages` | deploys the artifact to GitHub Pages |
 
-A manual run is the dry run: it builds and signs everything and keeps the
-packages and the site as workflow artifacts, without a release or a
-deployment.
+A manual run builds and signs the packages and keeps them as workflow
+artifacts without a release, and republishes the site from the existing
+releases: the way to publish a change to the front page or the repository
+scripts without stamping a release.
 
 The build tracks refineid-core `main` at the moment of the run, never
 the revision in `Cargo.lock`; both builds use the same commit, and the
