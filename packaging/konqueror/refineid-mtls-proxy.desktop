@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RefineID mTLS Proxy
+Comment=Local smart card mTLS bridge for Konqueror and desktop browsers
+Exec=/usr/local/bin/refineid-mtls-proxy
+X-KDE-autostart-phase=1
+Hidden=false
+NoDisplay=true

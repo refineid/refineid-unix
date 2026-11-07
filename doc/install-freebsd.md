@@ -25,6 +25,12 @@ and add the user to the `video` group. Without `xdg-desktop-portal-gtk`
 the desktop portal has no file chooser and the GUI's file dialogs do not
 open.
 
+For KDE Plasma 6 or GNOME 47, install `plasma6-plasma` or `gnome` (along
+with `gnome-terminal`), and ensure `procfs` and `fdescfs` are mounted in
+`/etc/fstab` (`proc /proc procfs rw 0 0` and `fdesc /dev/fd fdescfs rw 0 0`).
+Leave `user-session` unset in `/usr/local/etc/lightdm/lightdm.conf` so the
+login greeter allows selecting the session.
+
 ## 2. Smart-card daemon
 
 ```sh
@@ -36,15 +42,31 @@ service pcscd start
 With polkit enabled, a client outside a logind seat gets "Service not
 available"; FreeBSD has no logind, so polkit is disabled.
 
-An ACS reader needs the ACS driver. With the generic CCID bundle in
-place pcscd binds the ACR39U to libccid and the reader never finishes
-initialising, so move the bundle aside; other CCID readers need it back:
+An ACS reader needs the ACS driver (`acsccid`). With the generic CCID bundle
+in place, `pcscd` binds the ACR39U to `libccid` and the reader never finishes
+initialising. However, moving `ifd-ccid.bundle` aside breaks all non-ACS card
+readers (e.g. Alcor Micro, Realtek, generic EMV chips).
+
+To make both ACS readers and generic CCID readers work simultaneously, keep
+both bundles active in `/usr/local/lib/pcsc/drivers/` and remove the
+conflicting ACS vendor entries (`0x072F`) from `ifd-ccid.bundle`'s `Info.plist`:
 
 ```sh
-mkdir -p /usr/local/lib/pcsc/drivers-disabled
-mv /usr/local/lib/pcsc/drivers/ifd-ccid.bundle /usr/local/lib/pcsc/drivers-disabled/
+python3 -c '
+import plistlib
+p = "/usr/local/lib/pcsc/drivers/ifd-ccid.bundle/Contents/Info.plist"
+with open(p, "rb") as f:
+    d = plistlib.load(f)
+keep = [(v, pr, n) for v, pr, n in zip(d["ifdVendorID"], d["ifdProductID"], d["ifdFriendlyName"]) if v.lower() != "0x072f"]
+d["ifdVendorID"], d["ifdProductID"], d["ifdFriendlyName"] = [list(x) for x in zip(*keep)]
+with open(p, "wb") as f:
+    plistlib.dump(d, f)
+'
 service pcscd restart
 ```
+
+`ifd-acsccid.bundle` then serves ACS readers while `ifd-ccid.bundle` serves all
+other CCID readers.
 
 `pcsc_scan -r` lists the reader. If `service pcscd restart` answers
 "already running?" after a crash, stop it, remove `/var/run/pcscd.pid`,
@@ -116,6 +138,8 @@ every rebuild.
 
 ## 6. Browsers
 
+### Firefox and Chromium
+
 Neither browser is configured by the user. The module is installed on a
 stable path, and `script/install-desktop.sh` (section 5) installs the
 two things the browsers need: a Firefox enterprise policy naming the
@@ -141,6 +165,17 @@ program reading that database then see the card. Reinstall the module
 copy after every rebuild; the policy and the autostart entry need no
 change.
 
+For Chromium to offer the citizen certificate during TLS authentication,
+NSS requires that the issuing CA certificates be present in `~/.pki/nssdb`
+with client certificate trust flags (`CT,C,C`):
+
+```sh
+certutil -A -d sql:$HOME/.pki/nssdb -n "DVV Gov. Root CA - G3 ECC" \
+    -t "CT,C,C" -i /path/to/dvv-gov-root-ca-g3-ecc.der
+certutil -A -d sql:$HOME/.pki/nssdb -n "DVV Citizen Certificates - G4E" \
+    -t "CT,C,C" -i /path/to/dvvcqc4ec.crt
+```
+
 In Firefox the module appears under "RefineID" in Settings > Privacy &
 Security > Security Devices, with the reader as one slot and the paired
 phone (section 7) as another, "RefineID Remote" with the phone's name.
@@ -155,6 +190,52 @@ phone's card. Without a card nothing is offered and nothing is asked.
 One program on the computer holds the phone session at a time: while a
 browser holds it, `refineid card` and the desktop application report
 the phone as in use.
+
+### Konqueror (KDE Plasma / WebEnginePart)
+
+Konqueror uses KDE's `webenginepart`, backed by QtWebEngine. On FreeBSD,
+QtWebEngine is built without NSS client certificate support (`use_nss_certs=false`),
+and its internal `QWebEngineClientCertificateStore` mandates that client
+private keys be exported to PEM (`QSslKey::toPem()`). Because hardware smart cards
+strictly prohibit private key extraction, QtWebEngine cannot natively complete
+mTLS handshakes with PKCS#11 tokens.
+
+To support Konqueror on FreeBSD without upstream QtWebEngine architectural changes,
+RefineID provides a local loopback mTLS proxy bridge (`refineid-mtls-proxy`):
+
+1. **Proxy Daemon (`refineid-mtls-proxy`)**:
+   Runs as a user daemon listening on `127.0.0.1:18443`. It intercepts HTTPS `CONNECT`
+   tunnels for card authentication domains (`card.refineid.fi`, `*.suomi.fi`,
+   `*.dvv.fi`, etc.), while transparently forwarding other traffic.
+2. **Upstream Smart Card Authentication**:
+   The proxy terminates upstream TLS using OpenSSL 3 and `openssl-pkcs11provider`
+   via `/usr/local/lib/p11-kit-proxy.so` (backed by `librefineid_pkcs11.so`). When the
+   card's authentication private key is accessed, the proxy prompts for PIN 1
+   via `refineid-ask-pin` (a native Qt modal dialog that displays over the desktop
+   session without logging or leaking the PIN).
+3. **Local Bridge CA**:
+   Downstream connections to Konqueror are secured using a locally generated CA
+   installed into FreeBSD system trust (`/usr/local/share/certs/refineid-ca.pem`
+   with `certctl rehash`).
+4. **Konqueror Integration**:
+   Konqueror's `webenginepart` is patched (`packaging/konqueror/webenginepart-mtls-bridge.patch`)
+   to probe `127.0.0.1:18443` on startup, automatically routing requests through
+   the proxy, and trusting the local bridge CA.
+5. **Autostart**:
+   `packaging/konqueror/refineid-mtls-proxy.desktop` installed to `~/.config/autostart/`
+   starts the proxy bridge on KDE login.
+
+Build, initialize the local bridge CA, and install the bridge components:
+
+```sh
+cd packaging/konqueror
+make ca
+make
+make install
+```
+
+See [packaging/konqueror/README.md](../packaging/konqueror/README.md) for detailed
+architecture notes and instructions on patching `webenginepart`.
 
 OpenSSH and OpenSSL reach the module through p11-kit when it is
 registered there, which the browsers no longer need:

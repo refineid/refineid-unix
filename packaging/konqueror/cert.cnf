@@ -1,0 +1,30 @@
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+CN = card.refineid.fi
+O = RefineID Bridge
+C = FI
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = card.refineid.fi
+DNS.2 = *.refineid.fi
+DNS.3 = refineid.fi
+DNS.4 = tunnistus.suomi.fi
+DNS.5 = *.suomi.fi
+DNS.6 = suomi.fi
+DNS.7 = *.dvv.fi
+DNS.8 = dvv.fi
+DNS.9 = *.vrk.fi
+DNS.10 = vrk.fi
+DNS.11 = *.fineid.fi
+DNS.12 = fineid.fi
+DNS.13 = localhost
+IP.1 = 127.0.0.1
