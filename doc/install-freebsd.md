@@ -2,7 +2,7 @@
 
 This is the from-source installation. The `refineid` package
 ([packages.md](packages.md)) installs the same files and enables pcscd;
-the ACS reader note in section 2 and section 3 apply to it as well.
+section 3 applies to it as well.
 
 Verified on FreeBSD 15.1-RELEASE amd64 with an ACS ACR39U USB reader and
 an xfce desktop. Everything below runs as root unless the prompt says
@@ -11,7 +11,7 @@ otherwise.
 ## 1. Packages
 
 ```sh
-pkg install pcsc-lite acsccid libccid pcsc-tools \
+pkg install pcsc-lite libccid pcsc-tools \
     avahi-app nss_mdns \
     rust git pkgconf cmake ninja evdev-proto \
     p11-kit nss firefox chromium
@@ -41,25 +41,8 @@ service pcscd start
 With polkit enabled, a client outside a logind seat gets "Service not
 available"; FreeBSD has no logind, so polkit is disabled.
 
-An ACS reader needs the ACS driver. With the generic CCID bundle in
-place pcscd binds the ACR39U to libccid and the reader never finishes
-initialising. Moving the bundle aside breaks every other CCID reader, so
-keep both bundles and remove the ACS vendor entries (`0x072F`) from the
-generic bundle's `Info.plist`. This needs `python3`, and a libccid upgrade
-restores the file:
-
-```sh
-python3 -c '
-import plistlib
-p = "/usr/local/lib/pcsc/drivers/ifd-ccid.bundle/Contents/Info.plist"
-with open(p, "rb") as f:
-    d = plistlib.load(f)
-keep = [(v, pr, n) for v, pr, n in zip(d["ifdVendorID"], d["ifdProductID"], d["ifdFriendlyName"]) if v.lower() != "0x072f"]
-d["ifdVendorID"], d["ifdProductID"], d["ifdFriendlyName"] = [list(x) for x in zip(*keep)]
-with open(p, "wb") as f:
-    plistlib.dump(d, f)
-' && service pcscd restart
-```
+The generic CCID driver, libccid, serves the ACS ACR39U as it serves other
+CCID readers; the ACS driver is not needed for it.
 
 `pcsc_scan -r` lists the reader. If `service pcscd restart` answers
 "already running?" after a crash, stop it, remove `/var/run/pcscd.pid`,
