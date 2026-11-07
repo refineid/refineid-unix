@@ -42,7 +42,7 @@ use refineid_gui_core::model::{CanRequest, SignFormat, UiState, UserIntent};
 use refineid_gui_core::window::{
     self, IdentityLine, PinTask, Recovery, WindowContent, activation_complete, digits_only,
 };
-use refineid_lib_core::can::{CAN_DIGITS, Can};
+use refineid_lib_core::can::{CAN_MAX_DIGITS, CAN_MIN_DIGITS, Can};
 use refineid_lib_core::pin::PinBytes;
 use refineid_rapp_core::offer::{
     PAIRING_CODE_GROUP_SIZE, PAIRING_CODE_LENGTH, pairing_code_character,
@@ -131,9 +131,9 @@ fn pairing_code(typed: &str) -> String {
         .collect()
 }
 
-/// Keeps the digits of `typed`, up to the access number's length.
+/// Keeps the digits of `typed`, up to the access number's maximum length.
 fn access_number(typed: &str) -> String {
-    digits_only(typed, CAN_DIGITS)
+    digits_only(typed, CAN_MAX_DIGITS)
 }
 
 /// The files a drop names: one `file:` URI or path per line.
@@ -259,7 +259,14 @@ fn code_input(x: i32, y: i32, length: usize, group: usize, refused: &Rc<RefCell<
             true
         }
         Event::Drag | Event::Released => true,
-        Event::KeyDown => CURSOR_KEYS.contains(&app::event_key()),
+        Event::KeyDown => {
+            if app::event_key() == Key::Enter {
+                input.do_callback();
+                true
+            } else {
+                CURSOR_KEYS.contains(&app::event_key())
+            }
+        }
         _ => false,
     });
     input
@@ -493,7 +500,7 @@ impl FltkDriver {
         let mut caption = line_frame(0, 0, 40, CODE_BOX_SIZE, window::CAN_CAPTION);
         caption.set_label_color(SECONDARY);
         let can_refused = Rc::new(RefCell::new(false));
-        let can_input = code_input(50, 0, CAN_DIGITS, CAN_DIGITS, &can_refused);
+        let can_input = code_input(50, 0, CAN_MAX_DIGITS, CAN_MAX_DIGITS, &can_refused);
         can.end();
         column.fixed(&can, can.h());
 
@@ -634,11 +641,18 @@ impl FltkDriver {
                 }
                 *refused.borrow_mut() = false;
                 input.redraw();
-                if kept.len() == CAN_DIGITS
-                    && let Ok(number) = Can::new(&kept)
-                {
-                    input.set_value("");
-                    c.handle_intent(UserIntent::EnterCan(number));
+                let is_enter = app::event_key() == Key::Enter;
+                if kept.len() == CAN_MAX_DIGITS || (is_enter && kept.len() >= CAN_MIN_DIGITS) {
+                    if let Ok(number) = Can::new(&kept) {
+                        input.set_value("");
+                        c.handle_intent(UserIntent::EnterCan(number));
+                    } else if is_enter {
+                        *refused.borrow_mut() = true;
+                        input.redraw();
+                    }
+                } else if is_enter {
+                    *refused.borrow_mut() = true;
+                    input.redraw();
                 }
             });
         }
@@ -1255,7 +1269,7 @@ mod tests {
         assert_eq!(pairing_code("7k x4-m9"), "7KX4M9");
         assert_eq!(pairing_code("7K X4 M9 extra"), "7KX4M9");
         assert_eq!(pairing_code("7k"), "7K");
-        assert_eq!(access_number("12a34b567"), "123456");
+        assert_eq!(access_number("12a34b567"), "1234567");
     }
 
     #[test]
@@ -1271,8 +1285,8 @@ mod tests {
             code_box_offset(PAIRING_CODE_LENGTH - 1, PAIRING_CODE_GROUP_SIZE) + CODE_BOX_SIZE
         );
         assert_eq!(
-            code_boxes_width(CAN_DIGITS, CAN_DIGITS),
-            CAN_DIGITS as i32 * CODE_BOX_SIZE + (CAN_DIGITS as i32 - 1) * CODE_BOX_SPACING
+            code_boxes_width(CAN_MAX_DIGITS, CAN_MAX_DIGITS),
+            CAN_MAX_DIGITS as i32 * CODE_BOX_SIZE + (CAN_MAX_DIGITS as i32 - 1) * CODE_BOX_SPACING
         );
     }
 
