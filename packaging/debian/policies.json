@@ -3,12 +3,6 @@
     "SecurityDevices": {
       "FINEID": "@MODULE@",
       "FINEID (snap)": "/var/snap/firefox/common/refineid/librefineid_pkcs11.so"
-    },
-    "Certificates": {
-      "Install": [
-        "/etc/firefox/policies/dvv-gov-root-ca-g3-ecc.der",
-        "/etc/firefox/policies/dvv-gov-root-ca-g3-rsa.der"
-      ]
     }
   }
 }
