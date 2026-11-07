@@ -1,0 +1,13 @@
+# Copyright 2026 Petri Koistinen. SPDX-License-Identifier: Apache-2.0
+#
+# gitleaks configuration: the default rules, minus Cargo lockfiles, which
+# list package names, versions, sources and checksums and nothing else.
+
+title = "refineid-unix"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Cargo lockfiles hold no secrets"
+paths = ['''(^|/)Cargo\.lock$''']
