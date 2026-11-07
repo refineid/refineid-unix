@@ -18,7 +18,8 @@
 #
 # Packages generated:
 #   1. refineid-pkcs11: PKCS#11 module (multiarch), p11-kit config,
-#                       polkit pcscd rule, Firefox enterprise policy
+#                       polkit pcscd rule, Firefox enterprise policy;
+#                       maintainer scripts and policy from packaging/debian
 #   2. refineid-cli:    Command-line tool (/usr/bin/refineid), refineid(1)
 #   3. refineid-gui:    Desktop GUI tool (/usr/bin/refineid-gui), launcher, icons
 #   4. refineid:        Architecture-independent metapackage pulling in all components
@@ -176,21 +177,11 @@ install -m 644 crates/refineid-client/trust-anchors/dvv-gov-root-ca-g3-ecc.der \
     crates/refineid-client/trust-anchors/dvv-gov-root-ca-g3-rsa.der \
     "$STAGING_PKCS11/etc/firefox/policies/"
 
-cat > "$STAGING_PKCS11/etc/firefox/policies/policies.json" << POLICIESEOF
-{
-  "policies": {
-    "SecurityDevices": {
-      "FINEID": "$FIREFOX_LIB_PATH"
-    },
-    "Certificates": {
-      "Install": [
-        "/etc/firefox/policies/dvv-gov-root-ca-g3-ecc.der",
-        "/etc/firefox/policies/dvv-gov-root-ca-g3-rsa.der"
-      ]
-    }
-  }
-}
-POLICIESEOF
+# The policy names the module twice: at its host path, and at the copy
+# postinst places for Ubuntu's Firefox snap, whose confinement denies the
+# host path. Firefox ignores a SecurityDevices path it cannot load.
+sed "s|@MODULE@|$FIREFOX_LIB_PATH|" packaging/debian/policies.json \
+    > "$STAGING_PKCS11/etc/firefox/policies/policies.json"
 chmod 644 "$STAGING_PKCS11/etc/firefox/policies/policies.json"
 
 # Chromium reads the user's NSS database only: an autostart entry gives
@@ -228,81 +219,17 @@ Homepage: https://github.com/refineid/refineid-unix
 Description: Open-source FINEID PKCS#11 module for Finnish identity cards
  RefineID PKCS#11 module enabling authentication, document signing, and
  card cryptography across web browsers (Firefox, Chrome), OpenSC, and
- NSS applications.
+ NSS applications. Where Ubuntu's Firefox snap is installed, a copy of
+ the module is kept under /var/snap/firefox/common/refineid, since the
+ snap's confinement denies the host path.
 CONTROLEOF
 chmod 644 "$STAGING_PKCS11/DEBIAN/control"
 
-cat > "$STAGING_PKCS11/DEBIAN/postinst" << 'POSTINSTEOF'
-#!/bin/sh
-set -e
-
-case "$1" in
-    configure)
-        if command -v ldconfig >/dev/null 2>&1; then
-            ldconfig
-        fi
-        if [ -d /run/systemd/system ]; then
-            if systemctl is-active --quiet polkit 2>/dev/null; then
-                systemctl reload polkit 2>/dev/null || true
-            fi
-            systemctl enable --now pcscd.socket 2>/dev/null \
-                || systemctl enable --now pcscd 2>/dev/null \
-                || true
-        fi
-        ;;
-    abort-upgrade|abort-remove|abort-deconfigure)
-        ;;
-    *)
-        echo "postinst called with unknown argument \`$1'" >&2
-        exit 1
-        ;;
-esac
-
-exit 0
-POSTINSTEOF
+sed "s|@MODULE@|$FIREFOX_LIB_PATH|" packaging/debian/postinst \
+    > "$STAGING_PKCS11/DEBIAN/postinst"
 chmod 755 "$STAGING_PKCS11/DEBIAN/postinst"
-
-cat > "$STAGING_PKCS11/DEBIAN/postrm" << 'POSTRMEOF'
-#!/bin/sh
-set -e
-
-case "$1" in
-    purge|remove|upgrade|disappear|abort-install|abort-upgrade|failed-upgrade)
-        if command -v ldconfig >/dev/null 2>&1; then
-            ldconfig
-        fi
-        if [ -d /run/systemd/system ]; then
-            if systemctl is-active --quiet polkit 2>/dev/null; then
-                systemctl reload polkit 2>/dev/null || true
-            fi
-        fi
-        ;;
-    *)
-        echo "postrm called with unknown argument \`$1'" >&2
-        exit 1
-        ;;
-esac
-
-exit 0
-POSTRMEOF
-chmod 755 "$STAGING_PKCS11/DEBIAN/postrm"
-
-cat > "$STAGING_PKCS11/DEBIAN/prerm" << 'PRERMEOF'
-#!/bin/sh
-set -e
-
-case "$1" in
-    remove|upgrade|deconfigure|failed-upgrade)
-        ;;
-    *)
-        echo "prerm called with unknown argument \`$1'" >&2
-        exit 1
-        ;;
-esac
-
-exit 0
-PRERMEOF
-chmod 755 "$STAGING_PKCS11/DEBIAN/prerm"
+install -m 755 packaging/debian/postrm "$STAGING_PKCS11/DEBIAN/postrm"
+install -m 755 packaging/debian/prerm "$STAGING_PKCS11/DEBIAN/prerm"
 
 dpkg-deb --build --root-owner-group "$STAGING_PKCS11" "$DEB_DIR/${PKG_PKCS11}.deb"
 rm -rf "$STAGING_PKCS11"

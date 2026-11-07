@@ -1,7 +1,8 @@
 {
   "policies": {
     "SecurityDevices": {
-      "FINEID": "/usr/lib/librefineid_pkcs11.so"
+      "FINEID": "@MODULE@",
+      "FINEID (snap)": "/var/snap/firefox/common/refineid/librefineid_pkcs11.so"
     },
     "Certificates": {
       "Install": [

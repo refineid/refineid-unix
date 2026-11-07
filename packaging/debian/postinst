@@ -1,29 +1,33 @@
 #!/bin/sh
-# postinst for refineid - install-time hooks.
-# Per Debian Policy 6.5: handle every documented case argument
-# explicitly. cargo-deb auto-fills `#DEBHELPER#` with debhelper-
-# generated snippets if any.
+# Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
+#
+# postinst of refineid-pkcs11. The packaging script fills in @MODULE@.
 set -e
+
+MODULE="@MODULE@"
+# Ubuntu's Firefox snap cannot load a module from the host's /usr/lib:
+# its confinement denies the path, a symlink included, so the module is
+# copied into the snap's common data directory and the Firefox policy
+# names both paths. Every configure refreshes the copy.
+SNAP_COMMON="/var/snap/firefox/common"
+SNAP_DIR="$SNAP_COMMON/refineid"
 
 case "$1" in
     configure)
-        # Reload polkit so the new pcscd-access rule takes effect
-        # without a session restart.
+        if command -v ldconfig >/dev/null 2>&1; then
+            ldconfig
+        fi
+        if [ -d "$SNAP_COMMON" ]; then
+            install -d -m 755 "$SNAP_DIR"
+            install -m 644 "$MODULE" "$SNAP_DIR/librefineid_pkcs11.so"
+        fi
         if [ -d /run/systemd/system ]; then
             if systemctl is-active --quiet polkit 2>/dev/null; then
                 systemctl reload polkit 2>/dev/null || true
             fi
-            # pcscd is socket-activated on modern systemd; ensure
-            # the unit is enabled so it picks up requests.
             systemctl enable --now pcscd.socket 2>/dev/null \
                 || systemctl enable --now pcscd 2>/dev/null \
                 || true
-        fi
-        # Trigger ldconfig so the cdylib's transitive shared-lib
-        # deps (libpcsclite, libssl) resolve cleanly when Firefox
-        # dlopens it.
-        if command -v ldconfig >/dev/null 2>&1; then
-            ldconfig
         fi
         ;;
     abort-upgrade|abort-remove|abort-deconfigure)
@@ -33,7 +37,5 @@ case "$1" in
         exit 1
         ;;
 esac
-
-#DEBHELPER#
 
 exit 0

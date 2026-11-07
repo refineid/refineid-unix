@@ -70,6 +70,15 @@ sudo apt install ./target/deb/refineid_*.deb
   for automatic card login
 - Enables and activates the smart-card daemon socket (`pcscd.socket`)
 
+*Firefox from snap:* Ubuntu's default Firefox is a snap, and its
+confinement denies loading a module from the host's `/usr/lib`, a
+symlink into it included. When `/var/snap/firefox/common` exists, the
+package keeps a copy of the module at
+`/var/snap/firefox/common/refineid/librefineid_pkcs11.so`, refreshed on
+every install and upgrade and removed with the package, and the Firefox
+policy names both paths; Firefox ignores the one it cannot load. Install
+the package after the snap, or reinstall it, for the copy to appear.
+
 ### 1d. Uninstalling
 To cleanly remove the package and all its integrations:
 ```sh
