@@ -396,6 +396,9 @@ pub fn asks_pin2_here(state: &UiState) -> bool {
     state.selected_card_is_local
 }
 
+/// The count a blocked or exhausted counter reports.
+const NO_TRIES: u8 = 0;
+
 /// The tries a counter reports: its count, or none when blocked.
 fn pin_tries(status: Option<PinStatus>) -> Option<u8> {
     match status? {
@@ -414,13 +417,19 @@ fn puk_tries(status: Option<PukStatus>) -> Option<u8> {
     }
 }
 
-/// Whether a PIN's counter is below the retry floor.
+/// Whether a PIN needs a reset: its counter is on the last two tries
+/// or at none. The floor sends a PIN at no tries left to the card, which
+/// refuses it for itself, so only the PUK brings that PIN back.
 fn pin_below_floor(slot: PinSlot, status: Option<PinStatus>) -> bool {
-    pin_tries(status).is_some() && status.is_some_and(|s| check_retry_floor(slot, s).is_err())
+    pin_tries(status) == Some(NO_TRIES)
+        || (pin_tries(status).is_some()
+            && status.is_some_and(|s| check_retry_floor(slot, s).is_err()))
 }
 
-/// Whether the PUK's counter is below the retry floor.
-fn puk_below_floor(status: Option<PukStatus>) -> bool {
+/// Whether the floor refuses the PUK on a counter it reports: its last
+/// two tries. A PUK at no tries left or blocked is not refused: the
+/// reset goes to the card, which answers for itself.
+fn puk_refused(status: Option<PukStatus>) -> bool {
     puk_tries(status).is_some() && status.is_some_and(|s| check_puk_retry_floor(s).is_err())
 }
 
@@ -432,15 +441,16 @@ pub enum Recovery {
     ResetPin1,
     /// PIN 2 is below the floor: reset it with the PUK.
     ResetPin2,
-    /// The PUK is below the floor: other software recovers the card.
+    /// The PUK is on its last two tries: other software recovers the
+    /// card.
     UseOtherSoftware,
-    /// The PUK is blocked.
-    Unrecoverable,
 }
 
 impl Recovery {
-    /// What the card in a reader here needs, when one of its counters is
-    /// below the floor.
+    /// What the card in a reader here needs, when the PUK is on its last
+    /// two tries or a PIN needs a reset. A PUK at no tries left or blocked
+    /// needs nothing of its own: the code in the holder's hand may be an
+    /// activation code, and the card answers for itself.
     #[must_use]
     pub fn derive(state: &UiState) -> Option<Self> {
         if !state.selected_card_is_local {
@@ -448,9 +458,7 @@ impl Recovery {
         }
         // A counter that reports no tries (verified, or not reported) is
         // no concern for that credential.
-        if puk_tries(state.puk_status) == Some(0) {
-            Some(Self::Unrecoverable)
-        } else if puk_below_floor(state.puk_status) {
+        if puk_refused(state.puk_status) {
             Some(Self::UseOtherSoftware)
         } else if pin_below_floor(PinSlot::Pin1, state.pin1_status) {
             Some(Self::ResetPin1)
@@ -477,10 +485,6 @@ impl Recovery {
                 "Use other software to recover the card",
                 "RefineID will not use either of the final two PUK attempts.",
             ],
-            Self::Unrecoverable => [
-                "The PUK is blocked",
-                "This card cannot be recovered with software.",
-            ],
         }
     }
 
@@ -490,7 +494,7 @@ impl Recovery {
     pub fn tasks(recovery: Option<Self>) -> &'static [PinTask] {
         match recovery {
             Some(Self::ResetPin1 | Self::ResetPin2) => &[PinTask::ResetPin1, PinTask::ResetPin2],
-            Some(Self::UseOtherSoftware | Self::Unrecoverable) => &[],
+            Some(Self::UseOtherSoftware) => &[],
             None => &PinTask::ALL,
         }
     }
@@ -501,7 +505,7 @@ impl Recovery {
         match recovery {
             Some(Self::ResetPin2) => PinTask::ResetPin2,
             Some(Self::ResetPin1) => PinTask::ResetPin1,
-            Some(Self::UseOtherSoftware | Self::Unrecoverable) | None => PinTask::ChangePin1,
+            Some(Self::UseOtherSoftware) | None => PinTask::ChangePin1,
         }
     }
 }
@@ -680,7 +684,9 @@ pub fn attempts_below_full(state: &UiState) -> Vec<AttemptsEntry> {
         };
         Some(AttemptsEntry {
             text: format!("{PUK} {value}"),
-            below_floor: puk_below_floor(status) || matches!(status, Some(PukStatus::Invalidated)),
+            below_floor: puk_refused(status)
+                || puk_tries(status) == Some(NO_TRIES)
+                || matches!(status, Some(PukStatus::Invalidated)),
         })
     };
     if !state.selected_card_is_local {
@@ -930,8 +936,73 @@ mod tests {
         state.puk_status = Some(PukStatus::Remaining(retries(2)));
         assert_eq!(Recovery::derive(&state), Some(Recovery::UseOtherSoftware));
         assert!(Recovery::tasks(Recovery::derive(&state)).is_empty());
-        state.puk_status = Some(PukStatus::Locked);
-        assert_eq!(Recovery::derive(&state), Some(Recovery::Unrecoverable));
+    }
+
+    /// A PIN at no tries left or blocked reads as blocked or never set:
+    /// it is offered the reset like a PIN on its last two tries.
+    #[test]
+    fn a_pin_at_no_tries_left_or_blocked_opens_on_its_reset() {
+        for status in [PinStatus::Remaining(retries(NO_TRIES)), PinStatus::Locked] {
+            let mut state = local_card_state();
+            state.pin1_status = Some(PinStatus::Remaining(retries(5)));
+            state.pin2_status = Some(status);
+            state.puk_status = Some(PukStatus::Remaining(retries(5)));
+            let recovery = Recovery::derive(&state);
+            assert_eq!(recovery, Some(Recovery::ResetPin2));
+            assert_eq!(
+                Recovery::tasks(recovery),
+                &[PinTask::ResetPin1, PinTask::ResetPin2]
+            );
+            assert_eq!(Recovery::initial_task(recovery), PinTask::ResetPin2);
+            assert!(PinTask::ResetPin2.available(&state));
+            assert_eq!(
+                attempts_below_full(&state),
+                vec![AttemptsEntry {
+                    text: "Signature PIN 2 blocked".to_owned(),
+                    below_floor: true
+                }]
+            );
+        }
+    }
+
+    /// A PUK at no tries left or blocked is not the software's to close:
+    /// the reset is offered and goes to the card. The counter stays
+    /// marked in the attempts row.
+    #[test]
+    fn a_puk_at_no_tries_left_or_blocked_still_offers_the_reset() {
+        for status in [PukStatus::Remaining(retries(NO_TRIES)), PukStatus::Locked] {
+            let mut state = local_card_state();
+            state.pin1_status = Some(PinStatus::Remaining(retries(5)));
+            state.pin2_status = Some(PinStatus::Locked);
+            state.puk_status = Some(status);
+            let recovery = Recovery::derive(&state);
+            assert_eq!(recovery, Some(Recovery::ResetPin2));
+            assert_eq!(Recovery::initial_task(recovery), PinTask::ResetPin2);
+            assert!(PinTask::ResetPin2.available(&state));
+            assert!(attempts_below_full(&state).contains(&AttemptsEntry {
+                text: "PUK blocked".to_owned(),
+                below_floor: true
+            }));
+
+            state.pin2_status = Some(PinStatus::Remaining(retries(5)));
+            assert_eq!(Recovery::derive(&state), None);
+            assert_eq!(Recovery::tasks(None), &PinTask::ALL);
+            assert!(PinTask::ResetPin1.available(&state));
+        }
+    }
+
+    /// The PUK's last two tries are refused whatever the PINs read, and
+    /// the window offers no task.
+    #[test]
+    fn a_puk_on_its_last_tries_offers_no_task() {
+        for tries in [2, 1] {
+            let mut state = local_card_state();
+            state.pin2_status = Some(PinStatus::Locked);
+            state.puk_status = Some(PukStatus::Remaining(retries(tries)));
+            assert_eq!(Recovery::derive(&state), Some(Recovery::UseOtherSoftware));
+            assert!(Recovery::tasks(Recovery::derive(&state)).is_empty());
+            assert!(!PinTask::ResetPin2.available(&state));
+        }
     }
 
     #[test]

@@ -1145,16 +1145,11 @@ impl UiDriver for FltkDriver {
             for (index, frame) in pin.recovery.iter_mut().enumerate() {
                 let text = sentences.map(|pair| pair[index]).unwrap_or_default();
                 frame.set_label(text);
-                frame.set_label_color(
-                    if matches!(
-                        recovery,
-                        Some(Recovery::UseOtherSoftware | Recovery::Unrecoverable)
-                    ) {
-                        ERROR
-                    } else {
-                        Color::Black
-                    },
-                );
+                frame.set_label_color(if recovery == Some(Recovery::UseOtherSoftware) {
+                    ERROR
+                } else {
+                    Color::Black
+                });
                 set_shown(frame, !text.is_empty());
             }
             let tasks = Recovery::tasks(recovery);

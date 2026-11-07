@@ -265,9 +265,15 @@ the §4.6.1 counter fallback applies.
 - `pin activate` proceeds when every targeted PIN awaits
   activation, and otherwise refuses as already activated unless
   `--allow-reactivate` is given.
-- `pin change` and `pin unblock` refuse a PIN that awaits
-  activation and point to `pin activate`; an activated or
-  undecided PIN meets only the retry floor.
+- `pin change` refuses a PIN that awaits activation, says it is
+  blocked or never set, and points to both `pin unblock` and
+  `pin activate`; an activated or undecided PIN meets only the
+  retry floor.
+- `pin unblock` meets only the PUK's retry floor. The PIN's
+  readiness and counter gate nothing: without the PIN changed flag
+  a blocked PIN and a never-set PIN both read `63C0`, the PUK
+  resets either, and the card answers for itself. A PIN at no
+  tries left is noted before the PUK prompt.
 - The type system keeps the paths apart through
   `PinManagementCardContext` and `ActivationCardContext` (see
   `crates/refineid-client/src/card_pin.rs`): a refactor that

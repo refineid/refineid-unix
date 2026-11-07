@@ -257,8 +257,8 @@ pub enum PinReadiness {
     /// The holder has set the PIN.
     Activated,
     /// The card's answers decide neither. Every consumer treats it
-    /// as [`Self::Activated`]: activation refuses it, change and
-    /// unblock meet only the retry floor.
+    /// as [`Self::Activated`]: activation refuses it, a change meets
+    /// only the retry floor.
     Undecided,
 }
 
@@ -377,9 +377,10 @@ pub fn check_retry_floor(slot: PinSlot, status: PinStatus) -> Result<(), RetryFl
 
 /// The same retry floor applied to the PUK's own counter: anything that
 /// presents the PUK -- RESET RETRY COUNTER, or the activation PIN on a
-/// card that ships with blocked PINs -- is sent only at five, four or
-/// three PUK tries left. A blocked or invalidated PUK, and a counter the
-/// card did not report, are refused.
+/// card that ships with blocked PINs -- is refused at two or one PUK
+/// tries left and at a counter the card did not report. At five, four or
+/// three tries left, at no tries left, blocked or invalidated it goes to
+/// the card, which answers for itself.
 ///
 /// # Errors
 /// [`RetryFloorRefusal`] naming the PUK and the state that refused it.

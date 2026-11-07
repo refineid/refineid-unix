@@ -122,16 +122,6 @@ impl ManagedCard {
     pub fn is_organization_card(&self) -> bool {
         self.report.pin_reference_scheme == PinReferenceScheme::Organizational
     }
-
-    /// Check if PIN unblocking is available for PIN1 and PIN2.
-    pub fn recovery_availability(&self) -> (bool, bool) {
-        if self.activation_available() {
-            return (false, false);
-        }
-        let pin1_locked = matches!(self.report.pin1, Some(PinStatus::Locked));
-        let pin2_locked = matches!(self.report.pin2, Some(PinStatus::Locked));
-        (pin1_locked, pin2_locked)
-    }
 }
 
 impl UiState {
@@ -297,10 +287,6 @@ pub struct UiState {
     pub pin2_change_available: bool,
     /// Whether factory activation is available.
     pub activation_available: bool,
-    /// Whether unblocking PIN1 is available.
-    pub pin1_unblock_available: bool,
-    /// Whether unblocking PIN2 is available.
-    pub pin2_unblock_available: bool,
     /// Whether unblocking uses an activation PIN.
     pub unblock_uses_activation_code: bool,
     /// Whether the selected card is an organization card (FINEID S4-2
@@ -365,8 +351,6 @@ impl Default for UiState {
             pin1_change_available: false,
             pin2_change_available: false,
             activation_available: false,
-            pin1_unblock_available: false,
-            pin2_unblock_available: false,
             unblock_uses_activation_code: false,
             organization_card: false,
             signature_supported: false,
