@@ -383,10 +383,20 @@ impl WindowContent {
 }
 
 /// Whether the toolbar button opens the PIN codes window rather than
-/// switching remote use: a card is in a reader here.
+/// switching remote use: a card is in a reader here and is not waiting
+/// to be taken into use. A card awaiting activation has no PINs to
+/// manage: the activation form on screen is all it needs.
 #[must_use]
 pub fn toolbar_opens_pin_codes(state: &UiState) -> bool {
-    state.reader == ReaderPresence::Card || state.has_local_card
+    !state.activation_available && (state.reader == ReaderPresence::Card || state.has_local_card)
+}
+
+/// Whether the toolbar shows the remote use switch: no card is in a
+/// reader here. A card awaiting activation is in a reader, and its form
+/// stands alone with neither control beside it.
+#[must_use]
+pub fn toolbar_switches_remote_use(state: &UiState) -> bool {
+    !state.activation_available && !toolbar_opens_pin_codes(state)
 }
 
 /// Whether the signing controls ask for PIN 2 here: the card is in a
@@ -453,7 +463,9 @@ impl Recovery {
     /// activation code, and the card answers for itself.
     #[must_use]
     pub fn derive(state: &UiState) -> Option<Self> {
-        if !state.selected_card_is_local {
+        // A card awaiting activation reads its PINs at no tries left. The
+        // activation form is its way forward, so nothing speaks of a reset.
+        if !state.selected_card_is_local || state.activation_available {
             return None;
         }
         // A counter that reports no tries (verified, or not reported) is
@@ -855,6 +867,28 @@ mod tests {
         assert_eq!(activation_heading(&state), IDENTITY_CARD_ACTIVATION);
         state.organization_card = true;
         assert_eq!(activation_heading(&state), ORGANISATION_CARD_ACTIVATION);
+    }
+
+    #[test]
+    fn a_card_awaiting_activation_offers_no_pin_codes_or_reset() {
+        let mut state = local_card_state();
+        state.pin1_status = Some(PinStatus::Remaining(
+            PinRetries::from_nibble(0).expect("count"),
+        ));
+        state.pin2_status = Some(PinStatus::Remaining(
+            PinRetries::from_nibble(0).expect("count"),
+        ));
+        assert!(
+            Recovery::derive(&state).is_some(),
+            "a blocked PIN on an activated card"
+        );
+        assert!(toolbar_opens_pin_codes(&state));
+
+        state.activation_available = true;
+        assert_eq!(WindowContent::derive(&state), WindowContent::Activation);
+        assert_eq!(Recovery::derive(&state), None);
+        assert!(!toolbar_opens_pin_codes(&state));
+        assert!(!toolbar_switches_remote_use(&state));
     }
 
     #[test]

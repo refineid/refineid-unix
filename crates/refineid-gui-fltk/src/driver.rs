@@ -1009,7 +1009,10 @@ impl UiDriver for FltkDriver {
         // The top row's one control.
         let opens_pin_codes = window::toolbar_opens_pin_codes(state);
         set_shown(&mut widgets.pin_codes_button, opens_pin_codes);
-        set_shown(&mut widgets.remote_switch, !opens_pin_codes);
+        set_shown(
+            &mut widgets.remote_switch,
+            window::toolbar_switches_remote_use(state),
+        );
         widgets.remote_switch.set_value(state.remote_use);
         widgets.remote_switch.set_tooltip(&format!(
             "{}: {}",

@@ -143,7 +143,7 @@ fn form_row(label: &gtk4::Label, field: &impl IsA<gtk4::Widget>) -> gtk4::Box {
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(SPACING)
         .build();
-    label.set_width_chars(20);
+    label.set_width_chars(25);
     label.set_wrap(false);
     row.append(label);
     row.append(field);
@@ -904,7 +904,8 @@ impl Ui {
         // The header bar's switch and the identity line's button.
         let opens_pin_codes = window::toolbar_opens_pin_codes(state);
         self.pin_codes_button.set_visible(opens_pin_codes);
-        self.remote_switch.set_visible(!opens_pin_codes);
+        self.remote_switch
+            .set_visible(window::toolbar_switches_remote_use(state));
         self.remote_switch.set_active(state.remote_use);
         self.remote_switch
             .update_property(&[gtk4::accessible::Property::Description(
