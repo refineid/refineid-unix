@@ -14,7 +14,9 @@
 
 // The build number `B` of the project version `YY.M.D.B`: the UTC time
 // of day as the one integer hour * 100 + minute, with no leading zeros
-// (7 at 00:07, 2105 at 21:05).
+// (7 at 00:07, 2105 at 21:05). A build mark `M`, a word of letters a-z,
+// makes the version `YY.M.D~MB` instead. script/version.sh prints the
+// version by the same rules; the two must agree.
 //
 // build.rs compiles this file through `include!`, and the crate
 // compiles it as a test-only module, so it holds plain comments and
@@ -51,9 +53,26 @@ fn is_build_number(text: &str) -> bool {
             .is_ok_and(|value| value <= MAX_BUILD_NUMBER && value % HOUR_WEIGHT < MINUTES_PER_HOUR)
 }
 
+/// Whether `text` is a build mark: one or more letters a-z.
+fn is_build_mark(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_lowercase())
+}
+
+/// The project version of the workspace version `day` and the build
+/// number `number`: `day.number`, or `day~marknumber` with a build mark.
+fn project_version(day: &str, mark: Option<&str>, number: &str) -> String {
+    match mark {
+        Some(mark) => format!("{day}~{mark}{number}"),
+        None => format!("{day}.{number}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SECONDS_PER_HOUR, SECONDS_PER_MINUTE, build_number, is_build_number};
+    use super::{
+        SECONDS_PER_HOUR, SECONDS_PER_MINUTE, build_number, is_build_mark, is_build_number,
+        project_version,
+    };
 
     /// A synthetic day start: 2001-01-01T00:00:00Z.
     const DAY_START: u64 = 978_307_200;
@@ -103,5 +122,29 @@ mod tests {
         assert!(!is_build_number("-1"));
         assert!(!is_build_number("1.5"));
         assert!(!is_build_number(""));
+    }
+
+    #[test]
+    fn build_mark_shape() {
+        assert!(is_build_mark("bob"));
+        assert!(is_build_mark("a"));
+        assert!(!is_build_mark(""));
+        assert!(!is_build_mark("Bob"));
+        assert!(!is_build_mark("bob1"));
+        assert!(!is_build_mark("bo-b"));
+        assert!(!is_build_mark("b\u{f6}b"));
+    }
+
+    #[test]
+    fn version_without_mark() {
+        assert_eq!(project_version("26.11.7", None, "1543"), "26.11.7.1543");
+    }
+
+    #[test]
+    fn version_with_mark() {
+        assert_eq!(
+            project_version("26.11.7", Some("bob"), "1600"),
+            "26.11.7~bob1600"
+        );
     }
 }

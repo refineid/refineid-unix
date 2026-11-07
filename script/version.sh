@@ -16,9 +16,12 @@
 # Print the project version YY.M.D.B: the workspace version YY.M.D from
 # Cargo.toml and the build number B, the UTC time of day as hour * 100 +
 # minute with no leading zeros (7 at 00:07, 2105 at 21:05). B is
-# REFINEID_BUILD_NUMBER when set, else the clock, as in
-# crates/refineid-lib-core/build.rs; a build that exports the number it
-# printed gives the binaries the same B. --day prints YY.M.D alone.
+# REFINEID_BUILD_NUMBER when set, else the clock. When the build mark
+# REFINEID_BUILD_MARK, a word of letters a-z, is set, the version is
+# YY.M.D~<mark>B instead. crates/refineid-lib-core/build.rs assembles the
+# binaries' version by the same rules, and the two must agree; a build
+# that exports the number it printed gives the binaries the same B.
+# --day prints YY.M.D alone.
 #
 # Usage: script/version.sh [--day]
 
@@ -48,4 +51,14 @@ if [ "$valid" -eq 0 ] || [ "${#number}" -gt 4 ] || [ "$number" -gt 2359 ] \
     echo "version: REFINEID_BUILD_NUMBER=$number is not hour * 100 + minute" >&2
     exit 1
 fi
-printf '%s.%s\n' "$day" "$number"
+if [ -n "${REFINEID_BUILD_MARK+set}" ]; then
+    case "$REFINEID_BUILD_MARK" in
+        ''|*[!abcdefghijklmnopqrstuvwxyz]*)
+            echo "version: REFINEID_BUILD_MARK=$REFINEID_BUILD_MARK is not a word of letters a-z" >&2
+            exit 1
+            ;;
+    esac
+    printf '%s~%s%s\n' "$day" "$REFINEID_BUILD_MARK" "$number"
+else
+    printf '%s.%s\n' "$day" "$number"
+fi
