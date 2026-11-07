@@ -30,8 +30,9 @@ use refineid_doc_sign::pin::{PinEntryError, PinRole, PromptedPin};
 use refineid_doc_sign::remote::PhoneSignOptions;
 use refineid_doc_sign::service::reader::{ReaderSignError, SignOptions};
 use refineid_doc_sign::service::{
-    DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest, EU_QUALIFIED_TIMESTAMP_AUTHORITIES, SignOutput,
-    SignReport, SignSlot, SigningDevice,
+    BaselineLevel, DEFAULT_TIMESTAMP_AUTHORITY, DocumentRequest,
+    EU_QUALIFIED_TIMESTAMP_AUTHORITIES, SignOutput, SignReport, SignSlot, SigningBuild,
+    SigningDevice,
 };
 use refineid_doc_sign::signed_name::PendingSignedName;
 use refineid_doc_sign::x509::DateTime;
@@ -76,7 +77,10 @@ typed on the phone. Prints nothing on success; -v shows each step.
                 stays invisible
 Signs at the highest level the format supports: LTA (embedded
 evidence plus archive timestamp) for pades and asice-cades, LT
-(embedded evidence) for the rest. There is no lower level.
+(embedded evidence) for the rest. There is no lower level: when
+the evidence cannot be had, nothing is written. A development build
+writes the level it reached as '<name>-dev-<level>.<ext>' and says
+why on stderr.
   --timestamp U   RFC 3161 timestamp authority URL, or a named set.
                   Default: http://timestamp.sectigo.com/qualified.
                   Repeat for alternatives; a failed answer is
@@ -218,7 +222,8 @@ impl DocumentSignArgs {
                     crate::signer_anchors::for_card(reader_filter.as_deref(), now)
                 }
             };
-            if anchors.is_empty() {
+            // A development build lets core lower the level instead.
+            if anchors.is_empty() && SigningBuild::THIS == SigningBuild::Release {
                 eprintln!("{cmd}: {NO_ANCHOR}: {}", anchors.lists);
                 return ExitStatus::RuntimeFailure.into();
             }
@@ -236,6 +241,7 @@ impl DocumentSignArgs {
             timestamp_credentials: None,
             long_term,
             archive,
+            build: SigningBuild::THIS,
         };
         if let Some(SigningSource::Phone(pair_id)) = phone {
             return sign_on_phone(cmd, verbose, pair_id, jobs, &request, &level).into();
@@ -560,10 +566,20 @@ impl core::fmt::Display for DocumentReport<'_> {
             sign.local_verify,
         )?;
         writeln!(f, "format:           {}", format_label(self.level.format))?;
+        // A development build may have saved a lower level than asked.
+        let (long_term, archive) = sign.below_requested_level.as_ref().map_or(
+            (self.level.long_term, self.level.archive),
+            |below| {
+                (
+                    below.reached >= BaselineLevel::Lt,
+                    below.reached >= BaselineLevel::Lta,
+                )
+            },
+        );
         writeln!(
             f,
             "signature level:  {}",
-            describe_level(sign.timestamps, self.level.long_term, self.level.archive)
+            describe_level(sign.timestamps, long_term, archive)
         )
     }
 }
@@ -585,6 +601,11 @@ fn report_outcome(
     let whose = name.map(|name| format!("{name}: ")).unwrap_or_default();
     match result {
         Ok(report) => {
+            // Said even without -v: the file is not what a release
+            // build would have made.
+            if let Some(below) = &report.below_requested_level {
+                eprintln!("{cmd}: {whose}{}: {below}", report.signature_path.display());
+            }
             let verified = !report.local_verify.is_failed();
             super::util::show_outcome(
                 verbose,
@@ -882,6 +903,7 @@ mod tests {
     use crate::cli::argv::fixtures::remaining_argv as argv;
     use crate::cli::util::write_report;
     use crate::test_util::{TestResult, check, check_true};
+    use refineid_doc_sign::service::{BaselineLevel, BelowRequestedLevel};
 
     /// A synthetic reader name.
     const READER: &str = "Synthetic Card Reader";
@@ -918,7 +940,35 @@ mod tests {
             cert_subject_cn: None,
             pin_retries_after: None,
             local_verify: LocalVerifyOutcome::Ok,
+            below_requested_level: None,
         }
+    }
+
+    #[test]
+    fn a_development_document_reports_the_level_it_reached() -> TestResult {
+        let mut sign = signed_report();
+        sign.below_requested_level = Some(BelowRequestedLevel {
+            format: Format::Pades,
+            requested: BaselineLevel::Lta,
+            reached: BaselineLevel::T,
+            reasons: vec!["validation material: signer path: no anchor".to_owned()],
+        });
+        let lta = Level {
+            format: Format::Pades,
+            long_term: true,
+            archive: true,
+        };
+        let report = DocumentReport {
+            sign: &sign,
+            level: &lta,
+        };
+        let mut out = Vec::new();
+        write_report(&mut out, true, &report)?;
+        let text = String::from_utf8(out)?;
+        check_true(
+            text.contains("signature level:  B-T"),
+            "the level reached, not the level asked",
+        )
     }
 
     /// The bytes [`write_report`] writes for the synthetic signature.

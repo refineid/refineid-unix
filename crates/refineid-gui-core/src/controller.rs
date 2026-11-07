@@ -908,7 +908,7 @@ impl RefineIdController {
                             timestamp_credentials: None,
                         },
                     )
-                    .map(|_| ())
+                    .map(|report| development_note(&report))
                     .inspect_err(|error| {
                         refineid_dev_errors::report!(Gui, "document not signed", error)
                     })
@@ -926,7 +926,7 @@ impl RefineIdController {
                             timestamp_credentials: None,
                         },
                     )
-                    .map(|_| ())
+                    .map(|report| development_note(&report))
                     .inspect_err(|error| {
                         refineid_dev_errors::report!(Gui, "document not signed", error)
                     })
@@ -942,7 +942,7 @@ impl RefineIdController {
     /// Shows how each batch of documents fared: "*name* signed" for every
     /// signed document, the failure for each other; signed documents
     /// leave the pile.
-    fn show_sign_outcome(&self, results: &[(Vec<PathBuf>, Result<(), String>)]) {
+    fn show_sign_outcome(&self, results: &[(Vec<PathBuf>, SignOutcome)]) {
         self.update_state(|s| {
             s.busy = false;
             let mut signed = Vec::new();
@@ -951,9 +951,12 @@ impl RefineIdController {
                 for document in batch {
                     let name = document_name(document);
                     match result {
-                        Ok(()) => signed.push(crate::window::document_signed(&name)),
+                        Ok(_) => signed.push(crate::window::document_signed(&name)),
                         Err(error) => failed.push(format!("{name}: {error}")),
                     }
+                }
+                if let Ok(Some(note)) = result {
+                    signed.push(note.clone());
                 }
             }
             if !signed.is_empty() {
@@ -1010,13 +1013,13 @@ impl RefineIdController {
                 requests,
                 DEFAULT_TIMESTAMP_AUTHORITY,
             );
-            let results: Vec<(Vec<PathBuf>, Result<(), String>)> = match outcome {
+            let results: Vec<(Vec<PathBuf>, SignOutcome)> = match outcome {
                 Ok(results) => batches
                     .iter()
                     .zip(results)
                     .map(|(batch, result)| {
                         let result = result
-                            .map(|_| ())
+                            .map(|report| development_note(&report))
                             .inspect_err(|error| {
                                 refineid_dev_errors::report!(Gui, "document not signed", error);
                             })
@@ -1311,6 +1314,21 @@ fn phone_card(dev_name: &str, serial: TokenSerial, identity: CredentialIdentity)
     }
 }
 
+/// One batch's outcome: on success the development-build line when the
+/// document was saved below the requested level, else the failure.
+type SignOutcome = Result<Option<String>, String>;
+
+/// The line that tells the holder a development build saved `report`'s
+/// document below the requested level, and why; `None` otherwise.
+fn development_note(report: &refineid_doc_sign::service::SignReport) -> Option<String> {
+    report.below_requested_level.as_ref().map(|below| {
+        crate::window::document_below_level(
+            &document_name(&report.signature_path),
+            &below.to_string(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1600,13 +1618,32 @@ mod tests {
             added_while_signing.clone(),
         ]));
         controller.show_sign_outcome(&[
-            (vec![report], Ok(())),
+            (vec![report], Ok(None)),
             (vec![notes.clone()], Err("refused".to_owned())),
         ]);
         let state = controller.state();
         assert_eq!(state.pdf_documents, vec![notes, added_while_signing]);
         assert_eq!(state.sign_result.as_deref(), Some("report.pdf signed"));
         assert_eq!(state.status_message, "notes.pdf: refused");
+    }
+
+    #[test]
+    fn a_development_document_is_signed_with_the_reason_beside_it() {
+        let controller = RefineIdController::new(|_| {});
+        let report = PathBuf::from("/documents/report.pdf");
+        controller.handle_intent(UserIntent::AddDocuments(vec![report.clone()]));
+        let note = crate::window::document_below_level(
+            "report-signed-dev-B-T.pdf",
+            "development build: saved as PAdES B-T",
+        );
+        controller.show_sign_outcome(&[(vec![report], Ok(Some(note.clone())))]);
+        let state = controller.state();
+        assert!(state.pdf_documents.is_empty());
+        assert_eq!(
+            state.sign_result,
+            Some(format!("report.pdf signed\n{note}"))
+        );
+        assert!(state.status_message.is_empty(), "not shown as an error");
     }
 
     #[test]

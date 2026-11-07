@@ -247,10 +247,19 @@ and
 .Cm asice-cades ;
 LT, embedded evidence, for the rest.
 There is no lower level.
-The evidence's chain may end at the card's CA certificates, cached or
-read from the card, or at the certificate-issuing services the EU
-trusted lists name; with none of these at hand the signing is refused
-before the card is used.
+The evidence's chain may end at the card's CA certificates, read from
+the card in the reader or cached, or at the certificate-issuing
+services the EU trusted lists name; with none of these at hand the
+signing is refused before the card is used, and a chain that can never
+reach one is refused before PIN2 is sent.
+When the evidence cannot be collected after signing, nothing is
+written.
+A development build instead writes the highest level it reached, B-LT,
+B-T or B-B, under a name ending in
+.Ql -dev- Ns Ar level
+before the extension, and says so on standard error with the reason,
+even without
+.Fl v .
 .Bl -tag -width Ds
 .It Fl -format Ar format
 .Bl -tag -width "cades-detached" -compact

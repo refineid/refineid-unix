@@ -30,7 +30,8 @@ use refineid_doc_sign::pin::{PinEntryError, PromptedPin};
 use refineid_doc_sign::remote::PhoneSignOptions;
 use refineid_doc_sign::service::reader::{ReaderSignError, SignOptions};
 use refineid_doc_sign::service::{
-    DocumentRequest, SignErrorKind, SignOutput, SignReport, SignSlot, TimestampCredentials,
+    DocumentRequest, SignErrorKind, SignOutput, SignReport, SignSlot, SigningBuild,
+    TimestampCredentials,
 };
 use refineid_lib_core::identity::TokenSerial;
 use refineid_lib_core::pin::PinBytes;
@@ -375,6 +376,7 @@ fn asice_document_request(
         signer_anchors,
         timestamp_authorities: vec![timestamp_authority],
         timestamp_credentials,
+        build: SigningBuild::THIS,
     }
 }
 
@@ -399,6 +401,7 @@ fn pdf_document_request(
         signer_anchors,
         timestamp_authorities: vec![timestamp_authority],
         timestamp_credentials,
+        build: SigningBuild::THIS,
     }
 }
 
@@ -479,7 +482,23 @@ mod tests {
 
     use refineid_doc_sign::pades::{StampLanguage, VisibleSignature};
 
-    use super::{ensure_displayed_serial, pdf_document_request};
+    use super::{
+        SigningBuild, asice_document_request, ensure_displayed_serial, pdf_document_request,
+    };
+
+    #[test]
+    fn a_release_build_signs_by_the_release_rule() {
+        let request = asice_document_request(
+            Vec::new(),
+            "https://timestamp.sectigo.com/qualified".to_owned(),
+            None,
+            vec![ANCHOR.to_vec()],
+        );
+        #[cfg(debug_assertions)]
+        assert_eq!(request.build, SigningBuild::Development);
+        #[cfg(not(debug_assertions))]
+        assert_eq!(request.build, SigningBuild::Release);
+    }
 
     #[test]
     fn displayed_serial_mismatch_is_refused() {
@@ -509,6 +528,7 @@ mod tests {
         assert!(request.archive);
         assert!(request.long_term);
         assert_eq!(request.signer_anchors, [ANCHOR.to_vec()]);
+        assert_eq!(request.build, SigningBuild::THIS);
         assert_eq!(
             request.timestamp_authorities,
             ["https://timestamp.sectigo.com/qualified"]

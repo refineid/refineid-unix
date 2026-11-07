@@ -563,6 +563,7 @@ mod tests {
             signer_anchors: Vec::new(),
             timestamp_authorities: Vec::new(),
             timestamp_credentials: None,
+            build: refineid_doc_sign::service::SigningBuild::Release,
         }
     }
 

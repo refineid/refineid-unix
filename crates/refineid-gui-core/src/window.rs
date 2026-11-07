@@ -236,6 +236,14 @@ pub fn document_signed(name: &str) -> String {
     format!("{name} signed")
 }
 
+/// The line under a document a development build saved below the
+/// requested level: the file it saved and why it is not a release
+/// build's signature.
+#[must_use]
+pub fn document_below_level(saved: &str, why: &str) -> String {
+    format!("{saved}: {why}")
+}
+
 /// The line after the paired phone said it forgot this computer.
 #[must_use]
 pub fn phone_forgot(phone: &str) -> String {
