@@ -295,6 +295,13 @@ install -m 644 packaging/refineid.desktop \
 
 install -m 644 crates/refineid-gui/assets/app-icon.svg \
     "$STAGING_GUI/usr/share/icons/hicolor/scalable/apps/refineid.svg"
+# Pre-rendered sizes beside the SVG: desktop shells pick the raster size
+# they need and never depend on a loader's format sniffing.
+for size in 16 24 32 48 64 128 256 512; do
+    install -d "$STAGING_GUI/usr/share/icons/hicolor/${size}x${size}/apps"
+    install -m 644 "crates/refineid-gui/assets/icons/refineid-${size}.png" \
+        "$STAGING_GUI/usr/share/icons/hicolor/${size}x${size}/apps/refineid.png"
+done
 
 write_copyright "$STAGING_GUI/usr/share/doc/refineid-gui/copyright" "refineid-gui"
 
