@@ -11,7 +11,7 @@ You open a SaaS app whose tenant uses Entra federation. The browser
 redirects through `login.microsoftonline.com/<tenant>/saml2`.
 Before the tenant's sign-in page renders -- while the status bar
 still shows "Looking up device.login.microsoftonline.com..." --
-Firefox pops the NSS password dialog for the `Basic (PIN 1)`
+Firefox pops the NSS password dialog for the `Basic PIN 1`
 token (Finnish: "Perus (PIN 1)"). Typing PIN1 completes the SAML
 flow; Cancel generally continues without the cert via Microsoft's
 non-cert fallback.
