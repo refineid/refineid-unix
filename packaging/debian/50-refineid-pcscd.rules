@@ -1,15 +1,14 @@
-// Allow any active local-session user to access pcscd
-// (smartcard reader) without an extra polkit prompt.
+// Grant every user access to pcscd and to the card, without a polkit
+// prompt and whether or not the user holds an active local session.
+// Remote card use over SSH is a supported use case: the card in the
+// reader and its PINs are the security perimeter, not the session, so
+// the grant is the same one the NixOS module makes.
 //
-// Installed by the `refineid` Debian package. Active local
-// session = user logged in on this seat (console / Wayland / X
-// / SSH-with-systemd-user). Remote inactive sessions still
-// require explicit auth.
+// Installed by the refineid-pkcs11 Debian package.
 
 polkit.addRule(function(action, subject) {
-    if ((action.id == "org.debian.pcsc-lite.access_pcsc" ||
-         action.id == "org.debian.pcsc-lite.access_card") &&
-        subject.local && subject.active) {
+    if (action.id == "org.debian.pcsc-lite.access_pcsc" ||
+        action.id == "org.debian.pcsc-lite.access_card") {
         return polkit.Result.YES;
     }
 });

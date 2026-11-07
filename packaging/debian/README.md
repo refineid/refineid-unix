@@ -13,7 +13,7 @@ Binary `.deb` packages are produced automatically by `script/package-deb.sh`
    - PKCS#11 module symlink `/usr/lib/${DEB_HOST_MULTIARCH}/pkcs11/librefineid_pkcs11.so`
    - Compatibility symlink `/usr/lib/librefineid_pkcs11.so`
    - System p11-kit module `/usr/share/p11-kit/modules/refineid.module`
-   - Polkit access rule `/usr/share/polkit-1/rules.d/50-refineid-pcscd.rules`
+   - Polkit access rule `/usr/share/polkit-1/rules.d/50-refineid-pcscd.rules`, granting `org.debian.pcsc-lite.access_pcsc` and `access_card` to every user, active local session or not: remote card use over SSH is a supported use case, and the card in the reader and its PINs are the security perimeter, as in the NixOS module's rule
    - Firefox enterprise policy `/etc/firefox/policies/policies.json`, from `policies.json` here with `@MODULE@` replaced by the multiarch module path
    - Module copy `/var/snap/firefox/common/refineid/librefineid_pkcs11.so` for Ubuntu's Firefox snap, placed by `postinst` (see below)
    - Desktop autostart entry `/etc/xdg/autostart/refineid-browser-token.desktop` running `/usr/libexec/refineid/refineid-browser-token`, which gives the signed-in user's NSS database the module for Chromium
