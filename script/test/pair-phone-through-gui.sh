@@ -19,8 +19,9 @@
 # is opened with remote use on (--pair) and the code is typed into the
 # pairing prompt's boxes; the host forgets its phone first, since the
 # prompt shows only while no phone is paired; the new
-# pairing, which is then the host's one phone, and the certificate read
-# through the phone are then checked on the host.
+# pairing, which is then the host's one phone, is then checked on the
+# host. The certificate read through the phone is held in the window's
+# memory only, so the host's store has none to check.
 #
 # usage: script/test/pair-phone-through-gui.sh <ssh host> <phone udid> [display]
 #
@@ -35,7 +36,6 @@ display=${3:-:0}
 bundle=fi.refineid.ReFineID
 code_wait_seconds=40
 pair_wait_seconds=120
-read_wait_seconds=90
 
 work=$(mktemp -d)
 offer_pid=
@@ -118,12 +118,9 @@ pair_id() {
     sed -n 's/^  Pair ID: *//p'
 }
 
-# The listing's entry as one line: the phone's line and its certificate
-# line.
+# The listing's entry: the phone's line.
 entry() {
-    awk '
-        /^Phone:/ { phone = $0; next }
-        /^  Cert cache:/ { print phone " " $0; exit }'
+    grep '^Phone:'
 }
 
 # Waits until the paired phone is not `known` and its entry matches
@@ -163,13 +160,6 @@ if ! new_id=$(wait_for "$known" '^Phone: ' "$pair_wait_seconds"); then
 fi
 say "paired as $new_id; the phone serves again"
 phone_serve
-
-say "waiting for the certificate read through the phone"
-if ! wait_for "$known" 'Cert cache: Cached' "$read_wait_seconds" > /dev/null; then
-    say "FAIL: the certificate was not read within ${read_wait_seconds} s"
-    host_phone
-    exit 1
-fi
 say "PASS"
 host_phone || true
 exit 0

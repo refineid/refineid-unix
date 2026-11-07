@@ -132,7 +132,7 @@ impl ResolvesClientCert for RappClientCertResolver {
                 return None;
             }
         };
-        let cert = match reader.confirmed_auth_cert(&mut session) {
+        let cert = match reader.confirmed_auth_cert(&mut session, None) {
             Ok(der) => CertificateDer::from(der),
             Err(error) => {
                 reader.close_session(session);

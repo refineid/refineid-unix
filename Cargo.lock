@@ -2010,6 +2010,7 @@ dependencies = [
  "refineid-doc-sign",
  "refineid-lib-core",
  "refineid-lib-pcsc",
+ "refineid-rapp",
  "refineid-rapp-core",
  "zeroize",
 ]

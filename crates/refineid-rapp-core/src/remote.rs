@@ -25,7 +25,9 @@
 //! An open session reports which card the phone holds, if any (section
 //! 8.4); an operation is sent only on a session that reports one, and the
 //! phone's identity is offered only on a certificate whose fingerprint the
-//! phone confirmed on a session.
+//! phone confirmed on a session. The certificate is read from the phone
+//! and handed to the caller, which holds it in memory; nothing here
+//! stores it.
 //!
 //! A reader that follows a [`Withdrawal`] stops when it is raised (section
 //! 4.5 item 8): its open session closes with `service_withdrawn`, a dial
@@ -423,9 +425,6 @@ pub struct PairSummary {
     pub peer_platform: String,
     /// The granted credential profiles.
     pub granted_profiles: Vec<ProfileName>,
-    /// The cached authentication certificate, if read and within its
-    /// retention.
-    pub auth_cert: Option<Vec<u8>>,
     /// Where the stored pairing stands: awaiting the phone's storage
     /// confirmation (section 4.3 item 4), usable, or forgotten here with
     /// the phone yet to be told (section 4.6 item 2).
@@ -602,7 +601,8 @@ impl RemoteReader {
 
     /// Opens the store in `directory` as this computer without sweeping
     /// it, for a program that reads the records another program keeps. A
-    /// certificate past retention still leaves its record.
+    /// record an earlier build stored with a certificate is still
+    /// rewritten without it.
     ///
     /// # Errors
     /// [`RemoteError::Store`] when the store cannot be opened.
@@ -676,7 +676,6 @@ impl RemoteReader {
     /// running ceremony's record is unconfirmed until its phone answers. A
     /// change the store refused is made by the next open.
     fn sweep(&mut self) {
-        let _ = self.drop_outlived_certificates();
         let _ = self.expire_idle_pairings();
         self.requester.expire_revocation_notices(current_time_ms());
         if let Ok(_ceremony) = take_lock(&ceremony_lock_path(self.requester.store().directory())) {
@@ -702,31 +701,10 @@ impl RemoteReader {
             })
     }
 
-    /// Drops every certificate past its retention from the store now
-    /// ([`crate::store::CERTIFICATE_RETENTION_DAYS`]), for a program that
-    /// keeps this reader open: the pairings stay, and the next session
-    /// reads the certificate again.
-    ///
-    /// # Errors
-    /// [`RemoteError::Store`] when the store refused a record's change;
-    /// that record stays as it was for the next call, and [`Self::pairs`]
-    /// serves no such certificate meanwhile.
-    pub fn drop_outlived_certificates(&mut self) -> Result<(), RemoteError> {
-        let store = self.requester.store_mut();
-        let now_ms = store.now_ms();
-        store
-            .drop_outlived_certificates(now_ms)
-            .map_err(RemoteError::Store)
-            .inspect_err(|error| {
-                refineid_dev_errors::report!(Rapp, "certificate not dropped from record", error);
-            })
-    }
-
     /// Every stored pairing, newest first.
     #[must_use]
     pub fn pairs(&self) -> Vec<PairSummary> {
         let store = self.requester.store();
-        let now_ms = store.now_ms();
         store
             .pair_ids()
             .into_iter()
@@ -736,7 +714,6 @@ impl RemoteReader {
                 peer_display_name: record.peer_display_name().as_str().to_owned(),
                 peer_platform: record.peer_platform().to_owned(),
                 granted_profiles: record.pairing().profiles().to_vec(),
-                auth_cert: record.auth_cert_at(now_ms).map(<[u8]>::to_vec),
                 state: record.state(),
             })
             .collect()
@@ -1226,7 +1203,7 @@ impl RemoteReader {
     }
 
     /// Reads the authentication certificate through the phone, on a session
-    /// opened and closed for it, and caches it on the pairing.
+    /// opened and closed for it, for the caller to hold in memory.
     ///
     /// # Errors
     /// As [`Self::confirmed_auth_cert`], and as [`Self::open_session`].
@@ -1236,29 +1213,27 @@ impl RemoteReader {
         discovery_timeout: Duration,
     ) -> Result<Vec<u8>, RemoteError> {
         let mut session = self.open_session(Some(pair_id), discovery_timeout)?;
-        let result = self.confirmed_auth_cert(&mut session);
+        let result = self.confirmed_auth_cert(&mut session, None);
         self.close_session(session);
         result
     }
 
     /// The authentication certificate of the card the phone reports
-    /// serving on `session` (section 8.4 item 2): the cached one when its
-    /// fingerprint is the reported one, and otherwise the card's, read
-    /// afresh on the session, checked against the report, and cached in
-    /// place of the old one. Whichever program holds the session caches
-    /// it; the write replaces the record file whole, under the session's
-    /// lock.
+    /// serving on `session` (section 8.4 item 2): `held`, the certificate
+    /// the caller holds in memory, when its fingerprint is the reported
+    /// one, and otherwise the card's, read afresh on the session and
+    /// checked against the report. Nothing is stored.
     ///
     /// # Errors
     /// [`RemoteError::CardAbsent`] while the phone reports no card,
     /// [`RemoteError::CardChanged`] when the certificate read is not the
-    /// one reported, as [`Self::execute_on`] for the read, and
-    /// [`RemoteError::Store`] when the cache write fails.
+    /// one reported, and as [`Self::execute_on`] for the read.
     pub fn confirmed_auth_cert(
         &mut self,
         session: &mut RemoteSession,
+        held: Option<&[u8]>,
     ) -> Result<Vec<u8>, RemoteError> {
-        self.confirmed_auth_cert_unreported(session)
+        self.confirmed_auth_cert_unreported(session, held)
             .inspect_err(|error| {
                 refineid_dev_errors::report!(Rapp, "certificate not confirmed", error)
             })
@@ -1268,22 +1243,15 @@ impl RemoteReader {
     fn confirmed_auth_cert_unreported(
         &mut self,
         session: &mut RemoteSession,
+        held: Option<&[u8]>,
     ) -> Result<Vec<u8>, RemoteError> {
         let reported = session
             .card_fingerprint()
             .ok_or_else(|| RemoteError::CardAbsent(session.card_request()))?;
-        let pair_id = session.pair_id();
-        let cached = self
-            .requester
-            .store()
-            .get(pair_id)
-            .map_err(RemoteError::Store)?
-            .auth_cert()
-            .map(<[u8]>::to_vec);
-        if let Some(cached) = cached
-            && CertificateFingerprint::of_certificate(&cached) == reported
+        if let Some(held) = held
+            && CertificateFingerprint::of_certificate(held) == reported
         {
-            return Ok(cached);
+            return Ok(held.to_vec());
         }
         let operation = CardOperation::ReadCertificate {
             kind: CertificateKind::Authentication,
@@ -1294,35 +1262,7 @@ impl RemoteReader {
         if session.card_fingerprint() != Some(CertificateFingerprint::of_certificate(&der)) {
             return Err(RemoteError::CardChanged);
         }
-        self.cache_auth_cert(pair_id, &der)?;
         Ok(der)
-    }
-
-    /// Writes `der` as the pairing's cached authentication certificate.
-    fn cache_auth_cert(&mut self, pair_id: PairId, der: &[u8]) -> Result<(), RemoteError> {
-        self.requester
-            .store_mut()
-            .update(pair_id, &mut |record| {
-                Some(record.with_auth_cert(Some(der.to_vec())))
-            })
-            .map_err(RemoteError::Store)
-    }
-
-    /// Drops the cached authentication certificate of `pair_id`, so the
-    /// next session reads the card for it again: for a signature that
-    /// did not verify against the cached certificate, which says the
-    /// card on the phone is not the one cached.
-    ///
-    /// # Errors
-    /// [`RemoteError::Store`] when the record cannot be rewritten.
-    pub fn forget_auth_cert(&mut self, pair_id: PairId) -> Result<(), RemoteError> {
-        self.requester
-            .store_mut()
-            .update(pair_id, &mut |record| Some(record.with_auth_cert(None)))
-            .map_err(RemoteError::Store)
-            .inspect_err(|error| {
-                refineid_dev_errors::report!(Rapp, "cached certificate not dropped", error)
-            })
     }
 }
 
@@ -1677,17 +1617,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
-    /// The clock of the fixture's pairing as it was made.
-    fn at_creation() -> u64 {
-        CREATED_AT_MS
-    }
-
-    /// The fixture's clock just past the certificate's retention, with the
-    /// pairing standing.
-    fn past_retention() -> u64 {
-        CREATED_AT_MS + crate::store::CERTIFICATE_RETENTION_MS
-    }
-
     /// Whether any file in `directory` holds [`CERTIFICATE`].
     fn store_holds_certificate(directory: &std::path::Path) -> bool {
         std::fs::read_dir(directory).unwrap().any(|entry| {
@@ -1699,27 +1628,25 @@ mod tests {
         })
     }
 
-    /// A store in `directory` at the fixture's creation, holding `pair_id`'s
-    /// usable record caching [`CERTIFICATE`].
+    /// Writes `pair_id`'s usable record in `directory` as an earlier build
+    /// stored it, holding [`CERTIFICATE`].
     fn seed_certificate(directory: &std::path::Path, pair_id: PairId) {
-        FilePairingStore::open_with_clock(directory, at_creation)
-            .unwrap()
-            .insert(record(pair_id).with_auth_cert(Some(CERTIFICATE.to_vec())))
-            .unwrap();
+        std::fs::create_dir_all(directory).unwrap();
+        let blob = crate::persistence::frame_certificate_revision(&record(pair_id), CERTIFICATE);
+        std::fs::write(path_for(directory, pair_id), blob).unwrap();
+        assert!(store_holds_certificate(directory));
     }
 
     #[test]
-    fn a_reader_past_retention_offers_no_certificate_and_keeps_the_pairing() {
+    fn the_modules_reader_erases_a_stored_certificate_and_keeps_the_pairing() {
         let directory = scratch();
         let pair_id = PairId::from_array(PAIR_ID);
         seed_certificate(&directory, pair_id);
-        assert!(store_holds_certificate(&directory));
-        let store = FilePairingStore::open_with_clock(&directory, past_retention).unwrap();
-        let reader = RemoteReader::with_store(desk(), "Linux", store);
+        let reader = RemoteReader::open_local_without_sweep(&directory).unwrap();
         assert!(!store_holds_certificate(&directory));
         let phone = reader.phone().unwrap();
         assert_eq!(phone.pair_id, pair_id);
-        assert_eq!(phone.auth_cert, None);
+        assert!(phone.usable());
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -1728,7 +1655,7 @@ mod tests {
         let directory = scratch();
         let pair_id = PairId::from_array(PAIR_ID);
         seed_certificate(&directory, pair_id);
-        let store = FilePairingStore::open_with_clock(&directory, at_creation).unwrap();
+        let store = FilePairingStore::open(&directory).unwrap();
         let mut reader = RemoteReader::with_store(desk(), "Linux", store);
         // Held here, the lock leaves the record to its holder and the bound.
         let held = SessionLock::acquire(&session_lock_path(&directory, pair_id)).unwrap();
@@ -1747,7 +1674,7 @@ mod tests {
             PairId::from_array(UNKNOWN_PAIR_ID),
         );
         seed_certificate(&directory, old);
-        let mut store = FilePairingStore::open_with_clock(&directory, at_creation).unwrap();
+        let mut store = FilePairingStore::open(&directory).unwrap();
         store.insert(record(new)).unwrap();
         let mut reader = RemoteReader::with_store(desk(), "Linux", store);
         let held = SessionLock::acquire(&session_lock_path(&directory, old)).unwrap();
@@ -1767,36 +1694,6 @@ mod tests {
         assert_eq!(reader.expire_idle_pairings(), Ok(1));
         assert!(!path_for(&directory, pair_id).exists());
         assert!(!store_holds_certificate(&directory));
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn a_cached_certificate_replaces_the_record_file_and_survives_reopening() {
-        let directory = scratch();
-        let store = FilePairingStore::open_with_clock(&directory, at_creation).unwrap();
-        let mut reader = RemoteReader::with_store(desk(), "Linux", store);
-        let pair_id = PairId::from_array(PAIR_ID);
-        reader
-            .requester
-            .store_mut()
-            .insert(record(pair_id))
-            .unwrap();
-        reader.cache_auth_cert(pair_id, CERTIFICATE).unwrap();
-        let record_path = path_for(&directory, pair_id);
-        assert!(record_path.exists());
-        assert!(!record_path.with_extension("tmp").exists());
-        let store = FilePairingStore::open_with_clock(&directory, at_creation).unwrap();
-        let summary = RemoteReader::with_store(desk(), "Linux", store).pairs();
-        assert_eq!(
-            summary.first().unwrap().auth_cert.as_deref(),
-            Some(CERTIFICATE)
-        );
-        assert_eq!(
-            reader
-                .cache_auth_cert(PairId::from_array(UNKNOWN_PAIR_ID), CERTIFICATE)
-                .err(),
-            Some(RemoteError::Store(crate::store::StoreError::Unknown))
-        );
         let _ = std::fs::remove_dir_all(directory);
     }
 

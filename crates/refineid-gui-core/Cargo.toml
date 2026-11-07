@@ -15,6 +15,8 @@ workspace = true
 refineid-client = { path = "../refineid-client", version = "26" }
 refineid-lib-core.workspace = true
 refineid-doc-sign.workspace = true
+# IDENTITY_OFFER_GRACE_MS, the bound on the phone's certificate in memory.
+refineid-rapp.workspace = true
 refineid-rapp-core.workspace = true
 refineid-dev-errors.workspace = true
 refineid-lib-pcsc.workspace = true

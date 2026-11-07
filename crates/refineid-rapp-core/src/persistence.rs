@@ -7,7 +7,10 @@
 //! time it was forgotten and its latest session time, travels in the engine's own encoding
 //! ([`refineid_rapp::encode_pair_record`]);
 //! this module frames it with what the workstation keeps beside it, in a
-//! versioned, length-framed encoding with no external serde surface.
+//! versioned, length-framed encoding with no external serde surface. No
+//! revision this build writes holds a certificate; a record of the one
+//! revision before it, which held the holder's authentication
+//! certificate, is read without it so the store can rewrite it.
 //!
 //! The encoded blob carries the private key, so [`encode_pairing_record`]
 //! returns it inside [`Zeroizing`]; callers hand it straight to device-only
@@ -26,9 +29,16 @@ use crate::store::{PairingRecord, RecordError};
 /// Format tag identifying a `RefineID` pairing-record blob.
 pub(crate) const PAIRING_BLOB_MAGIC: &[u8] = b"RAPP-pair-record";
 
-/// The one encoding revision this build reads and writes. Records of earlier
-/// revisions belong to earlier protocol versions and are re-paired.
-pub(crate) const PAIRING_BLOB_VERSION: u8 = 11;
+/// The one encoding revision this build writes. Records of revisions before
+/// [`CERTIFICATE_REVISION`] belong to earlier protocol versions and are
+/// re-paired.
+pub(crate) const PAIRING_BLOB_VERSION: u8 = 12;
+
+/// The revision that framed an optional authentication certificate after
+/// the platform label. Its records are read with the certificate
+/// discarded, and rewritten at this build's revision.
+pub(crate) const CERTIFICATE_REVISION: u8 = 11;
+const _: () = assert!(CERTIFICATE_REVISION + 1 == PAIRING_BLOB_VERSION);
 
 /// The engine's pair record format this revision frames. A new engine
 /// format takes a new revision, so that records of the old one read as
@@ -43,15 +53,23 @@ const _: () = assert!(
 
 /// Bytes of a length prefix: a big-endian `u32`.
 const LENGTH_PREFIX_BYTES: usize = 4;
-/// Bytes of the presence flag of an optional field.
-const OPTIONAL_FLAG_BYTES: usize = 1;
 /// Bytes of the encoding revision.
 const VERSION_BYTES: usize = 1;
 
-/// An absent optional field.
+/// A [`CERTIFICATE_REVISION`] record's flag: no certificate follows.
 const ABSENT: u8 = 0;
-/// A present optional field.
+/// A [`CERTIFICATE_REVISION`] record's flag: a certificate follows.
 const PRESENT: u8 = 1;
+
+/// What a stored blob's revision asks of the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stored {
+    /// The blob is at this build's revision.
+    Current,
+    /// The blob is of [`CERTIFICATE_REVISION`]: the store rewrites it, so
+    /// no certificate it held stays on disk.
+    Rewrite,
+}
 
 /// Why a stored pairing blob could not be encoded or decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,23 +131,7 @@ pub fn encode_pairing_record(
     record: &PairingRecord,
 ) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
     let pairing = encode_pair_record(record.pairing()).map_err(PairingCodecError::Pairing)?;
-    frame_pairing_record(
-        pairing.as_bytes(),
-        record.peer_platform(),
-        record.auth_cert(),
-    )
-}
-
-/// [`encode_pairing_record`] of `record` as it stands once its certificate
-/// is dropped.
-///
-/// # Errors
-/// As [`encode_pairing_record`].
-pub(crate) fn encode_pairing_record_without_certificate(
-    record: &PairingRecord,
-) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
-    let pairing = encode_pair_record(record.pairing()).map_err(PairingCodecError::Pairing)?;
-    frame_pairing_record(pairing.as_bytes(), record.peer_platform(), None)
+    frame_pairing_record(pairing.as_bytes(), record.peer_platform())
 }
 
 /// Frames `pairing`, the engine's encoded record, with what the workstation
@@ -141,18 +143,13 @@ pub(crate) fn encode_pairing_record_without_certificate(
 pub(crate) fn frame_pairing_record(
     pairing: &[u8],
     platform: &str,
-    auth_cert: Option<&[u8]>,
 ) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
     let size = PAIRING_BLOB_MAGIC.len()
         + VERSION_BYTES
         + LENGTH_PREFIX_BYTES
         + pairing.len()
         + LENGTH_PREFIX_BYTES
-        + platform.len()
-        + OPTIONAL_FLAG_BYTES
-        + auth_cert
-            .map(|cert| LENGTH_PREFIX_BYTES + cert.len())
-            .unwrap_or_default();
+        + platform.len();
     // Sized once, so the key bytes are copied into one buffer and no
     // discarded reallocation keeps them.
     let mut out = Zeroizing::new(Vec::with_capacity(size));
@@ -160,13 +157,6 @@ pub(crate) fn frame_pairing_record(
     out.push(PAIRING_BLOB_VERSION);
     put_bytes(&mut out, pairing)?;
     put_bytes(&mut out, platform.as_bytes())?;
-    match auth_cert {
-        Some(cert) => {
-            out.push(PRESENT);
-            put_bytes(&mut out, cert)?;
-        }
-        None => out.push(ABSENT),
-    }
     Ok(out)
 }
 
@@ -179,7 +169,7 @@ pub fn is_superseded(blob: &[u8]) -> bool {
     reader.take(PAIRING_BLOB_MAGIC.len()) == Ok(PAIRING_BLOB_MAGIC)
         && reader
             .take_u8()
-            .is_ok_and(|version| version < PAIRING_BLOB_VERSION)
+            .is_ok_and(|version| version < CERTIFICATE_REVISION)
 }
 
 /// Reconstructs a pairing record from a device-only blob.
@@ -190,26 +180,56 @@ pub fn is_superseded(blob: &[u8]) -> bool {
 /// mid-field, carries trailing bytes, or holds a malformed field or engine
 /// record.
 pub fn decode_pairing_record(blob: &[u8]) -> Result<PairingRecord, PairingCodecError> {
+    decode_stored_pairing_record(blob).map(|(record, _)| record)
+}
+
+/// [`decode_pairing_record`], with what the blob's revision asks of the
+/// store. A [`CERTIFICATE_REVISION`] blob's certificate is checked for
+/// framing and discarded: it never reaches the record.
+///
+/// # Errors
+/// As [`decode_pairing_record`].
+pub(crate) fn decode_stored_pairing_record(
+    blob: &[u8],
+) -> Result<(PairingRecord, Stored), PairingCodecError> {
     let mut reader = Reader::new(blob);
     if reader.take(PAIRING_BLOB_MAGIC.len())? != PAIRING_BLOB_MAGIC {
         return Err(PairingCodecError::BadMagic);
     }
-    let version = reader.take_u8()?;
-    if version != PAIRING_BLOB_VERSION {
-        return Err(PairingCodecError::UnsupportedVersion { found: version });
-    }
+    let stored = match reader.take_u8()? {
+        PAIRING_BLOB_VERSION => Stored::Current,
+        CERTIFICATE_REVISION => Stored::Rewrite,
+        found => return Err(PairingCodecError::UnsupportedVersion { found }),
+    };
     let pairing = EncodedPairRecord::from_stored(reader.take_length_prefixed()?.to_vec());
     let pairing = decode_pair_record(&pairing).map_err(PairingCodecError::Pairing)?;
     let platform = reader.take_text()?;
-    let auth_cert = match reader.take_u8()? {
-        ABSENT => None,
-        PRESENT => Some(reader.take_length_prefixed()?.to_vec()),
-        _ => return Err(PairingCodecError::InvalidFlag),
-    };
+    if stored == Stored::Rewrite {
+        match reader.take_u8()? {
+            ABSENT => {}
+            PRESENT => {
+                reader.take_length_prefixed()?;
+            }
+            _ => return Err(PairingCodecError::InvalidFlag),
+        }
+    }
     reader.finish()?;
-    Ok(PairingRecord::new(pairing, platform)
-        .map_err(PairingCodecError::Record)?
-        .with_auth_cert(auth_cert))
+    let record = PairingRecord::new(pairing, platform).map_err(PairingCodecError::Record)?;
+    Ok((record, stored))
+}
+
+/// `record` as a [`CERTIFICATE_REVISION`] blob holding `certificate`, the
+/// way an earlier build stored it, for the tests of its rewrite.
+#[cfg(test)]
+pub(crate) fn frame_certificate_revision(record: &PairingRecord, certificate: &[u8]) -> Vec<u8> {
+    let pairing = encode_pair_record(record.pairing()).expect("an encodable record");
+    let mut out = PAIRING_BLOB_MAGIC.to_vec();
+    out.push(CERTIFICATE_REVISION);
+    put_bytes(&mut out, pairing.as_bytes()).expect("a short record");
+    put_bytes(&mut out, record.peer_platform().as_bytes()).expect("a short label");
+    out.push(PRESENT);
+    put_bytes(&mut out, certificate).expect("a short certificate");
+    out
 }
 
 /// Appends a length-prefixed byte string.
@@ -286,8 +306,10 @@ mod tests {
     use refineid_rapp::{ProfileName, SweepOutcome, encode_pair_record};
 
     use super::{
-        PAIRING_BLOB_MAGIC, PAIRING_BLOB_VERSION, PairingCodecError, decode_pairing_record,
-        encode_pairing_record, is_superseded,
+        ABSENT, CERTIFICATE_REVISION, LENGTH_PREFIX_BYTES, PAIRING_BLOB_MAGIC,
+        PAIRING_BLOB_VERSION, PairingCodecError, Stored, decode_pairing_record,
+        decode_stored_pairing_record, encode_pairing_record, frame_certificate_revision,
+        is_superseded,
     };
     use crate::ids::PairId;
     use crate::store::PairingRecord;
@@ -305,6 +327,8 @@ mod tests {
     const FIRST_REVISION: u8 = 1;
     /// A revision past the one this build reads.
     const LATER_REVISION: u8 = PAIRING_BLOB_VERSION + 1;
+    /// Bytes of a [`CERTIFICATE_REVISION`] record's certificate flag.
+    const FLAG_BYTES: usize = 1;
     /// A byte appended past the record's end.
     const TRAILING: &[u8] = b"!";
 
@@ -317,7 +341,6 @@ mod tests {
             PHONE_PLATFORM.to_owned(),
         )
         .unwrap()
-        .with_auth_cert(Some(CERTIFICATE.to_vec()))
     }
 
     fn assert_same(left: &PairingRecord, right: &PairingRecord) {
@@ -343,7 +366,6 @@ mod tests {
         );
         assert_eq!(left.peer_display_name(), right.peer_display_name());
         assert_eq!(left.peer_platform(), right.peer_platform());
-        assert_eq!(left.auth_cert(), right.auth_cert());
     }
 
     /// `blob` with its revision replaced by `revision`.
@@ -428,6 +450,50 @@ mod tests {
     }
 
     #[test]
+    fn no_blob_this_build_writes_holds_a_certificate() {
+        let blob = encode_pairing_record(&sample()).unwrap();
+        assert!(!blob.windows(CERTIFICATE.len()).any(|w| w == CERTIFICATE));
+        assert_eq!(
+            decode_stored_pairing_record(&blob).unwrap().1,
+            Stored::Current
+        );
+    }
+
+    #[test]
+    fn a_record_that_held_a_certificate_is_read_without_it_for_rewriting() {
+        let record = sample();
+        let blob = frame_certificate_revision(&record, CERTIFICATE);
+        assert!(!is_superseded(&blob));
+        let (decoded, stored) = decode_stored_pairing_record(&blob).unwrap();
+        assert_eq!(stored, Stored::Rewrite);
+        assert_same(&record, &decoded);
+        let rewritten = encode_pairing_record(&decoded).unwrap();
+        assert!(
+            !rewritten
+                .windows(CERTIFICATE.len())
+                .any(|w| w == CERTIFICATE)
+        );
+        // Its certificate is framed like any field: a cut one is refused.
+        let cut = blob.get(..blob.len() - TRAILING.len()).unwrap();
+        assert!(matches!(
+            decode_stored_pairing_record(cut),
+            Err(PairingCodecError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn a_record_of_the_certificate_revision_without_one_reads_too() {
+        let record = sample();
+        let mut blob = frame_certificate_revision(&record, CERTIFICATE);
+        let flag_at = blob.len() - CERTIFICATE.len() - LENGTH_PREFIX_BYTES - FLAG_BYTES;
+        blob.truncate(flag_at);
+        blob.push(ABSENT);
+        let (decoded, stored) = decode_stored_pairing_record(&blob).unwrap();
+        assert_eq!(stored, Stored::Rewrite);
+        assert_same(&record, &decoded);
+    }
+
+    #[test]
     fn rejects_a_later_revision_and_sweeps_only_earlier_ones() {
         let blob = encode_pairing_record(&sample()).unwrap();
         let later = at_revision(&blob, LATER_REVISION);
@@ -437,7 +503,7 @@ mod tests {
         ));
         assert!(!is_superseded(&later));
         assert!(!is_superseded(&blob));
-        for earlier in FIRST_REVISION..PAIRING_BLOB_VERSION {
+        for earlier in FIRST_REVISION..CERTIFICATE_REVISION {
             let earlier_blob = at_revision(&blob, earlier);
             assert!(matches!(
                 decode_pairing_record(&earlier_blob),

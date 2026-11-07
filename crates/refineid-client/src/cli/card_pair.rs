@@ -148,17 +148,6 @@ impl PairArgs {
                 "Paired with {} ({})",
                 pair.peer_display_name, pair.peer_platform
             );
-            println!("Retrieving the authentication certificate for offline caching");
-        }
-        match reader.refresh_auth_cert(pair.pair_id, DISCOVERY_TIMEOUT) {
-            Ok(_) => {
-                if verbose {
-                    println!("Cached the authentication certificate");
-                }
-            }
-            Err(e) => eprintln!("pair: authentication certificate not cached: {e}"),
-        }
-        if verbose {
             println!("Pair ID: {}", pair.pair_id_hex());
             println!(
                 "Granted profiles: {}",
@@ -225,14 +214,6 @@ impl PairsArgs {
         println!("Phone: {} - {}", pair.peer_display_name, pair.peer_platform);
         println!("  Pair ID:    {}", pair.pair_id_hex());
         println!("  Profiles:   {}", profile_names(&pair.granted_profiles));
-        println!(
-            "  Cert cache: {}",
-            if pair.auth_cert.is_some() {
-                "Cached"
-            } else {
-                "None"
-            }
-        );
         ExitStatus::Ok.into()
     }
 }
