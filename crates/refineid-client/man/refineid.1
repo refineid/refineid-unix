@@ -156,7 +156,9 @@ certificate-issuing service the EU trusted lists name; the on-card
 root alone anchors nothing.
 With no list at hand it reads
 .Li skipped (not anchored: trusted lists not fetched) ,
-which is no failure of the card.
+and with lists at hand but not the Finnish one,
+.Li skipped (Finnish trusted list unavailable: reason) ;
+neither is a failure of the card.
 Without
 .Fl -no-can
 on a terminal, prompts for the CAN; an empty answer skips the eMRTD

@@ -45,8 +45,8 @@ use std::path::{Path, PathBuf};
 
 use refineid_doc_sign::uri::Uri;
 use refineid_doc_sign::verification::trusted_list::{
-    CachedList, LOTL_LOCATION, NationalList, TrustedListError, TrustedLists, fetch_over_http,
-    lotl_signers,
+    CachedList, LOTL_LOCATION, ListFailure, NationalList, TrustedListError, TrustedLists,
+    fetch_over_http, lotl_signers,
 };
 use refineid_doc_sign::verification::{AnchorRole, TrustAnchors};
 use refineid_doc_sign::x509::{DateTime, OwnedCert};
@@ -99,6 +99,51 @@ const LISTS_OF_THE_LISTS: usize = 1;
 /// What ends the record, its last line and one blank line, and starts
 /// the list's bytes.
 const RECORD_END: &[u8] = b"\n\n";
+
+/// The `SchemeTerritory` of Finland's national list: the ISO 3166-1
+/// alpha-2 code `ETSI TS 119 612` clause 5.3.10 names a member
+/// state's list by. FINEID cards chain to the services it lists.
+pub const FINNISH_TERRITORY: &str = "FI";
+
+/// Why the Finnish national list gave no anchors while other lists
+/// did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinnishListGap {
+    /// The list of the lists points at no Finnish list.
+    NotPointedAt,
+    /// The list it points at did not arrive or read.
+    Failed(ListFailure),
+}
+
+impl core::fmt::Display for FinnishListGap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotPointedAt => f.write_str("the list of the lists points at none"),
+            Self::Failed(failure) => write!(f, "{failure}"),
+        }
+    }
+}
+
+/// Why the Finnish list in `lists` gave no anchors, or `None` when it
+/// read.
+fn finnish_gap(lists: &TrustedLists) -> Option<FinnishListGap> {
+    let mut gap = Some(FinnishListGap::NotPointedAt);
+    for list in lists
+        .national()
+        .iter()
+        .filter(|list| list.territory() == FINNISH_TERRITORY)
+    {
+        match list.outcome() {
+            Ok(_) => return None,
+            Err(failure) => {
+                if gap == Some(FinnishListGap::NotPointedAt) {
+                    gap = Some(FinnishListGap::Failed(failure));
+                }
+            }
+        }
+    }
+    gap
+}
 
 /// When a run fetches the lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +202,9 @@ pub struct RunAnchors {
     pub anchors: TrustAnchors,
     /// Where they came from.
     pub source: AnchorSource,
+    /// Why the Finnish list gave no anchors when other lists are at
+    /// hand; `None` when it read or when no list is at hand at all.
+    pub finnish_gap: Option<FinnishListGap>,
 }
 
 /// The lists' cache directory.
@@ -293,10 +341,12 @@ pub fn run_anchors(
                 fetched_at: lists.fetched_at(),
                 stale: lists.is_stale(now),
             },
+            finnish_gap: finnish_gap(&lists),
         },
         Err(error) => RunAnchors {
             anchors: without_lists(),
             source: AnchorSource::Unavailable(error),
+            finnish_gap: None,
         },
     }
 }

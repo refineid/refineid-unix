@@ -71,8 +71,11 @@ Citations are BibTeX keys in [`references.md`](references.md).
   on-card root (`EF.4334`) is path material, never an anchor by
   itself: the software ships no root (`AGENTS.md`, "Certificates and
   trust"; owner's decision of 2026-11-07). With no list cached the row
-  reads `skipped (not anchored: trusted lists not fetched)`, a state
-  of this computer and not a failure of the card; `--offline` uses the
+  reads `skipped (not anchored: trusted lists not fetched)`, and with
+  lists cached but the Finnish one not among them, `skipped (Finnish
+  trusted list unavailable: <reason>)`: states of this computer and
+  not failures of the card. `FAILED` is kept for a chain that does
+  not verify, or that the Finnish list does not name; `--offline` uses the
   cached lists as they are and fetches nothing. The card's issuing CA
   and root are kept under `$XDG_CACHE_HOME/refineid/ca-certificates/`
   until they expire, the directory refineid-core's PKCS#11 module

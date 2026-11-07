@@ -76,8 +76,9 @@ const LIST_CLOSE: &str = "</TrustServiceStatusList>";
 
 /// The territory of the list of the lists.
 const EU: &str = "EU";
-/// The territory of the national list.
-const TERRITORY: &str = "XX";
+/// The territory of the national list: Finland's, the list a FINEID
+/// chain needs.
+const TERRITORY: &str = FINNISH_TERRITORY;
 /// The scheme operator of the list of the lists.
 const LOTL_OPERATOR: &str = "Synthetic Commission";
 /// The scheme operator of the national list.
@@ -900,7 +901,7 @@ fn live_lists_fetch_read_and_anchor() -> TestResult {
         lists
             .national()
             .iter()
-            .any(|list| list.territory() == "FI" && list.outcome().is_ok()),
+            .any(|list| list.territory() == FINNISH_TERRITORY && list.outcome().is_ok()),
         "the Finnish list read",
     )?;
     check_true(
@@ -963,4 +964,64 @@ fn cache_only_without_a_cache_fetches_nothing_and_has_no_anchor() -> TestResult 
         "source",
     )?;
     check_true(run.anchors.anchors().is_empty(), "no anchor")
+}
+
+#[test]
+fn the_finnish_list_that_read_leaves_no_gap() -> TestResult {
+    let world = World::new();
+    let dir = TempDir::new("trusted-lists-finnish-read")?;
+    let cache = ListCache::at(dir.path().join(LISTS_DIRECTORY));
+    let calls = Cell::new(NOT_FETCHED);
+    let run = run_anchors(
+        Some(&cache),
+        day(FETCHED),
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &calls),
+    );
+    check(&run.finnish_gap, &None, "no gap")
+}
+
+#[test]
+fn a_finnish_list_that_does_not_arrive_is_a_gap_beside_the_lists() -> TestResult {
+    let world = World::new();
+    let dir = TempDir::new("trusted-lists-finnish-missing")?;
+    let cache = ListCache::at(dir.path().join(LISTS_DIRECTORY));
+    let calls = Cell::new(NOT_FETCHED);
+    let run = run_anchors(
+        Some(&cache),
+        day(FETCHED),
+        Refresh::WhenDue,
+        &world.signers()?,
+        transport(vec![(LOTL_LOCATION, world.lotl_bytes())], &calls),
+    );
+    check_true(
+        matches!(run.source, AnchorSource::Lists { .. }),
+        "the list of the lists is at hand",
+    )?;
+    check(
+        &run.finnish_gap,
+        &Some(FinnishListGap::Failed(ListFailure::NotFetched)),
+        "the Finnish list is the gap",
+    )
+}
+
+#[test]
+fn a_list_of_the_lists_without_a_finnish_pointer_is_a_gap() -> TestResult {
+    let world = World::new();
+    let dir = TempDir::new("trusted-lists-finnish-unpointed")?;
+    let cache = ListCache::at(dir.path().join(LISTS_DIRECTORY));
+    let calls = Cell::new(NOT_FETCHED);
+    let run = run_anchors(
+        Some(&cache),
+        day(FETCHED),
+        Refresh::WhenDue,
+        &world.signers()?,
+        transport(vec![(LOTL_LOCATION, world.lotl_without_pointers())], &calls),
+    );
+    check(
+        &run.finnish_gap,
+        &Some(FinnishListGap::NotPointedAt),
+        "no Finnish pointer",
+    )
 }
