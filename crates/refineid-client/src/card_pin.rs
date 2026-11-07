@@ -744,9 +744,11 @@ pub(crate) fn change_pin_first_for_cli(
 /// exhausted the card is dead -- no software recovery, DVV
 /// reissue required. The card's own outcome (wrong-PUK with
 /// retries-left, PUK locked, etc.) is surfaced via
-/// [`UnblockPinReport::outcome`]. The PUK is presented only at five,
-/// four or three PUK tries left; below that, blocked or unreadable, the
-/// reset is refused before it is sent.
+/// [`UnblockPinReport::outcome`]. The PUK is refused before it is sent
+/// at two or one PUK tries left and at an unreadable counter; at no
+/// tries left or blocked the reset goes to the card, which answers for
+/// itself and spends nothing, since the holder's code may be a PUK or
+/// an activation code and the software cannot tell.
 ///
 /// # Errors
 /// PC/SC / PKCS#15 / local-policy / transport failures, and
