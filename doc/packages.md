@@ -92,9 +92,7 @@ pkg install refineid
 
 The package depends on pcsc-lite, libccid, p11-kit and nss. Installing it
 enables pcscd with `--disable-polkit` in `/etc/rc.conf` and starts it;
-removing the package leaves `/etc/rc.conf` as it is. An ACS reader needs
-the ACS driver as [install-freebsd.md](install-freebsd.md) section 2
-describes; the package does not move the CCID driver aside.
+removing the package leaves `/etc/rc.conf` as it is.
 
 ### Known limits
 
