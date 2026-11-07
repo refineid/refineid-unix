@@ -78,8 +78,11 @@ ubuntu_commands="$(commands '### Ubuntu 26.04' | escape)"
 freebsd_commands="$(commands '### FreeBSD 15' | escape)"
 [ -n "$ubuntu_commands" ] || { echo "error: no Ubuntu commands in $DOC" >&2; exit 1; }
 [ -n "$freebsd_commands" ] || { echo "error: no FreeBSD commands in $DOC" >&2; exit 1; }
-ubuntu_newest="$(ubuntu_version | escape)"
-freebsd_newest="$(freebsd_version | escape)"
+# A plain assignment lets set -e see a failed helper; a pipe would hide it.
+ubuntu_newest="$(ubuntu_version)"
+freebsd_newest="$(freebsd_version)"
+ubuntu_newest="$(printf '%s' "$ubuntu_newest" | escape)"
+freebsd_newest="$(printf '%s' "$freebsd_newest" | escape)"
 
 cat > "$SITE/index.html" <<HTML
 <!DOCTYPE html>
