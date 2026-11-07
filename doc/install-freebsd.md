@@ -25,6 +25,11 @@ and add the user to the `video` group. Without `xdg-desktop-portal-gtk`
 the desktop portal has no file chooser and the GUI's file dialogs do not
 open.
 
+For KDE Plasma 6 or GNOME 47, install `plasma6-plasma` or `gnome` with
+`gnome-terminal`, mount `procfs` and `fdescfs` in `/etc/fstab`
+(`proc /proc procfs rw 0 0` and `fdesc /dev/fd fdescfs rw 0 0`), and leave
+`user-session` unset in `lightdm.conf` so the greeter offers the session.
+
 ## 2. Smart-card daemon
 
 ```sh
@@ -38,12 +43,22 @@ available"; FreeBSD has no logind, so polkit is disabled.
 
 An ACS reader needs the ACS driver. With the generic CCID bundle in
 place pcscd binds the ACR39U to libccid and the reader never finishes
-initialising, so move the bundle aside; other CCID readers need it back:
+initialising. Moving the bundle aside breaks every other CCID reader, so
+keep both bundles and remove the ACS vendor entries (`0x072F`) from the
+generic bundle's `Info.plist`. This needs `python3`, and a libccid upgrade
+restores the file:
 
 ```sh
-mkdir -p /usr/local/lib/pcsc/drivers-disabled
-mv /usr/local/lib/pcsc/drivers/ifd-ccid.bundle /usr/local/lib/pcsc/drivers-disabled/
-service pcscd restart
+python3 -c '
+import plistlib
+p = "/usr/local/lib/pcsc/drivers/ifd-ccid.bundle/Contents/Info.plist"
+with open(p, "rb") as f:
+    d = plistlib.load(f)
+keep = [(v, pr, n) for v, pr, n in zip(d["ifdVendorID"], d["ifdProductID"], d["ifdFriendlyName"]) if v.lower() != "0x072f"]
+d["ifdVendorID"], d["ifdProductID"], d["ifdFriendlyName"] = [list(x) for x in zip(*keep)]
+with open(p, "wb") as f:
+    plistlib.dump(d, f)
+' && service pcscd restart
 ```
 
 `pcsc_scan -r` lists the reader. If `service pcscd restart` answers
