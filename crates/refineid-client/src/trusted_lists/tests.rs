@@ -1132,3 +1132,44 @@ fn a_cache_without_the_finnish_list_is_fetched_again() -> TestResult {
     check(&calls.get(), &FETCHED_ONCE, "fetched again")?;
     check(&run.finnish_gap, &None, "the Finnish list is at hand")
 }
+
+#[test]
+fn prefetch_returns_each_location_once_with_its_bytes() -> TestResult {
+    /// Locations each thread takes, so that a thread takes several.
+    const PER_THREAD: usize = 3;
+    /// The one location nothing is served at.
+    const UNSERVED: &str = "https://trusted-list.example/unserved.xml";
+    let mut locations = vec![Uri::parse(UNSERVED.to_owned())?];
+    for index in 0..PARALLEL_FETCHES * PER_THREAD {
+        locations.push(Uri::parse(format!(
+            "https://trusted-list.example/{index}.xml"
+        ))?);
+    }
+    let served = |location: &Uri| {
+        let text = location.to_string();
+        (text != UNSERVED).then(|| text.into_bytes())
+    };
+    let fetched = prefetch(&locations, served);
+    check(&fetched.len(), &locations.len(), "one result per location")?;
+    for location in &locations {
+        let found: Vec<_> = fetched.iter().filter(|(at, _)| at == location).collect();
+        check(&found.len(), &FETCHED_ONCE, "fetched once")?;
+        check(
+            &found.first().and_then(|(_, bytes)| bytes.clone()),
+            &served(location),
+            "its own bytes, or none",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn national_locations_are_the_pointers_the_lists_follow() -> TestResult {
+    let world = World::new();
+    let lotl = TrustedList::read(world.lotl_bytes(), &world.signers()?)?;
+    check(
+        &national_locations(&lotl),
+        &vec![Uri::parse(NATIONAL_LOCATION.to_owned())?],
+        "the national list's location",
+    )
+}

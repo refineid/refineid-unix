@@ -44,13 +44,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use refineid_doc_sign::uri::Uri;
 use refineid_doc_sign::verification::trusted_list::{
-    CachedList, LOTL_LOCATION, ListFailure, NationalList, TrustedListError, TrustedLists,
-    fetch_over_http, lotl_signers,
+    CachedList, LOTL_LOCATION, ListFailure, ListPointer, NationalList, TrustedList,
+    TrustedListError, TrustedLists, fetch_over_http, lotl_signers,
 };
 use refineid_doc_sign::verification::{AnchorRole, TrustAnchors};
 use refineid_doc_sign::x509::{DateTime, OwnedCert};
@@ -94,6 +95,12 @@ const LISTS_DIRECTORY: &str = "trusted-lists";
 const LIST_EXTENSION: &str = "list";
 /// File extension of a list being written.
 const TEMPORARY_EXTENSION: &str = "tmp";
+/// How many national lists are downloaded at once. One after another
+/// the thirty-odd EU lists, some 30 MB, take as long as their sum,
+/// tens of seconds; eight at a time bring that near the slowest
+/// server's time without opening a connection to every operator at
+/// once.
+const PARALLEL_FETCHES: usize = 8;
 /// The file holding when the lists were last fetched or tried.
 const ATTEMPT_FILE: &str = "attempted-at";
 /// Owner-only directory permissions.
@@ -501,13 +508,70 @@ static USER_CACHE: Mutex<()> = Mutex::new(());
 pub fn user_anchors(now: DateTime, refresh: Refresh) -> RunAnchors {
     let _one_at_a_time = USER_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     crate::doc_sign_http::install();
+    let signers = lotl_signers();
     run_anchors(
         ListCache::user().as_ref(),
         now,
         refresh,
-        &lotl_signers(),
-        fetch_over_http,
+        &signers,
+        parallel_http(&signers),
     )
+}
+
+/// [`fetch_over_http`], except that fetching the list of the lists
+/// also downloads every national list it points at, [`PARALLEL_FETCHES`]
+/// at a time, for the requests that follow to take. Only a list of the
+/// lists that verifies under `signers` is followed.
+fn parallel_http(signers: &[OwnedCert]) -> impl FnMut(&Uri) -> Option<Vec<u8>> + '_ {
+    let mut prefetched: Vec<(Uri, Option<Vec<u8>>)> = Vec::new();
+    move |location| {
+        if location.to_string() == LOTL_LOCATION {
+            let lotl = fetch_over_http(location)?;
+            prefetched = TrustedList::read(lotl.clone(), signers)
+                .map(|list| prefetch(&national_locations(&list), fetch_over_http))
+                .unwrap_or_default();
+            return Some(lotl);
+        }
+        match prefetched.iter().position(|(at, _)| at == location) {
+            Some(index) => prefetched.swap_remove(index).1,
+            None => fetch_over_http(location),
+        }
+    }
+}
+
+/// The locations of the national lists `lotl` points at, as
+/// [`TrustedLists::read`] follows them.
+fn national_locations(lotl: &TrustedList) -> Vec<Uri> {
+    lotl.pointers()
+        .iter()
+        .filter(|pointer| pointer.names_national_list())
+        .filter_map(ListPointer::location)
+        .cloned()
+        .collect()
+}
+
+/// Each of `locations` with what `get` returned for it, fetched by
+/// [`PARALLEL_FETCHES`] threads at once.
+fn prefetch(
+    locations: &[Uri],
+    get: impl Fn(&Uri) -> Option<Vec<u8>> + Sync,
+) -> Vec<(Uri, Option<Vec<u8>>)> {
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(Uri, Option<Vec<u8>>)>> = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..PARALLEL_FETCHES.min(locations.len()) {
+            scope.spawn(|| {
+                while let Some(location) = locations.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let bytes = get(location);
+                    results
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((location.clone(), bytes));
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Bring the user's lists up to date on a thread of their own when a
