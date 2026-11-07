@@ -13,15 +13,25 @@
 # Usage:
 #   script/e2e-card.sh [--pin-dir DIR] [--reader SUBSTR]
 #
-# DIR defaults to ${XDG_CONFIG_HOME:-$HOME/.config}/refineid and must hold
-# `test-pin1` and `test-pin2`, each one line, mode 0600. Prints one line
-# per step with `ok` or `FAIL` and exits non-zero on the first failure.
-# Every step that spends a PIN try runs once; the retry floor in the CLI
-# refuses the attempt if the card reports two or fewer tries left.
+# The PINs come from the holder's keyring by default: the Secret Service
+# items `refineid test-pin1` and `refineid test-pin2`, stored once by the
+# holder with
+#   secret-tool store --label 'RefineID test PIN 1' refineid test-pin1
+#   secret-tool store --label 'RefineID test PIN 2' refineid test-pin2
+# (each prompts for the digits; nothing on the command line). Over SSH the
+# script reaches the desktop session's keyring through the user's session
+# bus. With --pin-dir DIR, for hosts without a keyring, DIR must hold
+# `test-pin1` and `test-pin2`, each one line, mode 0600.
+#
+# Prints one line per step with `ok` or `FAIL` and exits non-zero on the
+# first failure. Every step that spends a PIN try runs once; the retry
+# floor in the CLI refuses the attempt if the card reports two or fewer
+# tries left. No PIN ever appears in a command line, the environment or
+# this script's output.
 
 set -eu
 
-pin_dir="${XDG_CONFIG_HOME:-$HOME/.config}/refineid"
+pin_dir=""
 reader=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -31,18 +41,32 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-pin1="$pin_dir/test-pin1"
-pin2="$pin_dir/test-pin2"
-for f in "$pin1" "$pin2"; do
-    if [ ! -f "$f" ]; then
-        echo "missing PIN file: $f (one line, mode 0600, created by the holder)" >&2
-        exit 2
+# pin_source NAME writes the PIN named NAME (test-pin1 or test-pin2) to
+# standard output, from the keyring or from the file directory.
+pin_source() {
+    if [ -n "$pin_dir" ]; then
+        f="$pin_dir/$1"
+        if [ ! -f "$f" ]; then
+            echo "missing PIN file: $f (one line, mode 0600, created by the holder)" >&2
+            return 2
+        fi
+        case "$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f")" in
+            600) ;;
+            *) echo "refusing $f: mode must be 0600" >&2; return 2 ;;
+        esac
+        cat "$f"
+        return 0
     fi
-    case "$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f")" in
-        600) ;;
-        *) echo "refusing $f: mode must be 0600" >&2; exit 2 ;;
-    esac
-done
+    if ! command -v secret-tool >/dev/null 2>&1; then
+        echo "secret-tool not found: install libsecret-tools, or use --pin-dir" >&2
+        return 2
+    fi
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ]; then
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+        export DBUS_SESSION_BUS_ADDRESS
+    fi
+    secret-tool lookup refineid "$1"
+}
 
 reader_arg=""
 if [ -n "$reader" ]; then
@@ -68,16 +92,15 @@ step() {
 step "card read" refineid card $reader_arg
 
 # 2. PIN 1: raw signature with the authentication key, verified by the CLI
-#    against the on-card certificate. The PIN file is the command's
-#    standard input; the CLI reads one line from it when stdin is not a
-#    terminal.
+#    against the on-card certificate. The PIN reaches the CLI as its
+#    standard input; the CLI reads one line when stdin is not a terminal.
 sign_auth() {
     # shellcheck disable=SC2086
-    refineid card sign-auth --in "$1" --out "$2" --save-cert "$3" $reader_arg <"$pin1"
+    pin_source test-pin1 | refineid card sign-auth --in "$1" --out "$2" --save-cert "$3" $reader_arg
 }
 sign_document() {
     # shellcheck disable=SC2086
-    refineid document sign "$1" --out "$2" $reader_arg <"$pin2"
+    pin_source test-pin2 | refineid document sign "$1" --out "$2" $reader_arg
 }
 
 printf 'refineid end-to-end %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$work/message"
