@@ -44,7 +44,7 @@ Citations are BibTeX keys in [`references.md`](references.md).
 - **Secrets at the terminal only.** A PIN is asked once the card is in
   hand, read from the terminal, never from the command line, and
   nothing is echoed while it is typed. When the paired phone signs,
-  PIN 2 is typed on the phone and never reaches this computer.
+  Signature PIN 2 is typed on the phone and never reaches this computer.
 - **Names a shell can pass back.** A signed document is
   `<stem>-signed-<UTC time>.<ext>`: the user's stem untouched, and a
   suffix that adds no spaces. The time is the signature timestamp's

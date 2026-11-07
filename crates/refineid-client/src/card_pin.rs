@@ -70,13 +70,14 @@ impl PinManageSlot {
             Self::Pin2 => PinSlot::Pin2,
         }
     }
-    /// User-facing label ("PIN1" / "PIN2") for prompts and report
-    /// strings. `&'static str` from a fixed compile-time set.
+    /// User-facing name ("Basic PIN 1" / "Signature PIN 2") for
+    /// prompts and report strings. `&'static str` from a fixed
+    /// compile-time set.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Pin1 => "PIN1",
-            Self::Pin2 => "PIN2",
+            Self::Pin1 => "Basic PIN 1",
+            Self::Pin2 => "Signature PIN 2",
         }
     }
 }
@@ -282,8 +283,8 @@ impl fmt::Display for CardPinError {
                 write!(
                     f,
                     "{} awaits activation (pin_status probe: {probe_desc}); refusing to send \
-                     a modify APDU to it. Run `refineid pin activate` first to set PIN1 and \
-                     PIN2.",
+                     a modify APDU to it. Run `refineid pin activate` first to set Basic \
+                     PIN 1 and Signature PIN 2.",
                     slot.label()
                 )
             }
@@ -1709,8 +1710,10 @@ impl fmt::Display for ActivateReport {
             ActivatePreflightOutcome::LooksActivated { pin1, pin2 } => {
                 writeln!(
                     f,
-                    "preflight: card looks ALREADY ACTIVATED (PIN1: {}, PIN2: {})",
+                    "preflight: card looks ALREADY ACTIVATED ({}: {}, {}: {})",
+                    PinManageSlot::Pin1.label(),
                     CardPinHelpers::fmt_probe(*pin1),
+                    PinManageSlot::Pin2.label(),
                     CardPinHelpers::fmt_probe(*pin2),
                 )?;
                 if self.pin1_outcome.is_none() && self.pin2_outcome.is_none() {
@@ -1723,20 +1726,22 @@ impl fmt::Display for ActivateReport {
                 }
             }
         }
+        let pin1 = PinManageSlot::Pin1.label();
+        let pin2 = PinManageSlot::Pin2.label();
         if let Some(o) = self.pin1_outcome {
-            writeln!(f, "PIN1 setup: {}", CardPinHelpers::fmt_unblock(o, "PIN1"))?;
+            writeln!(f, "{pin1} setup: {}", CardPinHelpers::fmt_unblock(o, pin1))?;
         }
         if let Some(o) = self.pin2_outcome {
-            writeln!(f, "PIN2 setup: {}", CardPinHelpers::fmt_unblock(o, "PIN2"))?;
+            writeln!(f, "{pin2} setup: {}", CardPinHelpers::fmt_unblock(o, pin2))?;
         } else if self.target != ActivationTarget::Both {
             // A one-PIN activation reports only its PIN.
         } else if matches!(self.pin1_outcome, Some(UnblockOutcome::Ok)) {
             // Shouldn't happen -- if PIN1 succeeded we always try PIN2.
-            writeln!(f, "PIN2 setup: not attempted")?;
+            writeln!(f, "{pin2} setup: not attempted")?;
         } else if self.pin1_outcome.is_some() {
             writeln!(
                 f,
-                "PIN2 setup: not attempted (PIN1 setup failed; re-run after fixing \
+                "{pin2} setup: not attempted ({pin1} setup failed; re-run after fixing \
                  the activation PIN -- each invocation consumes one card-side try)"
             )?;
         } else {

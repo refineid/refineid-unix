@@ -36,9 +36,9 @@ pub const HELP: &str = "\
 usage: refineid pin activate [1|2] [--allow-reactivate] [--reader SUBSTR]
 
 First-time DVV card activation. Prompts for the activation PIN, then
-new PIN 1 and PIN 2, or only the PIN named. Prints nothing on success,
-except a line on stderr when the other PIN is still unactivated; -v
-shows each step.
+new Basic PIN 1 and Signature PIN 2, or only the PIN named. Prints
+nothing on success, except a line on stderr when the other PIN is
+still unactivated; -v shows each step.
   --allow-reactivate  run on a card that already looks activated
   --reader S          narrow to readers whose name contains S
 The card decides the activation PIN: 8 digits (the PUK) on citizen
@@ -73,18 +73,15 @@ const fn cmd(slot: Option<PinManageSlot>) -> &'static str {
     }
 }
 
-/// The length hint of a new PIN's first prompt: the PIN's kind and the
-/// lengths the card accepts for it.
-fn digit_hint(slot: PinManageSlot, lengths: &CardPinLengths) -> String {
-    let kind = match slot {
-        PinManageSlot::Pin1 => "basic",
-        PinManageSlot::Pin2 => "signature",
-    };
-    match lengths.slot(slot.as_pin_slot().into()).accepted() {
-        Some(range) if range.min() == range.max() => format!("{kind}, {} digits", range.min()),
-        Some(range) => format!("{kind}, {}-{} digits", range.min(), range.max()),
-        None => kind.to_owned(),
-    }
+/// The length hint of a new PIN's first prompt: the lengths the card
+/// accepts for it; none when the card accepts no length.
+fn digit_hint(slot: PinManageSlot, lengths: &CardPinLengths) -> Option<String> {
+    let range = lengths.slot(slot.as_pin_slot().into()).accepted()?;
+    Some(if range.min() == range.max() {
+        format!("{} digits", range.min())
+    } else {
+        format!("{}-{} digits", range.min(), range.max())
+    })
 }
 
 /// The env var consulted for a new PIN; see [`ENV_NEW_PIN1`].
@@ -178,7 +175,7 @@ impl ActivateArgs {
                 cmd,
                 env_new_pin(slot),
                 super::util::pin_name(slot),
-                Some(&digit_hint(slot, &ctx.lengths)),
+                digit_hint(slot, &ctx.lengths).as_deref(),
             )
         };
         let result = match slot {
@@ -425,13 +422,13 @@ mod tests {
         let lengths =
             CardPinLengths::not_listed(refineid_lib_core::auth::PinReferenceScheme::Citizen.into());
         check(
-            digit_hint(PinManageSlot::Pin1, &lengths).as_str(),
-            "basic, 4-12 digits",
+            &digit_hint(PinManageSlot::Pin1, &lengths).as_deref(),
+            &Some("4-12 digits"),
             "PIN 1 hint",
         )?;
         check(
-            digit_hint(PinManageSlot::Pin2, &lengths).as_str(),
-            "signature, 6-12 digits",
+            &digit_hint(PinManageSlot::Pin2, &lengths).as_deref(),
+            &Some("6-12 digits"),
             "PIN 2 hint",
         )
     }
