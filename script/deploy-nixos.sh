@@ -32,7 +32,7 @@ cd "$(dirname "$0")/.."
 
 # The workspace version YY.M.D; the binary carries it followed by the
 # build number of the build on the target.
-EXPECTED_VERSION="$(script/version.sh)"
+EXPECTED_VERSION="$(script/version.sh --day)"
 TARGET="${1:-}"
 
 SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
