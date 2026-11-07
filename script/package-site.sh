@@ -15,7 +15,8 @@
 
 # Write the front page of the package site: the install commands for each
 # repository, taken from doc/packages.md so that there is one copy of them,
-# and the newest version each repository holds.
+# and the newest version each repository holds. An empty repository is an
+# error: the page never publishes without packages behind it.
 #
 # Usage: script/package-site.sh <site-dir>
 
@@ -31,6 +32,7 @@ DOC="$(dirname "$0")/../doc/packages.md"
 commands() {
     awk -v heading="$1" '
         $0 == heading { in_section = 1; next }
+        in_section && /^#/ { exit }
         in_section && /^```sh$/ { in_block = 1; next }
         in_block && /^```$/ { exit }
         in_block { print }
@@ -55,7 +57,7 @@ ubuntu_version() {
         v="${deb##*/refineid_}"
         versions="$versions ${v%_*.deb}"
     done
-    [ -n "$versions" ] || return 0
+    [ -n "$versions" ] || { echo "error: no refineid .deb under $SITE/ubuntu" >&2; exit 1; }
     # shellcheck disable=SC2086
     newest $versions
 }
@@ -67,7 +69,7 @@ freebsd_version() {
         v="${pkg##*/refineid-}"
         versions="$versions ${v%.pkg}"
     done
-    [ -n "$versions" ] || return 0
+    [ -n "$versions" ] || { echo "error: no refineid .pkg under $SITE/freebsd" >&2; exit 1; }
     # shellcheck disable=SC2086
     newest $versions
 }
@@ -76,8 +78,8 @@ ubuntu_commands="$(commands '### Ubuntu 26.04' | escape)"
 freebsd_commands="$(commands '### FreeBSD 15' | escape)"
 [ -n "$ubuntu_commands" ] || { echo "error: no Ubuntu commands in $DOC" >&2; exit 1; }
 [ -n "$freebsd_commands" ] || { echo "error: no FreeBSD commands in $DOC" >&2; exit 1; }
-ubuntu_newest="$(ubuntu_version)"
-freebsd_newest="$(freebsd_version)"
+ubuntu_newest="$(ubuntu_version | escape)"
+freebsd_newest="$(freebsd_version | escape)"
 
 cat > "$SITE/index.html" <<HTML
 <!DOCTYPE html>
@@ -98,11 +100,11 @@ h2 { font-size: 1.15rem; margin-top: 2rem; }
 <h1>RefineID packages</h1>
 <p>Signed package repositories for the RefineID smart card software on Ubuntu and FreeBSD. Source, issues and the full installation notes are at <a href="https://github.com/refineid/refineid-unix">github.com/refineid/refineid-unix</a>.</p>
 <h2>Ubuntu 26.04</h2>
-${ubuntu_newest:+<p>Newest version: $ubuntu_newest</p>}
+<p>Newest version: $ubuntu_newest</p>
 <pre>$ubuntu_commands</pre>
 <p>Key: <a href="ubuntu/refineid.asc">ubuntu/refineid.asc</a>.</p>
 <h2>FreeBSD 15</h2>
-${freebsd_newest:+<p>Newest version: $freebsd_newest</p>}
+<p>Newest version: $freebsd_newest</p>
 <p>As root:</p>
 <pre>$freebsd_commands</pre>
 <p>Key: <a href="freebsd/refineid.pub">freebsd/refineid.pub</a>.</p>
