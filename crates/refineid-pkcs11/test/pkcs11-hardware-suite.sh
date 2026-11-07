@@ -133,8 +133,8 @@ parse_pin_line() {
 read_pin_status() {
     local raw
     raw=$("$CLI" card --offline --no-can 2>&1)
-    CURRENT_PIN1="$(parse_pin_line "$raw" 'PIN1 (auth):')"
-    CURRENT_PIN2="$(parse_pin_line "$raw" 'PIN2 (qualified-sig):')"
+    CURRENT_PIN1="$(parse_pin_line "$raw" 'Basic PIN 1:')"
+    CURRENT_PIN2="$(parse_pin_line "$raw" 'Signature PIN 2:')"
 }
 
 # "verified" is benign: the in-session presentation flag is set and

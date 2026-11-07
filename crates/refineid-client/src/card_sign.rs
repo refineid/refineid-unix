@@ -115,13 +115,13 @@ impl SignSlot {
         }
     }
     /// Human label for the PIN slot, used in CLI prompts and
-    /// the `Display` impl. `"PIN1"` / `"PIN2"` -- matches the
-    /// labels printed on FINEID activation letters so the
-    /// cardholder sees the same wording in both places.
+    /// the `Display` impl: the full credential names every other
+    /// text of the project uses (maintainer decision, 2026-11-07,
+    /// replacing the terse `PIN1` / `PIN2`).
     const fn pin_label(self) -> &'static str {
         match self {
-            Self::Auth => "PIN1",
-            Self::Qualified => "PIN2",
+            Self::Auth => "Basic PIN 1",
+            Self::Qualified => "Signature PIN 2",
         }
     }
     /// Human label for the signing slot itself, used in the
@@ -959,7 +959,7 @@ mod tests {
             matches!(s.cert_slot(), CertSlot::Authentication),
             "auth cert slot",
         )?;
-        check(&s.pin_label(), &"PIN1", "auth pin label")?;
+        check(&s.pin_label(), &"Basic PIN 1", "auth pin label")?;
         check(&s.slot_label(), &"auth", "auth slot label")
     }
 
@@ -981,7 +981,7 @@ mod tests {
             matches!(s.cert_slot(), CertSlot::Signature),
             "qualified cert slot",
         )?;
-        check(&s.pin_label(), &"PIN2", "qualified pin label")?;
+        check(&s.pin_label(), &"Signature PIN 2", "qualified pin label")?;
         check(
             &s.slot_label(),
             &"qualified-signature",
@@ -1031,7 +1031,7 @@ mod tests {
             },
         }
         .to_string();
-        check_true(wrong.contains("PIN1"), "wrong-pin slot label")?;
+        check_true(wrong.contains("Basic PIN 1"), "wrong-pin slot label")?;
         check_true(wrong.contains("wrong PIN"), "wrong-pin reason")?;
         check_true(wrong.contains("retries left"), "wrong-pin counter")?;
 
@@ -1040,7 +1040,7 @@ mod tests {
             outcome: VerifyOutcome::Locked,
         }
         .to_string();
-        check_true(locked.contains("PIN2"), "locked slot label")?;
+        check_true(locked.contains("Signature PIN 2"), "locked slot label")?;
         check_true(locked.contains("blocked"), "locked reason")?;
 
         let other = SignErrorKind::PinRejected {
@@ -1068,7 +1068,7 @@ mod tests {
                 reason: PinPolicyReason::NonDigit,
             }
             .to_string()
-            .contains("PIN1 rejected locally"),
+            .contains("Basic PIN 1 rejected locally"),
             "pin policy",
         )?;
         check_true(
