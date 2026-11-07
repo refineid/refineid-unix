@@ -5,7 +5,8 @@
 # re-resolve the users of every registry package locked at more than one
 # version, with that package held at its locked version, until the lock
 # file stops changing. Its users move to a version the lock file already
-# holds, so no new version enters and none skips the 48-hour cooldown.
+# holds, so this step brings in no new version. The core update itself
+# takes what core's manifests ask for.
 # `cargo update --package refineid-apdu` alone re-resolves the users of a
 # duplicated package differently on each run, so the lock file flipped
 # between versions from one commit to the next.
@@ -36,7 +37,9 @@ pass=0
 while [ "$pass" -lt 3 ]; do
     pass=$((pass + 1))
     before=$(cksum < Cargo.lock)
-    duplicates | while read -r spec; do
+    # The list is read before cargo rewrites the lock file.
+    specs=$(duplicates)
+    for spec in $specs; do
         cargo update --quiet --offline --package "$spec" --precise "${spec#*@}" ||
             echo "update-core: could not settle $spec" >&2
     done
