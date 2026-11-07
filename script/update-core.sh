@@ -1,9 +1,11 @@
 #!/bin/sh
 # Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
 #
-# Moves the refineid-core git dependencies to core main, then moves every
-# registry package locked at more than one version as far up as its users
-# allow, repeating until the lock file stops changing.
+# Moves the refineid-core git dependencies to core main, then has cargo
+# re-resolve the users of every registry package locked at more than one
+# version, with that package held at its locked version, until the lock
+# file stops changing. Its users move to a version the lock file already
+# holds, so no new version enters and none skips the 48-hour cooldown.
 # `cargo update --package refineid-apdu` alone re-resolves the users of a
 # duplicated package differently on each run, so the lock file flipped
 # between versions from one commit to the next.
@@ -15,7 +17,8 @@ cd "$(git rev-parse --show-toplevel)"
 
 cargo update --quiet --package refineid-apdu
 
-# Prints name@lowest-version for each registry package locked more than once.
+# Prints name@lowest-version for each registry package locked more than
+# once.
 duplicates() {
     awk '
         /^\[\[package\]\]/ { if (name != "" && registry) print name, version; name = ""; version = ""; registry = 0 }
@@ -33,8 +36,8 @@ pass=0
 while [ "$pass" -lt 3 ]; do
     pass=$((pass + 1))
     before=$(cksum < Cargo.lock)
-    for spec in $(duplicates); do
-        cargo update --quiet --offline --package "$spec" ||
+    duplicates | while read -r spec; do
+        cargo update --quiet --offline --package "$spec" --precise "${spec#*@}" ||
             echo "update-core: could not settle $spec" >&2
     done
     [ "$(cksum < Cargo.lock)" = "$before" ] && break
