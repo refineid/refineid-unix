@@ -49,10 +49,9 @@ newest() {
 }
 
 ubuntu_version() {
-    set -- "$SITE"/ubuntu/pool/main/r/refineid/refineid_*_arm64.deb \
-           "$SITE"/ubuntu/pool/main/r/refineid/refineid_*_amd64.deb
+    # The refineid package is architecture-independent (_all.deb).
     versions=""
-    for deb; do
+    for deb in "$SITE"/ubuntu/pool/main/r/refineid/refineid_*.deb; do
         [ -f "$deb" ] || continue
         v="${deb##*/refineid_}"
         versions="$versions ${v%_*.deb}"
