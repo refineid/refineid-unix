@@ -49,7 +49,7 @@ refineid-remote = { git = "https://github.com/refineid/refineid-core.git", branc
 refineid-doc-sign = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pace = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 fltk = "1.5.23"
-gtk4 = "0.9"
+gtk4 = "0.11"
 
 # rustls backend for server-authenticated HTTPS (TSA calls, trusted
 # lists, validator APIs). `ring` rather than the default aws-lc-rs:
