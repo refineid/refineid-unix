@@ -226,13 +226,14 @@ impl CertSlot {
     /// error.
     #[must_use]
     #[inline]
-    pub const fn all() -> [Self; 5] {
+    pub const fn all() -> [Self; 6] {
         [
             Self::Authentication,
             Self::Signature,
             Self::AuthenticationAlt,
             Self::RootCa,
             Self::SignatureAlt,
+            Self::IssuingCaEcc,
         ]
     }
 }
