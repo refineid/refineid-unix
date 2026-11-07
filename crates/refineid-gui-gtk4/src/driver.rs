@@ -773,31 +773,22 @@ impl Ui {
 
     /// Opens the file dialog; the chosen files join the pile.
     fn choose_documents(&self) {
-        let chooser = gtk4::FileChooserNative::new(
-            None,
-            Some(&self.window),
-            gtk4::FileChooserAction::Open,
-            None,
-            None,
-        );
-        chooser.set_select_multiple(true);
         let controller = Arc::clone(&self.controller);
-        chooser.connect_response(move |dialog, response| {
-            if response != gtk4::ResponseType::Accept {
-                return;
-            }
-            let files = dialog.files();
-            let paths: Vec<PathBuf> = (0..files.n_items())
-                .filter_map(|index| files.item(index))
-                .filter_map(|item| item.downcast::<gio::File>().ok())
-                .filter_map(|file| file.path())
-                .collect();
-            if !paths.is_empty() {
-                controller.handle_intent(UserIntent::AddDocuments(paths));
-            }
-        });
-        keep_until_response(&chooser);
-        chooser.show();
+        gtk4::FileDialog::new().open_multiple(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            move |chosen| {
+                let Ok(files) = chosen else { return };
+                let paths: Vec<PathBuf> = (0..files.n_items())
+                    .filter_map(|index| files.item(index))
+                    .filter_map(|item| item.downcast::<gio::File>().ok())
+                    .filter_map(|file| file.path())
+                    .collect();
+                if !paths.is_empty() {
+                    controller.handle_intent(UserIntent::AddDocuments(paths));
+                }
+            },
+        );
     }
 
     fn sign(&self) {
@@ -1324,16 +1315,6 @@ fn build_pin_codes(parent: &gtk4::Window) -> PinCodesWidgets {
         task: Cell::new(PinTask::ChangePin1),
         limits,
     }
-}
-
-/// Holds `chooser` until it answers. GTK keeps no reference to a native
-/// dialog of its own; the last reference dropping destroys it, and
-/// without a desktop portal it is gone before it is shown.
-fn keep_until_response(chooser: &gtk4::FileChooserNative) {
-    let held = Rc::new(RefCell::new(Some(chooser.clone())));
-    chooser.connect_response(move |_, _| {
-        let _released = held.borrow_mut().take();
-    });
 }
 
 #[cfg(test)]

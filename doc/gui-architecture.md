@@ -4,7 +4,7 @@
 - **Protocol Wire Version**: `26.11.2`
 - **Status**: Implemented (Tier 1: GTK 4; Tier 2: FLTK)
 - **Date**: 2026-09-28
-- **Implemented**: the GTK 4 driver (`refineid-gui-gtk4`, GTK 4.6 or later) is the Tier 1 backend and the FLTK driver (`refineid-gui-fltk`) the Tier 2 backend; both lay out the one window of section 4.4.
+- **Implemented**: the GTK 4 driver (`refineid-gui-gtk4`, GTK 4.10 or later) is the Tier 1 backend and the FLTK driver (`refineid-gui-fltk`) the Tier 2 backend; both lay out the one window of section 4.4.
 - **Applies To**: `RefineID-Unix` (Linux, NetBSD, FreeBSD, OpenBSD)
 
 ---

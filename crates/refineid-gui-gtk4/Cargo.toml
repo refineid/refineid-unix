@@ -17,4 +17,4 @@ refineid-lib-core.workspace = true
 refineid-rapp-core.workspace = true
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-gtk4 = { workspace = true, features = ["v4_6"] }
+gtk4 = { workspace = true, features = ["v4_10"] }
