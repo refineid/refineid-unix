@@ -155,8 +155,8 @@ _refineid_pin() {
     local -a verbs
     verbs=(
       'activate:activate a new card'\''s PINs'
-      'change:change PIN 1 or PIN 2'
-      'unblock:unblock PIN 1 or PIN 2 with the PUK'
+      'change:change Basic PIN 1 or Signature PIN 2'
+      'unblock:unblock Basic PIN 1 or Signature PIN 2 with the PUK'
       'help:show the pin commands'
     )
     _describe -t verbs 'pin command' verbs

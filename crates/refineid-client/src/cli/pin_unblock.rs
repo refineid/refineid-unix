@@ -22,7 +22,7 @@ use crate::card_pin::PinManageSlot;
 pub const HELP: &str = "\
 usage: refineid pin unblock 1|2 [--reader SUBSTR]
 
-Unblock PIN 1 or PIN 2 with the PUK and set a new PIN.
+Unblock Basic PIN 1 or Signature PIN 2 with the PUK and set a new PIN.
 Prints nothing on success; -v shows each step.
   --reader S  narrow to readers whose name contains S
 DANGER: a wrong PUK decrements the PUK counter; exhausting it

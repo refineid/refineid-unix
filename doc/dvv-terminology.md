@@ -18,7 +18,12 @@ PIN.
 | `ActivationCode`        | activation PIN       | aktivointitunnusluku    | aktiveringskod  | 8 digits (§4.6.1) / 7 digits (§4.6.2) | DVV (in the activation letter) |
 | `Puk`                   | PUK code             | PUK-tunnusluku          | PUK-kod         | 8-12 digits    | DVV      |
 
-UI text writes "PIN 1" and "PIN 2" with a space.
+Text a person reads names each PIN in full, with its number: "Basic
+PIN 1" and "Signature PIN 2", never a bare "PIN 1" or "PIN 2"
+(maintainer decision, 2026-11-07). "PUK" stays "PUK", and "PIN" alone
+may stay where it is generic. Code identifiers, log and trace
+messages, test fixture names, option names and anything a program
+parses keep their forms.
 
 The activation credential takes DVV's official name from the
 activation letters, under both activation schemes: "Activation

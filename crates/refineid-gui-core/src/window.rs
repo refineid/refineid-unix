@@ -187,7 +187,7 @@ pub const SEPARATELY: &str = "Separately (PDF)";
 /// One container over every document.
 pub const AS_A_PACKAGE: &str = "As a package";
 /// The PIN 2 field of the signing controls.
-pub const PIN_2: &str = "PIN 2";
+pub const PIN_2: &str = "Signature PIN 2";
 /// Signs the pile.
 pub const SIGN: &str = "Sign\u{2026}";
 /// The accessible name of the progress shown while signing.
@@ -209,13 +209,13 @@ pub const fn activation_heading(state: &UiState) -> &'static str {
 /// The activation form's first field.
 pub const ACTIVATION_PIN: &str = "Activation PIN";
 /// The activation form's new PIN 1.
-pub const NEW_PIN_1: &str = "New PIN 1";
+pub const NEW_PIN_1: &str = "New Basic PIN 1";
 /// The activation form's repeated PIN 1.
-pub const NEW_PIN_1_AGAIN: &str = "New PIN 1 again";
+pub const NEW_PIN_1_AGAIN: &str = "New Basic PIN 1 again";
 /// The activation form's new PIN 2.
-pub const NEW_PIN_2: &str = "New PIN 2";
+pub const NEW_PIN_2: &str = "New Signature PIN 2";
 /// The activation form's repeated PIN 2.
-pub const NEW_PIN_2_AGAIN: &str = "New PIN 2 again";
+pub const NEW_PIN_2_AGAIN: &str = "New Signature PIN 2 again";
 /// Activates the card.
 pub const ACTIVATE_CARD: &str = "Activate Card";
 /// The label before the attempts row of the PIN codes window.
@@ -466,12 +466,12 @@ impl Recovery {
     pub fn sentences(self) -> [&'static str; 2] {
         match self {
             Self::ResetPin1 => [
-                "RefineID does not use PIN 1 with fewer than 3 attempts left.",
-                "Reset PIN 1 with the PUK, or use other software.",
+                "RefineID does not use Basic PIN 1 with fewer than 3 attempts left.",
+                "Reset Basic PIN 1 with the PUK, or use other software.",
             ],
             Self::ResetPin2 => [
-                "RefineID does not use PIN 2 with fewer than 3 attempts left.",
-                "Reset PIN 2 with the PUK, or use other software.",
+                "RefineID does not use Signature PIN 2 with fewer than 3 attempts left.",
+                "Reset Signature PIN 2 with the PUK, or use other software.",
             ],
             Self::UseOtherSoftware => [
                 "Use other software to recover the card",
@@ -532,10 +532,10 @@ impl PinTask {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::ChangePin1 => "Change PIN 1",
-            Self::ChangePin2 => "Change PIN 2",
-            Self::ResetPin1 => "Reset PIN 1",
-            Self::ResetPin2 => "Reset PIN 2",
+            Self::ChangePin1 => "Change Basic PIN 1",
+            Self::ChangePin2 => "Change Signature PIN 2",
+            Self::ResetPin1 => "Reset Basic PIN 1",
+            Self::ResetPin2 => "Reset Signature PIN 2",
         }
     }
 
@@ -643,7 +643,7 @@ impl PinTask {
 /// One entry of the attempts row: a counter below full.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttemptsEntry {
-    /// "PIN 1", "PIN 2" or "PUK", then the count or the state.
+    /// "Basic PIN 1", "Signature PIN 2" or "PUK", then the count or the state.
     pub text: String,
     /// Whether the counter is below the retry floor or blocked: drawn in
     /// red beside a mark.
@@ -687,8 +687,8 @@ pub fn attempts_below_full(state: &UiState) -> Vec<AttemptsEntry> {
         return Vec::new();
     }
     [
-        pin("PIN 1", PinSlot::Pin1, state.pin1_status),
-        pin("PIN 2", PinSlot::Pin2, state.pin2_status),
+        pin("Basic PIN 1", PinSlot::Pin1, state.pin1_status),
+        pin("Signature PIN 2", PinSlot::Pin2, state.pin2_status),
         puk(state.puk_status),
     ]
     .into_iter()
@@ -877,7 +877,7 @@ mod tests {
         assert_eq!(
             attempts_below_full(&state),
             vec![AttemptsEntry {
-                text: "PIN 2 4/5".to_owned(),
+                text: "Signature PIN 2 4/5".to_owned(),
                 below_floor: false
             }]
         );
@@ -908,8 +908,8 @@ mod tests {
         assert_eq!(
             Recovery::ResetPin1.sentences(),
             [
-                "RefineID does not use PIN 1 with fewer than 3 attempts left.",
-                "Reset PIN 1 with the PUK, or use other software."
+                "RefineID does not use Basic PIN 1 with fewer than 3 attempts left.",
+                "Reset Basic PIN 1 with the PUK, or use other software."
             ]
         );
         assert_eq!(
@@ -920,13 +920,13 @@ mod tests {
         assert_eq!(
             attempts_below_full(&state),
             vec![AttemptsEntry {
-                text: "PIN 1 2/5".to_owned(),
+                text: "Basic PIN 1 2/5".to_owned(),
                 below_floor: true
             }]
         );
 
         state.pin1_status = Some(PinStatus::Locked);
-        assert_eq!(attempts_below_full(&state)[0].text, "PIN 1 blocked");
+        assert_eq!(attempts_below_full(&state)[0].text, "Basic PIN 1 blocked");
         state.puk_status = Some(PukStatus::Remaining(retries(2)));
         assert_eq!(Recovery::derive(&state), Some(Recovery::UseOtherSoftware));
         assert!(Recovery::tasks(Recovery::derive(&state)).is_empty());

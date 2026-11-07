@@ -171,8 +171,8 @@ Read the card through the paired phone only.
 .Op Fl -reader Ar substr
 .Xc
 First-time DVV card activation.
-Prompts for the activation PIN, then the new PIN 1 and PIN 2, PIN 1
-set first; with
+Prompts for the activation PIN, then the new Basic PIN 1 and
+Signature PIN 2, Basic PIN 1 set first; with
 .Cm 1
 or
 .Cm 2 ,
@@ -196,15 +196,15 @@ Run on a card whose PIN already looks activated.
 .Cm 1 | 2
 .Op Fl -reader Ar substr
 .Xc
-Rotate PIN 1, the authentication PIN, or PIN 2, the qualified-signature
-PIN.
+Rotate Basic PIN 1, the authentication PIN, or Signature PIN 2, the
+qualified-signature PIN.
 Prompts for the current PIN, then the new PIN twice.
 .It Xo
 .Cm pin unblock
 .Cm 1 | 2
 .Op Fl -reader Ar substr
 .Xc
-Unblock PIN 1 or PIN 2 with the PUK and set a new PIN.
+Unblock Basic PIN 1 or Signature PIN 2 with the PUK and set a new PIN.
 A wrong PUK decrements the PUK counter; exhausting it permanently
 bricks the card.
 .It Xo

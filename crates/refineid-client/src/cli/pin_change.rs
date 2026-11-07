@@ -22,8 +22,8 @@ use crate::card_pin::PinManageSlot;
 pub const HELP: &str = "\
 usage: refineid pin change 1|2 [--reader SUBSTR]
 
-Rotate PIN 1 (authentication) or PIN 2 (qualified signature). Prompts
-for the current PIN, then the new PIN twice.
+Rotate Basic PIN 1 (authentication) or Signature PIN 2 (qualified
+signature). Prompts for the current PIN, then the new PIN twice.
 Prints nothing on success; -v shows each step.
   --reader S    narrow to readers whose name contains S
 ";

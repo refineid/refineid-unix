@@ -32,10 +32,10 @@ use crate::card_sign::SignSlot;
 use crate::exit_status::ExitStatus;
 use crate::pin_source::{PinEntryError, PinSource};
 
-/// Prompt for PIN 1.
-pub(super) const PROMPT_PIN1: &str = "PIN 1: ";
-/// Prompt for PIN 2.
-pub(super) const PROMPT_PIN2: &str = "PIN 2: ";
+/// Prompt for Basic PIN 1.
+pub(super) const PROMPT_PIN1: &str = "Basic PIN 1: ";
+/// Prompt for Signature PIN 2.
+pub(super) const PROMPT_PIN2: &str = "Signature PIN 2: ";
 /// Prompt for the PUK.
 pub(super) const PROMPT_PUK: &str = "PUK: ";
 /// Prompt for the activation PIN of a new card.
@@ -49,11 +49,12 @@ pub(super) const fn sign_pin_prompt(slot: SignSlot) -> &'static str {
     }
 }
 
-/// The name prompts give the PIN in `slot`: `PIN 1` or `PIN 2`.
+/// The name prompts give the PIN in `slot`: its full DVV name,
+/// `Basic PIN 1` or `Signature PIN 2`.
 pub(super) const fn pin_name(slot: PinManageSlot) -> &'static str {
     match slot {
-        PinManageSlot::Pin1 => "PIN 1",
-        PinManageSlot::Pin2 => "PIN 2",
+        PinManageSlot::Pin1 => "Basic PIN 1",
+        PinManageSlot::Pin2 => "Signature PIN 2",
     }
 }
 
@@ -324,11 +325,11 @@ pub(super) fn pin_source_at_use(
 /// - stdin / prompt error -> `RuntimeFailure`
 /// - new/confirm mismatch -> `BadInvocation`
 ///
-/// `label` is the PIN name (`"PIN 1"`, `"PIN 2"`), shown in
-/// both the first and the confirm prompt and in the mismatch
-/// error. `digit_hint`, when `Some`, is appended in parens to
-/// the first prompt only -- `Some("4-12 digits")` gives `"new
-/// PIN 1 (4-12 digits): "` then `"new PIN 1 (confirm): "`. Pass
+/// `label` is the PIN name (`"Basic PIN 1"`, `"Signature PIN 2"`),
+/// shown in both the first and the confirm prompt and in the
+/// mismatch error. `digit_hint`, when `Some`, is appended in parens
+/// to the first prompt only -- `Some("4-12 digits")` gives `"new
+/// Basic PIN 1 (4-12 digits): "` then `"new Basic PIN 1 (confirm): "`. Pass
 /// `None` for `pin change` / `pin unblock` where no length hint is
 /// shown.
 ///
@@ -406,15 +407,23 @@ mod tests {
     }
 
     #[test]
-    fn prompts_name_the_pin_with_a_space() -> TestResult {
-        check(sign_pin_prompt(SignSlot::Auth), "PIN 1: ", "auth prompt")?;
+    fn prompts_name_the_pin_in_full() -> TestResult {
+        check(
+            sign_pin_prompt(SignSlot::Auth),
+            "Basic PIN 1: ",
+            "auth prompt",
+        )?;
         check(
             sign_pin_prompt(SignSlot::Qualified),
-            "PIN 2: ",
+            "Signature PIN 2: ",
             "qualified prompt",
         )?;
-        check(pin_name(PinManageSlot::Pin1), "PIN 1", "PIN 1 name")?;
-        check(pin_name(PinManageSlot::Pin2), "PIN 2", "PIN 2 name")?;
+        check(pin_name(PinManageSlot::Pin1), "Basic PIN 1", "PIN 1 name")?;
+        check(
+            pin_name(PinManageSlot::Pin2),
+            "Signature PIN 2",
+            "PIN 2 name",
+        )?;
         check(PROMPT_PUK, "PUK: ", "PUK prompt")?;
         check(
             PROMPT_ACTIVATION_PIN,

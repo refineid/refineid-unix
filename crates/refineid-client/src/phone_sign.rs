@@ -405,7 +405,9 @@ const fn refusal_text(refusal: PhoneRefusal) -> &'static str {
         PhoneRefusal::Declined => "the signature request was declined on the paired phone",
         PhoneRefusal::Expired => "the request was not approved on the phone in time",
         PhoneRefusal::CardUnavailable => "the card's answer was lost; nothing was written",
-        PhoneRefusal::RetryFloor => "RefineID does not use either of the last two PIN 2 attempts",
+        PhoneRefusal::RetryFloor => {
+            "RefineID does not use either of the last two Signature PIN 2 attempts"
+        }
         PhoneRefusal::NotGranted | PhoneRefusal::Unsupported => {
             "the phone cannot make this kind of signature"
         }

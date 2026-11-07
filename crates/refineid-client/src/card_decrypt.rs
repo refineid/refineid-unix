@@ -148,13 +148,16 @@ impl fmt::Display for DecryptAuthError {
                 "ciphertext is {n} bytes; RSA-3072 decrypt expects exactly {RSA_3072_SIG_BYTES}"
             ),
             Self::PinRejected(VerifyOutcome::WrongPin { retries_left }) => {
-                write!(f, "PIN1 rejected (wrong PIN, {retries_left} retries left)")
+                write!(
+                    f,
+                    "Basic PIN 1 rejected (wrong PIN, {retries_left} retries left)"
+                )
             }
             Self::PinRejected(VerifyOutcome::Locked) => {
-                write!(f, "PIN1 is blocked -- card needs a PUK unblock")
+                write!(f, "Basic PIN 1 is blocked -- card needs a PUK unblock")
             }
             Self::PinRejected(VerifyOutcome::Other(sw)) => {
-                write!(f, "PIN1 verify: unexpected SW={sw:#06X}")
+                write!(f, "Basic PIN 1 verify: unexpected SW={sw:#06X}")
             }
             Self::PinRejected(VerifyOutcome::Ok) => {
                 write!(f, "internal: PinRejected(Ok) is not an error state")
@@ -162,7 +165,7 @@ impl fmt::Display for DecryptAuthError {
             Self::RetryFloor(refusal) => write!(f, "{refusal}"),
             Self::PinEntry(e) => write!(f, "{e}"),
             Self::CardChanged => f.write_str(crate::card_sign::CARD_CHANGED_DURING_PROMPT),
-            Self::PinPolicy(r) => write!(f, "PIN1 rejected locally: {r}"),
+            Self::PinPolicy(r) => write!(f, "Basic PIN 1 rejected locally: {r}"),
             Self::Pkcs15Select(s) => write!(f, "SELECT PKCS#15 app: {s}"),
             Self::DecryptSw { stage, sw } => {
                 write!(f, "decrypt failed at {stage}: SW={sw:#06X}")
@@ -333,13 +336,13 @@ mod tests {
                 retries_left: pin_retries(3)?,
             })
             .to_string()
-            .contains("PIN1 rejected (wrong PIN"),
+            .contains("Basic PIN 1 rejected (wrong PIN"),
             "wrong pin",
         )?;
         check_true(
             DecryptAuthError::PinRejected(VerifyOutcome::Locked)
                 .to_string()
-                .contains("PIN1 is blocked"),
+                .contains("Basic PIN 1 is blocked"),
             "locked",
         )?;
         check_true(
@@ -373,7 +376,7 @@ mod tests {
         check_true(
             DecryptAuthError::PinPolicy(PinPolicyReason::NonDigit)
                 .to_string()
-                .contains("PIN1 rejected locally"),
+                .contains("Basic PIN 1 rejected locally"),
             "pin policy",
         )?;
         check_true(

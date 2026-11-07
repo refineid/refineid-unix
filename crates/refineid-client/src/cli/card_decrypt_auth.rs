@@ -91,7 +91,7 @@ impl DecryptAuthArgs {
                         refineid_lib_core::auth::VerifyOutcome::Locked
                     )
                 ) {
-                    eprintln!("  -> use the PUK to unblock PIN1 before retrying");
+                    eprintln!("  -> use the PUK to unblock Basic PIN 1 before retrying");
                 }
                 crate::exit_status::ExitStatus::CardCredentialRejected.into()
             }
