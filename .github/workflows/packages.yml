@@ -233,8 +233,9 @@ jobs:
   deploy:
     name: Publish to GitHub Pages
     # The default condition fails when a job earlier in the chain was
-    # skipped, as the release job is on a manual run.
-    if: ${{ !cancelled() && !failure() }}
+    # skipped, as the release job is on a manual run; this one asks for
+    # the artifact's job alone.
+    if: ${{ !cancelled() && needs.repository.result == 'success' }}
     needs: repository
     runs-on: ubuntu-24.04
     concurrency:
