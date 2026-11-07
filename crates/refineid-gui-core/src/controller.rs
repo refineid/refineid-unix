@@ -34,6 +34,7 @@ use refineid_lib_core::identity::{CredentialIdentity, TokenSerial, render_token_
 use refineid_lib_core::pin::{
     ActivationCode, ActivationPinEight, ActivationPinSeven, PinBytes, Puk,
 };
+use refineid_rapp::RequesterSessionEnd;
 use refineid_rapp_core::engine::{OperationOutcome, PairingSearchError};
 use refineid_rapp_core::ids::PairId;
 
@@ -91,6 +92,21 @@ const CARD_SETTLE_RETRIES: u32 = 5;
 /// The wait before each repeated inspection, doubling every time.
 const CARD_SETTLE_FIRST_RETRY: Duration = Duration::from_millis(400);
 
+/// How long the paired phone's certificate stays in memory after the
+/// last look that saw the phone (RAPP v26.11.2 section 8.4 item 3).
+const PHONE_CERTIFICATE_GRACE: Duration =
+    Duration::from_millis(refineid_rapp::IDENTITY_OFFER_GRACE_MS);
+
+/// The paired phone's authentication certificate, read through the phone
+/// and held in memory only while the phone is in sight (refineid-core
+/// `doc/security/certificate-custody.md`): nothing stores it.
+struct HeldCertificate {
+    pair_id: PairId,
+    der: Vec<u8>,
+    /// When a look last saw the phone, or the certificate was read.
+    sighted: Instant,
+}
+
 /// Controller managing card state, background presence monitoring, and operations.
 pub struct RefineIdController {
     state: Mutex<UiState>,
@@ -104,6 +120,8 @@ pub struct RefineIdController {
     /// Where the remote-use switch's position is stored; `None` when no
     /// per-user directory resolves, and the switch then lasts the run.
     switch_directory: Option<PathBuf>,
+    /// The paired phone's certificate, while the phone is in sight.
+    phone_certificate: Mutex<Option<HeldCertificate>>,
     on_state_change: Box<dyn Fn(&UiState) + Send + Sync + 'static>,
 }
 
@@ -140,8 +158,57 @@ impl RefineIdController {
             presence_stop: AtomicBool::new(false),
             inspection_in_flight: AtomicBool::new(false),
             switch_directory,
+            phone_certificate: Mutex::new(None),
             on_state_change: Box::new(on_state_change),
         })
+    }
+
+    /// Holds `der`, the certificate just read through the phone of
+    /// `pair_id`, in memory.
+    fn hold_phone_certificate(&self, pair_id: PairId, der: Vec<u8>) {
+        *self.phone_certificate.lock().expect("mutex lock") = Some(HeldCertificate {
+            pair_id,
+            der,
+            sighted: Instant::now(),
+        });
+    }
+
+    /// A look saw the phone of `pair_id`: its certificate stays.
+    fn phone_sighted(&self, pair_id: PairId) {
+        if let Some(held) = self
+            .phone_certificate
+            .lock()
+            .expect("mutex lock")
+            .as_mut()
+            .filter(|held| held.pair_id == pair_id)
+        {
+            held.sighted = Instant::now();
+        }
+    }
+
+    /// The phone went, withdrew or was forgotten: its certificate goes.
+    fn drop_phone_certificate(&self) {
+        *self.phone_certificate.lock().expect("mutex lock") = None;
+    }
+
+    /// The certificate held for the phone of `pair_id`, unless no look has
+    /// seen the phone for [`PHONE_CERTIFICATE_GRACE`], which drops it.
+    fn held_phone_certificate(&self, pair_id: PairId) -> Option<Vec<u8>> {
+        let mut held = self.phone_certificate.lock().expect("mutex lock");
+        if held.as_ref().is_some_and(|held| {
+            held.pair_id != pair_id || held.sighted.elapsed() >= PHONE_CERTIFICATE_GRACE
+        }) {
+            *held = None;
+        }
+        held.as_ref().map(|held| held.der.clone())
+    }
+
+    /// The phone's line in the card list: its name and the certificate
+    /// held for it, while a phone is paired and its certificate held.
+    fn phone_card_source(&self) -> Option<(String, Vec<u8>)> {
+        let phone = self.state().phone?;
+        let der = self.held_phone_certificate(phone.pair_id)?;
+        Some((phone.name, der))
     }
 
     /// Read the current UI state snapshot.
@@ -182,10 +249,12 @@ impl RefineIdController {
 
     /// Keeps the paired phone's line true while the GUI holds no session:
     /// while remote use is on, at each round it looks for the paired
-    /// phone's record, reads the authentication certificate when none is
-    /// cached yet and the phone appears (RAPP v26.11.2 section 8.3), and
-    /// re-reads the pairing record, which another program on this computer
-    /// may have rewritten. Nothing is dialed on a timer.
+    /// phone's record, reads the authentication certificate into memory
+    /// when none is held and the phone appears (RAPP v26.11.2 section
+    /// 8.3), keeps it while looks see the phone and drops it
+    /// [`PHONE_CERTIFICATE_GRACE`] after the last, and re-reads the pairing
+    /// record, which another program on this computer may have rewritten.
+    /// Nothing is dialed on a timer.
     ///
     /// When a physical card reader with an inserted card is connected, the local
     /// card reader overrides RAPP completely, and phone polling is suppressed.
@@ -205,27 +274,44 @@ impl RefineIdController {
                     .state()
                     .phone
                     .as_ref()
-                    .map(|phone| (phone.pair_id, phone.name.clone(), phone.certificate_cached));
-                if let (Ok(mut reader), Some((pair_id, name, certificate_cached))) =
-                    (RemoteReader::open_local(), phone)
+                    .map(|phone| (phone.pair_id, phone.name.clone()));
+                if let (Ok(mut reader), Some((pair_id, name))) = (RemoteReader::open_local(), phone)
                 {
                     let appeared = match reader.look(pair_id) {
-                        Ok(instances) => view.looked(instances),
+                        Ok(instances) => {
+                            if !instances.is_empty() {
+                                self.phone_sighted(pair_id);
+                            }
+                            view.looked(instances)
+                        }
                         Err(RemoteError::Withdrawn) => {
                             view.withdrawal_seen();
+                            self.drop_phone_certificate();
                             false
                         }
                         Err(_) => false,
                     };
                     let redial = view.redial_due(Instant::now());
-                    if (appeared || redial) && !certificate_cached {
+                    if (appeared || redial) && self.held_phone_certificate(pair_id).is_none() {
                         match reader.refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT) {
                             // The read's session is closed: the next read
                             // follows the next appearance.
-                            Ok(_) => view.closed_here(),
+                            Ok(der) => {
+                                self.hold_phone_certificate(pair_id, der);
+                                view.closed_here();
+                            }
                             Err(error) => {
                                 match (error.session_end(), &error) {
-                                    (Some(end), _) => view.session_ended(end, Instant::now()),
+                                    (Some(end), _) => {
+                                        if matches!(
+                                            end,
+                                            RequesterSessionEnd::Revoked
+                                                | RequesterSessionEnd::Withdrawn
+                                        ) {
+                                            self.drop_phone_certificate();
+                                        }
+                                        view.session_ended(end, Instant::now());
+                                    }
                                     // The phone answered and holds no card:
                                     // its next appearance is read again.
                                     (None, RemoteError::CardAbsent(_)) => view.closed_here(),
@@ -285,6 +371,9 @@ impl RefineIdController {
             .ok()
             .and_then(|reader| reader.phone())
             .and_then(|summary| PairedPhone::from_summary(&summary));
+        if phone.is_none() {
+            self.drop_phone_certificate();
+        }
         self.update_state(|state| {
             if phone.is_some() {
                 state.phone_that_forgot = None;
@@ -342,6 +431,7 @@ impl RefineIdController {
         else {
             return;
         };
+        self.drop_phone_certificate();
         self.update_state(|state| {
             state.phone = None;
             state.phone_reader_empty = false;
@@ -506,13 +596,15 @@ impl RefineIdController {
     /// while no reader holds a card.
     fn apply_inspection(&self, signature: &[(String, bool)], inspection: Inspection) {
         let reader = ReaderPresence::from_signature(signature);
-        let include_phones = reader != ReaderPresence::Card && self.has_usable_phone();
+        let phone = (reader != ReaderPresence::Card)
+            .then(|| self.phone_card_source())
+            .flatten();
         let (reports, can_request, failure) = match inspection {
             Inspection::Cards(reports) => (reports, None, None),
             Inspection::Can(request) => (Vec::new(), Some(request), None),
             Inspection::Failed(error) => (Vec::new(), None, Some(error)),
         };
-        let cards = deduplicate_cards(reports, include_phones);
+        let cards = deduplicate_cards(reports, phone);
         let card_read = cards.iter().any(|card| card.source == CardSource::Local);
         self.update_state(|state| {
             state.reader = reader;
@@ -1080,6 +1172,9 @@ impl RefineIdController {
 
             let phone = pair.peer_display_name.clone();
             let read = reader.refresh_auth_cert(pair.pair_id, PAIRING_DISCOVERY_TIMEOUT);
+            if let Ok(der) = &read {
+                controller.hold_phone_certificate(pair.pair_id, der.clone());
+            }
 
             controller.update_state(|s| {
                 s.pairing = None;
@@ -1233,7 +1328,10 @@ fn card_key(card: &CardCheckReport) -> String {
     )
 }
 
-fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec<ManagedCard> {
+fn deduplicate_cards(
+    reports: Vec<CardCheckReport>,
+    phone: Option<(String, Vec<u8>)>,
+) -> Vec<ManagedCard> {
     let mut cards = Vec::new();
     for report in reports {
         if !cards
@@ -1251,14 +1349,12 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
         }
     }
 
-    // Include paired phones only when no local physical card is present.
-    // An attached card reader with an inserted card overrides RAPP.
-    if include_phones
-        && cards.is_empty()
-        && let Ok(reader) = RemoteReader::open_local()
-        && let Some(pair) = reader.phone()
-        && let Some(cached_der) = pair.auth_cert
-        && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(cached_der)
+    // The paired phone's card, from the certificate held for it, only
+    // when no local physical card is present. An attached card reader
+    // with an inserted card overrides RAPP.
+    if cards.is_empty()
+        && let Some((phone_name, der)) = phone
+        && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(der)
     {
         let view = owned_cert.view();
         let serial = TokenSerial::new(owned_cert.serial().to_string());
@@ -1272,14 +1368,14 @@ fn deduplicate_cards(reports: Vec<CardCheckReport>, include_phones: bool) -> Vec
         if let Some(organization) = view.subject.organization_name() {
             identity = identity.with_organization(organization);
         }
-        cards.push(phone_card(&pair.peer_display_name, serial, identity));
+        cards.push(phone_card(&phone_name, serial, identity));
     }
 
     cards
 }
 
-/// The card a paired phone serves, as the pairing record describes it:
-/// the holder from the cached authentication certificate and nothing
+/// The card a paired phone serves: the holder from the authentication
+/// certificate read through the phone and held in memory, and nothing
 /// from the card itself. No PIN was probed, so every PIN field is
 /// `None`.
 fn phone_card(dev_name: &str, serial: TokenSerial, identity: CredentialIdentity) -> ManagedCard {
@@ -1484,14 +1580,19 @@ mod tests {
             emrtd_error: None,
         };
 
-        // When a physical card is present, phone is never added even if include_phones is true
-        let cards = deduplicate_cards(vec![physical_report], true);
+        // When a physical card is present, the phone is never added, even
+        // with its certificate held.
+        let held = Some((
+            "custodian-1".to_owned(),
+            b"synthetic authentication certificate".to_vec(),
+        ));
+        let cards = deduplicate_cards(vec![physical_report], held);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].source, CardSource::Local);
         assert_eq!(cards[0].report.reader, "Synthetic Card Reader");
 
-        // When no physical card is present and include_phones is false, cards is empty
-        let empty_cards = deduplicate_cards(Vec::new(), false);
+        // With no physical card and no certificate held, the list is empty.
+        let empty_cards = deduplicate_cards(Vec::new(), None);
         assert!(empty_cards.is_empty());
     }
 
@@ -1590,7 +1691,6 @@ mod tests {
                     pair_id: PairId::from_array(*b"synthetic-pair-1"),
                     name: "custodian-1".to_owned(),
                     platform: "Synthetic".to_owned(),
-                    certificate_cached: false,
                     signs_documents,
                 });
             });

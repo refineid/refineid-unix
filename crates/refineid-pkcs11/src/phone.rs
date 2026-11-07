@@ -20,14 +20,17 @@
 //! when the phone appears, when the browser asks with no session open,
 //! and within the redial window after a loss), and keeps the session open,
 //! answering the phone's pings and reading its card reports (section 8.4). The slot's token is
-//! the authentication certificate the record caches, confirmed against
-//! the fingerprint the phone reports for its card and read from the card
-//! afresh when the record lacks it or the phone serves another card. The
-//! token stands before and between sessions, and goes when for
-//! [`IDENTITY_OFFER_GRACE_MS`] no session has reported the card present,
-//! at once when the pairing goes or a session reports another card
-//! (section 8.4 item 3). A signature asked for by the browser is handed to
-//! that thread and answered on the same session, dialing for one when
+//! the authentication certificate read from the phone's card on a session
+//! and held in memory only: the pairing record keeps none (refineid-core
+//! `doc/security/certificate-custody.md`). Until a session confirms the
+//! card the slot has no token. The token then stands while sessions follow,
+//! and goes when for [`IDENTITY_OFFER_GRACE_MS`] no session has reported
+//! the card present, at once when the pairing goes or a session reports
+//! another card (section 8.4 item 3); a session then reads the card again.
+//! A browser that lists the slots while no token stands wakes the dial and
+//! waits up to `BROWSER_WAKE_WAIT` for the token, so its first login
+//! finds the certificate. A signature asked for by the browser is handed
+//! to that thread and answered on the same session, dialing for one when
 //! none is open; that is the one thing the phone does. A phone that
 //! withdrew, or closed with `card_unavailable`, takes the token at once
 //! and is not dialed until it announces itself again (section 4.5 item 6);
@@ -36,11 +39,7 @@
 //! that session (section 4.6 item 1); the program that forgot it makes the
 //! attempt otherwise. The thread sweeps the pairings for idle expiry when
 //! it starts and daily (section 4.6 item 5); a pairing that expires takes
-//! its slot with it, silently. The record's certificate leaves it after
-//! [`refineid_rapp_core::store::CERTIFICATE_RETENTION_DAYS`] without a
-//! session, whichever program looks first; this thread looks every round,
-//! and a pairing without one is offered as a slot with no token until a
-//! session reads the card.
+//! its slot with it, silently.
 //!
 //! The host finalizes the module when its user quits it or unloads the
 //! module, and that is this computer's withdrawal (section 4.5 item 8):
@@ -110,6 +109,17 @@ const IDENTITY_OFFER_GRACE: Duration = Duration::from_millis(IDENTITY_OFFER_GRAC
 /// so a host that lists the slots once at load sees the phone's slot.
 const FIRST_WORD_WAIT: Duration = Duration::from_secs(2);
 
+/// How long a slot listing that finds the phone's slot without a token
+/// waits while the thread dials the phone and reads its certificate: a
+/// dial on the local network and one certificate read fit well within it.
+const BROWSER_WAKE_WAIT: Duration = Duration::from_secs(3);
+
+/// After a wake that raised no token, how long slot listings answer at
+/// once: a host lists the slots many times in a row, and a phone out of
+/// reach would hold each listing for [`BROWSER_WAKE_WAIT`]. The thread
+/// raises the token when the phone appears meanwhile.
+const WAKE_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 /// A signature request from the browser, answered on the held session.
 struct SignRequest {
     pair_id: RemoteSlotId,
@@ -129,8 +139,8 @@ impl SignRequest {
 
 /// What the module offers for the paired phone (section 8.4 item 3): the
 /// slot while the pairing stands, and the token on a certificate the phone
-/// confirmed on a session, held while a session reports that card present
-/// and for the grace after.
+/// confirmed on a session, held in memory while a session reports that
+/// card present and for the grace after.
 struct Offering {
     slot: RemoteSlotId,
     label: String,
@@ -162,16 +172,22 @@ impl Token {
 }
 
 impl Offering {
-    /// The pairing's slot as the module starts serving it at `now`: a
-    /// certificate cached on an earlier session stands for the grace,
-    /// before any session confirms it.
-    fn new(slot: RemoteSlotId, label: String, cached: Option<Vec<u8>>, now: Instant) -> Self {
+    /// The pairing's slot as the module starts serving it: no token until
+    /// a session confirms the card.
+    const fn new(slot: RemoteSlotId, label: String) -> Self {
         Self {
             slot,
             label,
-            token: cached
-                .map(|certificate| Token::new(certificate, Some(now + IDENTITY_OFFER_GRACE))),
+            token: None,
         }
+    }
+
+    /// The certificate the token stands on at `now`, if it stands.
+    fn standing_certificate(&self, now: Instant) -> Option<&[u8]> {
+        self.token
+            .as_ref()
+            .filter(|token| token.stands_at(now))
+            .map(|token| token.certificate.as_slice())
     }
 
     /// What the module offers at `now`.
@@ -180,10 +196,8 @@ impl Offering {
             self.slot,
             self.label.clone(),
             context.clone(),
-            self.token
-                .as_ref()
-                .filter(|token| token.stands_at(now))
-                .map(|token| SessionCertificate::new(token.certificate.clone())),
+            self.standing_certificate(now)
+                .map(|certificate| SessionCertificate::new(certificate.to_vec())),
         )
     }
 
@@ -236,6 +250,10 @@ struct Shared {
     /// A request is waiting while no session is held: the thread dials
     /// at once instead of pausing out its round.
     wanted: AtomicBool,
+    /// The thread holds a session to the phone.
+    in_session: AtomicBool,
+    /// When a slot listing last woke the dial and no token came of it.
+    unanswered_wake: Mutex<Option<Instant>>,
     context: DisplayText,
     spoken: (Mutex<bool>, Condvar),
 }
@@ -260,19 +278,61 @@ impl Shared {
 
     /// The slot of the pairing the thread serves. A slot already offered
     /// keeps its token as it stands, so a new dial never extends the
-    /// grace; another pairing's slot starts afresh from its cached
-    /// certificate.
-    fn serve_pairing(
-        &self,
-        slot: RemoteSlotId,
-        label: String,
-        cached: Option<Vec<u8>>,
-        now: Instant,
-    ) {
+    /// grace; another pairing's slot starts with no token.
+    fn serve_pairing(&self, slot: RemoteSlotId, label: String) {
         self.offering(|offering| match offering {
             Some(current) if current.slot == slot => current.label = label,
-            _ => *offering = Some(Offering::new(slot, label, cached, now)),
+            _ => *offering = Some(Offering::new(slot, label)),
         });
+    }
+
+    /// The certificate the offered token stands on at `now`, if any: the
+    /// one a session read, held in memory.
+    fn standing_certificate(&self, now: Instant) -> Option<Vec<u8>> {
+        self.offer.lock().ok().and_then(|offering| {
+            offering
+                .as_ref()
+                .and_then(|offering| offering.standing_certificate(now))
+                .map(<[u8]>::to_vec)
+        })
+    }
+
+    /// Whether the phone's slot is offered without a standing token.
+    fn slot_without_token(&self) -> bool {
+        self.offer.lock().is_ok_and(|offering| {
+            offering
+                .as_ref()
+                .is_some_and(|offering| offering.standing_certificate(Instant::now()).is_none())
+        })
+    }
+
+    /// A slot listing found the phone's slot without a token: with no
+    /// session held, the thread is asked to dial (section 8.3), and the
+    /// listing waits up to `limit` for a session to raise the token. A
+    /// wake that raised none is not repeated for [`WAKE_RETRY_AFTER`].
+    fn wake_for_token(&self, limit: Duration) {
+        if self.in_session.load(Ordering::Acquire) || !self.slot_without_token() {
+            return;
+        }
+        let now = Instant::now();
+        {
+            let Ok(unanswered) = self.unanswered_wake.lock() else {
+                return;
+            };
+            if unanswered.is_some_and(|at| now.duration_since(at) < WAKE_RETRY_AFTER) {
+                return;
+            }
+        }
+        self.wanted.store(true, Ordering::Release);
+        let (spoken, word) = &self.spoken;
+        if let Ok(guard) = spoken.lock() {
+            let _ = word.wait_timeout_while(guard, limit, |_| {
+                self.slot_without_token() && !self.stopped()
+            });
+        }
+        if let Ok(mut unanswered) = self.unanswered_wake.lock() {
+            *unanswered = self.slot_without_token().then_some(now);
+        }
     }
 
     /// Whether the offered token stands on a card other than `reported`.
@@ -365,6 +425,8 @@ impl PhoneSource {
                 requests: Mutex::new(None),
                 withdrawal: Mutex::new(Withdrawal::new()),
                 wanted: AtomicBool::new(false),
+                in_session: AtomicBool::new(false),
+                unanswered_wake: Mutex::new(None),
                 context: computer_context(),
                 spoken: (Mutex::new(false), Condvar::new()),
             }),
@@ -398,6 +460,7 @@ impl PhoneSource {
 impl RemoteTokenSource for PhoneSource {
     fn offered(&self) -> Option<RemoteOffer> {
         self.ensure_started();
+        self.shared.wake_for_token(BROWSER_WAKE_WAIT);
         let now = Instant::now();
         self.shared.offer.lock().ok().and_then(|offering| {
             offering
@@ -605,9 +668,6 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
             pause(shared, UNPAIRED_PAUSE);
             continue;
         };
-        // A refused drop is tried again on the next round; the reader
-        // offers no certificate past retention meanwhile.
-        let _ = reader.drop_outlived_certificates();
         let Some(phone) = reader.phone() else {
             unpaired(shared, requests);
             viewed = None;
@@ -622,19 +682,13 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
             view = CustodianView::new();
             viewed = Some(phone.pair_id);
         }
-        // The slot stands while the pairing does, and so does its token,
-        // on the certificate a session confirmed, for the grace without a
-        // session: a browser that asks before the session is open is given
-        // the identity, and its signature wakes the dial and waits for the
-        // phone within the browser's deadline (section 8.4 item 3). A
-        // browser that was given no certificate once keeps resuming that
-        // handshake and never asks again.
-        shared.serve_pairing(
-            slot,
-            phone.peer_display_name.clone(),
-            phone.auth_cert.clone(),
-            Instant::now(),
-        );
+        // The slot stands while the pairing does. Its token stands on the
+        // certificate a session read, for the grace without a session: a
+        // signature asked meanwhile wakes the dial and waits for the phone
+        // within the browser's deadline (section 8.4 item 3). Before any
+        // session the slot has no token, and a browser listing the slots
+        // wakes the dial and waits for one.
+        shared.serve_pairing(slot, phone.peer_display_name.clone());
         if !dial_due(shared, requests, reader, &phone, &mut view) {
             pause(shared, LOOK_PAUSE);
             continue;
@@ -642,7 +696,9 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
         match reader.dial_session(phone.pair_id, DIAL_BROWSE) {
             Ok(session) => {
                 view.dial_succeeded();
+                shared.in_session.store(true, Ordering::Release);
                 let held = hold(shared, requests, store, reader, session, &phone, slot);
+                shared.in_session.store(false, Ordering::Release);
                 match held.after {
                     After::Grace => shared.token(|offering| offering.unconfirmed(Instant::now())),
                     After::Withdraw => shared.token(Offering::withdrawn),
@@ -788,8 +844,8 @@ fn ended_by(error: &RemoteError) -> Option<After> {
         // presence goes at once (sections 4.6 item 4 and 4.5 item 6).
         RemoteError::RevokedByPhone | RemoteError::Withdrawn => Some(After::Withdraw),
         RemoteError::Session(_) => Some(After::Grace),
-        // A read that failed, a card that went or changed meanwhile, or a
-        // cache that was not written: the session stays, the grace runs,
+        // A read that failed, or a card that went or changed meanwhile:
+        // the session stays, the grace runs,
         // and the next report the phone sends is followed.
         _ => None,
     }
@@ -845,10 +901,11 @@ fn hold(
                 if tried != Some(reported) {
                     tried = Some(reported);
                     // The identity is the one whose fingerprint the phone
-                    // reports (section 8.4 item 2): the cached certificate
-                    // when it is that one, otherwise the card's, read once
-                    // and cached.
-                    match reader.confirmed_auth_cert(&mut session) {
+                    // reports (section 8.4 item 2): the certificate held in
+                    // memory when it is that one, otherwise the card's,
+                    // read once on this session.
+                    let held = shared.standing_certificate(Instant::now());
+                    match reader.confirmed_auth_cert(&mut session, held.as_deref()) {
                         Ok(certificate) => {
                             confirmed = Some(Confirmed {
                                 fingerprint: CertificateFingerprint::of_certificate(&certificate),
@@ -899,16 +956,15 @@ fn hold(
                         }
                         // A signature the confirmed certificate does not
                         // verify says the card on the phone is not the one
-                        // cached: the token goes, the cache goes, and the
+                        // read: the token goes with its certificate, and the
                         // next session reads the card again.
                         Err(Failure::Mismatch) => {
                             refineid_dev_errors::report!(
                                 Pkcs11,
                                 "signature not handed on",
-                                "it does not verify under the cached certificate"
+                                "it does not verify under the confirmed certificate"
                             );
                             refuse(&request, RemoteSignError::Ambiguous);
-                            let _ = reader.forget_auth_cert(phone.pair_id);
                             reader.close_session(session);
                             return Held {
                                 after: After::Withdraw,
@@ -916,7 +972,7 @@ fn hold(
                             };
                         }
                         // A check that cannot run says nothing of the
-                        // card: the request is refused and the cache kept.
+                        // card: the request is refused and the token kept.
                         Err(Failure::Refused) => {
                             let _ = request.reply.send(Err(RemoteSignError::Unsupported));
                         }
@@ -1043,11 +1099,11 @@ fn held_record(store: &Path, pair_id: PairId) -> HeldRecord {
 /// Why a request yielded no signature for the browser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Failure {
-    /// The phone answered with a signature the cached certificate does
-    /// not verify: the card on the phone is not the one cached.
+    /// The phone answered with a signature the confirmed certificate does
+    /// not verify: the card on the phone is not the one read.
     Mismatch,
     /// The phone answered with a signature the module cannot check
-    /// under the cached certificate: the certificate does not decode,
+    /// under the confirmed certificate: the certificate does not decode,
     /// its key is not of the request's kind, or the digest is not the
     /// hash's length.
     Refused,
@@ -1072,7 +1128,7 @@ fn sign(
 /// The signature as it may be handed on: checked under the public key
 /// of the certificate the token carries, which this computer does
 /// alone. A profile the module cannot check is reported unsupported, a
-/// check that cannot run is refused, and both keep the cache; a
+/// check that cannot run is refused, and both keep the token; a
 /// signature that does not verify is a mismatch.
 fn checked(
     signed: Result<Vec<u8>, RemoteSignError>,
@@ -1203,13 +1259,13 @@ fn pause(shared: &Shared, duration: Duration) {
 mod tests {
     use super::*;
     use refineid_rapp::{
-        DisplayName, EndpointRole, PAIR_ID_SIZE, PAIRING_IDLE_EXPIRY_DAYS, PAIRING_IDLE_EXPIRY_MS,
-        PairRecord, ProfileName, compute_grants_hash, generate_pair_key_material,
+        DisplayName, EndpointRole, PAIR_ID_SIZE, PAIRING_IDLE_EXPIRY_MS, PairRecord, ProfileName,
+        compute_grants_hash, generate_pair_key_material,
     };
     use refineid_rapp_core::engine::current_time_ms;
     use refineid_rapp_core::remote::CardRequest;
     use refineid_rapp_core::session_lock::{SessionLock, session_lock_path};
-    use refineid_rapp_core::store::{CERTIFICATE_RETENTION_DAYS, PairingRecord, PairingStore as _};
+    use refineid_rapp_core::store::{PairingRecord, PairingStore as _};
 
     const DIGEST_SHA384_LEN: usize = 48;
 
@@ -1323,14 +1379,12 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_certificate_stands_before_any_session_for_the_grace() {
+    fn no_token_stands_until_a_session_confirms_the_card() {
         let start = Instant::now();
-        let offering = Offering::new(
-            the_slot(),
-            "Alpha Phone".to_owned(),
-            Some(CERTIFICATE.to_vec()),
-            start,
-        );
+        let mut offering = Offering::new(the_slot(), "Alpha Phone".to_owned());
+        assert_eq!(certificate_at(&offering, start), None);
+        offering.confirmed(CERTIFICATE.to_vec());
+        offering.unconfirmed(start);
         assert_eq!(
             certificate_at(&offering, start + IDENTITY_OFFER_GRACE - WITHIN_GRACE),
             Some(CERTIFICATE.to_vec())
@@ -1344,7 +1398,7 @@ mod tests {
     #[test]
     fn a_reported_card_holds_the_token_and_absence_starts_the_grace() {
         let start = Instant::now();
-        let mut offering = Offering::new(the_slot(), "Alpha Phone".to_owned(), None, start);
+        let mut offering = Offering::new(the_slot(), "Alpha Phone".to_owned());
         assert_eq!(certificate_at(&offering, start), None);
         offering.confirmed(CERTIFICATE.to_vec());
         let long_after = start + IDENTITY_OFFER_GRACE + IDENTITY_OFFER_GRACE;
@@ -1371,12 +1425,8 @@ mod tests {
     #[test]
     fn another_card_withdraws_at_once_until_a_session_confirms_it() {
         let start = Instant::now();
-        let mut offering = Offering::new(
-            the_slot(),
-            "Alpha Phone".to_owned(),
-            Some(CERTIFICATE.to_vec()),
-            start,
-        );
+        let mut offering = Offering::new(the_slot(), "Alpha Phone".to_owned());
+        offering.confirmed(CERTIFICATE.to_vec());
         offering.withdrawn();
         assert_eq!(certificate_at(&offering, start), None);
         offering.present();
@@ -1394,6 +1444,8 @@ mod tests {
             requests: Mutex::new(None),
             withdrawal: Mutex::new(Withdrawal::new()),
             wanted: AtomicBool::new(false),
+            in_session: AtomicBool::new(false),
+            unanswered_wake: Mutex::new(None),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
         }
@@ -1415,30 +1467,19 @@ mod tests {
         let shared = shared();
         let start = Instant::now();
         // A session confirmed the card and then ended: the grace runs.
-        shared.serve_pairing(the_slot(), "Alpha Phone".to_owned(), None, start);
+        shared.serve_pairing(the_slot(), "Alpha Phone".to_owned());
         shared.token(|offering| offering.confirmed(CERTIFICATE.to_vec()));
         shared.token(|offering| offering.unconfirmed(start));
         let running = deadline(&shared);
         assert_eq!(running, Some(start + IDENTITY_OFFER_GRACE));
         // The next round of the thread serves the same pairing and dials
-        // again, the record still caching the certificate: the deadline
-        // stays, and so does a session that ends again.
-        shared.serve_pairing(
-            the_slot(),
-            "Alpha Phone".to_owned(),
-            Some(CERTIFICATE.to_vec()),
-            start + WITHIN_GRACE,
-        );
+        // again: the deadline stays, and so does a session that ends again.
+        shared.serve_pairing(the_slot(), "Alpha Phone".to_owned());
         shared.token(|offering| offering.unconfirmed(start + WITHIN_GRACE));
         assert_eq!(deadline(&shared), running);
         // A token withdrawn at once stays withdrawn over a new round.
         shared.token(Offering::withdrawn);
-        shared.serve_pairing(
-            the_slot(),
-            "Alpha Phone".to_owned(),
-            Some(CERTIFICATE.to_vec()),
-            start + WITHIN_GRACE,
-        );
+        shared.serve_pairing(the_slot(), "Alpha Phone".to_owned());
         let offered = shared.offer.lock().expect("offer");
         let offering = offered.as_ref().expect("the slot stands");
         assert_eq!(certificate_at(offering, start + WITHIN_GRACE), None);
@@ -1449,18 +1490,21 @@ mod tests {
         let shared = shared();
         let start = Instant::now();
         let fingerprint = CertificateFingerprint::of_certificate(CERTIFICATE);
-        shared.serve_pairing(
-            the_slot(),
-            "Alpha Phone".to_owned(),
-            Some(CERTIFICATE.to_vec()),
-            start,
-        );
-        // The session opens with the phone reporting no card: absence is
-        // no other card, so the token stays on the grace it started with.
+        shared.serve_pairing(the_slot(), "Alpha Phone".to_owned());
+        // An earlier session confirmed the card and ended.
+        shared.token(|offering| offering.confirmed(CERTIFICATE.to_vec()));
+        shared.token(|offering| offering.unconfirmed(start));
+        // The next session opens with the phone reporting no card: absence
+        // is no other card, so the token stays on the grace it started
+        // with, and the certificate held in memory is the one to confirm.
         assert_eq!(card_event(None, None), CardEvent::Absent);
         shared.token(|offering| offering.unconfirmed(start + WITHIN_GRACE));
         assert_eq!(deadline(&shared), Some(start + IDENTITY_OFFER_GRACE));
         assert!(!shared.offers_another_card(fingerprint));
+        assert_eq!(
+            shared.standing_certificate(start + WITHIN_GRACE),
+            Some(CERTIFICATE.to_vec())
+        );
         // The phone then reports the card: the session confirms it, and
         // the token stands while the card is reported present.
         assert_eq!(
@@ -1486,6 +1530,8 @@ mod tests {
             requests: Mutex::new(None),
             withdrawal: Mutex::new(Withdrawal::new()),
             wanted: AtomicBool::new(false),
+            in_session: AtomicBool::new(false),
+            unanswered_wake: Mutex::new(None),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
         };
@@ -1513,7 +1559,7 @@ mod tests {
             checked(Ok(vec![0; 96]), &[], &request),
             Err(Failure::Refused)
         );
-        // The phone's own refusal passes through and keeps the cache.
+        // The phone's own refusal passes through and keeps the token.
         assert_eq!(
             checked(Err(RemoteSignError::Cancelled), &[], &request),
             Err(Failure::Sign(RemoteSignError::Cancelled))
@@ -1543,6 +1589,8 @@ mod tests {
             requests: Mutex::new(None),
             withdrawal: Mutex::new(Withdrawal::new()),
             wanted: AtomicBool::new(true),
+            in_session: AtomicBool::new(false),
+            unanswered_wake: Mutex::new(None),
             context: computer_context(),
             spoken: (Mutex::new(false), Condvar::new()),
         };
@@ -1658,95 +1706,83 @@ mod tests {
         }
     }
 
-    /// One day in milliseconds.
-    const DAY_MS: u64 = PAIRING_IDLE_EXPIRY_MS / PAIRING_IDLE_EXPIRY_DAYS;
-    /// Six days ago, short of the certificate's retention.
-    fn six_days_ago() -> u64 {
-        current_time_ms() - (CERTIFICATE_RETENTION_DAYS - 1) * DAY_MS
-    }
-    /// Eight days ago, past the certificate's retention.
-    fn eight_days_ago() -> u64 {
-        current_time_ms() - (CERTIFICATE_RETENTION_DAYS + 1) * DAY_MS
-    }
+    /// Generous slack over a bounded wait, for a loaded test machine.
+    const WAIT_SLACK: Duration = Duration::from_secs(2);
 
-    /// Whether the record of [`PAIR_ID`] in `store` holds [`CERTIFICATE`]
-    /// on disk.
-    fn record_file_holds_certificate(store: &Path) -> bool {
-        std::fs::read_dir(store).expect("the store").any(|entry| {
-            std::fs::read(entry.expect("an entry").path()).is_ok_and(|bytes| {
-                bytes
-                    .windows(CERTIFICATE.len())
-                    .any(|window| window == CERTIFICATE)
-            })
-        })
-    }
-
-    /// A store holding [`PAIR_ID`], paired and caching [`CERTIFICATE`] by
-    /// `clock`.
-    fn store_cached_at(clock: fn() -> u64) -> PathBuf {
+    /// Before the phone connects the browser sees the phone's slot with no
+    /// token, after one bounded wait for the dial; the next listing
+    /// answers at once. No certificate is on the computer.
+    #[test]
+    fn before_the_phone_connects_the_slot_has_no_token() {
         let store = scratch_store();
-        FilePairingStore::open_with_clock(&store, clock)
+        FilePairingStore::open(&store)
             .expect("the test's store")
-            .insert(pairing_made_at(clock()).with_auth_cert(Some(CERTIFICATE.to_vec())))
+            .insert(pairing_made_at(current_time_ms()))
             .expect("the pairing is stored");
-        assert!(record_file_holds_certificate(&store));
-        store
-    }
-
-    #[test]
-    fn the_module_offers_the_cached_certificate_on_day_6() {
-        let store = store_cached_at(six_days_ago);
-        let phone = RemoteReader::open_local_without_sweep(&store)
-            .expect("the reader")
-            .phone()
-            .expect("the pairing");
-        assert_eq!(phone.auth_cert.as_deref(), Some(CERTIFICATE));
-        assert!(record_file_holds_certificate(&store));
-        std::fs::remove_dir_all(&store).expect("the test's store is removed");
-    }
-
-    /// On day 8 the module falls back to what a pairing that never cached a
-    /// certificate does: a slot with no token, until a session reads the
-    /// card and the token stands on what it read.
-    #[test]
-    fn the_module_falls_back_to_a_tokenless_slot_on_day_8() {
-        let store = store_cached_at(eight_days_ago);
-        let phone = RemoteReader::open_local_without_sweep(&store)
-            .expect("the reader")
-            .phone()
-            .expect("the pairing stands");
-        assert_eq!(phone.state, PairingState::PairedDisconnected);
-        assert_eq!(phone.auth_cert, None);
-        assert!(!record_file_holds_certificate(&store));
-
-        let start = Instant::now();
-        let mut offering =
-            Offering::new(the_slot(), "Alpha Phone".to_owned(), phone.auth_cert, start);
-        assert_eq!(certificate_at(&offering, start), None);
-        offering.confirmed(CERTIFICATE.to_vec());
-        assert_eq!(certificate_at(&offering, start), Some(CERTIFICATE.to_vec()));
-        std::fs::remove_dir_all(&store).expect("the test's store is removed");
-    }
-
-    #[test]
-    fn the_session_thread_drops_a_certificate_past_retention_from_the_file() {
-        let store = store_cached_at(eight_days_ago);
+        // Held here, the pairing's session lock keeps the thread's dial
+        // from reaching a phone.
         let session = SessionLock::acquire(&session_lock_path(&store, PairId::from_array(PAIR_ID)))
             .expect("the pairing's session lock");
         let source = PhoneSource::over_store(store.clone());
-        let _ = source.offered();
-        let deadline = Instant::now() + SWEEP_WAIT;
-        while record_file_holds_certificate(&store) && Instant::now() < deadline {
-            thread::sleep(SWEEP_LOOK);
-        }
-        assert!(!record_file_holds_certificate(&store));
-        assert_eq!(
-            state_within_wait(&store, Some(PairingState::PairedDisconnected)),
-            Some(PairingState::PairedDisconnected)
-        );
+        let started = Instant::now();
+        let offer = source.offered().expect("the phone's slot");
+        assert!(started.elapsed() < FIRST_WORD_WAIT + BROWSER_WAKE_WAIT + WAIT_SLACK);
+        assert_eq!(Some(*offer.pair_id()), slot_id_of_pair());
+        assert!(offer.certificate().is_none());
+        let again = Instant::now();
+        assert!(source.offered().expect("the slot").certificate().is_none());
+        assert!(again.elapsed() < BROWSER_WAKE_WAIT);
         source.stop();
         drop(session);
         std::fs::remove_dir_all(&store).expect("the test's store is removed");
+    }
+
+    /// The slot of [`PAIR_ID`].
+    fn slot_id_of_pair() -> Option<RemoteSlotId> {
+        let hex: String = PAIR_ID.iter().map(|byte| format!("{byte:02x}")).collect();
+        RemoteSlotId::parse(&hex).ok()
+    }
+
+    /// A slot listing with no token asks the thread to dial and waits for
+    /// the session to raise the token on the certificate it read.
+    #[test]
+    fn a_slot_listing_wakes_the_dial_and_a_session_raises_the_token() {
+        let shared = Arc::new(shared());
+        shared.serve_pairing(the_slot(), "Alpha Phone".to_owned());
+        let session = Arc::clone(&shared);
+        let reader = thread::spawn(move || {
+            while !session.wanted() {
+                thread::sleep(SWEEP_LOOK);
+            }
+            session.token(|offering| offering.confirmed(CERTIFICATE.to_vec()));
+        });
+        let started = Instant::now();
+        shared.wake_for_token(BROWSER_WAKE_WAIT);
+        assert!(started.elapsed() < BROWSER_WAKE_WAIT);
+        reader.join().expect("the session's thread");
+        assert_eq!(
+            shared.standing_certificate(Instant::now()),
+            Some(CERTIFICATE.to_vec())
+        );
+        assert!(shared.unanswered_wake.lock().expect("wake").is_none());
+    }
+
+    /// A listing while a session is held, or while the token stands, asks
+    /// nothing of the phone and waits for nothing.
+    #[test]
+    fn a_held_session_or_a_standing_token_needs_no_wake() {
+        let shared = shared();
+        shared.serve_pairing(the_slot(), "Alpha Phone".to_owned());
+        shared.in_session.store(true, Ordering::Release);
+        let started = Instant::now();
+        shared.wake_for_token(BROWSER_WAKE_WAIT);
+        assert!(started.elapsed() < BROWSER_WAKE_WAIT);
+        assert!(!shared.wanted());
+        shared.in_session.store(false, Ordering::Release);
+        shared.token(|offering| offering.confirmed(CERTIFICATE.to_vec()));
+        shared.wake_for_token(BROWSER_WAKE_WAIT);
+        assert!(started.elapsed() < BROWSER_WAKE_WAIT);
+        assert!(!shared.wanted());
     }
 
     /// A synthetic ordinary user's uid.

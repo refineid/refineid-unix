@@ -6,13 +6,13 @@
 //! private key; nothing here prints or logs it. A pairing's file goes when
 //! its key does.
 //!
-//! A certificate past retention ([`CERTIFICATE_RETENTION_DAYS`]) leaves its
-//! file whenever the store loads the record or a write touches the store:
-//! the file is rewritten without it, keeping its age, and the pairing
-//! stays. A reader beside the owner does this too, since the module that
-//! serves the browser may be the only program running. A file owned by
-//! another user, as a privileged process with an inherited home directory
-//! sees, is left to its owner: a rewrite would take it from them.
+//! No file holds a certificate. A record an earlier build stored with the
+//! holder's certificate is rewritten without it when the store loads it,
+//! keeping the file's age, and the pairing stays. A reader beside the
+//! owner does this too, since the module that serves the browser may be
+//! the only program running. A file owned by another user, as a privileged
+//! process with an inherited home directory sees, is left to its owner: a
+//! rewrite would take it from them.
 //!
 //! The store lives beside, not inside, the directory earlier releases used:
 //! those records belong to an older protocol revision and are left
@@ -29,14 +29,11 @@ use std::path::{Path, PathBuf};
 use refineid_rapp::{DisplayName, RecordStoreError, SweepOutcome};
 use zeroize::Zeroizing;
 
-use crate::engine::current_time_ms;
 use crate::ids::PairId;
 use crate::persistence::{
-    decode_pairing_record, encode_pairing_record, encode_pairing_record_without_certificate,
+    Stored, decode_pairing_record, decode_stored_pairing_record, encode_pairing_record,
     is_superseded,
 };
-#[cfg(doc)]
-use crate::store::CERTIFICATE_RETENTION_DAYS;
 use crate::store::{PairingRecord, PairingStore, StoreError};
 
 /// File extension of one stored pairing.
@@ -69,10 +66,6 @@ enum Sweep {
     Keep,
 }
 
-/// The wall clock the store judges certificate retention by: milliseconds
-/// since the Unix epoch.
-pub type Clock = fn() -> u64;
-
 /// Pairings stored as files in one owner-only directory, each file
 /// holding the whole record, its private key included.
 #[derive(Debug)]
@@ -81,7 +74,6 @@ pub struct FilePairingStore {
     /// Loaded records, oldest first, identifier order breaking
     /// timestamp ties.
     records: Vec<PairingRecord>,
-    clock: Clock,
 }
 
 impl FilePairingStore {
@@ -103,27 +95,19 @@ impl FilePairingStore {
     /// [`StoreError::WriteRefused`] when the directory cannot be created or
     /// read.
     pub fn open(directory: &Path) -> Result<Self, StoreError> {
-        Self::open_with_clock(directory, current_time_ms)
-    }
-
-    /// [`Self::open`], judging certificate retention by `clock`.
-    ///
-    /// # Errors
-    /// As [`Self::open`].
-    pub fn open_with_clock(directory: &Path, clock: Clock) -> Result<Self, StoreError> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(DIRECTORY_MODE)
             .create(directory)
             .map_err(|_| StoreError::WriteRefused)?;
-        Self::load(directory, Sweep::Remove, clock)
+        Self::load(directory, Sweep::Remove)
     }
 
     /// Opens the store in `directory` and loads every usable record,
     /// leaving the files of other records in place: a program that reads
     /// the store beside the one that owns it opens it this way, and never
-    /// deletes a record; it does drop a certificate past retention. A
-    /// directory that does not exist is an empty store and is not created.
+    /// deletes a record; it does rewrite a record that held a certificate.
+    /// A directory that does not exist is an empty store and is not created.
     ///
     /// # Errors
     /// [`StoreError::WriteRefused`] when the directory exists but cannot
@@ -134,14 +118,12 @@ impl FilePairingStore {
             return Ok(Self {
                 directory: directory.to_path_buf(),
                 records: Vec::new(),
-                clock: current_time_ms,
             });
         }
-        Self::load(directory, Sweep::Keep, current_time_ms)
+        Self::load(directory, Sweep::Keep)
     }
 
-    fn load(directory: &Path, sweep: Sweep, clock: Clock) -> Result<Self, StoreError> {
-        let now_ms = clock();
+    fn load(directory: &Path, sweep: Sweep) -> Result<Self, StoreError> {
         let mut loaded = Vec::new();
         for entry in fs::read_dir(directory).map_err(|_| StoreError::WriteRefused)? {
             let Ok(entry) = entry else { continue };
@@ -152,7 +134,7 @@ impl FilePairingStore {
             let Ok(bytes) = fs::read(&path).map(Zeroizing::new) else {
                 continue;
             };
-            let Ok(mut record) = decode_pairing_record(&bytes) else {
+            let Ok((record, stored)) = decode_stored_pairing_record(&bytes) else {
                 if sweep == Sweep::Remove && is_superseded(&bytes) {
                     // A pairing from an earlier protocol version: its
                     // holder pairs again, so the record goes.
@@ -160,10 +142,10 @@ impl FilePairingStore {
                 }
                 continue;
             };
-            if record.certificate_outlived(now_ms)
-                && let Err(error) = drop_certificate_from_file(directory, &mut record)
+            if stored == Stored::Rewrite
+                && let Err(error) = rewrite_keeping_age(directory, &record)
             {
-                refineid_dev_errors::report!(Rapp, "certificate not dropped from record", error);
+                refineid_dev_errors::report!(Rapp, "stored certificate not erased", error);
             }
             let modified = entry
                 .metadata()
@@ -175,14 +157,7 @@ impl FilePairingStore {
         Ok(Self {
             directory: directory.to_path_buf(),
             records: loaded.into_iter().map(|(_, record)| record).collect(),
-            clock,
         })
-    }
-
-    /// The time by the store's clock, milliseconds since the Unix epoch.
-    #[must_use]
-    pub fn now_ms(&self) -> u64 {
-        (self.clock)()
     }
 
     /// The directory holding the records.
@@ -270,34 +245,27 @@ fn write_blob(directory: &Path, pair_id: PairId, blob: &[u8]) -> Result<(), Stor
     Ok(())
 }
 
-/// Rewrites `record`'s file without its certificate and drops it from
-/// `record`. The file keeps its age: a drop says nothing of how recent the
-/// pairing is, which is what the store's order follows. Another user's file
-/// is left as it is.
+/// Rewrites `record`'s file at this build's revision, which holds no
+/// certificate. The file keeps its age: a rewrite says nothing of how
+/// recent the pairing is, which is what the store's order follows. Another
+/// user's file is left as it is.
 ///
 /// # Errors
-/// [`StoreError::WriteRefused`] when the file cannot be rewritten; `record`
-/// keeps the certificate the file still holds.
-fn drop_certificate_from_file(
-    directory: &Path,
-    record: &mut PairingRecord,
-) -> Result<(), StoreError> {
-    let pair_id = record.pair_id();
-    let path = path_for(directory, pair_id);
+/// [`StoreError::WriteRefused`] when the file cannot be rewritten; the next
+/// load tries again.
+fn rewrite_keeping_age(directory: &Path, record: &PairingRecord) -> Result<(), StoreError> {
+    let path = path_for(directory, record.pair_id());
     let metadata = fs::metadata(&path).map_err(|_| StoreError::WriteRefused)?;
     if metadata.uid() != rustix::process::geteuid().as_raw() {
         return Ok(());
     }
-    let blob =
-        encode_pairing_record_without_certificate(record).map_err(|_| StoreError::WriteRefused)?;
-    write_blob(directory, pair_id, &blob)?;
+    write_record(directory, record)?;
     if let Ok(modified) = metadata.modified() {
         let _ = File::options()
             .write(true)
             .open(&path)
             .and_then(|file| file.set_modified(modified));
     }
-    record.drop_auth_cert();
     Ok(())
 }
 
@@ -318,19 +286,15 @@ impl FilePairingStore {
     /// Applies `change` to `pair_id`'s record as the disk holds it now,
     /// handing it the writer of the whole record: another program may have
     /// rewritten the file since this store read it, and a record the disk
-    /// no longer holds readably is gone. A certificate past retention at
-    /// `now_ms` leaves the file first.
+    /// no longer holds readably is gone.
     fn change_in_place<Outcome>(
         &mut self,
         pair_id: PairId,
-        now_ms: u64,
         change: impl FnOnce(
             &mut PairingRecord,
             &dyn Fn(&[u8]) -> Result<(), StoreError>,
         ) -> Result<Outcome, RecordStoreError<StoreError>>,
     ) -> Result<Outcome, RecordStoreError<StoreError>> {
-        // A refused drop is made by the next touch.
-        let _ = self.drop_outlived_certificates(now_ms);
         let unknown = RecordStoreError::Store(StoreError::Unknown);
         let position = self
             .records
@@ -342,14 +306,7 @@ impl FilePairingStore {
             return Err(unknown);
         };
         let directory = &self.directory;
-        let dropped = if current.certificate_outlived(now_ms) {
-            drop_certificate_from_file(directory, &mut current)
-        } else {
-            Ok(())
-        };
-        let outcome = dropped
-            .map_err(RecordStoreError::Store)
-            .and_then(|()| change(&mut current, &|blob| write_blob(directory, pair_id, blob)));
+        let outcome = change(&mut current, &|blob| write_blob(directory, pair_id, blob));
         // Changed or refused, `current` is what the disk holds.
         if let Some(entry) = self.records.get_mut(position) {
             *entry = current;
@@ -360,14 +317,10 @@ impl FilePairingStore {
 
 impl PairingStore for FilePairingStore {
     fn insert(&mut self, record: PairingRecord) -> Result<(), StoreError> {
-        let now_ms = self.now_ms();
-        let record = record.without_outlived_certificate(now_ms);
         write_record(&self.directory, &record)?;
         self.records
             .retain(|entry| entry.pair_id() != record.pair_id());
         self.records.push(record);
-        // A refused drop is made by the next touch.
-        let _ = self.drop_outlived_certificates(now_ms);
         Ok(())
     }
 
@@ -383,9 +336,6 @@ impl PairingStore for FilePairingStore {
         pair_id: PairId,
         change: &mut dyn FnMut(PairingRecord) -> Option<PairingRecord>,
     ) -> Result<(), StoreError> {
-        let now_ms = self.now_ms();
-        // A refused drop is made by the next touch.
-        let _ = self.drop_outlived_certificates(now_ms);
         let mut outcome = Err(StoreError::Unknown);
         let directory = &self.directory;
         self.records = core::mem::take(&mut self.records)
@@ -398,7 +348,7 @@ impl PairingStore for FilePairingStore {
                 // since this store read it: the change applies to the
                 // record as the disk holds it now, and a record the disk
                 // no longer holds readably is gone.
-                let current = read_record(directory, pair_id)?.without_outlived_certificate(now_ms);
+                let current = read_record(directory, pair_id)?;
                 let durable = match change(current) {
                     Some(next) => write_record(directory, &next).map(|()| Some(next)),
                     None => delete_record(directory, pair_id).map(|()| None),
@@ -426,7 +376,7 @@ impl PairingStore for FilePairingStore {
         now_ms: u64,
         session_established: bool,
     ) -> Result<SweepOutcome, RecordStoreError<StoreError>> {
-        self.change_in_place(pair_id, now_ms, |current, write| {
+        self.change_in_place(pair_id, |current, write| {
             current.sweep(now_ms, session_established, write)
         })
     }
@@ -436,9 +386,7 @@ impl PairingStore for FilePairingStore {
         pair_id: PairId,
         name: &DisplayName,
     ) -> Result<bool, RecordStoreError<StoreError>> {
-        self.change_in_place(pair_id, self.now_ms(), |current, write| {
-            current.rename_peer(name, write)
-        })
+        self.change_in_place(pair_id, |current, write| current.rename_peer(name, write))
     }
 
     fn pair_ids(&self) -> Vec<PairId> {
@@ -447,29 +395,6 @@ impl PairingStore for FilePairingStore {
             .rev()
             .map(PairingRecord::pair_id)
             .collect()
-    }
-
-    /// As the trait says, on each record as the disk holds it now, and
-    /// keeping each file's age.
-    fn drop_outlived_certificates(&mut self, now_ms: u64) -> Result<(), StoreError> {
-        let directory = &self.directory;
-        let mut outcome = Ok(());
-        self.records.retain_mut(|entry| {
-            if !entry.certificate_outlived(now_ms) {
-                return true;
-            }
-            let Some(mut current) = read_record(directory, entry.pair_id()) else {
-                return false;
-            };
-            if current.certificate_outlived(now_ms)
-                && let Err(error) = drop_certificate_from_file(directory, &mut current)
-            {
-                outcome = Err(error);
-            }
-            *entry = current;
-            true
-        });
-        outcome
     }
 }
 
@@ -486,7 +411,6 @@ mod tests {
         encode_pair_record,
     };
 
-    use std::cell::Cell;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
@@ -496,31 +420,11 @@ mod tests {
         STORE_DIRECTORY, Sweep, TEMPORARY_EXTENSION, XDG_CONFIG_HOME, directory_from, path_for,
     };
     use crate::ids::PairId;
-    use crate::persistence::{PAIRING_BLOB_MAGIC, PAIRING_BLOB_VERSION};
+    use crate::persistence::{
+        CERTIFICATE_REVISION, PAIRING_BLOB_MAGIC, PAIRING_BLOB_VERSION, frame_certificate_revision,
+    };
     use crate::store::fixtures::{CREATED_AT_MS, record};
-    use crate::store::{CERTIFICATE_RETENTION_MS, PairingRecord, PairingStore, StoreError};
-
-    /// One day in milliseconds.
-    const DAY_MS: u64 = PAIRING_IDLE_EXPIRY_MS / refineid_rapp::PAIRING_IDLE_EXPIRY_DAYS;
-    /// The sixth day after the fixture's pairing, short of the retention.
-    const DAY_6_MS: u64 = CREATED_AT_MS + CERTIFICATE_RETENTION_MS - DAY_MS;
-    /// The eighth day after the fixture's pairing, past the retention.
-    const DAY_8_MS: u64 = CREATED_AT_MS + CERTIFICATE_RETENTION_MS + DAY_MS;
-
-    thread_local! {
-        /// What [`test_clock`] reads, for the test on this thread.
-        static NOW_MS: Cell<u64> = const { Cell::new(CREATED_AT_MS) };
-    }
-
-    /// The injected clock: the time this test set.
-    fn test_clock() -> u64 {
-        NOW_MS.with(Cell::get)
-    }
-
-    /// Sets the injected clock.
-    fn set_clock(now_ms: u64) {
-        NOW_MS.with(|now| now.set(now_ms));
-    }
+    use crate::store::{PairingStore, StoreError};
 
     /// Whether any file in `directory` holds `needle`.
     fn any_file_holds(directory: &Path, needle: &[u8]) -> bool {
@@ -532,20 +436,27 @@ mod tests {
         })
     }
 
-    /// `pair_id`'s record caching the certificate, made at the injected
-    /// clock's [`CREATED_AT_MS`].
-    fn cached(pair_id: PairId) -> PairingRecord {
-        record(pair_id).with_auth_cert(Some(CERTIFICATE.to_vec()))
+    /// A store in `directory` holding `pair_id`'s usable record as an
+    /// earlier build stored it, with the holder's certificate. Opening the
+    /// store has already rewritten it; the caller asserts that.
+    fn store_after_certificate(directory: &Path, pair_id: PairId) -> FilePairingStore {
+        write_certificate_revision(directory, pair_id);
+        FilePairingStore::open(directory).unwrap()
     }
 
-    /// A store in `directory`, at the injected clock, holding `records`.
-    fn store_holding(directory: &Path, records: Vec<PairingRecord>) -> FilePairingStore {
-        set_clock(CREATED_AT_MS);
-        let mut store = FilePairingStore::open_with_clock(directory, test_clock).unwrap();
-        for record in records {
-            store.insert(record).unwrap();
-        }
-        store
+    /// Writes `pair_id`'s usable record in `directory` as an earlier build
+    /// stored it, with the holder's certificate.
+    fn write_certificate_revision(directory: &Path, pair_id: PairId) {
+        std::fs::create_dir_all(directory).unwrap();
+        let blob = frame_certificate_revision(&record(pair_id), CERTIFICATE);
+        std::fs::write(path_for(directory, pair_id), blob).unwrap();
+        assert!(any_file_holds(directory, CERTIFICATE));
+    }
+
+    /// The encoding revision of `pair_id`'s file in `directory`.
+    fn revision_of(directory: &Path, pair_id: PairId) -> u8 {
+        let blob = std::fs::read(path_for(directory, pair_id)).unwrap();
+        *blob.get(PAIRING_BLOB_MAGIC.len()).unwrap()
     }
 
     /// Synthetic pair identifiers.
@@ -559,8 +470,8 @@ mod tests {
     const IDLE_LIMIT_AT_MS: u64 = CREATED_AT_MS + PAIRING_IDLE_EXPIRY_MS;
     /// When another program noted a session to the fixture's pairing.
     const SESSION_AT_MS: u64 = 1_700_500_000_000;
-    /// A revision before the one this build reads.
-    const EARLIER_REVISION: u8 = PAIRING_BLOB_VERSION - 1;
+    /// A revision before the earliest one this build reads.
+    const EARLIER_REVISION: u8 = CERTIFICATE_REVISION - 1;
     /// The body of a record of an earlier revision.
     const EARLIER_BODY: &[u8] = b"synthetic record of an earlier revision";
     /// The permission bits of a mode.
@@ -658,14 +569,9 @@ mod tests {
     fn records_survive_reopening_in_owner_only_files() {
         let directory = scratch();
         {
-            let mut store = store_holding(&directory, Vec::new());
+            let mut store = FilePairingStore::open(&directory).unwrap();
             store.insert(record(PairId::from_array(FIRST))).unwrap();
             store.insert(record(PairId::from_array(SECOND))).unwrap();
-            store
-                .update(PairId::from_array(FIRST), &mut |entry| {
-                    Some(entry.with_auth_cert(Some(CERTIFICATE.to_vec())))
-                })
-                .unwrap();
         }
         // Timestamps can tie within one tick; stamp the order in explicitly.
         let now = SystemTime::now();
@@ -675,13 +581,11 @@ mod tests {
             now - Duration::from_secs(STAMP_GAP_SECS),
         );
         stamp(&directory, PairId::from_array(FIRST), now);
-        let store = FilePairingStore::open_with_clock(&directory, test_clock).unwrap();
+        let store = FilePairingStore::open(&directory).unwrap();
         assert_eq!(
             store.pair_ids(),
             [PairId::from_array(FIRST), PairId::from_array(SECOND)]
         );
-        let first = store.get(PairId::from_array(FIRST)).unwrap();
-        assert_eq!(first.auth_cert(), Some(CERTIFICATE));
         let directory_mode = std::fs::metadata(&directory).unwrap().permissions().mode();
         assert_eq!(directory_mode & PERMISSION_BITS, DIRECTORY_MODE);
         for entry in std::fs::read_dir(&directory).unwrap() {
@@ -844,35 +748,44 @@ mod tests {
     }
 
     #[test]
-    fn a_load_on_day_6_keeps_the_certificate_and_writes_nothing() {
+    fn no_file_this_store_writes_holds_a_certificate() {
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
-        drop(store_holding(&directory, vec![cached(pair_id)]));
-        let before = std::fs::read(path_for(&directory, pair_id)).unwrap();
-        set_clock(DAY_6_MS);
-        let store = FilePairingStore::open_with_clock(&directory, test_clock).unwrap();
-        assert_eq!(store.get(pair_id).unwrap().auth_cert(), Some(CERTIFICATE));
+        let mut store = FilePairingStore::open(&directory).unwrap();
+        store.insert(record(pair_id)).unwrap();
+        store.sweep(pair_id, SESSION_AT_MS, true).unwrap();
+        let renamed = refineid_rapp::DisplayName::parse("Beta Phone".to_owned()).unwrap();
+        assert_eq!(store.rename_peer(pair_id, &renamed), Ok(true));
+        assert_eq!(revision_of(&directory, pair_id), PAIRING_BLOB_VERSION);
+        let reopened = FilePairingStore::open_without_sweep(&directory).unwrap();
         assert_eq!(
-            std::fs::read(path_for(&directory, pair_id)).unwrap(),
-            before
+            reopened
+                .get(pair_id)
+                .unwrap()
+                .pairing()
+                .last_session_at_ms(),
+            Some(SESSION_AT_MS)
         );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// A certificate an earlier build stored goes at the first load, the
+    /// day after it was stored as much as the week after, and by the
+    /// module's reader as much as by the owner's open; the pairing stays.
     #[test]
-    fn a_load_on_day_8_rewrites_the_file_and_the_pairing_stays() {
+    fn a_stored_certificate_goes_at_the_first_load_and_the_pairing_stays() {
         for sweep in [Sweep::Remove, Sweep::Keep] {
             let directory = scratch();
             let pair_id = PairId::from_array(FIRST);
-            drop(store_holding(&directory, vec![cached(pair_id)]));
-            assert!(any_file_holds(&directory, CERTIFICATE));
-            set_clock(DAY_8_MS);
-            let store = FilePairingStore::load(&directory, sweep, test_clock).unwrap();
+            write_certificate_revision(&directory, pair_id);
+            let store = FilePairingStore::load(&directory, sweep).unwrap();
             assert!(!any_file_holds(&directory, CERTIFICATE));
-            let entry = store.get(pair_id).unwrap();
-            assert_eq!(entry.auth_cert(), None);
-            assert_eq!(entry.state(), PairingState::PairedDisconnected);
-            let reread = FilePairingStore::load(&directory, Sweep::Keep, test_clock).unwrap();
+            assert_eq!(revision_of(&directory, pair_id), PAIRING_BLOB_VERSION);
+            assert_eq!(
+                store.get(pair_id).unwrap().state(),
+                PairingState::PairedDisconnected
+            );
+            let reread = FilePairingStore::load(&directory, Sweep::Keep).unwrap();
             assert_eq!(
                 reread.get(pair_id).unwrap().state(),
                 PairingState::PairedDisconnected
@@ -882,107 +795,66 @@ mod tests {
     }
 
     #[test]
-    fn a_touch_of_a_store_held_open_past_the_bound_rewrites_every_file() {
-        let directory = scratch();
-        let (first, second) = (PairId::from_array(FIRST), PairId::from_array(SECOND));
-        let mut store = store_holding(&directory, vec![cached(first), cached(second)]);
-        set_clock(DAY_8_MS);
-        store
-            .update(second, &mut |entry| Some(entry.forgotten(DAY_8_MS)))
-            .unwrap();
-        assert!(!any_file_holds(&directory, CERTIFICATE));
-        assert_eq!(store.get(first).unwrap().auth_cert(), None);
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    fn a_session_on_day_6_carries_the_certificate_past_day_8() {
+    fn a_session_after_a_stored_certificate_writes_none_back() {
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
-        let mut store = store_holding(&directory, vec![cached(pair_id)]);
-        set_clock(DAY_6_MS);
-        store.sweep(pair_id, DAY_6_MS, true).unwrap();
-        set_clock(DAY_8_MS);
-        store.drop_outlived_certificates(DAY_8_MS).unwrap();
-        assert!(any_file_holds(&directory, CERTIFICATE));
-        let last_session = DAY_6_MS + CERTIFICATE_RETENTION_MS;
-        store.drop_outlived_certificates(last_session).unwrap();
-        assert!(!any_file_holds(&directory, CERTIFICATE));
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    fn a_session_on_day_8_writes_no_certificate_back() {
-        let directory = scratch();
-        let pair_id = PairId::from_array(FIRST);
-        let mut store = store_holding(&directory, vec![cached(pair_id)]);
-        set_clock(DAY_8_MS);
+        let mut store = store_after_certificate(&directory, pair_id);
         assert_eq!(
-            store.sweep(pair_id, DAY_8_MS, true),
+            store.sweep(pair_id, SESSION_AT_MS, true),
             Ok(SweepOutcome::Recorded)
         );
         assert!(!any_file_holds(&directory, CERTIFICATE));
-        let entry = store.get(pair_id).unwrap();
-        assert_eq!(entry.auth_cert(), None);
-        assert_eq!(entry.pairing().last_session_at_ms(), Some(DAY_8_MS));
+        assert_eq!(
+            store.get(pair_id).unwrap().pairing().last_session_at_ms(),
+            Some(SESSION_AT_MS)
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
-    fn a_rename_past_the_bound_writes_no_certificate_back() {
-        let directory = scratch();
-        let pair_id = PairId::from_array(FIRST);
-        let mut store = store_holding(&directory, vec![cached(pair_id)]);
-        set_clock(DAY_8_MS);
-        let renamed = refineid_rapp::DisplayName::parse("Beta Phone".to_owned()).unwrap();
-        assert_eq!(store.rename_peer(pair_id, &renamed), Ok(true));
-        assert!(!any_file_holds(&directory, CERTIFICATE));
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    fn a_drop_keeps_the_files_age_and_so_the_stores_order() {
+    fn a_rewrite_keeps_the_files_age_and_so_the_stores_order() {
         let directory = scratch();
         let (older, newer) = (PairId::from_array(FIRST), PairId::from_array(SECOND));
-        drop(store_holding(
-            &directory,
-            vec![cached(older), record(newer)],
-        ));
+        write_certificate_revision(&directory, older);
+        FilePairingStore::open(&directory)
+            .unwrap()
+            .insert(record(newer))
+            .unwrap();
+        // The open above rewrote the older file; write it as it was.
+        write_certificate_revision(&directory, older);
         let now = SystemTime::now();
         stamp(&directory, older, now - Duration::from_secs(STAMP_GAP_SECS));
         stamp(&directory, newer, now);
-        set_clock(DAY_8_MS);
-        let store = FilePairingStore::open_with_clock(&directory, test_clock).unwrap();
+        let store = FilePairingStore::open(&directory).unwrap();
         assert!(!any_file_holds(&directory, CERTIFICATE));
         assert_eq!(store.pair_ids(), [newer, older]);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
-    fn a_refused_drop_serves_no_certificate_and_is_made_by_the_next_touch() {
+    fn a_refused_rewrite_keeps_no_certificate_in_memory_and_the_next_load_makes_it() {
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
-        let mut store = store_holding(&directory, vec![cached(pair_id)]);
+        write_certificate_revision(&directory, pair_id);
         let blocked = path_for(&directory, pair_id).with_extension(TEMPORARY_EXTENSION);
         std::fs::create_dir(&blocked).unwrap();
-        set_clock(DAY_8_MS);
+        let store = FilePairingStore::open_without_sweep(&directory).unwrap();
+        assert_eq!(revision_of(&directory, pair_id), CERTIFICATE_REVISION);
         assert_eq!(
-            store.drop_outlived_certificates(DAY_8_MS),
-            Err(StoreError::WriteRefused)
+            store.get(pair_id).unwrap().state(),
+            PairingState::PairedDisconnected
         );
-        let entry = store.get(pair_id).unwrap();
-        assert_eq!(entry.auth_cert_at(DAY_8_MS), None);
         std::fs::remove_dir(&blocked).unwrap();
-        store.drop_outlived_certificates(DAY_8_MS).unwrap();
+        drop(FilePairingStore::open_without_sweep(&directory).unwrap());
         assert!(!any_file_holds(&directory, CERTIFICATE));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
-    fn forgetting_erases_the_certificate_from_the_file_at_once() {
+    fn forgetting_keeps_the_key_and_no_certificate() {
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
-        let mut store = store_holding(&directory, vec![cached(pair_id)]);
+        let mut store = store_after_certificate(&directory, pair_id);
         store
             .update(pair_id, &mut |entry| Some(entry.forgotten(CREATED_AT_MS)))
             .unwrap();
@@ -995,7 +867,7 @@ mod tests {
     fn revoking_erases_the_file_and_any_temporary_a_stopped_write_left() {
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
-        let mut store = store_holding(&directory, vec![cached(pair_id)]);
+        let mut store = store_after_certificate(&directory, pair_id);
         let leftover = path_for(&directory, pair_id).with_extension(TEMPORARY_EXTENSION);
         std::fs::write(&leftover, CERTIFICATE).unwrap();
         store.remove(pair_id).unwrap();
@@ -1009,30 +881,13 @@ mod tests {
     fn expiring_writes_no_certificate_even_on_the_way_out() {
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
-        let mut store = store_holding(&directory, vec![cached(pair_id)]);
-        set_clock(IDLE_LIMIT_AT_MS);
+        let mut store = store_after_certificate(&directory, pair_id);
         assert_eq!(
             store.sweep(pair_id, IDLE_LIMIT_AT_MS, false),
             Ok(SweepOutcome::Expired)
         );
         assert!(path_for(&directory, pair_id).exists());
         assert!(!any_file_holds(&directory, CERTIFICATE));
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    fn a_new_certificate_replaces_the_old_ones_bytes() {
-        const OTHER_CERTIFICATE: &[u8] = b"synthetic certificate of another card";
-        let directory = scratch();
-        let pair_id = PairId::from_array(FIRST);
-        let mut store = store_holding(&directory, vec![cached(pair_id)]);
-        store
-            .update(pair_id, &mut |entry| {
-                Some(entry.with_auth_cert(Some(OTHER_CERTIFICATE.to_vec())))
-            })
-            .unwrap();
-        assert!(!any_file_holds(&directory, CERTIFICATE));
-        assert!(any_file_holds(&directory, OTHER_CERTIFICATE));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1045,12 +900,13 @@ mod tests {
         let blocked = path_for(&directory, pair_id).with_extension(TEMPORARY_EXTENSION);
         std::fs::create_dir(&blocked).unwrap();
         assert_eq!(
-            store.update(pair_id, &mut |entry| {
-                Some(entry.with_auth_cert(Some(CERTIFICATE.to_vec())))
-            }),
+            store.update(pair_id, &mut |entry| Some(entry.forgotten(FORGOTTEN_AT_MS))),
             Err(StoreError::WriteRefused)
         );
-        assert_eq!(store.get(pair_id).unwrap().auth_cert(), None);
+        assert_eq!(
+            store.get(pair_id).unwrap().state(),
+            PairingState::PairedDisconnected
+        );
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }

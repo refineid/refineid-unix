@@ -34,8 +34,9 @@ use refineid_rapp_core::remote::PairSummary;
 /// a paired phone over RAPP.
 ///
 /// Only a local card is inspected by this program. A phone's card is
-/// listed from the pairing record, its PINs are handled on the phone,
-/// and no PIN action applies to it here.
+/// listed from the certificate read through the phone and held in
+/// memory, its PINs are handled on the phone, and no PIN action applies
+/// to it here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardSource {
     /// A card in a PC/SC reader attached to this computer.
@@ -231,8 +232,6 @@ pub struct PairedPhone {
     pub name: String,
     /// The platform the phone introduced itself with.
     pub platform: String,
-    /// Whether the phone's authentication certificate is cached.
-    pub certificate_cached: bool,
     /// Whether the pairing grants document signing: the phone's card
     /// signs, and PIN 2 is typed on the phone.
     pub signs_documents: bool,
@@ -247,7 +246,6 @@ impl PairedPhone {
             pair_id: summary.pair_id,
             name: summary.peer_display_name.clone(),
             platform: summary.peer_platform.clone(),
-            certificate_cached: summary.auth_cert.is_some(),
             signs_documents: summary
                 .granted_profiles
                 .contains(&ProfileName::DocumentSigning),
@@ -443,7 +441,6 @@ mod tests {
             peer_display_name: "Alpha Phone".to_owned(),
             peer_platform: "Android".to_owned(),
             granted_profiles: Vec::new(),
-            auth_cert: None,
             state,
         }
     }
@@ -503,7 +500,6 @@ mod tests {
         let phone =
             PairedPhone::from_summary(&summary(PairingState::PairedDisconnected)).expect("phone");
         assert_eq!(phone.name, "Alpha Phone");
-        assert!(!phone.certificate_cached);
         assert!(PairedPhone::from_summary(&summary(PairingState::StorageConfirming)).is_none());
         assert!(PairedPhone::from_summary(&summary(PairingState::Revoking)).is_none());
     }

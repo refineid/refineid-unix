@@ -846,7 +846,6 @@ mod tests {
             peer_display_name: "custodian-1".to_owned(),
             peer_platform: "Synthetic".to_owned(),
             granted_profiles: profiles,
-            auth_cert: None,
             state,
         }
     }

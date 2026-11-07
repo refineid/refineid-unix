@@ -772,7 +772,6 @@ mod tests {
             pair_id: PairId::from_array(*b"synthetic-pair-1"),
             name: "custodian-1".to_owned(),
             platform: "Android".to_owned(),
-            certificate_cached: true,
             signs_documents: true,
         }
     }
