@@ -54,6 +54,18 @@ Firefox on Linux with a card; then `Certificates.Install` leaves
 `policies.json` and the package scripts in one change, and only the
 `SecurityDevices` entry that loads the module stays.
 
+What to expect in that test: NSS searches the certificates and trust
+records of a login-required token only after the user has logged in
+to it, unless the module was registered as friendly (`modutil -add
+... -mechanisms FRIENDLY`), and the `SecurityDevices` policy registers
+without that flag. So the certificate manager should show the DVV root
+as trusted for identifying mail users and clients, and not web sites,
+from the session's first PIN login on; before it, the token's
+certificates are not listed at all. Whether the token should be made
+friendly, by the registration flag in `refineid-browser-token` or by a
+public-certificates profile object in the module, is the maintainer's
+call after that observation.
+
 ## Debian / Ubuntu Policy Compliance
 
 | Component | Policy Rule | Location in Package |
