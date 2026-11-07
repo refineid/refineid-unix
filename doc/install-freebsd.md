@@ -58,8 +58,7 @@ keep = [(v, pr, n) for v, pr, n in zip(d["ifdVendorID"], d["ifdProductID"], d["i
 d["ifdVendorID"], d["ifdProductID"], d["ifdFriendlyName"] = [list(x) for x in zip(*keep)]
 with open(p, "wb") as f:
     plistlib.dump(d, f)
-'
-service pcscd restart
+' && service pcscd restart
 ```
 
 `pcsc_scan -r` lists the reader. If `service pcscd restart` answers
