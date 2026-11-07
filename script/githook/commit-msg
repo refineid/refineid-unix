@@ -1,0 +1,18 @@
+#!/bin/sh
+# Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
+#
+# Mandatory commit-message gate; active in every clone whose
+# core.hooksPath is script/githook. A commit message is a subject and a
+# body. Trailers are refused, above all the AI attribution lines some
+# tools append (Co-authored-by: Claude, Cursor, Copilot, ...). AGENTS.md
+# states the rule; this hook enforces it. Bypassing it (--no-verify or
+# otherwise) is prohibited for every contributor, human or AI agent alike.
+
+msg="$1"
+if grep -qiE '^(Co-authored-by|Signed-off-by|Reviewed-by|Acked-by|Tested-by|Reported-by):' "$msg" \
+    || grep -qi 'Generated with \[Claude Code\]' "$msg"; then
+    echo "commit-msg: commit trailers are forbidden (AGENTS.md)." >&2
+    echo "No Co-authored-by for Claude, Cursor, Copilot or any AI." >&2
+    echo "Subject and body only; disable the tool's trailer injection." >&2
+    exit 1
+fi

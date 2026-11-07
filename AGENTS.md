@@ -31,7 +31,8 @@
   logging code.
 - Please No AI attribution spam in commits.
   No `Co-authored-by` / `Signed-off-by` / `Reviewed-by`
-  or any AI-naming trailer; subject + body only. 
+  or any AI-naming trailer; subject + body only. The tracked
+  `script/githook/commit-msg` hook refuses a message that carries one.
 - ASCII only in source, UTF-8 only where required.
 - New source files carry `Copyright 2026 Petri Koistinen` with no
   email address and HTTPS license URLs; shell scripts carry the
