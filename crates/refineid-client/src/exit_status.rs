@@ -29,6 +29,9 @@ use std::process::ExitCode;
 /// - `Ok = 0` -- success.
 /// - `VerifyFailed = 1` -- a negative answer: offline verify rejected
 ///   the signature, or the site answered a login with a 4xx or 5xx status.
+/// - `VerifyIndeterminate = 2` -- `document verify` could neither
+///   confirm nor reject a signature: nothing is proven wrong, but
+///   something the verdict needs could not be established.
 /// - `BadInvocation = 64` -- argv shape rejected (= `EX_USAGE`).
 /// - `NoReaders = 65` -- PC/SC: no readers connected.
 /// - `NoCardPresent = 66` -- readers present but no card.
@@ -44,6 +47,9 @@ pub enum ExitStatus {
     /// A negative answer: offline `verify` rejected the signature, or
     /// the site answered a login with a 4xx or 5xx status (`1`).
     VerifyFailed = 1,
+    /// `document verify` could neither confirm nor reject a signature:
+    /// its verdict is indeterminate (`2`).
+    VerifyIndeterminate = 2,
     /// argv shape rejected (`64` = `EX_USAGE`).
     BadInvocation = 64,
     /// PC/SC reported zero connected readers (`65`).
@@ -85,6 +91,7 @@ mod tests {
     fn codes_match_documented_convention() {
         assert_eq!(ExitStatus::Ok.code(), 0_u8);
         assert_eq!(ExitStatus::VerifyFailed.code(), 1_u8);
+        assert_eq!(ExitStatus::VerifyIndeterminate.code(), 2_u8);
         assert_eq!(ExitStatus::BadInvocation.code(), 64_u8);
         assert_eq!(ExitStatus::NoReaders.code(), 65_u8);
         assert_eq!(ExitStatus::NoCardPresent.code(), 66_u8);

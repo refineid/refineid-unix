@@ -317,29 +317,42 @@ the time a verified timestamp proves the signature existed, or
 when the signature is judged as of now.
 .It Li verdict\&:
 .Li valid ,
+.Li indeterminate ,
 .Li not valid ,
 .Li revoked
 or
-.Li unsupported .
+.Li unsupported ,
+the three answers of ETSI EN 319 102-1 with revoked and unsupported
+told apart from not valid.
 .It Li reason\&:
-one line per cause of a
-.Li not valid
+one line per cause of a verdict other than valid or revoked.
+For
+.Li not valid ,
+what is proven wrong:
+.Li document changed
 or
-.Li unsupported
-verdict:
-.Li document changed ,
-.Li signature invalid ,
-.Li certificate chain unverified
+.Li signature invalid .
+For
+.Li indeterminate ,
+what could not be established:
+.Li certificate chain unverified ,
+.Li certificate chain search exhausted: too many issuers in the document
+(the search for the signer's chain spent its whole budget of signature
+verifications, which no legitimate document comes near)
 or
+.Li revocation status unknown .
+For
+.Li unsupported ,
 .Li profile not supported .
-.It Li revocation\&:
-.Li not checked ,
-when the verdict is valid but the signer's revocation could not be
-checked.
 .El
 .Pp
 A signature is valid when the document is unchanged since it was
-signed, the signature verifies, and the signer chains to a DVV root.
+signed, the signature verifies, the signer chains to a DVV root, and a
+verified revocation answer says the signer was not revoked.
+It is indeterminate when nothing is proven wrong but the chain could
+not be built or no revocation answer could be verified, as happens
+offline for a document that does not carry its own answers; a
+document RefineID signs carries them.
 A timestamp proves the signing time: the chain and revocation are
 judged at the earliest time a proven signature timestamp, or a proven
 document timestamp covering the signature, sets.
@@ -661,6 +674,10 @@ unsupported or revoked, or
 reached no self-signed root, or
 .Cm phone auth
 received a 4xx or 5xx status; a redirect counts as success.
+.It 2
+.Cm document verify
+judged every file, rejected none, and found a signature whose verdict
+is indeterminate.
 .It 64
 The command line was not understood
 .Pq Dv EX_USAGE .

@@ -25,7 +25,7 @@ use refineid_doc_sign::NameExt as _;
 use refineid_doc_sign::crl::CrlReason;
 use refineid_doc_sign::verification::{
     CertificationPath, DocumentReport, Revocation, SignatureOutcome, SignatureReport, SignatureRow,
-    TimestampReport,
+    TimestampReport, Verdict as CoreVerdict,
 };
 use refineid_doc_sign::x509::{DateTime, OwnedCert};
 
@@ -50,10 +50,9 @@ record per signature, records separated by a blank line, each line
     status as it is
   signed: the time a timestamp proves, or - when the signature is
     judged as of now
-  verdict: valid, not valid, revoked or unsupported
-  reason: one line per cause of not valid or unsupported
-  revocation: not checked, when a valid signature's revocation
-    could not be checked
+  verdict: valid, indeterminate, not valid, revoked or unsupported
+  reason: one line per cause of an indeterminate, not valid or
+    unsupported verdict
 
 -v adds intact, signature, chain, claimed, timestamp,
 timestamp-chain, revocation and document-timestamp lines. A file that
@@ -98,10 +97,10 @@ impl DocumentVerifyArgs {
                             .iter()
                             .map(|view| view.record(&file, verbose)),
                     );
-                    outcomes.push(if report.is_valid() {
-                        FileOutcome::Valid
-                    } else {
-                        FileOutcome::Rejected
+                    outcomes.push(match report.verdict() {
+                        CoreVerdict::Valid => FileOutcome::Valid,
+                        CoreVerdict::Indeterminate(_) => FileOutcome::Indeterminate,
+                        CoreVerdict::NotValid => FileOutcome::Rejected,
                     });
                 }
                 Err(error) => {
@@ -141,6 +140,8 @@ impl DocumentVerifyArgs {
 enum FileOutcome {
     /// Every signature is valid.
     Valid,
+    /// No signature is rejected, but one is indeterminate.
+    Indeterminate,
     /// A signature is not valid, revoked or unsupported.
     Rejected,
     /// The file could not be judged.
@@ -148,12 +149,15 @@ enum FileOutcome {
 }
 
 /// The exit status of a run: a file that could not be judged
-/// outranks a rejected signature, which outranks success.
+/// outranks a rejected signature, which outranks an indeterminate one,
+/// which outranks success.
 fn exit_status(outcomes: &[FileOutcome]) -> ExitStatus {
     if outcomes.contains(&FileOutcome::Unjudged) {
         ExitStatus::RuntimeFailure
     } else if outcomes.contains(&FileOutcome::Rejected) {
         ExitStatus::VerifyFailed
+    } else if outcomes.contains(&FileOutcome::Indeterminate) {
+        ExitStatus::VerifyIndeterminate
     } else {
         ExitStatus::Ok
     }
@@ -220,9 +224,14 @@ impl Key {
 /// The verdict on one signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
-    /// Every check holds and nothing says the signer is revoked.
+    /// Every check holds, the chain is anchored and a verified answer
+    /// says the signer is not revoked.
     Valid,
-    /// At least one check fails.
+    /// Nothing is proven wrong, but the chain is not anchored or no
+    /// verified revocation answer speaks for the signer (`ETSI EN 319
+    /// 102-1` clause 5.1.3).
+    Indeterminate,
+    /// The document changed or the signature does not verify.
     NotValid,
     /// A verified answer says the signer is revoked.
     Revoked,
@@ -235,6 +244,7 @@ impl Verdict {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Valid => "valid",
+            Self::Indeterminate => "indeterminate",
             Self::NotValid => "not valid",
             Self::Revoked => "revoked",
             Self::Unsupported => "unsupported",
@@ -251,8 +261,14 @@ enum Reason {
     SignatureInvalid,
     /// The signer does not chain to a trust anchor.
     ChainUnverified,
+    /// The search for the signer's chain spent its whole budget of
+    /// signature verifications: the document carries far more
+    /// verifiable issuers than any legitimate one.
+    ChainSearchExhausted,
     /// The signature's profile is not implemented.
     ProfileNotSupported,
+    /// No verified revocation answer speaks for the signer.
+    RevocationUnknown,
 }
 
 impl Reason {
@@ -262,7 +278,11 @@ impl Reason {
             Self::DocumentChanged => "document changed",
             Self::SignatureInvalid => "signature invalid",
             Self::ChainUnverified => "certificate chain unverified",
+            Self::ChainSearchExhausted => {
+                "certificate chain search exhausted: too many issuers in the document"
+            }
             Self::ProfileNotSupported => "profile not supported",
+            Self::RevocationUnknown => "revocation status unknown",
         }
     }
 }
@@ -343,6 +363,9 @@ struct Facts {
     signature: bool,
     /// Whether the signer chains to a trust anchor.
     chained: bool,
+    /// Whether the chain search ran out of verifications before it
+    /// could finish.
+    search_exhausted: bool,
     /// The signer's path line.
     chain: String,
     /// The signing time the signature claims.
@@ -402,6 +425,7 @@ fn facts(report: &SignatureReport) -> Facts {
         intact: report.document_intact(),
         signature: report.signature_valid(),
         chained: report.chain_verified(),
+        search_exhausted: report.chain_search_exhausted(),
         chain: path(&[], report.chain()),
         claimed: report.claimed_signing_time(),
         timestamps,
@@ -454,15 +478,12 @@ impl SignatureView {
         };
         record.line(Key::Signed, time_or_none(facts.signed));
         record.line(Key::Verdict, facts.verdict.as_str());
-        if facts.verdict == Verdict::NotValid {
+        if matches!(facts.verdict, Verdict::NotValid | Verdict::Indeterminate) {
             for reason in facts.reasons() {
                 record.line(Key::Reason, reason.as_str());
             }
         }
         if !verbose {
-            if facts.verdict == Verdict::Valid && facts.revocation == Revocation::Unavailable {
-                record.line(Key::Revocation, "not checked");
-            }
             return record;
         }
         record.line(Key::Intact, yes_no(facts.intact));
@@ -480,7 +501,7 @@ impl SignatureView {
                 Revocation::Revoked { at, reason } => {
                     format!("revoked {at} {}", reason_name(reason))
                 }
-                Revocation::Unavailable => "not checked".to_owned(),
+                Revocation::Unavailable => "unknown".to_owned(),
             },
         );
         for stamped in &facts.document_timestamps {
@@ -491,16 +512,37 @@ impl SignatureView {
 }
 
 impl Facts {
-    /// Every cause of a not valid verdict, in check order.
+    /// Every cause of the verdict, in check order: what is proven wrong
+    /// for a not valid one, what could not be established for an
+    /// indeterminate one.
     fn reasons(&self) -> Vec<Reason> {
-        [
-            (self.intact, Reason::DocumentChanged),
-            (self.signature, Reason::SignatureInvalid),
-            (self.chained, Reason::ChainUnverified),
-        ]
-        .into_iter()
-        .filter_map(|(holds, reason)| (!holds).then_some(reason))
-        .collect()
+        match self.verdict {
+            Verdict::NotValid => [
+                (self.intact, Reason::DocumentChanged),
+                (self.signature, Reason::SignatureInvalid),
+            ]
+            .into_iter()
+            .filter_map(|(holds, reason)| (!holds).then_some(reason))
+            .collect(),
+            Verdict::Indeterminate => {
+                let chain = if self.search_exhausted {
+                    Reason::ChainSearchExhausted
+                } else {
+                    Reason::ChainUnverified
+                };
+                [
+                    (self.chained, chain),
+                    (
+                        self.revocation != Revocation::Unavailable,
+                        Reason::RevocationUnknown,
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(holds, reason)| (!holds).then_some(reason))
+                .collect()
+            }
+            Verdict::Valid | Verdict::Revoked | Verdict::Unsupported => Vec::new(),
+        }
     }
 }
 
@@ -519,11 +561,12 @@ fn verdict(signature: &SignatureReport) -> Verdict {
         .revocation()
         .revoked_before(signature.proof_of_existence())
     {
-        Verdict::Revoked
-    } else if signature.is_valid() {
-        Verdict::Valid
-    } else {
-        Verdict::NotValid
+        return Verdict::Revoked;
+    }
+    match signature.verdict() {
+        CoreVerdict::Valid => Verdict::Valid,
+        CoreVerdict::Indeterminate(_) => Verdict::Indeterminate,
+        CoreVerdict::NotValid => Verdict::NotValid,
     }
 }
 
@@ -633,6 +676,7 @@ mod tests {
             intact: true,
             signature: true,
             chained: true,
+            search_exhausted: false,
             chain: DVV_PATH.to_owned(),
             claimed: Some(at(CLAIMED)?),
             timestamps: vec![(format!("{} proven", at(STAMPED)?), DVV_PATH.to_owned())],
@@ -679,7 +723,7 @@ verdict: valid
         let mut facts = valid()?;
         facts.verdict = Verdict::NotValid;
         facts.intact = false;
-        facts.chained = false;
+        facts.signature = false;
         check(
             &rendered(&[signed(facts)], false).as_str(),
             &"\
@@ -688,7 +732,26 @@ signer: SURNAME GIVEN 12345678X
 signed: 2026-06-10T12:00:00Z
 verdict: not valid
 reason: document changed
-reason: certificate chain unverified
+reason: signature invalid
+",
+            "record",
+        )
+    }
+
+    #[test]
+    fn an_exhausted_chain_search_is_named_as_the_reason() -> TestResult {
+        let mut facts = valid()?;
+        facts.verdict = Verdict::Indeterminate;
+        facts.chained = false;
+        facts.search_exhausted = true;
+        check(
+            &rendered(&[signed(facts)], false).as_str(),
+            &"\
+file: /documents/a.pdf
+signer: SURNAME GIVEN 12345678X
+signed: 2026-06-10T12:00:00Z
+verdict: indeterminate
+reason: certificate chain search exhausted: too many issuers in the document
 ",
             "record",
         )
@@ -815,8 +878,9 @@ verdict: valid
     }
 
     #[test]
-    fn an_unchecked_revocation_follows_a_valid_verdict() -> TestResult {
+    fn an_unknown_revocation_status_makes_the_verdict_indeterminate() -> TestResult {
         let mut facts = valid()?;
+        facts.verdict = Verdict::Indeterminate;
         facts.revocation = Revocation::Unavailable;
         check(
             &rendered(&[signed(facts)], false).as_str(),
@@ -824,8 +888,26 @@ verdict: valid
 file: /documents/a.pdf
 signer: SURNAME GIVEN 12345678X
 signed: 2026-06-10T12:00:00Z
-verdict: valid
-revocation: not checked
+verdict: indeterminate
+reason: revocation status unknown
+",
+            "record",
+        )
+    }
+
+    #[test]
+    fn an_unanchored_chain_makes_the_verdict_indeterminate() -> TestResult {
+        let mut facts = valid()?;
+        facts.verdict = Verdict::Indeterminate;
+        facts.chained = false;
+        check(
+            &rendered(&[signed(facts)], false).as_str(),
+            &"\
+file: /documents/a.pdf
+signer: SURNAME GIVEN 12345678X
+signed: 2026-06-10T12:00:00Z
+verdict: indeterminate
+reason: certificate chain unverified
 ",
             "record",
         )
@@ -954,6 +1036,16 @@ document-timestamp: 2026-06-12T12:00:00Z unproven
             &exit_status(&[FileOutcome::Rejected, FileOutcome::Valid]),
             &ExitStatus::VerifyFailed,
             "rejected then valid",
+        )?;
+        check(
+            &exit_status(&[FileOutcome::Valid, FileOutcome::Indeterminate]),
+            &ExitStatus::VerifyIndeterminate,
+            "valid then indeterminate",
+        )?;
+        check(
+            &exit_status(&[FileOutcome::Indeterminate, FileOutcome::Rejected]),
+            &ExitStatus::VerifyFailed,
+            "a rejection outranks an indeterminate verdict",
         )?;
         check(
             &exit_status(&[FileOutcome::Valid, FileOutcome::Valid]),
