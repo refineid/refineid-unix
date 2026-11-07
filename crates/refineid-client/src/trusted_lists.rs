@@ -495,18 +495,21 @@ fn fetch(
     Ok((lists, records))
 }
 
-/// Held by every run over the user's cache in this process, so a
-/// background fetch ([`fetch_in_background`]) and a run that needs the
-/// lists meanwhile fetch them once: the later run waits, then reads
-/// what the first stored.
+/// Held by every run over the user's cache in this process that may
+/// fetch, so a background fetch ([`fetch_in_background`]) and a run
+/// that needs the lists meanwhile fetch them once: the later run
+/// waits, then reads what the first stored. A [`Refresh::CacheOnly`]
+/// run, the GUI's card readout, never waits: every file is replaced
+/// by an atomic rename, so it reads whole lists, old or new.
 static USER_CACHE: Mutex<()> = Mutex::new(());
 
 /// [`run_anchors`] over the user's cache, the Official Journal's
 /// list-signing certificates core ships and this crate's HTTP
-/// transport, one run at a time in this process.
+/// transport, one fetching run at a time in this process.
 #[must_use]
 pub fn user_anchors(now: DateTime, refresh: Refresh) -> RunAnchors {
-    let _one_at_a_time = USER_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    let _one_at_a_time = (refresh != Refresh::CacheOnly)
+        .then(|| USER_CACHE.lock().unwrap_or_else(PoisonError::into_inner));
     crate::doc_sign_http::install();
     let signers = lotl_signers();
     run_anchors(
