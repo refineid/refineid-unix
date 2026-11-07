@@ -1901,10 +1901,13 @@ mod gate_tests {
         Ok(())
     }
 
+    /// The PUK's last two tries: refused before the card is commanded.
+    const PUK_LAST_TRIES: &[u8] = &[2, 1];
+
     #[test]
-    fn a_puk_reset_is_refused_at_two_one_zero_puk_tries() -> TestResult {
+    fn a_puk_reset_is_refused_at_two_or_one_puk_tries() -> TestResult {
         for &slot in SLOTS {
-            for &puk in BELOW_FLOOR {
+            for &puk in PUK_LAST_TRIES {
                 let refused = unblock_gate(
                     slot,
                     PinReadiness::Activated,
@@ -1925,13 +1928,11 @@ mod gate_tests {
     }
 
     #[test]
-    fn a_puk_reset_is_refused_on_a_blocked_or_unreadable_puk() -> TestResult {
+    fn a_puk_reset_is_refused_on_an_unreadable_puk_counter() -> TestResult {
         for &slot in SLOTS {
             for puk in [
                 None,
                 Some(PukStatus::NoInfo),
-                Some(PukStatus::Locked),
-                Some(PukStatus::Invalidated),
                 Some(PukStatus::Other(UNMODELED_SW)),
             ] {
                 check_true(
@@ -1940,6 +1941,27 @@ mod gate_tests {
                         Err(CardPinError::RetryFloor(_))
                     ),
                     "refused",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// At no tries left, blocked or invalidated the reset goes to the
+    /// card: it answers for itself and spends nothing, and whether the
+    /// holder's code is a PUK or an activation code is never known.
+    #[test]
+    fn a_puk_reset_goes_to_the_card_at_no_tries_left_or_blocked() -> TestResult {
+        for &slot in SLOTS {
+            for puk in [
+                Some(puk_remaining(0)?),
+                Some(PukStatus::Locked),
+                Some(PukStatus::Invalidated),
+            ] {
+                check_true(
+                    unblock_gate(slot, PinReadiness::Activated, Some(PinStatus::Locked), puk)
+                        .is_ok(),
+                    "served",
                 )?;
             }
         }
