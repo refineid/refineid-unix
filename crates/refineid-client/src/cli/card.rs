@@ -174,16 +174,18 @@ impl CardArgs {
             println!("Connecting to paired remote reader: {dev_name} ({platform})");
         }
 
-        let identity_res = reader.execute(
-            Some(pair.pair_id),
-            &CardOperation::ReadIdentity,
-            super::card_pair::DISCOVERY_TIMEOUT,
-        );
-        let inspect_res = reader.execute(
-            Some(pair.pair_id),
-            &CardOperation::InspectCard,
-            super::card_pair::DISCOVERY_TIMEOUT,
-        );
+        // One search and one session serve both reads: a phone not in
+        // sight costs one discovery bound, not two.
+        let (identity_res, inspect_res) =
+            match reader.open_session(Some(pair.pair_id), super::card_pair::DISCOVERY_TIMEOUT) {
+                Ok(mut session) => {
+                    let identity = reader.execute_on(&mut session, &CardOperation::ReadIdentity);
+                    let inspect = reader.execute_on(&mut session, &CardOperation::InspectCard);
+                    reader.close_session(session);
+                    (identity, inspect)
+                }
+                Err(error) => (Err(error.clone()), Err(error)),
+            };
 
         println!("Remote FINEID Card (via {dev_name} - {platform})");
         println!("  Pair ID:      {}", pair.pair_id_hex());

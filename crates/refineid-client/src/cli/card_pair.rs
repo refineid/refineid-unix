@@ -84,7 +84,7 @@ https://card.refineid.fi.
 ";
 
 /// How long pairing and operations browse for the phone.
-pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DISCOVERY_TIMEOUT: Duration = refineid_rapp_core::remote::PHONE_DISCOVERY_TIMEOUT;
 
 /// Arguments for `refineid phone pair`. The code is read from the prompt only,
 /// never from the command line, where other local accounts could read it.

@@ -64,6 +64,36 @@ use refineid_rapp::{
 
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
+/// How long a command-line search waits for the paired phone to come
+/// into sight and open a session: long enough for a phone that is
+/// asleep in the holder's pocket when the search starts.
+///
+/// This host finds the phone over the local network only (mDNS and
+/// DNS-SD, hierarchy specification section 3.2); it has no BLE
+/// transport. The terms, longest first:
+///
+/// - The holder picks the phone up, unlocks it and brings the RefineID
+///   app forward to serve. This is human time no specification
+///   bounds; about 20 seconds is an estimate, not a measurement.
+/// - A phone whose Wi-Fi dozed reassociates and takes its address
+///   again: a few seconds when it was disconnected; while it stays
+///   associated in power save, multicast waits only for the next DTIM
+///   beacon, a fraction of a second.
+/// - The phone registers its service: a random wait of up to 250 ms
+///   and three probes 250 ms apart before it may answer (RFC 6762
+///   section 8.1), about one second.
+/// - The record is seen at the next query: queries go out every
+///   `BROWSE_ROUND`, to the group and to the phone's remembered
+///   address, so at most one round, two seconds.
+///
+/// The sum is about 25 seconds; 30 leaves margin. For comparison on
+/// the transport this host lacks: Apple's accessory guidelines have a
+/// BLE peripheral advertise every 20 ms for its first 30 seconds, and
+/// Android's slowest advertising mode is about one advertisement a
+/// second, so a waking phone found over BLE is in sight well within the
+/// same bound. The dial and handshake that follow have their own
+/// deadlines (`SESSION_RECEIVE_DEADLINE`).
+pub const PHONE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long pairing waits for each custodian message; the holder may be
 /// reading the screen. `CPace` step 2 has the shorter attempt deadline.
 const PAIRING_RECEIVE_DEADLINE: Duration = Duration::from_secs(60);
