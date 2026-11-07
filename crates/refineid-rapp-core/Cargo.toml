@@ -15,7 +15,8 @@ workspace = true
 refineid-rapp.workspace = true
 refineid-dev-errors.workspace = true
 getrandom.workspace = true
-rustix.workspace = true
+# geteuid(2), for whether a record file belongs to this process.
+rustix = { workspace = true, features = ["process"] }
 sha2.workspace = true
 socket2.workspace = true
 zeroize.workspace = true

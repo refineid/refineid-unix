@@ -36,7 +36,11 @@
 //! that session (section 4.6 item 1); the program that forgot it makes the
 //! attempt otherwise. The thread sweeps the pairings for idle expiry when
 //! it starts and daily (section 4.6 item 5); a pairing that expires takes
-//! its slot with it, silently.
+//! its slot with it, silently. The record's certificate leaves it after
+//! [`refineid_rapp_core::store::CERTIFICATE_RETENTION_DAYS`] without a
+//! session, whichever program looks first; this thread looks every round,
+//! and a pairing without one is offered as a slot with no token until a
+//! session reads the card.
 //!
 //! The host finalizes the module when its user quits it or unloads the
 //! module, and that is this computer's withdrawal (section 4.5 item 8):
@@ -601,6 +605,9 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
             pause(shared, UNPAIRED_PAUSE);
             continue;
         };
+        // A refused drop is tried again on the next round; the reader
+        // offers no certificate past retention meanwhile.
+        let _ = reader.drop_outlived_certificates();
         let Some(phone) = reader.phone() else {
             unpaired(shared, requests);
             viewed = None;
@@ -1196,13 +1203,13 @@ fn pause(shared: &Shared, duration: Duration) {
 mod tests {
     use super::*;
     use refineid_rapp::{
-        DisplayName, EndpointRole, PAIR_ID_SIZE, PAIRING_IDLE_EXPIRY_MS, PairRecord, ProfileName,
-        compute_grants_hash, generate_pair_key_material,
+        DisplayName, EndpointRole, PAIR_ID_SIZE, PAIRING_IDLE_EXPIRY_DAYS, PAIRING_IDLE_EXPIRY_MS,
+        PairRecord, ProfileName, compute_grants_hash, generate_pair_key_material,
     };
     use refineid_rapp_core::engine::current_time_ms;
     use refineid_rapp_core::remote::CardRequest;
     use refineid_rapp_core::session_lock::{SessionLock, session_lock_path};
-    use refineid_rapp_core::store::{PairingRecord, PairingStore as _};
+    use refineid_rapp_core::store::{CERTIFICATE_RETENTION_DAYS, PairingRecord, PairingStore as _};
 
     const DIGEST_SHA384_LEN: usize = 48;
 
@@ -1603,6 +1610,12 @@ mod tests {
     /// A confirmed pairing of [`PAIR_ID`] made at [`LONG_AGO_MS`] that has
     /// had no session.
     fn idle_pairing() -> PairingRecord {
+        pairing_made_at(LONG_AGO_MS)
+    }
+
+    /// A confirmed pairing of [`PAIR_ID`] made at `created_at_ms` that has
+    /// had no session.
+    fn pairing_made_at(created_at_ms: u64) -> PairingRecord {
         let local = generate_pair_key_material().expect("local keys");
         let peer = generate_pair_key_material().expect("peer keys");
         let profiles = vec![ProfileName::Authentication];
@@ -1618,7 +1631,7 @@ mod tests {
                     grants_hash,
                     profiles,
                     DisplayName::parse("Alpha Phone".to_owned()).expect("a valid name"),
-                    LONG_AGO_MS,
+                    created_at_ms,
                 )
             })
             .expect("a valid record");
@@ -1643,6 +1656,97 @@ mod tests {
             }
             thread::sleep(SWEEP_LOOK);
         }
+    }
+
+    /// One day in milliseconds.
+    const DAY_MS: u64 = PAIRING_IDLE_EXPIRY_MS / PAIRING_IDLE_EXPIRY_DAYS;
+    /// Six days ago, short of the certificate's retention.
+    fn six_days_ago() -> u64 {
+        current_time_ms() - (CERTIFICATE_RETENTION_DAYS - 1) * DAY_MS
+    }
+    /// Eight days ago, past the certificate's retention.
+    fn eight_days_ago() -> u64 {
+        current_time_ms() - (CERTIFICATE_RETENTION_DAYS + 1) * DAY_MS
+    }
+
+    /// Whether the record of [`PAIR_ID`] in `store` holds [`CERTIFICATE`]
+    /// on disk.
+    fn record_file_holds_certificate(store: &Path) -> bool {
+        std::fs::read_dir(store).expect("the store").any(|entry| {
+            std::fs::read(entry.expect("an entry").path()).is_ok_and(|bytes| {
+                bytes
+                    .windows(CERTIFICATE.len())
+                    .any(|window| window == CERTIFICATE)
+            })
+        })
+    }
+
+    /// A store holding [`PAIR_ID`], paired and caching [`CERTIFICATE`] by
+    /// `clock`.
+    fn store_cached_at(clock: fn() -> u64) -> PathBuf {
+        let store = scratch_store();
+        FilePairingStore::open_with_clock(&store, clock)
+            .expect("the test's store")
+            .insert(pairing_made_at(clock()).with_auth_cert(Some(CERTIFICATE.to_vec())))
+            .expect("the pairing is stored");
+        assert!(record_file_holds_certificate(&store));
+        store
+    }
+
+    #[test]
+    fn the_module_offers_the_cached_certificate_on_day_6() {
+        let store = store_cached_at(six_days_ago);
+        let phone = RemoteReader::open_local_without_sweep(&store)
+            .expect("the reader")
+            .phone()
+            .expect("the pairing");
+        assert_eq!(phone.auth_cert.as_deref(), Some(CERTIFICATE));
+        assert!(record_file_holds_certificate(&store));
+        std::fs::remove_dir_all(&store).expect("the test's store is removed");
+    }
+
+    /// On day 8 the module falls back to what a pairing that never cached a
+    /// certificate does: a slot with no token, until a session reads the
+    /// card and the token stands on what it read.
+    #[test]
+    fn the_module_falls_back_to_a_tokenless_slot_on_day_8() {
+        let store = store_cached_at(eight_days_ago);
+        let phone = RemoteReader::open_local_without_sweep(&store)
+            .expect("the reader")
+            .phone()
+            .expect("the pairing stands");
+        assert_eq!(phone.state, PairingState::PairedDisconnected);
+        assert_eq!(phone.auth_cert, None);
+        assert!(!record_file_holds_certificate(&store));
+
+        let start = Instant::now();
+        let mut offering =
+            Offering::new(the_slot(), "Alpha Phone".to_owned(), phone.auth_cert, start);
+        assert_eq!(certificate_at(&offering, start), None);
+        offering.confirmed(CERTIFICATE.to_vec());
+        assert_eq!(certificate_at(&offering, start), Some(CERTIFICATE.to_vec()));
+        std::fs::remove_dir_all(&store).expect("the test's store is removed");
+    }
+
+    #[test]
+    fn the_session_thread_drops_a_certificate_past_retention_from_the_file() {
+        let store = store_cached_at(eight_days_ago);
+        let session = SessionLock::acquire(&session_lock_path(&store, PairId::from_array(PAIR_ID)))
+            .expect("the pairing's session lock");
+        let source = PhoneSource::over_store(store.clone());
+        let _ = source.offered();
+        let deadline = Instant::now() + SWEEP_WAIT;
+        while record_file_holds_certificate(&store) && Instant::now() < deadline {
+            thread::sleep(SWEEP_LOOK);
+        }
+        assert!(!record_file_holds_certificate(&store));
+        assert_eq!(
+            state_within_wait(&store, Some(PairingState::PairedDisconnected)),
+            Some(PairingState::PairedDisconnected)
+        );
+        source.stop();
+        drop(session);
+        std::fs::remove_dir_all(&store).expect("the test's store is removed");
     }
 
     /// A synthetic ordinary user's uid.

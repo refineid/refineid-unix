@@ -6,10 +6,16 @@
 //! this computer's user forgot it or it expired (section 4.6 items 2 and
 //! 5), its latest session time (item 5) and the phone's display name
 //! (section 4.3 item 4) -- with what this computer keeps beside it: the
-//! phone's platform label and the cached authentication certificate. Operations leave nothing here: an operation
-//! lives and ends inside its session (section 8.1), and a session that
-//! fails before authentication changes nothing stored (section 10.1 item
-//! 1).
+//! phone's platform label and the cached authentication certificate.
+//! Operations leave nothing here: an operation lives and ends inside its
+//! session (section 8.1), and a session that fails before authentication
+//! changes nothing stored (section 10.1 item 1).
+//!
+//! The certificate names the holder, so refineid-core's
+//! `doc/security/certificate-custody.md` bounds it: it leaves the record
+//! after [`CERTIFICATE_RETENTION_DAYS`] without a session, while the pairing
+//! lives on, and it never outlives the pairing being forgotten, revoked,
+//! expired or replaced.
 //!
 //! A record exists while its key does. A pairing that is revoked loses its
 //! key and its record together.
@@ -20,11 +26,22 @@
 
 pub use refineid_rapp::PairingState;
 use refineid_rapp::{
-    ActivePairing, DisplayName, EndpointRole, PairRecord, RecordStoreError, SweepOutcome,
+    ActivePairing, DisplayName, EndpointRole, PAIRING_IDLE_EXPIRY_DAYS, PAIRING_IDLE_EXPIRY_MS,
+    PairRecord, RecordStoreError, SweepOutcome,
 };
 
 use crate::ids::PairId;
 use crate::persistence::frame_pairing_record;
+
+/// Days a pairing record keeps its authentication certificate without a
+/// session (refineid-core `doc/security/certificate-custody.md`). The
+/// pairing itself lives on to [`PAIRING_IDLE_EXPIRY_DAYS`], so the bound is
+/// the shorter one: a pairing that expires has no certificate left.
+pub const CERTIFICATE_RETENTION_DAYS: u64 = 7;
+const _: () = assert!(CERTIFICATE_RETENTION_DAYS < PAIRING_IDLE_EXPIRY_DAYS);
+/// [`CERTIFICATE_RETENTION_DAYS`] in milliseconds.
+pub const CERTIFICATE_RETENTION_MS: u64 =
+    CERTIFICATE_RETENTION_DAYS * (PAIRING_IDLE_EXPIRY_MS / PAIRING_IDLE_EXPIRY_DAYS);
 
 /// What a phone introduced itself as in `pairing.hello` (section 4.3
 /// item 3): labels for display, not identities.
@@ -127,6 +144,43 @@ impl PairingRecord {
         self.auth_cert.as_deref()
     }
 
+    /// The cached certificate unless it is past retention at `now_ms`,
+    /// milliseconds since the Unix epoch: what may be served, whether or
+    /// not the store managed to drop it yet.
+    #[must_use]
+    pub fn auth_cert_at(&self, now_ms: u64) -> Option<&[u8]> {
+        self.auth_cert()
+            .filter(|_| !self.certificate_outlived(now_ms))
+    }
+
+    /// Whether the record holds a certificate past retention at `now_ms`:
+    /// [`CERTIFICATE_RETENTION_MS`] have passed since the later of the
+    /// pairing's creation and its latest session, or the clock reads before
+    /// that time, which says nothing of how long ago it was. Dropping costs
+    /// one read of the card at the next session.
+    #[must_use]
+    pub fn certificate_outlived(&self, now_ms: u64) -> bool {
+        let since_ms = self
+            .pairing
+            .last_session_at_ms()
+            .map_or(self.pairing.created_at_ms(), |at_ms| {
+                at_ms.max(self.pairing.created_at_ms())
+            });
+        self.auth_cert.is_some()
+            && (now_ms < since_ms || now_ms - since_ms >= CERTIFICATE_RETENTION_MS)
+    }
+
+    /// The record without its certificate when that is past retention at
+    /// `now_ms`, and as it is otherwise.
+    #[must_use]
+    pub fn without_outlived_certificate(self, now_ms: u64) -> Self {
+        if self.certificate_outlived(now_ms) {
+            self.with_auth_cert(None)
+        } else {
+            self
+        }
+    }
+
     /// The record once the peer confirmed its storage (section 4.3 item
     /// 4); `active` is the engine's proof of both confirmations.
     ///
@@ -150,11 +204,13 @@ impl PairingRecord {
     }
 
     /// The record its user forgot at `at_ms`, milliseconds since the Unix
-    /// epoch (section 4.6 item 2): it serves nothing from then on.
+    /// epoch (section 4.6 item 2): it serves nothing from then on, and
+    /// keeps the key for the close but no certificate.
     #[must_use]
     pub fn forgotten(self, at_ms: u64) -> Self {
         Self {
             pairing: self.pairing.forgotten(at_ms),
+            auth_cert: None,
             ..self
         }
     }
@@ -219,6 +275,12 @@ impl PairingRecord {
     #[must_use]
     pub fn with_auth_cert(self, auth_cert: Option<Vec<u8>>) -> Self {
         Self { auth_cert, ..self }
+    }
+
+    /// Takes the certificate out of the record, once the store holds it
+    /// without.
+    pub(crate) fn drop_auth_cert(&mut self) {
+        self.auth_cert = None;
     }
 }
 
@@ -309,6 +371,34 @@ pub trait PairingStore {
 
     /// Every stored pairing, newest first.
     fn pair_ids(&self) -> Vec<PairId>;
+
+    /// Drops from the stored records every certificate past retention at
+    /// `now_ms`; the pairings stay. A sweep does this first, so a session
+    /// after the bound reads the card again and an expiring record holds
+    /// no certificate.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::WriteRefused`] when a write was refused: that record
+    /// stays as it was for the next call, and the others are done.
+    fn drop_outlived_certificates(&mut self, now_ms: u64) -> Result<(), StoreError> {
+        let mut outcome = Ok(());
+        for pair_id in self.pair_ids() {
+            if !self
+                .get(pair_id)
+                .is_ok_and(|record| record.certificate_outlived(now_ms))
+            {
+                continue;
+            }
+            let dropped = self.update(pair_id, &mut |record| {
+                Some(record.without_outlived_certificate(now_ms))
+            });
+            if dropped == Err(StoreError::WriteRefused) {
+                outcome = dropped;
+            }
+        }
+        outcome
+    }
 }
 
 /// An in-memory pairing store for tests and composition.
@@ -365,6 +455,8 @@ impl PairingStore for MemoryPairingStore {
         now_ms: u64,
         session_established: bool,
     ) -> Result<SweepOutcome, RecordStoreError<StoreError>> {
+        self.drop_outlived_certificates(now_ms)
+            .map_err(RecordStoreError::Store)?;
         self.records
             .iter_mut()
             .find(|entry| entry.pair_id() == pair_id)
@@ -459,7 +551,11 @@ mod tests {
     use refineid_rapp::{DisplayName, EndpointRole, PairRecord, PairingState, ProfileName};
 
     use super::fixtures::{CREATED_AT_MS, PHONE_PLATFORM, phone_name, record};
-    use super::{MemoryPairingStore, PairingRecord, PairingStore, RecordError, StoreError};
+    use super::{
+        CERTIFICATE_RETENTION_DAYS, CERTIFICATE_RETENTION_MS, MemoryPairingStore,
+        PAIRING_IDLE_EXPIRY_DAYS, PAIRING_IDLE_EXPIRY_MS, PairingRecord, PairingStore, RecordError,
+        StoreError,
+    };
     use crate::ids::PairId;
 
     /// A synthetic pair identifier.
@@ -470,6 +566,17 @@ mod tests {
     const CERTIFICATE: &[u8] = b"synthetic authentication certificate";
     /// The phone's name after its user renamed it.
     const RENAMED_PHONE: &str = "Beta Phone";
+    /// One day in milliseconds.
+    const DAY_MS: u64 = PAIRING_IDLE_EXPIRY_MS / PAIRING_IDLE_EXPIRY_DAYS;
+    /// The day before the certificate's retention ends.
+    const DAY_BEFORE_MS: u64 = CERTIFICATE_RETENTION_MS - DAY_MS;
+    /// The day after the certificate's retention ended.
+    const DAY_AFTER_MS: u64 = CERTIFICATE_RETENTION_MS + DAY_MS;
+
+    /// A record holding the certificate.
+    fn cached() -> PairingRecord {
+        record(PairId::from_array(PAIR_ID)).with_auth_cert(Some(CERTIFICATE.to_vec()))
+    }
 
     #[test]
     fn records_update_into_their_successor_and_go_with_their_key() {
@@ -547,6 +654,80 @@ mod tests {
                 .is_err()
         );
         assert_eq!(entry.peer_display_name(), &phone_name());
+    }
+
+    #[test]
+    fn the_retention_is_the_seven_days_the_custody_document_names() {
+        const NAMED_DAYS: u64 = 7;
+        assert_eq!(CERTIFICATE_RETENTION_DAYS, NAMED_DAYS);
+        assert_eq!(CERTIFICATE_RETENTION_MS, NAMED_DAYS * DAY_MS);
+    }
+
+    #[test]
+    fn a_certificate_stands_for_six_days_and_goes_by_eight() {
+        let entry = cached();
+        let day_6 = CREATED_AT_MS + DAY_BEFORE_MS;
+        let limit = CREATED_AT_MS + CERTIFICATE_RETENTION_MS;
+        let day_8 = CREATED_AT_MS + DAY_AFTER_MS;
+        assert!(!entry.certificate_outlived(day_6));
+        assert_eq!(entry.auth_cert_at(day_6), Some(CERTIFICATE));
+        assert!(entry.certificate_outlived(limit));
+        assert!(entry.certificate_outlived(day_8));
+        assert_eq!(entry.auth_cert_at(day_8), None);
+        assert_eq!(entry.auth_cert(), Some(CERTIFICATE));
+        let dropped = entry.without_outlived_certificate(day_8);
+        assert_eq!(dropped.auth_cert(), None);
+        assert_eq!(dropped.state(), PairingState::PairedDisconnected);
+    }
+
+    #[test]
+    fn a_clock_before_the_latest_session_says_nothing_and_the_certificate_goes() {
+        assert!(cached().certificate_outlived(CREATED_AT_MS - DAY_MS));
+    }
+
+    #[test]
+    fn a_record_without_a_certificate_has_nothing_past_retention() {
+        let entry = record(PairId::from_array(PAIR_ID));
+        assert!(!entry.certificate_outlived(CREATED_AT_MS + DAY_AFTER_MS));
+    }
+
+    #[test]
+    fn retention_runs_from_the_latest_session() {
+        let mut store = MemoryPairingStore::new();
+        let pair_id = PairId::from_array(PAIR_ID);
+        store.insert(cached()).unwrap();
+        let session = CREATED_AT_MS + DAY_BEFORE_MS;
+        store.sweep(pair_id, session, true).unwrap();
+        // Eight days after the pairing, but two after its session.
+        store
+            .drop_outlived_certificates(CREATED_AT_MS + DAY_AFTER_MS)
+            .unwrap();
+        assert_eq!(store.get(pair_id).unwrap().auth_cert(), Some(CERTIFICATE));
+        store
+            .drop_outlived_certificates(session + DAY_AFTER_MS)
+            .unwrap();
+        assert_eq!(store.get(pair_id).unwrap().auth_cert(), None);
+        assert_eq!(
+            store.get(pair_id).unwrap().state(),
+            PairingState::PairedDisconnected
+        );
+    }
+
+    #[test]
+    fn a_session_after_the_bound_finds_no_certificate() {
+        let mut store = MemoryPairingStore::new();
+        let pair_id = PairId::from_array(PAIR_ID);
+        store.insert(cached()).unwrap();
+        let session = CREATED_AT_MS + DAY_AFTER_MS;
+        store.sweep(pair_id, session, true).unwrap();
+        let entry = store.get(pair_id).unwrap();
+        assert_eq!(entry.auth_cert(), None);
+        assert_eq!(entry.pairing().last_session_at_ms(), Some(session));
+    }
+
+    #[test]
+    fn a_forgotten_record_keeps_no_certificate() {
+        assert_eq!(cached().forgotten(FORGOTTEN_AT_MS).auth_cert(), None);
     }
 
     #[test]
