@@ -42,6 +42,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::thread::JoinHandle;
 
 use refineid_doc_sign::uri::Uri;
 use refineid_doc_sign::verification::trusted_list::{
@@ -422,11 +424,18 @@ fn fetch(
     Ok((lists, records))
 }
 
+/// Held by every run over the user's cache in this process, so a
+/// background fetch ([`fetch_in_background`]) and a run that needs the
+/// lists meanwhile fetch them once: the later run waits, then reads
+/// what the first stored.
+static USER_CACHE: Mutex<()> = Mutex::new(());
+
 /// [`run_anchors`] over the user's cache, the Official Journal's
 /// list-signing certificates core ships and this crate's HTTP
-/// transport.
+/// transport, one run at a time in this process.
 #[must_use]
 pub fn user_anchors(now: DateTime, refresh: Refresh) -> RunAnchors {
+    let _one_at_a_time = USER_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     crate::doc_sign_http::install();
     run_anchors(
         ListCache::user().as_ref(),
@@ -435,6 +444,18 @@ pub fn user_anchors(now: DateTime, refresh: Refresh) -> RunAnchors {
         &lotl_signers(),
         fetch_over_http,
     )
+}
+
+/// Bring the user's lists up to date on a thread of their own when a
+/// fetch is due ([`Refresh::WhenDue`]), so that the first signing or
+/// verification after an install, or after the cache went stale, finds
+/// them at hand instead of waiting for the download. A run that needs
+/// the lists before the thread is done waits for it and fetches
+/// nothing again.
+pub fn fetch_in_background() -> JoinHandle<()> {
+    std::thread::spawn(|| {
+        let _run = user_anchors(refineid_doc_sign::now_date_time(), Refresh::WhenDue);
+    })
 }
 
 /// How many of `lists` read: the list of the lists and every national
