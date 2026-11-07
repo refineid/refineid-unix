@@ -61,6 +61,21 @@ resume work or clean up. In particular:
 - A worktree outside `../wt/` (resolved next to the main checkout) is
   flagged as non-compliant.
 
+## Build artifacts and disk space
+
+Each worktree that compiles code maintains an independent `target/` directory,
+which across dozens of worktrees can exhaust disk space quickly.
+
+- `Cargo.toml` sets `debug = 1` for the `dev` profile (inherited by `test`).
+  This generates line number tables so panic backtraces (with `RUST_BACKTRACE=1`)
+  and test failures still identify exact source files and line numbers, while
+  omitting heavy DWARF type descriptions. If full variable inspection in a
+  debugger is ever needed, it can be overridden locally without modifying the
+  repository via `CARGO_PROFILE_DEV_DEBUG=2 cargo build`.
+- Inactive or blocked worktrees should have their `target/` directories pruned
+  (`rm -rf target/`) to keep disk space under control. Deleting `target/` loses
+  no work and no git state.
+
 ## Finishing a task
 
 1. Run the quality gates in the worktree: `script/verify-commit.sh` is the
