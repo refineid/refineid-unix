@@ -7,8 +7,9 @@
 //! signing controls and the outcome of the last action. A contactless
 //! card asking for its access number, a card waiting to be taken into
 //! use, and the pairing prompt replace that content. The header bar holds
-//! one control: the remote-use switch, or the button that opens the PIN
-//! codes window while a card is in a reader here.
+//! the remote-use switch; the button that opens the PIN codes window
+//! while a card is in a reader here sits at the right end of the identity
+//! line, beside the holder's name.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -478,7 +479,6 @@ impl Ui {
             .build();
         name(&pin_codes_button, window::PIN_CODES);
         header.pack_end(&remote_switch);
-        header.pack_end(&pin_codes_button);
         window.set_titlebar(Some(&header));
 
         let root = column();
@@ -487,9 +487,20 @@ impl Ui {
         root.set_margin_start(PADDING);
         root.set_margin_end(PADDING);
 
+        // The identity line: the holder's name at the left, and at the
+        // right end of the same line the PIN codes button, which opens
+        // the PIN management window while a card is present.
         let identity = text_label("");
         identity.set_selectable(true);
-        root.append(&identity);
+        identity.set_hexpand(true);
+        identity.set_halign(gtk4::Align::Start);
+        let identity_row = gtk4::Box::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(SPACING)
+            .build();
+        identity_row.append(&identity);
+        identity_row.append(&pin_codes_button);
+        root.append(&identity_row);
 
         // The pairing prompt.
         let prompt = column();
@@ -890,7 +901,7 @@ impl Ui {
         let content = WindowContent::derive(state);
         let entered = self.content.replace(Some(content)) != Some(content);
 
-        // The header bar's one control.
+        // The header bar's switch and the identity line's button.
         let opens_pin_codes = window::toolbar_opens_pin_codes(state);
         self.pin_codes_button.set_visible(opens_pin_codes);
         self.remote_switch.set_visible(!opens_pin_codes);
