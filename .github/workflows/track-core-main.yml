@@ -40,7 +40,7 @@ jobs:
 
       - name: Move every lock file to the head of core main
         run: |
-          cargo update --package refineid-apdu
+          script/update-core.sh
       - name: Stop when every lock file already names the head
         id: moved
         run: |
