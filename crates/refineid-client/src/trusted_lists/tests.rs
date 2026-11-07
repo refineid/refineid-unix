@@ -851,3 +851,60 @@ fn a_list_no_longer_pointed_at_leaves_the_cache() -> TestResult {
         "the national list is gone",
     )
 }
+
+/// The live lists, over the network, into a scratch cache. Run by hand:
+/// `cargo test -p refineid-client live_lists -- --ignored --nocapture`.
+#[test]
+#[ignore = "fetches the live EU trusted lists over the network"]
+fn live_lists_fetch_read_and_anchor() -> TestResult {
+    use refineid_doc_sign::verification::trusted_list::{MAX_LIST_BYTES, lotl_signers};
+
+    crate::doc_sign_http::install();
+    let now = refineid_doc_sign::now_date_time();
+    let lotl = Uri::parse(LOTL_LOCATION.to_owned())?;
+    let bytes = refineid_doc_sign::http::get(&lotl, MAX_LIST_BYTES)
+        .map_err(|error| format!("list of the lists: {error}"))?;
+    println!("list of the lists: {} bytes", bytes.len());
+    let dir = TempDir::new("trusted-lists-live")?;
+    let cache = ListCache::at(dir.path().to_path_buf());
+    let run = run_anchors(
+        Some(&cache),
+        now,
+        Refresh::Now,
+        &lotl_signers(),
+        fetch_over_http,
+    );
+    println!("{}", run.source);
+    println!("{} anchors", run.anchors.anchors().len());
+    let records = cache.load();
+    let lists = TrustedLists::from_cache(&records, &lotl_signers())?;
+    for list in lists.national() {
+        match list.outcome() {
+            Ok(read) => println!(
+                "{} read: {} services, next update {:?}",
+                list.territory(),
+                read.services().len(),
+                read.next_update()
+            ),
+            Err(failure) => {
+                let why = list
+                    .location()
+                    .map(|location| refineid_doc_sign::http::get(location, MAX_LIST_BYTES))
+                    .and_then(Result::err)
+                    .map_or_else(String::new, |error| format!(" ({error})"));
+                println!("{} not read: {failure}{why}", list.territory());
+            }
+        }
+    }
+    check_true(
+        lists
+            .national()
+            .iter()
+            .any(|list| list.territory() == "FI" && list.outcome().is_ok()),
+        "the Finnish list read",
+    )?;
+    check_true(
+        matches!(run.source, AnchorSource::Lists { .. }),
+        "anchors come from the lists",
+    )
+}
