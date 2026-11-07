@@ -23,7 +23,13 @@ Citations are BibTeX keys in [`references.md`](references.md).
   unasked; `-V` does that. There is no info page.
 - **Quiet on success.** An operation prints nothing when it works and
   reports its steps with `-v`. The exit status tells success from
-  failure, so `&&` and `||` compose.
+  failure, so `&&` and `||` compose. The one exception is a
+  development build's document saved below the level a release build
+  requires: `refineid document sign` says so on standard error, with
+  the file and the reason, even without `-v`, because the file is not
+  what the released program would have made. There is no evidence
+  behind this beyond the owner's rule (refineid-core
+  `doc/architecture/signing-levels.md`).
 - **Reports are records.** A command that reports facts, such as
   `refineid document verify`, prints one record per thing judged,
   records separated by one blank line, each line `key: value` with a
