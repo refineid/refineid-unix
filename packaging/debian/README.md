@@ -14,9 +14,10 @@ Binary `.deb` packages are produced automatically by `script/package-deb.sh`
    - Compatibility symlink `/usr/lib/librefineid_pkcs11.so`
    - System p11-kit module `/usr/share/p11-kit/modules/refineid.module`
    - Polkit access rule `/usr/share/polkit-1/rules.d/50-refineid-pcscd.rules`
-   - Firefox enterprise policy `/etc/firefox/policies/policies.json`
+   - Firefox enterprise policy `/etc/firefox/policies/policies.json`, from `policies.json` here with `@MODULE@` replaced by the multiarch module path
+   - Module copy `/var/snap/firefox/common/refineid/librefineid_pkcs11.so` for Ubuntu's Firefox snap, placed by `postinst` (see below)
    - Desktop autostart entry `/etc/xdg/autostart/refineid-browser-token.desktop` running `/usr/libexec/refineid/refineid-browser-token`, which gives the signed-in user's NSS database the module for Chromium
-   - Maintainer scripts (`postinst`, `postrm`, `prerm`) managing `ldconfig`, polkit reload, and `pcscd.socket` activation.
+   - Maintainer scripts `postinst`, `postrm` and `prerm` from this directory, managing `ldconfig`, polkit reload, `pcscd.socket` activation and the snap copy.
 2. **`refineid-cli`** (`Multi-Arch: foreign`):
    - Command-line tool `/usr/bin/refineid`
    - Manual page `/usr/share/man/man1/refineid.1.gz`
@@ -28,6 +29,34 @@ Binary `.deb` packages are produced automatically by `script/package-deb.sh`
    - Maintainer scripts triggering `update-desktop-database` and `gtk-update-icon-cache`
 4. **`refineid`** (`Architecture: all` metapackage):
    - Metapackage pulling in CLI, PKCS#11, and GUI, with `Recommends: pcscd, libccid, pcsc-tools`.
+
+## Firefox from snap
+
+Ubuntu's default Firefox is a snap under strict confinement. Inside it
+the host's `/usr/lib` is not at `/usr/lib`, and the dynamic loader is
+denied the host filesystem view at `/var/lib/snapd/hostfs`, so neither
+the module's host path nor a symlink to it can be loaded; the
+`SecurityDevices` entry for the host path does nothing there. The snap
+does see `/etc/firefox/policies`, its own common data directory
+`/var/snap/firefox/common`, and the `pcscd` socket through its
+connected `pcscd` interface.
+
+So `postinst` copies the module to
+`/var/snap/firefox/common/refineid/librefineid_pkcs11.so` (directory
+0755, file 0644, root-owned) whenever `/var/snap/firefox/common` exists,
+on every `configure`, so an upgrade refreshes the copy; `postrm` deletes
+the copy on `remove` and `purge`, and the directory when it is empty.
+Inside the snap the copy resolves against the snap's own
+`libpcsclite.so.1`. `policies.json` names both paths, `FINEID` for the
+host path and `FINEID (snap)` for the copy; Firefox silently ignores a
+`SecurityDevices` path it cannot load, so a deb-based Firefox sees one
+module and the snap sees one module. A Firefox snap installed after the
+package gets its copy when the package is next configured
+(`apt reinstall refineid-pkcs11`).
+
+The package registers no Thunderbird policy; the same confinement and
+the same remedy, a copy under `/var/snap/thunderbird/common`, apply to
+Thunderbird's snap if that is ever added.
 
 ## Firefox policy roots
 
@@ -75,6 +104,7 @@ call after that observation.
 | p11-kit registration | Distro modules in `/usr/share` | `/usr/share/p11-kit/modules/refineid.module` |
 | Polkit rule | Distro rules in `/usr/share` | `/usr/share/polkit-1/rules.d/50-refineid-pcscd.rules` |
 | Firefox policy | Conffile in `/etc` | `/etc/firefox/policies/policies.json` |
+| Firefox snap module copy | Snap common data (`/var/snap/<snap>/common`) | `/var/snap/firefox/common/refineid/librefineid_pkcs11.so` |
 | Desktop & icon | Freedesktop / XDG specs | `/usr/share/applications/refineid.desktop`, `/usr/share/icons/...` |
 | Package copyright | DEP-5 format (§12.3) | `/usr/share/doc/<pkg>/copyright` |
 | Shared library dependencies | Dynamic resolution | Generated via `dpkg-shlibdeps` |

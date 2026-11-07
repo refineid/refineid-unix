@@ -1,19 +1,21 @@
 #!/bin/sh
-# postrm for refineid - post-removal hooks.
+# Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
+#
+# postrm of refineid-pkcs11.
 set -e
 
+# The module copy that postinst places for Ubuntu's Firefox snap.
+SNAP_DIR="/var/snap/firefox/common/refineid"
+
 case "$1" in
-    purge)
-        # Conf-files (policies.json, polkit rule) are removed by
-        # dpkg automatically on `purge`; nothing for us to clean
-        # up beyond running ldconfig.
+    purge|remove|upgrade|disappear|abort-install|abort-upgrade|failed-upgrade)
         if command -v ldconfig >/dev/null 2>&1; then
             ldconfig
         fi
-        ;;
-    remove|upgrade|disappear|abort-install|abort-upgrade|failed-upgrade)
-        if command -v ldconfig >/dev/null 2>&1; then
-            ldconfig
+        if [ -d /run/systemd/system ]; then
+            if systemctl is-active --quiet polkit 2>/dev/null; then
+                systemctl reload polkit 2>/dev/null || true
+            fi
         fi
         ;;
     *)
@@ -22,6 +24,13 @@ case "$1" in
         ;;
 esac
 
-#DEBHELPER#
+case "$1" in
+    purge|remove)
+        rm -f "$SNAP_DIR/librefineid_pkcs11.so"
+        if [ -d "$SNAP_DIR" ]; then
+            rmdir "$SNAP_DIR" 2>/dev/null || true
+        fi
+        ;;
+esac
 
 exit 0
