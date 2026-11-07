@@ -554,19 +554,24 @@ impl PinTask {
         matches!(self, Self::ResetPin1 | Self::ResetPin2)
     }
 
-    /// The three field names: the code presented, the new code, the new
-    /// code again.
+    /// The three field names: the PIN presented, the new PIN, the new
+    /// PIN again. A PIN is called a PIN, by its FINEID name: there is no
+    /// such thing as a "code" on the card.
     #[must_use]
     pub fn fields(self) -> [&'static str; 3] {
         match self {
-            Self::ChangePin1 => ["Current basic code", "New basic code", "Basic code again"],
-            Self::ChangePin2 => [
-                "Current signature code",
-                "New signature code",
-                "Signature code again",
+            Self::ChangePin1 => [
+                "Current Basic PIN 1",
+                "New Basic PIN 1",
+                "Basic PIN 1 again",
             ],
-            Self::ResetPin1 => [PUK, "New basic code", "Basic code again"],
-            Self::ResetPin2 => [PUK, "New signature code", "Signature code again"],
+            Self::ChangePin2 => [
+                "Current Signature PIN 2",
+                "New Signature PIN 2",
+                "Signature PIN 2 again",
+            ],
+            Self::ResetPin1 => [PUK, "New Basic PIN 1", "Basic PIN 1 again"],
+            Self::ResetPin2 => [PUK, "New Signature PIN 2", "Signature PIN 2 again"],
         }
     }
 
