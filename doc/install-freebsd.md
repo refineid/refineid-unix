@@ -145,7 +145,7 @@ In Firefox the module appears under "RefineID" in Settings > Privacy &
 Security > Security Devices, with the reader as one slot and the paired
 phone (section 7) as another, "RefineID Remote" with the phone's name.
 A card in the reader shows the token "Basic PIN 1"; the paired phone
-shows "Phone PIN 1" while the module holds a session to it and the
+shows "Phone Basic PIN 1" while the module holds a session to it and the
 phone reports its card. The phone's certificate comes from the pairing
 record, read from the card once and cached, so the phone does nothing
 for the slot but answer the session's pings; it is asked for one

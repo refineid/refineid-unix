@@ -1482,7 +1482,7 @@ impl CardCheckReport {
         )?;
         writeln!(
             f,
-            "PIN1 (auth):              {} (changed since manufacture: {}; usage: {}; unblocks: {})",
+            "Basic PIN 1:             {} (changed since manufacture: {}; usage: {}; unblocks: {})",
             CardCheckHelpers::render_pin_status(self.pin1.as_ref()),
             CardCheckHelpers::render_pin_changed(self.pin1_changed),
             CardCheckHelpers::render_usage_counter(self.pin1_policy.as_ref()),
@@ -1490,7 +1490,7 @@ impl CardCheckReport {
         )?;
         writeln!(
             f,
-            "PIN2 (qualified-sig):     {} (changed since manufacture: {}; usage: {}; unblocks: {})",
+            "Signature PIN 2:         {} (changed since manufacture: {}; usage: {}; unblocks: {})",
             CardCheckHelpers::render_pin_status(self.pin2.as_ref()),
             CardCheckHelpers::render_pin_changed(self.pin2_changed),
             CardCheckHelpers::render_usage_counter(self.pin2_policy.as_ref()),
