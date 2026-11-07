@@ -30,7 +30,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ACT="python3 -I $HERE/e2e-firefox-a11y.py"
 SHOTS=$(xdg-user-dir PICTURES 2>/dev/null || echo "$HOME/Pictures")
 OUT=${OUT:-$(mktemp -d)}
-LOG=$OUT/pkcs11.log
+# The module log must be where the Firefox snap can write: its confinement
+# gives it a private /tmp, so the log lives under the snap's common data
+# when that exists, else beside the run.
+if [ -d "$HOME/snap/firefox/common" ]; then LOG=$HOME/snap/firefox/common/e2e-pkcs11.log; else LOG=$OUT/pkcs11.log; fi
 export YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-/tmp/.ydotool_socket}"
 until_ok() { desc=$1; shift; i=0; while [ $i -lt 60 ]; do $ACT "$@"; rc=$?; [ $rc -eq 0 ] && { echo "ok    $desc (${i}x0.5s)"; return 0; }; [ $rc -eq 4 ] && { echo "FAIL  $desc"; return 1; }; sleep 0.5; i=$((i+1)); done; echo "TIMEOUT $desc"; return 1; }
 umask 077
