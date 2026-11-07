@@ -124,6 +124,17 @@ Debian and FreeBSD compare each dot-separated run of digits as a number,
 so `26.11.7.905` sorts before `26.11.7.1512`, and both after any
 `26.11.6.B`.
 
+A development snapshot carries a build mark: with `REFINEID_BUILD_MARK`
+set to a word of letters a-z, such as `bob`, the version is
+`YY.M.D~<mark>B` (`26.11.7~bob1600`) in the binaries, `script/version.sh`
+and the package versions and file names; a release never sets it, and
+the `prepare` job fails when it is set. In dpkg a tilde sorts before
+anything, even the end of the version, so `26.11.7~bob1600` is below
+`26.11.7.1543` and below every release of a later day, while snapshots
+of one day order by their minute. FreeBSD's pkg reads the tilde as a
+separator and a component that starts with a letter as below every
+number, which gives the same order.
+
 ## Release
 
 A release is a stamp, made by hand: a tag `vYY.M.D.HHMM`, where `YY.M.D`

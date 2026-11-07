@@ -113,14 +113,11 @@ pub mod x509;
 pub use backend::ReaderBackend;
 pub use error::IoError;
 
-/// Project version `YY.M.D.B`: the workspace version `YY.M.D`, the UTC
-/// day the code last changed, and the build number `B` from build.rs,
-/// the UTC time of day of the build as hour * 100 + minute.
-pub const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    ".",
-    env!("REFINEID_BUILD_NUMBER")
-);
+/// Project version `YY.M.D.B`, or `YY.M.D~MB` with a build mark `M`:
+/// the workspace version `YY.M.D`, the UTC day the code last changed,
+/// and the build number `B`, the UTC time of day of the build as
+/// hour * 100 + minute, as build.rs assembles them.
+pub const VERSION: &str = env!("REFINEID_VERSION");
 
 #[cfg(test)]
 mod build_number;
