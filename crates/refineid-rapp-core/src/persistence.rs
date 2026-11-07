@@ -120,6 +120,18 @@ pub fn encode_pairing_record(
     )
 }
 
+/// [`encode_pairing_record`] of `record` as it stands once its certificate
+/// is dropped.
+///
+/// # Errors
+/// As [`encode_pairing_record`].
+pub(crate) fn encode_pairing_record_without_certificate(
+    record: &PairingRecord,
+) -> Result<Zeroizing<Vec<u8>>, PairingCodecError> {
+    let pairing = encode_pair_record(record.pairing()).map_err(PairingCodecError::Pairing)?;
+    frame_pairing_record(pairing.as_bytes(), record.peer_platform(), None)
+}
+
 /// Frames `pairing`, the engine's encoded record, with what the workstation
 /// keeps beside it, into the stored blob.
 ///
