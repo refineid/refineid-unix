@@ -58,42 +58,33 @@ The package registers no Thunderbird policy; the same confinement and
 the same remedy, a copy under `/var/snap/thunderbird/common`, apply to
 Thunderbird's snap if that is ever added.
 
-## Firefox policy roots
+## Trust from the card, not from installed roots
 
-`policies.json` installs two DVV root certificates system-wide through
-the Firefox `Certificates.Install` policy, trusted for every purpose
-including TLS server authentication, with no card in any reader. The
-policy exists because no Mozilla-derived root store knows the DVV roots:
-DVV's roots (DVV Gov. Root CA - G3 ECC and RSA) are in Microsoft's root
-program, so Windows and macOS system stores carry them, but DVV has not
-applied to Mozilla's root program, so Firefox's built-in store, and the
-stores derived from it (Debian `ca-certificates`, NixOS, FreeBSD), do
-not. Chrome's own root store covers server authentication only and
-Chrome on Linux takes client certificates, and the trust for their
-chains, from NSS.
-
-The PKCS#11 module now presents an NSS trust record next to each CA
-certificate it reads from the card (see the
+This package installs no certificate authority files and sets no
+`Certificates.Install` policy. The PKCS#11 module presents an NSS trust
+record next to each CA certificate it reads from the card (see the
 [module README](../../crates/refineid-pkcs11/README.md#nss-trust-records)):
 the DVV root is trusted for client authentication and email only, and
 only while a FINEID card is in the reader, from the card and through
-NSS, for Firefox, Thunderbird and Chrome alike. The policy roots remain
-in this package until the maintainer has confirmed that behaviour in
-Firefox on Linux with a card; then `Certificates.Install` leaves
-`policies.json` and the package scripts in one change, and only the
-`SecurityDevices` entry that loads the module stays.
+NSS, for Firefox, Thunderbird and Chrome alike. Verified on Ubuntu 26.10
+on 2026-11-07: with no root file installed, the Firefox snap logged a
+holder into a card-authenticated site with a production citizen card.
 
-What to expect in that test: NSS searches the certificates and trust
-records of a login-required token only after the user has logged in
-to it, unless the module was registered as friendly (`modutil -add
-... -mechanisms FRIENDLY`), and the `SecurityDevices` policy registers
-without that flag. So the certificate manager should show the DVV root
-as trusted for identifying mail users and clients, and not web sites,
-from the session's first PIN login on; before it, the token's
-certificates are not listed at all. Whether the token should be made
-friendly, by the registration flag in `refineid-browser-token` or by a
-public-certificates profile object in the module, is the maintainer's
-call after that observation.
+The roots were installed system-wide until then because no
+Mozilla-derived root store knows them: DVV's roots (DVV Gov. Root CA -
+G3 ECC and RSA) are in Microsoft's root program, so Windows and macOS
+system stores carry them, but DVV has not applied to Mozilla's root
+program, so Firefox's built-in store, and the stores derived from it
+(Debian `ca-certificates`, NixOS, FreeBSD), do not. Chrome's own root
+store covers server authentication only, and Chrome on Linux takes
+client certificates, and the trust for their chains, from NSS.
+
+## Firefox snap and the card daemon
+
+The Firefox snap reaches `pcscd` through its `pcscd` interface, which
+is not connected by default on every Ubuntu release. `postinst` connects
+it when the snap is installed (`snap connect firefox:pcscd`); without
+the connection the module loads inside the snap but sees no reader.
 
 ## Debian / Ubuntu Policy Compliance
 

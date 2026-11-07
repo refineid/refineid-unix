@@ -173,9 +173,6 @@ install -m 644 packaging/debian/50-refineid-pcscd.rules \
     "$STAGING_PKCS11/usr/share/polkit-1/rules.d/50-refineid-pcscd.rules"
 
 install -d "$STAGING_PKCS11/etc/firefox/policies"
-install -m 644 crates/refineid-client/trust-anchors/dvv-gov-root-ca-g3-ecc.der \
-    crates/refineid-client/trust-anchors/dvv-gov-root-ca-g3-rsa.der \
-    "$STAGING_PKCS11/etc/firefox/policies/"
 
 # The policy names the module twice: at its host path, and at the copy
 # postinst places for Ubuntu's Firefox snap, whose confinement denies the

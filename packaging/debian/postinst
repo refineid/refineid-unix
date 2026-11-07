@@ -20,6 +20,12 @@ case "$1" in
         if [ -d "$SNAP_COMMON" ]; then
             install -d -m 755 "$SNAP_DIR"
             install -m 644 "$MODULE" "$SNAP_DIR/librefineid_pkcs11.so"
+            # The snap reaches pcscd only through its pcscd interface,
+            # which some Ubuntu releases leave unconnected; without it
+            # the module loads inside the snap but sees no reader.
+            if command -v snap >/dev/null 2>&1; then
+                snap connect firefox:pcscd >/dev/null 2>&1 || true
+            fi
         fi
         if [ -d /run/systemd/system ]; then
             if systemctl is-active --quiet polkit 2>/dev/null; then

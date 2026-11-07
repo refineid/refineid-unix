@@ -118,11 +118,9 @@ with the trust string `T,C,`. The attribute table and the NSS source
 references are in the core crate's
 [README](https://github.com/refineid/refineid-core/blob/main/crates/pkcs11/README.md#nss-trust-records).
 
-The Debian package still installs the two DVV G3 roots through the
-Firefox `Certificates.Install` policy
-(`packaging/debian/policies.json`); see
-[the packaging notes](../../packaging/debian/README.md#firefox-policy-roots)
-for why, and for when that policy goes away.
+No package installs a root certificate for Firefox any more; trust comes
+from the card as described above. The history and the reasons are in
+[the packaging notes](../../packaging/debian/README.md#trust-from-the-card-not-from-installed-roots).
 
 ## Card access
 
