@@ -28,8 +28,10 @@
 //! On each run the cached lists are read back, every signature
 //! verified again, and used as they are while none is due: the lists
 //! are fetched afresh when there is no cache, a cached list no longer
-//! reads, one is past its `NextUpdate`, the cache is older than
-//! [`REFRESH_AFTER`], or the caller asks ([`Refresh::Now`]). A national
+//! reads, the Finnish list is missing, one is past its `NextUpdate`,
+//! the cache is older than [`REFRESH_AFTER`], or the caller asks
+//! ([`Refresh::Now`]). A fetch that leaves them due is not tried again
+//! for [`RETRY_AFTER`], recorded in an `attempted-at` file. A national
 //! list that fails in a refresh keeps its last cached copy; a list of
 //! the lists that fails leaves every cached list in use and the report
 //! says how old they are. With no list at all there is no anchor, and
@@ -66,6 +68,17 @@ const REFRESH_AFTER_DAYS: u64 = 30;
 /// often monthly; a month-old cache therefore misses a withdrawal the
 /// list's own schedule would announce only later.
 pub const REFRESH_AFTER: Duration = Duration::from_secs(REFRESH_AFTER_DAYS * SECONDS_PER_DAY);
+/// Seconds in an hour.
+const SECONDS_PER_HOUR: u64 = 3_600;
+/// How long after a fetch a run that finds the lists still due uses
+/// them as they are instead of fetching again. A fetch can leave them
+/// due through no fault of this computer: an operator late with its
+/// next list keeps a list past its `NextUpdate`, and a list that does
+/// not arrive keeps its old copy. Without this pause every run would
+/// download every list again, some 30 MB, until the operator or the
+/// network recovered; an hour bounds that to one download an hour,
+/// far inside the [`REFRESH_AFTER`] a fresh cache is trusted for.
+pub const RETRY_AFTER: Duration = Duration::from_secs(SECONDS_PER_HOUR);
 
 /// The XDG base-directory cache variable.
 const XDG_CACHE_HOME: &str = "XDG_CACHE_HOME";
@@ -81,6 +94,8 @@ const LISTS_DIRECTORY: &str = "trusted-lists";
 const LIST_EXTENSION: &str = "list";
 /// File extension of a list being written.
 const TEMPORARY_EXTENSION: &str = "tmp";
+/// The file holding when the lists were last fetched or tried.
+const ATTEMPT_FILE: &str = "attempted-at";
 /// Owner-only directory permissions.
 const DIRECTORY_MODE: u32 = 0o700;
 /// Owner-only file permissions.
@@ -272,6 +287,28 @@ impl ListCache {
         Ok(())
     }
 
+    /// When a fetch was last tried into this cache, if one was and
+    /// its record reads.
+    fn attempted_at(&self) -> Option<DateTime> {
+        let bytes = fs::read(self.directory.join(ATTEMPT_FILE)).ok()?;
+        core::str::from_utf8(&bytes).ok()?.trim().parse().ok()
+    }
+
+    /// Record that a fetch was tried at `now`.
+    ///
+    /// # Errors
+    /// The I/O error of the write.
+    fn mark_attempt(&self, now: DateTime) -> std::io::Result<()> {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(DIRECTORY_MODE)
+            .create(&self.directory)?;
+        write_atomically(
+            &self.directory.join(ATTEMPT_FILE),
+            now.to_string().as_bytes(),
+        )
+    }
+
     /// The file of the list at `location`: the SHA-256 of the location
     /// in lowercase hex.
     fn path_for(&self, location: &Uri) -> PathBuf {
@@ -284,9 +321,10 @@ impl ListCache {
 ///
 /// The lists in `cache` are read under `signers`, every signature
 /// verified again, and used as they are unless a fetch is due:
-/// `refresh` is [`Refresh::Now`], there are no lists, one no longer
-/// reads, one is past its `NextUpdate`, or the cache is older than
-/// [`REFRESH_AFTER`]. A due fetch reads the lists again with `get` and
+/// `refresh` is [`Refresh::Now`], there are no lists, or, unless a
+/// fetch was tried within [`RETRY_AFTER`], one no longer reads, the
+/// Finnish list is missing, one is past its `NextUpdate`, or the cache
+/// is older than [`REFRESH_AFTER`]. A due fetch reads the lists again with `get` and
 /// the cache takes the result; a list of the lists that does not
 /// arrive or read leaves the cached lists in use. Under
 /// [`Refresh::CacheOnly`] nothing is fetched and `get` is never
@@ -312,15 +350,20 @@ pub fn run_anchors(
         Refresh::Now => true,
         Refresh::CacheOnly => false,
         Refresh::WhenDue => {
-            lists.is_stale(now)
-                || age(lists.fetched_at(), now) > REFRESH_AFTER
-                || read_count(lists) != records.len()
+            let recently_tried = cache
+                .and_then(ListCache::attempted_at)
+                .is_some_and(|at| at <= now && age(at, now) < RETRY_AFTER);
+            !recently_tried
+                && (lists.is_stale(now)
+                    || age(lists.fetched_at(), now) > REFRESH_AFTER
+                    || read_count(lists) != records.len()
+                    || finnish_gap(lists).is_some())
         }
     };
     let lists = match cached {
         Some(lists) if !due(&lists) => Ok(lists),
         None if refresh == Refresh::CacheOnly => Err(TrustedListError::NotFetched),
-        cached => match fetch(get, now, signers, &records) {
+        cached => match fetch_and_mark(cache, get, now, signers, &records) {
             Ok((lists, fetched)) => {
                 if let Some(cache) = cache
                     && let Err(error) = cache.store(&fetched)
@@ -376,6 +419,27 @@ pub fn certificate_issuing_ders(anchors: &TrustAnchors, now: DateTime) -> Vec<Ve
 /// How long ago `then` was at `now`; nothing when `then` is later.
 fn age(then: DateTime, now: DateTime) -> Duration {
     now.unix_duration().saturating_sub(then.unix_duration())
+}
+
+/// [`fetch`], then record in `cache` that a fetch was tried at `now`,
+/// whatever came of it, when the cache holds lists to fall back on:
+/// with none, every run tries again.
+fn fetch_and_mark(
+    cache: Option<&ListCache>,
+    get: impl FnMut(&Uri) -> Option<Vec<u8>>,
+    now: DateTime,
+    signers: &[OwnedCert],
+    previous: &[CachedList],
+) -> Result<(TrustedLists, Vec<CachedList>), TrustedListError> {
+    let fetched = fetch(get, now, signers, previous);
+    if let Some(cache) = cache
+        && (fetched.is_ok() || !previous.is_empty())
+        && let Err(error) = cache.mark_attempt(now)
+    {
+        let kind = error.kind();
+        refineid_dev_errors::report!(Cli, "trusted-list fetch time not recorded", kind);
+    }
+    fetched
 }
 
 /// Fetch the lists afresh with `get` at `now`: the list of the lists

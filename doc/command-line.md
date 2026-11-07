@@ -56,7 +56,11 @@ Citations are BibTeX keys in [`references.md`](references.md).
   thirty days old (`REFRESH_AFTER`): TS 119 612 clause 5.3.15 lets an
   operator announce the next update up to six months ahead, while a
   withdrawal is published by reissuing the list at once, so a month
-  bounds how long a withdrawal goes unseen; `--refresh-trust` fetches
+  bounds how long a withdrawal goes unseen; a cache missing the
+  Finnish list is fetched again too. A fetch that leaves the lists due,
+  an operator late with its next list or a list that did not arrive,
+  is not tried again for an hour (`RETRY_AFTER`), so a late list costs
+  one download an hour, not one per command; `--refresh-trust` fetches
   at once. A fetch that fails leaves the cached lists in use, and the
   `trust-lists:` line under `-v` carries their fetch time and `stale`
   when one is overdue; with no list at all the record says `trusted

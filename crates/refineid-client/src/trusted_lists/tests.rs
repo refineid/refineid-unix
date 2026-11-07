@@ -536,7 +536,21 @@ fn a_first_run_fetches_and_stores_owner_only_files() -> TestResult {
         let mode = entry.metadata()?.permissions().mode();
         check(&(mode & PERMISSION_BITS), &FILE_MODE, "file mode")?;
     }
-    check(&entries.len(), &STORED_FILES, "one file per list")
+    let lists = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == LIST_EXTENSION)
+        })
+        .count();
+    check(&lists, &STORED_FILES, "one file per list")?;
+    check(
+        &cache.attempted_at(),
+        &Some(day(FETCHED)),
+        "the fetch time is recorded",
+    )
 }
 
 #[test]
@@ -1024,4 +1038,97 @@ fn a_list_of_the_lists_without_a_finnish_pointer_is_a_gap() -> TestResult {
         &Some(FinnishListGap::NotPointedAt),
         "no Finnish pointer",
     )
+}
+
+/// `minutes` after `time`.
+fn after(time: DateTime, minutes: u64) -> Result<DateTime, Box<dyn core::error::Error>> {
+    const SECONDS_PER_MINUTE: u64 = 60;
+    Ok(DateTime::from_unix_duration(
+        time.unix_duration() + Duration::from_secs(minutes * SECONDS_PER_MINUTE),
+    )?)
+}
+
+/// Minutes within [`RETRY_AFTER`] of a fetch.
+const WITHIN_RETRY: u64 = 30;
+/// Minutes past [`RETRY_AFTER`] after a fetch.
+const PAST_RETRY: u64 = 90;
+
+#[test]
+fn a_list_still_overdue_after_a_fetch_is_not_fetched_again_at_once() -> TestResult {
+    // The operator is late: the fetch at OVERDUE brings the same list,
+    // still past its next update.
+    let world = World::new();
+    let dir = TempDir::new("trusted-lists-late-operator")?;
+    let cache = ListCache::at(dir.path().join(LISTS_DIRECTORY));
+    cache.store(&world.serve(day(FETCHED))?.1)?;
+    let calls = Cell::new(NOT_FETCHED);
+    let _first = run_anchors(
+        Some(&cache),
+        day(OVERDUE),
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &calls),
+    );
+    check(&calls.get(), &FETCHED_ONCE, "the overdue list is fetched")?;
+    let calls = Cell::new(NOT_FETCHED);
+    let run = run_anchors(
+        Some(&cache),
+        after(day(OVERDUE), WITHIN_RETRY)?,
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &calls),
+    );
+    check(&calls.get(), &NOT_FETCHED, "not again within the hour")?;
+    check(
+        &run.anchors.anchors().len(),
+        &(unlisted_count() + LISTED_ANCHORS),
+        "the cached list still anchors",
+    )?;
+    let calls = Cell::new(NOT_FETCHED);
+    let _later = run_anchors(
+        Some(&cache),
+        after(day(OVERDUE), PAST_RETRY)?,
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &calls),
+    );
+    check(&calls.get(), &FETCHED_ONCE, "again after the hour")
+}
+
+#[test]
+fn a_cache_without_the_finnish_list_is_fetched_again() -> TestResult {
+    // The first fetch got the list of the lists but not the Finnish
+    // list; a later run fetches again instead of keeping the gap for
+    // the cache's thirty days.
+    let world = World::new();
+    let dir = TempDir::new("trusted-lists-finnish-later")?;
+    let cache = ListCache::at(dir.path().join(LISTS_DIRECTORY));
+    let calls = Cell::new(NOT_FETCHED);
+    let _first = run_anchors(
+        Some(&cache),
+        day(FETCHED),
+        Refresh::WhenDue,
+        &world.signers()?,
+        transport(vec![(LOTL_LOCATION, world.lotl_bytes())], &calls),
+    );
+    let calls = Cell::new(NOT_FETCHED);
+    let soon = run_anchors(
+        Some(&cache),
+        after(day(FETCHED), WITHIN_RETRY)?,
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &calls),
+    );
+    check(&calls.get(), &NOT_FETCHED, "not again within the hour")?;
+    check_true(soon.finnish_gap.is_some(), "the gap stays meanwhile")?;
+    let calls = Cell::new(NOT_FETCHED);
+    let run = run_anchors(
+        Some(&cache),
+        day(LATER),
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &calls),
+    );
+    check(&calls.get(), &FETCHED_ONCE, "fetched again")?;
+    check(&run.finnish_gap, &None, "the Finnish list is at hand")
 }
