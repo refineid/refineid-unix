@@ -118,6 +118,12 @@ Published by DVV at <https://dvv.fi/en/fineid-specifications>.
 - **Regulation (EU) No 910/2014 (eIDAS)** (`eidas910_2014`) — what "qualified" means in
   law. Cite it for the definition, never as proof that a given
   implementation achieves it.
+- **ETSI TS 119 612** (`etsi_ts119612`) — trusted lists: the list of
+  the lists and the national lists, their signatures, pointers,
+  service types and statuses, and the next-update rule (clause 5.3.15)
+  behind the client's refresh policy. It fixes what a list says, not
+  how often an operator reissues one; the thirty-day refresh bound is
+  the client's choice.
 
 #### Interfaces
 

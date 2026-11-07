@@ -295,7 +295,11 @@ pub const fn arguments(tag: VerbTag) -> Arguments {
                 value: Value::File,
                 repeated: true,
             }],
-            options: &[],
+            options: &[Opt {
+                flag: "--refresh-trust",
+                summary: "fetch the EU trusted lists first",
+                value: Value::None,
+            }],
         },
         VerbTag::PhoneCheck | VerbTag::PhonePair | VerbTag::PhoneUnpair => NOTHING,
         VerbTag::PhoneAuth => Arguments {

@@ -16,8 +16,9 @@
 //! network about revocation where the file carried no answer.
 //!
 //! The verdict comes from `refineid_doc_sign::verification` and the
-//! document's own bytes, under the roots core pins. Only the
-//! revocation row may go further: a signer on a verified chain the
+//! document's own bytes, under the anchors the caller took from the
+//! EU trusted lists ([`crate::trusted_lists`]). Only the revocation
+//! row may go further: a signer on a verified chain the
 //! document says nothing about is looked up over OCSP or CRL at `now`,
 //! and a network that does not answer leaves the row as it was.
 
@@ -59,10 +60,10 @@ impl core::fmt::Display for DocumentVerifyError {
 
 impl core::error::Error for DocumentVerifyError {}
 
-/// Judge the document at `path` as of `now`.
+/// Judge the document at `path` as of `now` under `anchors`.
 ///
-/// Every signature is verified from the file alone, anchored on the
-/// roots core pins, at the earliest time a timestamp proves, else at
+/// Every signature is verified from the file alone, anchored on
+/// `anchors`, at the earliest time a timestamp proves, else at
 /// `now`. A signer on a verified chain whose revocation the file does
 /// not answer is then asked about over the network; the answer is
 /// judged at `now`, and no answer leaves the row unavailable.
@@ -70,7 +71,11 @@ impl core::error::Error for DocumentVerifyError {}
 /// # Errors
 /// [`DocumentVerifyError`] when the file cannot be read or carries
 /// nothing to judge. A negative verdict is not an error.
-pub fn verify_file(path: &Path, now: DateTime) -> Result<DocumentReport, DocumentVerifyError> {
+pub fn verify_file(
+    path: &Path,
+    anchors: &TrustAnchors,
+    now: DateTime,
+) -> Result<DocumentReport, DocumentVerifyError> {
     let failure = |failure| DocumentVerifyError::Failure {
         path: path.to_path_buf(),
         failure,
@@ -80,10 +85,9 @@ pub fn verify_file(path: &Path, now: DateTime) -> Result<DocumentReport, Documen
         source,
     })?;
     let file = DocumentFile::from_file(bytes).map_err(failure)?;
-    let anchors = TrustAnchors::pinned();
-    let report = refineid_doc_sign::verification::verify(&file, &anchors, now).map_err(failure)?;
+    let report = refineid_doc_sign::verification::verify(&file, anchors, now).map_err(failure)?;
     crate::doc_sign_http::install();
-    Ok(report.with_live_revocation(|signature| live_revocation(signature, &anchors, now)))
+    Ok(report.with_live_revocation(|signature| live_revocation(signature, anchors, now)))
 }
 
 #[cfg(test)]
@@ -97,7 +101,11 @@ mod tests {
         std::fs::create_dir_all(&dir)?;
         let file = dir.join("notes.txt");
         std::fs::write(&file, b"synthetic notes")?;
-        let outcome = verify_file(&file, refineid_doc_sign::now_date_time());
+        let outcome = verify_file(
+            &file,
+            &TrustAnchors::default(),
+            refineid_doc_sign::now_date_time(),
+        );
         let _removed = std::fs::remove_dir_all(&dir);
         check_true(
             matches!(
@@ -116,7 +124,11 @@ mod tests {
         let missing = std::env::temp_dir().join("refineid-verify-file-missing.pdf");
         check_true(
             matches!(
-                verify_file(&missing, refineid_doc_sign::now_date_time()),
+                verify_file(
+                    &missing,
+                    &TrustAnchors::default(),
+                    refineid_doc_sign::now_date_time()
+                ),
                 Err(DocumentVerifyError::Read { .. })
             ),
             "read error",

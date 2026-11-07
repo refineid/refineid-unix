@@ -72,6 +72,7 @@ pub mod reader_keyboard;
 mod test_card;
 pub mod text;
 pub mod trust_roots;
+pub mod trusted_lists;
 pub mod user_agent;
 pub mod verify;
 

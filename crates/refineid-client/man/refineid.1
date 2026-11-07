@@ -291,10 +291,29 @@ Its middle lines are in the language of the locale, see
 and its band carries the other two.
 The seal names no one; the signature in the file is the evidence.
 .El
-.It Cm document verify Ar file ...
+.It Xo
+.Cm document verify
+.Op Fl -refresh-trust
+.Ar file ...
+.Xc
 Verify the signatures of a signed document: a PDF carrying PAdES
 signatures, an ASiC-E or BDOC container, or a CMS structure with the
 document attached.
+The trust anchors are the qualified certificate-issuing and
+time-stamping services the EU trusted lists name (ETSI TS 119 612):
+the list of the lists, read under the Official Journal's signing
+certificates, and the national lists it points at.
+The lists are kept in the cache directory named under
+.Sx FILES
+and fetched again when one is past its next update, the cache is
+thirty days old, or
+.Fl -refresh-trust
+is given; a fetch that fails leaves the cached lists in use.
+.Bl -tag -width Ds
+.It Fl -refresh-trust
+Fetch the trusted lists before judging.
+.El
+.Pp
 Prints one record per signature, records separated by one blank
 line.
 Each line of a record is a key, a colon, a space and the value; no
@@ -340,15 +359,19 @@ what could not be established:
 (the search for the signer's chain spent its whole budget of signature
 verifications, which no legitimate document comes near)
 or
-.Li revocation status unknown .
+.Li revocation status unknown ,
+and
+.Li trusted lists not fetched: nothing can be anchored
+after an unverified chain when no trusted list is at hand.
 For
 .Li unsupported ,
 .Li profile not supported .
 .El
 .Pp
 A signature is valid when the document is unchanged since it was
-signed, the signature verifies, the signer chains to a DVV root, and a
-verified revocation answer says the signer was not revoked.
+signed, the signature verifies, the signer chains to a trust anchor
+granted at the signing time, and a verified revocation answer says
+the signer was not revoked.
 It is indeterminate when nothing is proven wrong but the chain could
 not be built or no revocation answer could be verified, as happens
 offline for a document that does not carry its own answers; a
@@ -394,8 +417,7 @@ time and
 or
 .Li unproven
 when it does not verify over the signature or its signer's path
-reaches neither a DVV root nor the pinned Sectigo Qualified Time
-Stamping Root R45.
+reaches no time-stamping anchor.
 Only a proven timestamp sets
 .Li signed\&: .
 .It Li timestamp-chain\&:
@@ -432,6 +454,12 @@ or
 .Li unproven
 on the same terms as a signature timestamp.
 An unproven document timestamp proves nothing.
+.It Li trust-lists\&:
+the time the trusted lists the anchors come from were fetched, then
+.Li stale
+when one is past its next update, or
+.Li none
+when no list is at hand.
 .El
 .Pp
 A file that cannot be judged prints a record of
@@ -619,6 +647,9 @@ English otherwise.
 .It Ev XDG_CONFIG_HOME , HOME , SNAP_USER_COMMON
 Locate the pairing store; see
 .Sx FILES .
+.It Ev XDG_CACHE_HOME , HOME
+Locate the trusted-list cache; see
+.Sx FILES .
 .It Ev REFINEID_CA_BUNDLE
 A CA bundle file for TLS connections, used instead of the system
 bundle.
@@ -659,6 +690,14 @@ Without
 .Pa $HOME/.config/refineid/rapp-pairs/ ;
 under a Snap,
 .Pa $SNAP_USER_COMMON/.config/refineid/rapp-pairs/ .
+.It Pa $XDG_CACHE_HOME/refineid/trusted-lists/
+The EU trusted lists
+.Cm document verify
+fetched: one owner-only file per list, its location, fetch time and
+next update, then the list as fetched.
+Without
+.Ev XDG_CACHE_HOME ,
+.Pa $HOME/.cache/refineid/trusted-lists/ .
 .El
 .Sh EXIT STATUS
 .Bl -tag -width Ds

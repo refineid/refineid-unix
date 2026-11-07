@@ -24,6 +24,7 @@ Client library and the `refineid` command-line tool.
 - `signed_name.rs` -- the default name of a signed document, shared with the GUI.
 - `http.rs` -- a deliberately minimal plain-HTTP client for CRL/OCSP fetches
   (payloads are CA-signed; bounded bodies, no redirects).
+- `trusted_lists.rs` -- the EU trusted lists `document verify` anchors on, fetched and cached per user.
 - `trust_roots.rs`, `verify.rs`, `cert_show.rs`, `cert_chain.rs`, `exit_status.rs` (sysexits-style codes),
   `events.rs`, `apdu_trace.rs`.
 - `bin/refineid.rs` -- the thin CLI entry point.
