@@ -29,6 +29,31 @@ Binary `.deb` packages are produced automatically by `script/package-deb.sh`
 4. **`refineid`** (`Architecture: all` metapackage):
    - Metapackage pulling in CLI, PKCS#11, and GUI, with `Recommends: pcscd, libccid, pcsc-tools`.
 
+## Firefox policy roots
+
+`policies.json` installs two DVV root certificates system-wide through
+the Firefox `Certificates.Install` policy, trusted for every purpose
+including TLS server authentication, with no card in any reader. The
+policy exists because no Mozilla-derived root store knows the DVV roots:
+DVV's roots (DVV Gov. Root CA - G3 ECC and RSA) are in Microsoft's root
+program, so Windows and macOS system stores carry them, but DVV has not
+applied to Mozilla's root program, so Firefox's built-in store, and the
+stores derived from it (Debian `ca-certificates`, NixOS, FreeBSD), do
+not. Chrome's own root store covers server authentication only and
+Chrome on Linux takes client certificates, and the trust for their
+chains, from NSS.
+
+The PKCS#11 module now presents an NSS trust record next to each CA
+certificate it reads from the card (see the
+[module README](../../crates/refineid-pkcs11/README.md#nss-trust-records)):
+the DVV root is trusted for client authentication and email only, and
+only while a FINEID card is in the reader, from the card and through
+NSS, for Firefox, Thunderbird and Chrome alike. The policy roots remain
+in this package until the maintainer has confirmed that behaviour in
+Firefox on Linux with a card; then `Certificates.Install` leaves
+`policies.json` and the package scripts in one change, and only the
+`SecurityDevices` entry that loads the module stays.
+
 ## Debian / Ubuntu Policy Compliance
 
 | Component | Policy Rule | Location in Package |

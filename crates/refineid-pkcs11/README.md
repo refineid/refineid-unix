@@ -27,12 +27,14 @@ Implemented:
   PIN1 is validated as 4..=12 ASCII digits and cached in memory for
   at most five minutes;
   it is verified on the card inside each sign, never logged, and zeroized on logout, session close, or finalize.
-- Objects: `C_FindObjectsInit` / `C_FindObjects` / `C_FindObjectsFinal` and `C_GetAttributeValue` over three objects
-  -- the authentication certificate (`CKO_CERTIFICATE`, `CKC_X_509`),
+- Objects: `C_FindObjectsInit` / `C_FindObjects` / `C_FindObjectsFinal` and `C_GetAttributeValue` over
+  the authentication certificate (`CKO_CERTIFICATE`, `CKC_X_509`),
   its public key (`CKO_PUBLIC_KEY`, from the certificate SPKI, for
   consumers such as p11tool / libp11 that enumerate public keys),
-  and its private key (`CKO_PRIVATE_KEY`, `CKK_RSA` or `CKK_EC`).
-  They share one `CKA_ID` so NSS pairs them.
+  its private key (`CKO_PRIVATE_KEY`, `CKK_RSA` or `CKK_EC`),
+  the CA certificates the card carries, and one NSS trust record per
+  CA certificate (see [NSS trust records](#nss-trust-records)).
+  The three authentication objects share one `CKA_ID` so NSS pairs them.
   The private key answers `CKA_EXTRACTABLE` false and
   `CKA_NEVER_EXTRACTABLE` / `CKA_ALWAYS_SENSITIVE` true -- the FINEID
   key never leaves the card.
@@ -95,6 +97,32 @@ the commit hooks.
   by diffing their `C_Login`/`C_Sign` log lines. Reproduces in ~5
   seconds the cross-layer regression class that once evaded every
   unit test.
+
+## NSS trust records
+
+Every FINEID card carries its issuing CA certificate (EF.4336) and the
+DVV root (EF.4334), and the module presents both as certificate
+objects. Next to each it presents an NSS trust record (`CKO_NSS_TRUST`,
+NSS `lib/util/pkcs11n.h`) that marks the CA a trust anchor for TLS
+client authentication and email protection
+(`CKT_NSS_TRUSTED_DELEGATOR`) and asserts nothing for TLS server
+authentication and code signing (`CKT_NSS_MUST_VERIFY_TRUST`, not a
+distrust). The record exists exactly while the certificate object does:
+it is built with the token's objects when a card is found and dropped
+with them when the card leaves the reader. Trust therefore comes from
+the card, lasts only while a card is in the reader, needs no policy
+file and no root privilege, and reaches every NSS application that
+loads the module: Firefox, Thunderbird, and Chrome on Linux, which takes
+its client certificates from NSS. `certutil -L -h <token>` shows each CA
+with the trust string `T,C,`. The attribute table and the NSS source
+references are in the core crate's
+[README](https://github.com/refineid/refineid-core/blob/main/crates/pkcs11/README.md#nss-trust-records).
+
+The Debian package still installs the two DVV G3 roots through the
+Firefox `Certificates.Install` policy
+(`packaging/debian/policies.json`); see
+[the packaging notes](../../packaging/debian/README.md#firefox-policy-roots)
+for why, and for when that policy goes away.
 
 ## Card access
 
