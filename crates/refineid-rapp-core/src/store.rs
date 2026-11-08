@@ -2,7 +2,7 @@
 //!
 //! A pairing record is the engine's [`PairRecord`] -- the pair keys,
 //! `pair_id`, the granted profiles and their `grants_hash`, whether the
-//! peer confirmed its storage (RAPP v26.11.2 section 4.3 item 4), when
+//! peer confirmed its storage (RAPP v26.11.8 section 4.3 item 4), when
 //! this computer's user forgot it or it expired (section 4.6 items 2 and
 //! 5), its latest session time (item 5) and the phone's display name
 //! (section 4.3 item 4) -- with what this computer keeps beside it: the
@@ -93,7 +93,7 @@ impl PairingRecord {
     }
 
     /// Where the stored pairing stands in the pairing machine of RAPP
-    /// v26.11.2: awaiting the peer's storage confirmation
+    /// v26.11.8: awaiting the peer's storage confirmation
     /// ([`PairingState::StorageConfirming`]), usable
     /// ([`PairingState::PairedDisconnected`]), or forgotten and keeping
     /// its key for the close ([`PairingState::Revoking`]).

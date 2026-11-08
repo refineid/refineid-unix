@@ -265,7 +265,7 @@ pub enum IdentityLine {
     /// settled.
     CardNotReady,
     /// Remote use on, no card here and no phone card shown: the line is
-    /// the pairing prompt, exactly as with no phone paired (RAPP v26.11.2
+    /// the pairing prompt, exactly as with no phone paired (RAPP v26.11.8
     /// section 4.7).
     PairPhone,
     /// The phone, by name, said it forgot this computer.

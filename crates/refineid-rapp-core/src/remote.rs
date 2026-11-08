@@ -3,7 +3,7 @@
 //!
 //! This is the surface the CLI, the GUI, the TLS client, and the PKCS#11
 //! module use. Pairing browses for custodians in `mode=pairing` and tries
-//! the typed code with each one found, in turn (RAPP v26.11.2 section
+//! the typed code with each one found, in turn (RAPP v26.11.8 section
 //! 4.2, "Trying Each Custodian in Pairing Mode"). A session browses for
 //! custodians in `mode=session`, dials each, and opens with a routing
 //! value that is fresh per dial and keyed by the pairing's static
@@ -23,7 +23,7 @@
 //!
 //! The phone's word on the pairing comes only inside a session: a close
 //! carrying `pairing_revoked` revokes the pairing here at once (RAPP
-//! v26.11.2 section 4.6 item 4). A pairing forgotten here is told to the
+//! v26.11.8 section 4.6 item 4). A pairing forgotten here is told to the
 //! phone the same way: by the session that holds it, or on the next
 //! session with the phone, whose first message is the close (items 1, 2
 //! and 6). The record keeps its static key for the close alone, serves
@@ -586,7 +586,7 @@ where
     operation_result(outcome, ended_by(session.end()))
 }
 
-/// Where the user is asked to give the phone its card (RAPP v26.11.2
+/// Where the user is asked to give the phone its card (RAPP v26.11.8
 /// section 8.4 item 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardRequest {
@@ -1372,7 +1372,7 @@ impl RemoteReader {
 
     /// Pairs with the phone showing `code`, trying each phone in pairing
     /// mode found until `discovery_timeout` passes with none tried (RAPP
-    /// v26.11.2 section 4.2, "Trying Each Custodian in Pairing Mode").
+    /// v26.11.8 section 4.2, "Trying Each Custodian in Pairing Mode").
     ///
     /// Every profile the offer names is requested and granted; the phone
     /// decides what it grants and the sets must agree.

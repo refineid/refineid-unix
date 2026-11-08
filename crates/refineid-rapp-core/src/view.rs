@@ -1,5 +1,5 @@
 //! This computer's view of its paired phone: the
-//! `requester_view_of_custodian` machine of RAPP v26.11.2 section 4.7 and
+//! `requester_view_of_custodian` machine of RAPP v26.11.8 section 4.7 and
 //! its state model, for a program that keeps a session open while the
 //! phone is in sight (section 8.3).
 //!

@@ -137,7 +137,7 @@ pub const ATT_VALUE_HEADER_SIZE: usize = OPCODE_SIZE + U16_SIZE;
 /// The longest attribute value (section 3.2.9).
 pub const ATTRIBUTE_VALUE_LIMIT: usize = 512;
 /// The ATT MTU the requester asks for and receives with: the longest
-/// attribute value and its header (RAPP v26.11.2 section 5.2 item 1
+/// attribute value and its header (RAPP v26.11.8 section 5.2 item 1
 /// asks for at least 515).
 #[allow(
     clippy::cast_possible_truncation,
@@ -172,7 +172,7 @@ pub const CHARACTERISTIC_TYPE: u16 = 0x2803;
 /// G, section 3.3.3.3).
 pub const CCCD_TYPE: u16 = 0x2902;
 /// The CCCD value that turns indications on (Vol 3, Part G, section
-/// 3.3.3.3; RAPP v26.11.2 section 5.2 item 2).
+/// 3.3.3.3; RAPP v26.11.8 section 5.2 item 2).
 pub const CCCD_INDICATIONS: u16 = 0x0002;
 
 /// A 128-bit UUID in its canonical (text) octet order.
@@ -246,11 +246,11 @@ impl Uuid128 {
     }
 }
 
-/// The RAPP primary service (RAPP v26.11.2 section 5.1).
+/// The RAPP primary service (RAPP v26.11.8 section 5.1).
 pub const RAPP_SERVICE_UUID: Uuid128 = Uuid128::parse(refineid_rapp::BLE_SERVICE_UUID);
-/// The RAPP Channel Characteristic (RAPP v26.11.2 section 5.1).
+/// The RAPP Channel Characteristic (RAPP v26.11.8 section 5.1).
 pub const RAPP_CHANNEL_UUID: Uuid128 = Uuid128::parse("7E39FD02-A6B5-4D78-9E11-37E28E9545F1");
-/// The RAPP Bootstrap Characteristic (RAPP v26.11.2 section 5.1).
+/// The RAPP Bootstrap Characteristic (RAPP v26.11.8 section 5.1).
 pub const RAPP_BOOTSTRAP_UUID: Uuid128 = Uuid128::parse("7E39FD03-A6B5-4D78-9E11-37E28E9545F1");
 
 /// An attribute type as the server sent it: a 16-bit alias of the
@@ -367,7 +367,7 @@ impl HandleRange {
 
 /// The ATT MTU of a connection: the smaller of the server's Rx MTU and
 /// [`REQUESTED_ATT_MTU`] (section 3.4.2.2), never below the 512 bytes RAPP
-/// v26.11.2 section 5.2 item 1 demands.
+/// v26.11.8 section 5.2 item 1 demands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NegotiatedMtu(u16);
 
@@ -552,7 +552,7 @@ pub enum PeerPdu {
         /// The value: transit to the SAR layer or dropped.
         value: Vec<u8>,
     },
-    /// A notification: carries no RAPP frame (RAPP v26.11.2 section 5.2).
+    /// A notification: carries no RAPP frame (RAPP v26.11.8 section 5.2).
     Notification,
     /// `ATT_EXCHANGE_MTU_REQ` from the phone as client, carrying exactly
     /// its Client Rx MTU (section 3.4.2.1).

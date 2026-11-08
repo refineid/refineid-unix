@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! RAPP frames over a set-up GATT link (RAPP v26.11.2 sections 5.2 and
+//! RAPP frames over a set-up GATT link (RAPP v26.11.8 sections 5.2 and
 //! 5.3): each frame is one SAR message, sent as Write Requests on the
 //! Channel Characteristic, each awaiting its Write Response, and received
 //! as indications, each confirmed, reassembled within 5 seconds of its

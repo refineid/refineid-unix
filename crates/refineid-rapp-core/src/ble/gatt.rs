@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! The GATT client connection setup of RAPP v26.11.2 section 5.2 over one
+//! The GATT client connection setup of RAPP v26.11.8 section 5.2 over one
 //! ATT bearer, and the channel it leaves open.
 //!
 //! Setup runs, in order: the MTU exchange (Bluetooth Core Specification
@@ -47,7 +47,7 @@ use super::att::{
 pub const ATT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The most channel indications held for the transport: every fragment of
-/// one longest SAR message (RAPP v26.11.2 section 5.3).
+/// one longest SAR message (RAPP v26.11.8 section 5.3).
 const PENDING_INDICATION_LIMIT: usize = BLE_SAR_SEQUENCE_LIMIT;
 
 /// One ATT bearer: the L2CAP ATT channel of one LE connection, carrying
