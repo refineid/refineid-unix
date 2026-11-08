@@ -18,7 +18,7 @@
 //! section 1.1), read for the RAPP service UUID.
 //!
 //! A phone advertises only the service UUID and at most the generic name
-//! `RefineID`, from a rotating private address (RAPP v26.11.2 section
+//! `RefineID`, from a rotating private address (RAPP v26.11.8 section
 //! 4.1). With active scanning the UUID may come in the scan response
 //! instead (observed: iOS puts it in the advertising data, Android too,
 //! and neither needs a scan response). An address is never kept beyond
@@ -366,7 +366,7 @@ pub(crate) mod fixtures {
     pub(crate) const FLAGS_GENERAL_LE_ONLY: u8 = 0x06;
     /// AD type Complete Local Name (Supplement, Part A, section 1.2).
     pub(crate) const AD_COMPLETE_LOCAL_NAME: u8 = 0x09;
-    /// The generic name of RAPP v26.11.2 section 4.1.
+    /// The generic name of RAPP v26.11.8 section 4.1.
     pub(crate) const GENERIC_NAME: &[u8] = b"RefineID";
     pub(crate) const EVENT_CONNECTABLE: u8 = EVENT_ADV_IND;
     pub(crate) const EVENT_SCAN_RESPONSE: u8 = EVENT_SCAN_RSP;

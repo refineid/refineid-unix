@@ -209,7 +209,7 @@ impl CardArgs {
         }
 
         match inspect_res {
-            // RAPP v26.11.2 section 9.1: the inspection carries the answer
+            // RAPP v26.11.8 section 9.1: the inspection carries the answer
             // to reset, or its historical bytes; PIN state stays on the phone.
             Ok(CardOperationResult::Inspection(insp)) if insp.answer_to_reset.is_empty() => {
                 println!("  ATR:          (not exposed by the phone)");

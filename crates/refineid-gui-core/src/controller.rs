@@ -93,7 +93,7 @@ const CARD_SETTLE_RETRIES: u32 = 5;
 const CARD_SETTLE_FIRST_RETRY: Duration = Duration::from_millis(400);
 
 /// How long the paired phone's certificate stays in memory after the
-/// last look that saw the phone (RAPP v26.11.2 section 8.4 item 3).
+/// last look that saw the phone (RAPP v26.11.8 section 8.4 item 3).
 const PHONE_CERTIFICATE_GRACE: Duration =
     Duration::from_millis(refineid_rapp::IDENTITY_OFFER_GRACE_MS);
 
@@ -253,7 +253,7 @@ impl RefineIdController {
     /// Keeps the paired phone's line true while the GUI holds no session:
     /// while remote use is on, at each round it looks for the paired
     /// phone's record, reads the authentication certificate into memory
-    /// when none is held and the phone appears (RAPP v26.11.2 section
+    /// when none is held and the phone appears (RAPP v26.11.8 section
     /// 8.3), keeps it while looks see the phone and drops it
     /// [`PHONE_CERTIFICATE_GRACE`] after the last, and re-reads the pairing
     /// record, which another program on this computer may have rewritten.
@@ -424,7 +424,7 @@ impl RefineIdController {
 
     /// Forgets the paired phone: it goes from the window at once, and the
     /// phone is told when it appears, from the revocation backlog
-    /// (RAPP v26.11.2 section 4.6 item 6), in the background.
+    /// (RAPP v26.11.8 section 4.6 item 6), in the background.
     fn forget_phone(self: &Arc<Self>) {
         let Some((pair_id, name)) = self
             .state()
@@ -1131,7 +1131,7 @@ impl RefineIdController {
         });
     }
 
-    /// Pairs with the phone showing `code` (RAPP v26.11.2: the phone shows
+    /// Pairs with the phone showing `code` (RAPP v26.11.8: the phone shows
     /// the code and this workstation types it). One ceremony runs at a time.
     fn start_pairing(self: &Arc<Self>, code: &str) {
         if self.state().pairing.is_some() {
@@ -1217,7 +1217,7 @@ fn pairing_failure_line(error: &RemoteError) -> String {
 /// The status line after a pairing: nothing when the card was read, when
 /// the identity line says what stands in the way (no card at the phone,
 /// the phone forgot this computer), or when the phone stopped serving,
-/// which is never shown (RAPP v26.11.2 section 4.7); otherwise the
+/// which is never shown (RAPP v26.11.8 section 4.7); otherwise the
 /// failure.
 fn pairing_outcome_line(phone: &str, read_error: Option<&RemoteError>) -> String {
     match read_error {

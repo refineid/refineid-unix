@@ -21,7 +21,7 @@
 //! two calls over the paired phone's session: `read_certificate` with
 //! kind `signature`, then `sign_document` for one document, with the
 //! files of a package as `contained_files`, or `batch_sign_documents`
-//! for several single documents (RAPP v26.11.2 section 9.3).
+//! for several single documents (RAPP v26.11.8 section 9.3).
 //!
 //! A card in a reader attached to this computer outranks the phone:
 //! [`choose_source`] picks the phone only when no reader holds a card.
@@ -232,7 +232,7 @@ impl<Link: PhoneLink> RemoteSigner for PhoneSigner<Link> {
 /// order, `batch_sign_documents` for several single documents, with the
 /// batch's key profile, algorithm, names and digests unchanged and in
 /// order. `None` for a package among several documents, which RAPP
-/// v26.11.2 section 9.3 does not carry, or a package whose files RAPP
+/// v26.11.8 section 9.3 does not carry, or a package whose files RAPP
 /// refuses to name.
 fn operation_for(batch: &PhoneSigningBatch) -> Option<CardOperation> {
     let key_profile = key_profile(batch.key_profile());

@@ -13,7 +13,7 @@
 // permissions and limitations under the License.
 
 //! The BLE transport profile `fi.refineid.rapp.ble` for sessions (RAPP
-//! v26.11.2 sections 2.2, 5.1 to 5.3; hierarchy specification section
+//! v26.11.8 sections 2.2, 5.1 to 5.3; hierarchy specification section
 //! 3.3): the requester is the GATT client and the phone the GATT server.
 //!
 //! Everything but `freebsd` (FreeBSD only) is platform-neutral and runs on synthetic

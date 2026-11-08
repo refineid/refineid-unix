@@ -1,6 +1,6 @@
 //! Remote Authorization Proxy Protocol (RAPP) requester core.
 //!
-//! This crate implements the requester role of RAPP v26.11.2 for Unix
+//! This crate implements the requester role of RAPP v26.11.8 for Unix
 //! workstations: the workstation asks for typed credential operations, and
 //! the custodian — the holder's phone — takes the PIN on its own screen,
 //! talks to the identity card, and returns only the profile-defined

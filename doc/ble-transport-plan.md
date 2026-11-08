@@ -6,7 +6,7 @@ only; on every other system the BLE path is absent and behavior is the
 stream tier's alone. Pairing stays on the stream tier: both phone
 applications refuse a pairing preamble over BLE.
 
-Normative sources: RAPP v26.11.2 sections 2.2, 4.1, 5.1 to 5.3 and 8.3,
+Normative sources: RAPP v26.11.8 sections 2.2, 4.1, 5.1 to 5.3 and 8.3,
 and the transport and discovery hierarchy specification section 3, in
 refineid-core `doc/protocols/`; Bluetooth Core Specification v5.4 Vol 3
 Part F (ATT), Part G (GATT), Vol 4 Part E (HCI).
