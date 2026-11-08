@@ -2,10 +2,11 @@
 # Enables pcscd with polkit disabled in rc.conf: FreeBSD has no logind
 # seat, so a polkit-checked pcscd answers every client "Service not
 # available". On the live root it then enables Bluetooth LE on every USB
-# Bluetooth adapter already attached. pkg kills every process a package
-# script leaves behind, so this script starts no daemon and leaves nothing
-# in the background; the package message asks the admin to restart pcscd
-# and devd. An install into an alternate root only edits that root.
+# Bluetooth adapter already attached whose HCI node is ready, without
+# waiting for the others; their next attach does it. pkg kills every
+# process a package script leaves behind, so this script starts no daemon
+# and leaves nothing in the background; the package message asks the
+# admin to restart pcscd and devd. An install into an alternate root only edits that root.
 ROOT="${PKG_ROOTDIR:-/}"
 FLAG="--disable-polkit"
 HOOK="${PKG_PREFIX:-/usr/local}/libexec/refineid/refineid-bluetooth-le"
@@ -20,6 +21,6 @@ esac
 [ "$ROOT" = "/" ] || exit 0
 for dev in $(sysctl -N dev.ubt 2>/dev/null |
     sed -n 's/^dev\.ubt\.\([0-9][0-9]*\)\.%driver$/ubt\1/p'); do
-    "$HOOK" "$dev" >/dev/null 2>&1 || true
+    "$HOOK" -n "$dev" >/dev/null 2>&1 || true
 done
 exit 0
