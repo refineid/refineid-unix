@@ -678,12 +678,10 @@ Locate the trusted-list and CA-certificate caches; see
 .Sx FILES .
 .It Ev REFINEID_CA_CACHE_DIR
 Names the CA-certificate cache directory outright.
-.It Ev REFINEID_CA_BUNDLE
-A CA bundle file for TLS connections, used instead of the system
-bundle.
 .It Ev SSL_CERT_FILE , SSL_CERT_DIR
-Searched before the system bundle paths for the CA bundle of
-.Cm phone auth .
+Name the TLS root certificates on systems other than macOS, in place
+of the system bundle.
+On macOS the system's trust settings judge every TLS server.
 .It Ev REFINEID_TLS_MAX
 Set to
 .Li 1.2

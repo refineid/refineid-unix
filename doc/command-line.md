@@ -66,7 +66,9 @@ Citations are BibTeX keys in [`references.md`](references.md).
   when one is overdue; with no list at all the record says `trusted
   lists not fetched: nothing can be anchored` beside the unverified
   chain, and the exit status is the indeterminate one, never a crash.
-  The thirty days are a choice, not a measurement.
+  The thirty days are a choice, not a measurement. The first
+  download into an empty cache counts the national lists on standard
+  error when it is a terminal, and erases the line when it ends.
 - **A card's chain is judged against the same lists.** `refineid card`
   walks each certificate to its issuing CA, the AIA caIssuers
   certificate or the card's own `EF.4336`, and prints `chain verified:

@@ -16,10 +16,11 @@ refineid-lib-core.workspace = true
 refineid-doc-sign.workspace = true
 refineid-rapp-core.workspace = true
 rustls = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
 zeroize.workspace = true
 
 [features]
 # rustls backend for server-authenticated HTTPS: timestamp
 # authorities, EU trusted lists, validator APIs. Builds without a
 # C++ toolchain or a system OpenSSL.
-tls-rustls = ["dep:rustls"]
+tls-rustls = ["dep:rustls", "dep:rustls-platform-verifier"]

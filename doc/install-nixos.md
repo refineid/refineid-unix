@@ -445,6 +445,7 @@ and a card-login site will prompt for the certificate and PIN 1.
   installed package (which carries the needed rpath), not by copying
   the bare binary; inside `nix develop`, `LD_LIBRARY_PATH` is already
   set.
-- **HTTPS timestamp fetches fail with `no CA bundle found`.** Set
-  `REFINEID_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt` (present
-  when `security.pki` is at its NixOS defaults).
+- **HTTPS fetches fail with `No CA certificates were loaded from the
+  system`.** The client reads the system's roots
+  (`/etc/ssl/certs/ca-certificates.crt`, present when `security.pki` is
+  at its NixOS defaults); `SSL_CERT_FILE` names another bundle.

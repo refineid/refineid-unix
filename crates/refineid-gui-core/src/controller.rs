@@ -40,7 +40,7 @@ use refineid_rapp_core::ids::PairId;
 
 use refineid_rapp_core::file_store::FilePairingStore;
 use refineid_rapp_core::offer::{format_pairing_code, normalize_pairing_code};
-use refineid_rapp_core::remote::{CardRequest, RemoteError, RemoteReader};
+use refineid_rapp_core::remote::{CardRequest, PHONE_DISCOVERY_TIMEOUT, RemoteError, RemoteReader};
 use refineid_rapp_core::remote_use;
 use refineid_rapp_core::view::CustodianView;
 
@@ -296,7 +296,7 @@ impl RefineIdController {
                     };
                     let redial = view.redial_due(Instant::now());
                     if (appeared || redial) && self.held_phone_certificate(pair_id).is_none() {
-                        match reader.refresh_auth_cert(pair_id, CERTIFICATE_FETCH_TIMEOUT) {
+                        match reader.refresh_auth_cert(pair_id, PHONE_DISCOVERY_TIMEOUT) {
                             // The read's session is closed: the next read
                             // follows the next appearance.
                             Ok(der) => {
@@ -1162,7 +1162,7 @@ impl RefineIdController {
                     return;
                 }
             };
-            let pair = match reader.pair_with_code(&normalized, PAIRING_DISCOVERY_TIMEOUT) {
+            let pair = match reader.pair_with_code(&normalized, PHONE_DISCOVERY_TIMEOUT) {
                 Ok(pair) => pair,
                 Err(e) => {
                     controller.update_state(|s| {
@@ -1174,7 +1174,7 @@ impl RefineIdController {
             };
 
             let phone = pair.peer_display_name.clone();
-            let read = reader.refresh_auth_cert(pair.pair_id, PAIRING_DISCOVERY_TIMEOUT);
+            let read = reader.refresh_auth_cert(pair.pair_id, PHONE_DISCOVERY_TIMEOUT);
             if let Ok(der) = &read {
                 controller.hold_phone_certificate(pair.pair_id, der.clone());
             }
@@ -1197,10 +1197,6 @@ impl RefineIdController {
 
 /// The line for a typed code that is no pairing code.
 const PAIRING_CODE_INVALID: &str = "The pairing code is invalid";
-/// How long pairing browses for the phone showing the code.
-const PAIRING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long one certificate fetch browses for a paired phone.
-const CERTIFICATE_FETCH_TIMEOUT: Duration = Duration::from_secs(6);
 /// The pause between rounds of certificate fetches.
 const PHONE_WATCH_INTERVAL: Duration = Duration::from_secs(10);
 
