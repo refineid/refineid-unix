@@ -41,7 +41,7 @@
 use core::time::Duration;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -294,6 +294,19 @@ impl ListCache {
         Ok(())
     }
 
+    /// Whether the cache holds no list file: a fetch into it is the
+    /// first download.
+    fn holds_no_list(&self) -> bool {
+        fs::read_dir(&self.directory).map_or(true, |entries| {
+            !entries.filter_map(Result::ok).any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == LIST_EXTENSION)
+            })
+        })
+    }
+
     /// When a fetch was last tried into this cache, if one was and
     /// its record reads.
     fn attempted_at(&self) -> Option<DateTime> {
@@ -505,33 +518,97 @@ static USER_CACHE: Mutex<()> = Mutex::new(());
 
 /// [`run_anchors`] over the user's cache, the Official Journal's
 /// list-signing certificates core ships and this crate's HTTP
-/// transport, one fetching run at a time in this process.
+/// transport, one fetching run at a time in this process. The first
+/// download into an empty cache shows its progress on standard error
+/// when that is a terminal.
 #[must_use]
 pub fn user_anchors(now: DateTime, refresh: Refresh) -> RunAnchors {
+    user_anchors_shown(now, refresh, std::io::stderr().is_terminal())
+}
+
+/// [`user_anchors`], the first download's progress shown when
+/// `terminal` says standard error is one.
+fn user_anchors_shown(now: DateTime, refresh: Refresh, terminal: bool) -> RunAnchors {
     let _one_at_a_time = (refresh != Refresh::CacheOnly)
         .then(|| USER_CACHE.lock().unwrap_or_else(PoisonError::into_inner));
     crate::doc_sign_http::install();
     let signers = lotl_signers();
-    run_anchors(
-        ListCache::user().as_ref(),
+    let cache = ListCache::user();
+    let progress = DownloadProgress {
+        shown: terminal
+            && refresh != Refresh::CacheOnly
+            && cache.as_ref().is_none_or(ListCache::holds_no_list),
+    };
+    let run = run_anchors(
+        cache.as_ref(),
         now,
         refresh,
         &signers,
-        parallel_http(&signers),
-    )
+        parallel_http(&signers, &progress),
+    );
+    progress.end();
+    run
+}
+
+/// What the label of the first download's progress line says.
+const PROGRESS_LABEL: &str = "Fetching the EU trusted lists: ";
+/// Between the lists fetched and the lists to fetch.
+const PROGRESS_OF: &str = "/";
+/// Erase in Line from the cursor to its end (ECMA-48 section 8.3.41,
+/// `EL` with the default parameter).
+const ERASE_LINE: &str = "\x1b[K";
+
+/// The first download's progress: one line on standard error counting
+/// the national lists fetched, erased when the download ends, so a
+/// command stays silent on success. A later refresh shows nothing; it
+/// replaces lists already at hand.
+struct DownloadProgress {
+    /// Whether the line is shown.
+    shown: bool,
+}
+
+impl DownloadProgress {
+    /// Show that `fetched` of `total` national lists arrived.
+    fn fetched(&self, fetched: usize, total: usize) {
+        if self.shown {
+            let mut stderr = std::io::stderr().lock();
+            let _shown = write!(stderr, "\r{PROGRESS_LABEL}{fetched}{PROGRESS_OF}{total}")
+                .and_then(|()| stderr.flush());
+        }
+    }
+
+    /// Erase the line.
+    fn end(&self) {
+        if self.shown {
+            let mut stderr = std::io::stderr().lock();
+            let _erased = write!(stderr, "\r{ERASE_LINE}").and_then(|()| stderr.flush());
+        }
+    }
 }
 
 /// [`fetch_over_http`], except that fetching the list of the lists
 /// also downloads every national list it points at, [`PARALLEL_FETCHES`]
-/// at a time, for the requests that follow to take. Only a list of the
-/// lists that verifies under `signers` is followed.
-fn parallel_http(signers: &[OwnedCert]) -> impl FnMut(&Uri) -> Option<Vec<u8>> + '_ {
+/// at a time, for the requests that follow to take, each counted on
+/// `progress`. Only a list of the lists that verifies under `signers`
+/// is followed.
+fn parallel_http<'a>(
+    signers: &'a [OwnedCert],
+    progress: &'a DownloadProgress,
+) -> impl FnMut(&Uri) -> Option<Vec<u8>> + 'a {
     let mut prefetched: Vec<(Uri, Option<Vec<u8>>)> = Vec::new();
     move |location| {
         if location.to_string() == LOTL_LOCATION {
             let lotl = fetch_over_http(location)?;
             prefetched = TrustedList::read(lotl.clone(), signers)
-                .map(|list| prefetch(&national_locations(&list), fetch_over_http))
+                .map(|list| {
+                    prefetch(
+                        &national_locations(&list),
+                        fetch_over_http,
+                        &|fetched, total| {
+                            progress.fetched(fetched, total);
+                        },
+                    )
+                })
                 .unwrap_or_default();
             return Some(lotl);
         }
@@ -554,10 +631,12 @@ fn national_locations(lotl: &TrustedList) -> Vec<Uri> {
 }
 
 /// Each of `locations` with what `get` returned for it, fetched by
-/// [`PARALLEL_FETCHES`] threads at once.
+/// [`PARALLEL_FETCHES`] threads at once; `fetched` hears how many of
+/// them have arrived after each one.
 fn prefetch(
     locations: &[Uri],
     get: impl Fn(&Uri) -> Option<Vec<u8>> + Sync,
+    fetched: &(dyn Fn(usize, usize) + Sync),
 ) -> Vec<(Uri, Option<Vec<u8>>)> {
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<(Uri, Option<Vec<u8>>)>> = Mutex::new(Vec::new());
@@ -566,10 +645,9 @@ fn prefetch(
             scope.spawn(|| {
                 while let Some(location) = locations.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let bytes = get(location);
-                    results
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push((location.clone(), bytes));
+                    let mut results = results.lock().unwrap_or_else(PoisonError::into_inner);
+                    results.push((location.clone(), bytes));
+                    fetched(results.len(), locations.len());
                 }
             });
         }
@@ -585,7 +663,7 @@ fn prefetch(
 /// nothing again.
 pub fn fetch_in_background() -> JoinHandle<()> {
     std::thread::spawn(|| {
-        let _run = user_anchors(refineid_doc_sign::now_date_time(), Refresh::WhenDue);
+        let _run = user_anchors_shown(refineid_doc_sign::now_date_time(), Refresh::WhenDue, false);
     })
 }
 

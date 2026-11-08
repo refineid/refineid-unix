@@ -1149,8 +1149,20 @@ fn prefetch_returns_each_location_once_with_its_bytes() -> TestResult {
         let text = location.to_string();
         (text != UNSERVED).then(|| text.into_bytes())
     };
-    let fetched = prefetch(&locations, served);
+    let heard = Mutex::new(Vec::new());
+    let fetched = prefetch(&locations, served, &|count, total| {
+        heard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((count, total));
+    });
     check(&fetched.len(), &locations.len(), "one result per location")?;
+    let mut heard = heard.into_inner().unwrap_or_else(PoisonError::into_inner);
+    heard.sort_unstable();
+    let expected: Vec<(usize, usize)> = (1..=locations.len())
+        .map(|count| (count, locations.len()))
+        .collect();
+    check(&heard, &expected, "progress counts every arrival once")?;
     for location in &locations {
         let found: Vec<_> = fetched.iter().filter(|(at, _)| at == location).collect();
         check(&found.len(), &FETCHED_ONCE, "fetched once")?;
