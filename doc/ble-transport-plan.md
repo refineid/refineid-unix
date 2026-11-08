@@ -57,7 +57,8 @@ All but `freebsd/` is platform-neutral and tested on synthetic bytes.
 
 ## Prerequisites
 
-A normal user scans and connects once root has set the adapter up; the
-commands are in [install-freebsd.md](install-freebsd.md), section 3.
-RefineID does not run them. The adapter is the first USB one,
-`ubt0hci`.
+A normal user scans and connects once the adapter has LE Host Support
+and the LE event masks set, which only root can do. The FreeBSD
+package's devd hook sets both on every adapter attach;
+[install-freebsd.md](install-freebsd.md), section 3, has the commands
+for a from-source install. The adapter is the first USB one, `ubt0hci`.

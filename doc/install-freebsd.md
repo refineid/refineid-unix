@@ -1,8 +1,10 @@
 # Installing RefineID on FreeBSD
 
 This is the from-source installation. The `refineid` package
-([packages.md](packages.md)) installs the same files and enables pcscd;
-section 3 applies to it as well.
+([packages.md](packages.md)) installs the same files and enables pcscd
+in `/etc/rc.conf`; after installing it, run `service pcscd restart` and
+`service devd restart` once as root, or reboot. Section 3 applies to it
+as well.
 
 Verified on FreeBSD 15.1-RELEASE amd64 with an ACS ACR39U USB reader and
 an xfce desktop. Everything below runs as root unless the prompt says
@@ -74,20 +76,30 @@ and `service local_unbound restart` fixes it.
 ### Bluetooth
 
 Without a shared network RefineID reaches the phone over Bluetooth Low
-Energy ([ble-transport-plan.md](ble-transport-plan.md)). A normal user
-can scan and connect once root has set the adapter up, after each boot:
+Energy ([ble-transport-plan.md](ble-transport-plan.md)). RefineID uses
+the first USB adapter, `ubt0hci`. Install the adapter's firmware package,
+which devd loads on attach: `iwmbt-firmware` for Intel, `rtlbt-firmware`
+for Realtek.
+
+The package's devd rule `/usr/local/etc/devd/refineid-bluetooth.conf`
+runs, on every adapter attach (boot, resume, hot-plug), FreeBSD's
+`service bluetooth quietstart ubtN` and then
+`/usr/local/libexec/refineid/refineid-bluetooth-le ubtN`, which waits
+until the adapter is initialized and enables LE as root. Installing the
+package runs the script for adapters already attached; devd reads the
+rule after `service devd restart` or a reboot. The script runs:
 
 ```sh
-kldload ng_l2cap ng_btsocket
-service bluetooth start ubt0
-hccontrol write_le_host_support 1
-hccontrol le_enable enable
+hccontrol -n ubt0hci write_le_host_support 1
+hccontrol -n ubt0hci le_enable enable
 ```
 
-The adapter's firmware must be loaded first (for Intel adapters,
-iwmbtfw(8)). `hccontrol le_enable enable` sets the LE event mask; without
-it no advertising reports arrive. RefineID uses the first USB adapter,
-`ubt0hci`.
+`le_enable enable` sets the event masks; without it no advertising
+reports arrive. A normal user cannot send either command, and an adapter
+reset clears both. A from-source install copies the rule and the script
+from `packaging/freebsd/` (replacing `@HOOK@` with the script's path) and
+runs `service devd restart`, or runs the two commands as root after each
+attach.
 
 For automatic network link failover between wired Ethernet and Wi-Fi on
 laptops or workstations, see [freebsd-network-failover.md](freebsd-network-failover.md).

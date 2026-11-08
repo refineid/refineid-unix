@@ -20,7 +20,10 @@
 # dependencies are pcsc-lite, libccid, p11-kit, nss, xdg-desktop-portal-gtk
 # (the file chooser on a desktop whose portal has no FileChooser backend)
 # and every package that provides a shared library the binaries link, at
-# the versions installed on the build host. packaging/freebsd/+POST_INSTALL enables pcscd.
+# the versions installed on the build host. A devd rule enables Bluetooth
+# LE on every USB Bluetooth adapter attach. packaging/freebsd/+POST_INSTALL
+# enables pcscd in rc.conf and enables LE on attached adapters; the package
+# message asks the admin to restart pcscd and devd.
 #
 # Usage:
 #   script/package-freebsd.sh [--skip-build]
@@ -77,12 +80,14 @@ mkdir -p "$STAGE" "$META"
 ROOT="$STAGE$PREFIX"
 MODULE="$PREFIX/lib/refineid/librefineid_pkcs11.so"
 TOKEN="$PREFIX/libexec/refineid/refineid-browser-token"
+BLUETOOTH_LE="$PREFIX/libexec/refineid/refineid-bluetooth-le"
 
 install -d \
     "$ROOT/bin" \
     "$ROOT/lib/refineid" \
     "$ROOT/lib/firefox/distribution" \
     "$ROOT/libexec/refineid" \
+    "$ROOT/etc/devd" \
     "$ROOT/etc/xdg/autostart" \
     "$ROOT/share/p11-kit/modules" \
     "$ROOT/share/applications" \
@@ -106,6 +111,9 @@ sed "s|@MODULE@|$MODULE|" packaging/refineid-browser-token > "$STAGE$TOKEN"
 chmod 755 "$STAGE$TOKEN"
 sed "s|@EXEC@|$TOKEN|" packaging/refineid-browser-token.desktop \
     > "$ROOT/etc/xdg/autostart/refineid-browser-token.desktop"
+install -m 755 packaging/freebsd/refineid-bluetooth-le "$STAGE$BLUETOOTH_LE"
+sed "s|@HOOK@|$BLUETOOTH_LE|" packaging/freebsd/refineid-bluetooth.conf \
+    > "$ROOT/etc/devd/refineid-bluetooth.conf"
 install -m 644 packaging/refineid.desktop "$ROOT/share/applications/refineid.desktop"
 install -m 644 crates/refineid-gui/assets/app-icon.svg \
     "$ROOT/share/icons/hicolor/scalable/apps/refineid.svg"

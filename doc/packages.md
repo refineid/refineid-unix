@@ -91,8 +91,20 @@ pkg install refineid
 ```
 
 The package depends on pcsc-lite, libccid, p11-kit and nss. Installing it
-enables pcscd with `--disable-polkit` in `/etc/rc.conf` and starts it;
-removing the package leaves `/etc/rc.conf` as it is.
+enables pcscd with `--disable-polkit` in `/etc/rc.conf`, adds a devd rule
+that enables Bluetooth LE on every USB Bluetooth adapter attach
+([install-freebsd.md](install-freebsd.md), "Bluetooth") and enables LE
+on adapters already attached. pkg kills any daemon a package script
+starts, so the package starts none; its message asks root to run once,
+or reboot:
+
+```sh
+service pcscd restart
+service devd restart
+```
+
+Removing the package removes the rule and leaves `/etc/rc.conf` as it
+is; `service devd restart` (or a reboot) then drops the rule from devd.
 
 ### Known limits
 

@@ -1,0 +1,62 @@
+#!/bin/sh
+# Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
+
+# Usage: refineid-bluetooth-le [-n] ubtN
+# Enables Bluetooth LE on the USB Bluetooth adapter ubtN: waits until
+# rc.d/bluetooth has reset and initialized the adapter's HCI node, then
+# sets LE Host Support and the HCI and LE event masks the BLE session
+# transport needs. With -n it checks the node once and does nothing if it
+# is not ready, without waiting. A normal user cannot send either command.
+# Runs as root from the devd rule refineid-bluetooth.conf and, with -n,
+# from the package's +POST_INSTALL. Silent and idempotent; exits non-zero
+# on bad arguments, a node that is not ready in time, or a failed command.
+set -u
+
+# Seconds. The devd action runs rc.d/bluetooth's start synchronously
+# before the hook, so the node is normally ready at the first poll; the
+# bound only caps the wait after a failed or missing start.
+READY_TIMEOUT=30
+# Seconds between node state polls: the granularity of the wait.
+POLL_INTERVAL=1
+# NG_HCI_UNIT_READY = NG_HCI_UNIT_CONNECTED | NG_HCI_UNIT_INITED
+# (netgraph/bluetooth/include/ng_hci.h); hccontrol initialize, the last
+# step of rc.d/bluetooth, sets INITED.
+UNIT_READY=0x3
+# Write LE Host Support parameter LE_Supported_Host: enabled.
+LE_SUPPORTED_HOST=1
+
+wait_bound="$READY_TIMEOUT"
+if [ "$#" -eq 2 ] && [ "$1" = "-n" ]; then
+    wait_bound=0
+    shift
+fi
+[ "$#" -eq 1 ] || exit 1
+dev="$1"
+case "$dev" in
+    ubt | ubt*[!0-9]*) exit 1 ;;
+    ubt*) ;;
+    *) exit 1 ;;
+esac
+node="${dev}hci"
+
+node_ready() {
+    state="$(hccontrol -n "$node" read_node_state 2>/dev/null |
+        sed -n 's/^State: //p')"
+    case "$state" in
+        0x | 0x*[!0-9a-fA-F]*) return 1 ;;
+        0x*) [ "$((state & UNIT_READY))" -eq "$((UNIT_READY))" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+waited=0
+until node_ready; do
+    [ "$waited" -lt "$wait_bound" ] || exit 1
+    sleep "$POLL_INTERVAL"
+    waited=$((waited + POLL_INTERVAL))
+done
+
+hccontrol -n "$node" write_le_host_support "$LE_SUPPORTED_HOST" \
+    >/dev/null 2>&1 || exit 1
+hccontrol -n "$node" le_enable enable >/dev/null 2>&1 || exit 1
+exit 0
