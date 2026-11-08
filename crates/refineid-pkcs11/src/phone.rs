@@ -27,9 +27,10 @@
 //! and goes when for [`IDENTITY_OFFER_GRACE_MS`] no session has reported
 //! the card present, at once when the pairing goes or a session reports
 //! another card (section 8.4 item 3); a session then reads the card again.
-//! A browser that lists the slots while no token stands wakes the dial and
-//! waits up to `BROWSER_WAKE_WAIT` for the token, so its first login
-//! finds the certificate. A signature asked for by the browser is handed
+//! A module call that asks for the token while none stands and no session
+//! is open wakes the dial and waits, as long as the module allows it, for a
+//! session to raise the token, so a browser's first login finds the
+//! certificate. A signature asked for by the browser is handed
 //! to that thread and answered on the same session, dialing for one when
 //! none is open; that is the one thing the phone does. A phone that
 //! withdrew, or closed with `card_unavailable`, takes the token at once
@@ -105,20 +106,10 @@ const RECORD_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// reports the card present (section 8.4 item 3).
 const IDENTITY_OFFER_GRACE: Duration = Duration::from_millis(IDENTITY_OFFER_GRACE_MS);
 
-/// How long the first slot refresh waits for the thread's first word,
-/// so a host that lists the slots once at load sees the phone's slot.
+/// The longest part of a reading's wait spent on the thread's first word,
+/// so a host that lists the slots once at load sees the phone's slot; the
+/// rest of the wait is the token's.
 const FIRST_WORD_WAIT: Duration = Duration::from_secs(2);
-
-/// How long a slot listing that finds the phone's slot without a token
-/// waits while the thread dials the phone and reads its certificate: a
-/// dial on the local network and one certificate read fit well within it.
-const BROWSER_WAKE_WAIT: Duration = Duration::from_secs(3);
-
-/// After a wake that raised no token, how long slot listings answer at
-/// once: a host lists the slots many times in a row, and a phone out of
-/// reach would hold each listing for [`BROWSER_WAKE_WAIT`]. The thread
-/// raises the token when the phone appears meanwhile.
-const WAKE_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// A signature request from the browser, answered on the held session.
 struct SignRequest {
@@ -252,8 +243,6 @@ struct Shared {
     wanted: AtomicBool,
     /// The thread holds a session to the phone.
     in_session: AtomicBool,
-    /// When a slot listing last woke the dial and no token came of it.
-    unanswered_wake: Mutex<Option<Instant>>,
     context: DisplayText,
     spoken: (Mutex<bool>, Condvar),
 }
@@ -306,22 +295,15 @@ impl Shared {
         })
     }
 
-    /// A slot listing found the phone's slot without a token: with no
-    /// session held, the thread is asked to dial (section 8.3), and the
-    /// listing waits up to `limit` for a session to raise the token. A
-    /// wake that raised none is not repeated for [`WAKE_RETRY_AFTER`].
+    /// A reading that asks for the token found the phone's slot without
+    /// one: with no session held, the thread is asked to dial (section
+    /// 8.3), and the reading waits up to `limit` for a session to raise the
+    /// token. A zero `limit` asks nothing. How often a reading may wait is
+    /// the module's to decide.
     fn wake_for_token(&self, limit: Duration) {
-        if self.in_session.load(Ordering::Acquire) || !self.slot_without_token() {
-            return;
-        }
-        let now = Instant::now();
+        if limit.is_zero() || self.in_session.load(Ordering::Acquire) || !self.slot_without_token()
         {
-            let Ok(unanswered) = self.unanswered_wake.lock() else {
-                return;
-            };
-            if unanswered.is_some_and(|at| now.duration_since(at) < WAKE_RETRY_AFTER) {
-                return;
-            }
+            return;
         }
         self.wanted.store(true, Ordering::Release);
         let (spoken, word) = &self.spoken;
@@ -329,9 +311,6 @@ impl Shared {
             let _ = word.wait_timeout_while(guard, limit, |_| {
                 self.slot_without_token() && !self.stopped()
             });
-        }
-        if let Ok(mut unanswered) = self.unanswered_wake.lock() {
-            *unanswered = self.slot_without_token().then_some(now);
         }
     }
 
@@ -407,7 +386,7 @@ impl core::fmt::Debug for PhoneSource {
 
 impl PhoneSource {
     /// A source over this user's pairing store that starts its session
-    /// thread at the first slot refresh, or `None` when no per-user
+    /// thread at the first reading that may wait, or `None` when no per-user
     /// configuration directory resolves or the store is not this
     /// process's: owned by its effective uid, or missing while it is not root.
     #[must_use]
@@ -417,7 +396,7 @@ impl PhoneSource {
     }
 
     /// A source over the pairing store in `store` that starts its session
-    /// thread at the first slot refresh.
+    /// thread at the first reading that may wait.
     fn over_store(store: PathBuf) -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -426,7 +405,6 @@ impl PhoneSource {
                 withdrawal: Mutex::new(Withdrawal::new()),
                 wanted: AtomicBool::new(false),
                 in_session: AtomicBool::new(false),
-                unanswered_wake: Mutex::new(None),
                 context: computer_context(),
                 spoken: (Mutex::new(false), Condvar::new()),
             }),
@@ -435,32 +413,45 @@ impl PhoneSource {
         }
     }
 
-    fn ensure_started(&self) {
+    /// Starts the session thread when none runs, and waits at most `limit`
+    /// for its first word.
+    fn ensure_started(&self, limit: Duration) {
         let Ok(mut worker) = self.worker.lock() else {
             return;
         };
-        if worker.is_some() || self.shared.stopped() {
-            return;
+        if worker.is_none() && !self.shared.stopped() {
+            let (sender, receiver) = mpsc::channel();
+            if let Ok(mut requests) = self.shared.requests.lock() {
+                *requests = Some(sender);
+            }
+            let shared = Arc::clone(&self.shared);
+            let store = self.store.clone();
+            *worker = thread::Builder::new()
+                .name("refineid-phone".to_owned())
+                .spawn(move || serve(&shared, &receiver, &store))
+                .ok();
         }
-        let (sender, receiver) = mpsc::channel();
-        if let Ok(mut requests) = self.shared.requests.lock() {
-            *requests = Some(sender);
-        }
-        let shared = Arc::clone(&self.shared);
-        let store = self.store.clone();
-        *worker = thread::Builder::new()
-            .name("refineid-phone".to_owned())
-            .spawn(move || serve(&shared, &receiver, &store))
-            .ok();
+        let running = worker.is_some();
         drop(worker);
-        self.shared.await_first_word(FIRST_WORD_WAIT);
+        if running {
+            self.shared.await_first_word(limit);
+        }
     }
 }
 
 impl RemoteTokenSource for PhoneSource {
-    fn offered(&self) -> Option<RemoteOffer> {
-        self.ensure_started();
-        self.shared.wake_for_token(BROWSER_WAKE_WAIT);
+    /// The slot and its token as the thread last spoke of them. A reading
+    /// with a `wait` starts the thread, waits for its first word for at
+    /// most `FIRST_WORD_WAIT` of it, and spends the rest waking the dial
+    /// when no token stands; a zero `wait` reads what stands, starts
+    /// nothing and dials nothing.
+    fn offered(&self, wait: Duration) -> Option<RemoteOffer> {
+        let asked = Instant::now();
+        if !wait.is_zero() {
+            self.ensure_started(wait.min(FIRST_WORD_WAIT));
+            self.shared
+                .wake_for_token(wait.saturating_sub(asked.elapsed()));
+        }
         let now = Instant::now();
         self.shared.offer.lock().ok().and_then(|offering| {
             offering
@@ -519,7 +510,7 @@ impl RemoteTokenSource for PhoneSource {
         }
         self.shared.withdraw_slot();
         // A host that initialises the module again starts the thread
-        // again at its first slot refresh.
+        // again at its first reading that may wait.
         if let Ok(mut spoken) = self.shared.spoken.0.lock() {
             *spoken = false;
         }
@@ -1258,6 +1249,7 @@ fn pause(shared: &Shared, duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refineid_pkcs11::remote::REMOTE_WAKE_WAIT;
     use refineid_rapp::{
         DisplayName, EndpointRole, PAIR_ID_SIZE, PAIRING_IDLE_EXPIRY_MS, PairRecord, ProfileName,
         compute_grants_hash, generate_pair_key_material,
@@ -1445,7 +1437,6 @@ mod tests {
             withdrawal: Mutex::new(Withdrawal::new()),
             wanted: AtomicBool::new(false),
             in_session: AtomicBool::new(false),
-            unanswered_wake: Mutex::new(None),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
         }
@@ -1531,7 +1522,6 @@ mod tests {
             withdrawal: Mutex::new(Withdrawal::new()),
             wanted: AtomicBool::new(false),
             in_session: AtomicBool::new(false),
-            unanswered_wake: Mutex::new(None),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
         };
@@ -1590,7 +1580,6 @@ mod tests {
             withdrawal: Mutex::new(Withdrawal::new()),
             wanted: AtomicBool::new(true),
             in_session: AtomicBool::new(false),
-            unanswered_wake: Mutex::new(None),
             context: computer_context(),
             spoken: (Mutex::new(false), Condvar::new()),
         };
@@ -1706,12 +1695,17 @@ mod tests {
         }
     }
 
-    /// Generous slack over a bounded wait, for a loaded test machine.
-    const WAIT_SLACK: Duration = Duration::from_secs(2);
+    /// A wait shorter than [`FIRST_WORD_WAIT`], which a reading must keep
+    /// to however long the thread takes to speak.
+    const SHORT_WAIT: Duration = Duration::from_millis(300);
+
+    /// What the scheduler may add to a reading beyond its wait.
+    const SCHEDULING_SLACK: Duration = Duration::from_millis(500);
 
     /// Before the phone connects the browser sees the phone's slot with no
-    /// token, after one bounded wait for the dial; the next listing
-    /// answers at once. No certificate is on the computer.
+    /// token, after a reading that waited no longer than it was granted for
+    /// the dial; a reading that must not block answers at once. No
+    /// certificate is on the computer.
     #[test]
     fn before_the_phone_connects_the_slot_has_no_token() {
         let store = scratch_store();
@@ -1725,13 +1719,14 @@ mod tests {
             .expect("the pairing's session lock");
         let source = PhoneSource::over_store(store.clone());
         let started = Instant::now();
-        let offer = source.offered().expect("the phone's slot");
-        assert!(started.elapsed() < FIRST_WORD_WAIT + BROWSER_WAKE_WAIT + WAIT_SLACK);
+        let offer = source.offered(REMOTE_WAKE_WAIT).expect("the phone's slot");
+        assert!(started.elapsed() < REMOTE_WAKE_WAIT + SCHEDULING_SLACK);
         assert_eq!(Some(*offer.pair_id()), slot_id_of_pair());
         assert!(offer.certificate().is_none());
         let again = Instant::now();
-        assert!(source.offered().expect("the slot").certificate().is_none());
-        assert!(again.elapsed() < BROWSER_WAKE_WAIT);
+        let offer = source.offered(Duration::ZERO).expect("the slot");
+        assert!(offer.certificate().is_none());
+        assert!(again.elapsed() < SCHEDULING_SLACK);
         source.stop();
         drop(session);
         std::fs::remove_dir_all(&store).expect("the test's store is removed");
@@ -1743,10 +1738,35 @@ mod tests {
         RemoteSlotId::parse(&hex).ok()
     }
 
-    /// A slot listing with no token asks the thread to dial and waits for
-    /// the session to raise the token on the certificate it read.
+    /// A reading that must not block starts no thread and dials nothing,
+    /// even with a pairing stored; the first reading that may wait starts
+    /// the thread.
     #[test]
-    fn a_slot_listing_wakes_the_dial_and_a_session_raises_the_token() {
+    fn a_reading_that_must_not_block_starts_nothing_and_dials_nothing() {
+        let store = scratch_store();
+        FilePairingStore::open(&store)
+            .expect("the test's store")
+            .insert(pairing_made_at(current_time_ms()))
+            .expect("the pairing is stored");
+        let session = SessionLock::acquire(&session_lock_path(&store, PairId::from_array(PAIR_ID)))
+            .expect("the pairing's session lock");
+        let source = PhoneSource::over_store(store.clone());
+        let started = Instant::now();
+        assert!(source.offered(Duration::ZERO).is_none());
+        assert!(started.elapsed() < SCHEDULING_SLACK);
+        assert!(source.worker.lock().expect("worker").is_none());
+        assert!(!source.shared.wanted());
+        let _ = source.offered(REMOTE_WAKE_WAIT);
+        assert!(source.worker.lock().expect("worker").is_some());
+        source.stop();
+        drop(session);
+        std::fs::remove_dir_all(&store).expect("the test's store is removed");
+    }
+
+    /// A reading with a wait and no token asks the thread to dial and waits
+    /// for the session to raise the token on the certificate it read.
+    #[test]
+    fn a_reading_wakes_the_dial_and_a_session_raises_the_token() {
         let shared = Arc::new(shared());
         shared.serve_pairing(the_slot(), "Alpha Phone".to_owned());
         let session = Arc::clone(&shared);
@@ -1757,32 +1777,50 @@ mod tests {
             session.token(|offering| offering.confirmed(CERTIFICATE.to_vec()));
         });
         let started = Instant::now();
-        shared.wake_for_token(BROWSER_WAKE_WAIT);
-        assert!(started.elapsed() < BROWSER_WAKE_WAIT);
+        shared.wake_for_token(REMOTE_WAKE_WAIT);
+        assert!(started.elapsed() < REMOTE_WAKE_WAIT);
         reader.join().expect("the session's thread");
         assert_eq!(
             shared.standing_certificate(Instant::now()),
             Some(CERTIFICATE.to_vec())
         );
-        assert!(shared.unanswered_wake.lock().expect("wake").is_none());
     }
 
-    /// A listing while a session is held, or while the token stands, asks
-    /// nothing of the phone and waits for nothing.
+    /// A phone out of reach holds a reading to its wait and no longer, and
+    /// the next reading may wait again: the module decides how often.
     #[test]
-    fn a_held_session_or_a_standing_token_needs_no_wake() {
+    fn an_unanswered_wake_ends_at_its_wait_and_keeps_no_rest_of_its_own() {
         let shared = shared();
         shared.serve_pairing(the_slot(), "Alpha Phone".to_owned());
-        shared.in_session.store(true, Ordering::Release);
+        for _ in 0..2 {
+            shared.wanted.store(false, Ordering::Release);
+            let started = Instant::now();
+            shared.wake_for_token(SHORT_WAIT);
+            let took = started.elapsed();
+            assert!(took >= SHORT_WAIT, "{took:?}");
+            assert!(took < SHORT_WAIT + SCHEDULING_SLACK, "{took:?}");
+            assert!(shared.wanted(), "the dial was asked for");
+            assert!(shared.standing_certificate(Instant::now()).is_none());
+        }
+    }
+
+    /// A reading while a session is held, or while the token stands, or
+    /// with no wait, asks nothing of the phone and waits for nothing.
+    #[test]
+    fn a_held_session_a_standing_token_or_no_wait_needs_no_wake() {
+        let shared = shared();
+        shared.serve_pairing(the_slot(), "Alpha Phone".to_owned());
         let started = Instant::now();
-        shared.wake_for_token(BROWSER_WAKE_WAIT);
-        assert!(started.elapsed() < BROWSER_WAKE_WAIT);
+        shared.wake_for_token(Duration::ZERO);
+        assert!(!shared.wanted());
+        shared.in_session.store(true, Ordering::Release);
+        shared.wake_for_token(REMOTE_WAKE_WAIT);
         assert!(!shared.wanted());
         shared.in_session.store(false, Ordering::Release);
         shared.token(|offering| offering.confirmed(CERTIFICATE.to_vec()));
-        shared.wake_for_token(BROWSER_WAKE_WAIT);
-        assert!(started.elapsed() < BROWSER_WAKE_WAIT);
+        shared.wake_for_token(REMOTE_WAKE_WAIT);
         assert!(!shared.wanted());
+        assert!(started.elapsed() < SCHEDULING_SLACK);
     }
 
     /// A synthetic ordinary user's uid.
@@ -1812,11 +1850,15 @@ mod tests {
         std::fs::remove_dir_all(&store).expect("the test's store is removed");
     }
 
+    /// Over a missing store the thread pauses without a word: the reading
+    /// keeps to its wait, though it is shorter than [`FIRST_WORD_WAIT`].
     #[test]
     fn a_source_over_a_missing_store_offers_nothing_and_creates_nothing() {
         let store = scratch_store();
         let source = PhoneSource::over_store(store.clone());
-        assert!(source.offered().is_none());
+        let started = Instant::now();
+        assert!(source.offered(SHORT_WAIT).is_none());
+        assert!(started.elapsed() < SHORT_WAIT + SCHEDULING_SLACK);
         source.stop();
         assert!(!store.exists());
     }
@@ -1834,7 +1876,7 @@ mod tests {
         let session = SessionLock::acquire(&session_lock_path(&store, PairId::from_array(PAIR_ID)))
             .expect("the pairing's session lock");
         let source = PhoneSource::over_store(store.clone());
-        let _ = source.offered();
+        let _ = source.offered(REMOTE_WAKE_WAIT);
         assert!(source.worker.lock().expect("worker").is_some());
         // The thread swept the test's store at its start: the pairing idle
         // past the limit expired there, its record gone with its key.
@@ -1861,7 +1903,7 @@ mod tests {
             Err(RemoteSignError::Unreachable)
         );
         // A host that initialises again gets the thread again.
-        let _ = source.offered();
+        let _ = source.offered(REMOTE_WAKE_WAIT);
         assert!(source.worker.lock().expect("worker").is_some());
         source.stop();
         drop(session);
