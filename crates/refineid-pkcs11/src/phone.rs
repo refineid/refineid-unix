@@ -74,7 +74,8 @@ use refineid_rapp_core::operations::{
     CardKeyProfile, CardOperation, CardOperationResult, SignatureAlgorithm,
 };
 use refineid_rapp_core::remote::{
-    BacklogSightings, PairSummary, RemoteError, RemoteReader, RemoteSession, local_host_name,
+    BacklogSightings, PairSummary, RemoteError, RemoteReader, RemoteSession, SessionTier,
+    local_host_name,
 };
 use refineid_rapp_core::store::PairingState;
 use refineid_rapp_core::view::{ConsumerAnswer, CustodianView};
@@ -83,44 +84,50 @@ use refineid_remote::{DisplayText, RemoteKeyProfile, RemoteSignatureAlgorithm, S
 /// How long one dial browses for the phone beyond its first round: none,
 /// so a dial tries the phones in sight once.
 const DIAL_BROWSE: Duration = Duration::ZERO;
-/// The transport label a failed session names: the phone is reached over
-/// the local network stream tier only.
+/// The transport label a failure names when no session carried it.
 #[cfg(debug_assertions)]
-const SESSION_TRANSPORT_LABEL: &str = "network";
+const NO_SESSION_LABEL: &str = "no session";
 /// The peer a failed session names when no paired phone is served.
 const UNKNOWN_PAIRING_LABEL: &str = "unknown pairing";
 
 /// A failed session's cause with its peer and transport: `case` is the
 /// error's case name or a fixed text, `peer` the paired phone's display
-/// name (a device label, never a holder name).
+/// name (a device label, never a holder name), and `tier` the tier of the
+/// held session that carried the failure, `None` when none did.
 #[cfg(debug_assertions)]
 #[must_use]
-fn session_failure_message(case: &str, peer: &str) -> String {
-    format!("{case}, {peer}, {SESSION_TRANSPORT_LABEL}")
+fn session_failure_message(case: &str, peer: &str, tier: Option<SessionTier>) -> String {
+    let transport = tier.map_or(NO_SESSION_LABEL, SessionTier::label);
+    format!("{case}, {peer}, {transport}")
 }
 
 /// Reports a failed signature request naming its peer and transport; in a
 /// release build this borrows its inputs and writes nothing.
 #[cfg(debug_assertions)]
-fn report_signature_failure(peer: &str, error: &RemoteSignError) {
+fn report_signature_failure(peer: &str, tier: Option<SessionTier>, error: &RemoteSignError) {
     let case = refineid_dev_errors::Cause::case(error);
-    let message = session_failure_message(case.as_str(), peer);
+    let message = session_failure_message(case.as_str(), peer, tier);
     refineid_dev_errors::report!(Pkcs11, "signature request failed", name message.as_str());
 }
 
 /// Reports a failed signature request naming its peer and transport; in a
 /// release build this borrows its inputs and writes nothing.
 #[cfg(not(debug_assertions))]
-fn report_signature_failure(peer: &str, error: &RemoteSignError) {
-    let _ = (peer, error);
+fn report_signature_failure(peer: &str, tier: Option<SessionTier>, error: &RemoteSignError) {
+    let _ = (peer, tier, error);
 }
 
 /// Reports a failed session event with a fixed text cause, naming its peer
 /// and transport; in a release build this borrows its inputs and writes
 /// nothing.
 #[cfg(debug_assertions)]
-fn report_session_text(event: &'static str, peer: &str, text: &'static str) {
-    let message = session_failure_message(text, peer);
+fn report_session_text(
+    event: &'static str,
+    peer: &str,
+    tier: Option<SessionTier>,
+    text: &'static str,
+) {
+    let message = session_failure_message(text, peer, tier);
     refineid_dev_errors::report!(Pkcs11, event, name message.as_str());
 }
 
@@ -128,8 +135,13 @@ fn report_session_text(event: &'static str, peer: &str, text: &'static str) {
 /// and transport; in a release build this borrows its inputs and writes
 /// nothing.
 #[cfg(not(debug_assertions))]
-fn report_session_text(event: &'static str, peer: &str, text: &'static str) {
-    let _ = (event, peer, text);
+fn report_session_text(
+    event: &'static str,
+    peer: &str,
+    tier: Option<SessionTier>,
+    text: &'static str,
+) {
+    let _ = (event, peer, tier, text);
 }
 
 /// The pause between looks for the phone while no session is held.
@@ -850,6 +862,7 @@ fn dial_due(
                 &request,
                 RemoteSignError::Withdrawn,
                 &phone.peer_display_name,
+                None,
             );
         }
     }
@@ -869,15 +882,20 @@ fn unpaired(shared: &Shared, requests: &Receiver<SignRequest>) {
     shared.withdraw_slot();
     shared.wanted.store(false, Ordering::Release);
     while let Ok(request) = requests.try_recv() {
-        refuse(&request, RemoteSignError::Withdrawn, UNKNOWN_PAIRING_LABEL);
+        refuse(
+            &request,
+            RemoteSignError::Withdrawn,
+            UNKNOWN_PAIRING_LABEL,
+            None,
+        );
     }
     pause(shared, UNPAIRED_PAUSE);
 }
 
 /// Answers `request` with `error`, the module's failure for the browser,
-/// naming the paired `peer` and the transport.
-fn refuse(request: &SignRequest, error: RemoteSignError, peer: &str) {
-    report_signature_failure(peer, &error);
+/// naming the paired `peer` and the tier of the held session, if any.
+fn refuse(request: &SignRequest, error: RemoteSignError, peer: &str, tier: Option<SessionTier>) {
+    report_signature_failure(peer, tier, &error);
     let _ = request.reply.send(Err(error));
 }
 
@@ -960,6 +978,7 @@ fn hold(
     slot: RemoteSlotId,
     sightings: &mut BacklogSightings,
 ) -> Held {
+    let tier = Some(session.tier());
     let mut confirmed: Option<Confirmed> = None;
     // The card a confirmation was last tried for: a failed read is not
     // tried again until the phone reports a card anew.
@@ -1034,11 +1053,13 @@ fn hold(
                     "the browser stopped waiting"
                 );
             }
+            // A request for another slot: no session of its own carried it.
             Ok(request) if request.pair_id != slot => {
                 refuse(
                     &request,
                     RemoteSignError::Withdrawn,
                     &phone.peer_display_name,
+                    None,
                 );
             }
             Ok(request) => match &confirmed {
@@ -1050,7 +1071,7 @@ fn hold(
                     } else {
                         RemoteSignError::CardAbsent
                     };
-                    refuse(&request, error, &phone.peer_display_name);
+                    refuse(&request, error, &phone.peer_display_name, tier);
                 }
                 Some(card) => {
                     let signed = sign(reader, &mut session, &request);
@@ -1066,12 +1087,14 @@ fn hold(
                             report_session_text(
                                 "signature not handed on",
                                 &phone.peer_display_name,
+                                tier,
                                 "it does not verify under the confirmed certificate",
                             );
                             refuse(
                                 &request,
                                 RemoteSignError::Ambiguous,
                                 &phone.peer_display_name,
+                                tier,
                             );
                             reader.close_session(session);
                             return Held {
@@ -1085,7 +1108,7 @@ fn hold(
                             let _ = request.reply.send(Err(RemoteSignError::Unsupported));
                         }
                         Err(Failure::Sign(error)) => {
-                            refuse(&request, error, &phone.peer_display_name);
+                            refuse(&request, error, &phone.peer_display_name, tier);
                             match error {
                                 // The phone stopped serving or forgot this
                                 // computer: its presence goes at once.

@@ -20,3 +20,8 @@ rustix = { workspace = true, features = ["process"] }
 sha2.workspace = true
 socket2.workspace = true
 zeroize.workspace = true
+
+# socket(2), bind(2), connect(2), setsockopt(2), poll(2) for the BLE
+# transport's Bluetooth sockets (ble::freebsd::sys).
+[target.'cfg(target_os = "freebsd")'.dependencies]
+libc = "0.2"
