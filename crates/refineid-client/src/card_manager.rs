@@ -227,14 +227,14 @@ fn sign_qualified(
     )
 }
 
-/// Produce an `ASiC-E` container carrying an `XAdES-LT` signature.
+/// Produce an `ASiC-E` container carrying an `XAdES-B-LTA` signature.
 ///
 /// The `.asice`/`.bdoc` format Estonian `DigiDoc` and other Baltic
 /// tooling exchanges (`ETSI EN 319 162-1`, `BDOC 2.1`): the file
 /// travels unchanged inside the archive beside a signature that
-/// covers it, with a signature timestamp and the collected chain and
-/// revocation evidence. The original input is read before the
-/// destination is written.
+/// covers it, with a signature timestamp, the collected chain and
+/// revocation evidence, and an archive timestamp over them. The
+/// original input is read before the destination is written.
 ///
 /// # Errors
 /// Reader/card access, PIN, document construction, timestamp,
@@ -356,10 +356,10 @@ fn signing_time_now() -> SigningTime {
     }
 }
 
-/// An `ASiC-E` with `XAdES` request at level LT: an archive
-/// construction for the format is not implemented, and the format
-/// refuses to pretend. `signer_anchors` is what the long-term
-/// material's path may end at ([`crate::signer_anchors`]).
+/// An `ASiC-E` with `XAdES` request at level LTA: the evidence and an
+/// `ArchiveTimeStamp` over it, the only level a release build writes.
+/// `signer_anchors` is what the long-term material's path may end at
+/// ([`crate::signer_anchors`]).
 fn asice_document_request(
     additional_inputs: Vec<PathBuf>,
     timestamp_authority: String,
@@ -371,7 +371,7 @@ fn asice_document_request(
         additional_inputs,
         signing_time: signing_time_now(),
         metadata: SignatureMetadata::default(),
-        archive: false,
+        archive: true,
         long_term: true,
         signer_anchors,
         timestamp_authorities: vec![timestamp_authority],

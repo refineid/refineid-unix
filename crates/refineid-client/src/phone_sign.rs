@@ -551,7 +551,8 @@ mod tests {
         }
     }
 
-    /// A level-B request: no authority is reached.
+    /// A level-B request: no authority is reached, so only a
+    /// development build signs it.
     fn request(format: Format) -> DocumentRequest {
         DocumentRequest {
             format,
@@ -563,7 +564,7 @@ mod tests {
             signer_anchors: Vec::new(),
             timestamp_authorities: Vec::new(),
             timestamp_credentials: None,
-            build: refineid_doc_sign::service::SigningBuild::Release,
+            build: refineid_doc_sign::service::SigningBuild::Development,
         }
     }
 

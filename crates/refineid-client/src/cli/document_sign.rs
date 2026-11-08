@@ -75,11 +75,11 @@ typed on the phone. Prints nothing on success; -v shows each step.
   --no-stamp    no red seal asking the reader to check the
                 document's electronic signature; the signature
                 stays invisible
-Signs at the highest level the format supports: LTA (embedded
-evidence plus archive timestamp) for pades and asice-cades, LT
-(embedded evidence) for the rest. There is no lower level: when
-the evidence cannot be had, nothing is written. A development build
-writes the level it reached as '<name>-dev-<level>.<ext>' and says
+Signs at LTA (embedded evidence plus archive timestamp), for every
+format, the only level a release build writes: when the evidence or
+the archive timestamp cannot be had, nothing is written. A
+development build writes the level it reached as
+'<name>-dev-<level>.<ext>' and says
 why on stderr.
   --timestamp U   RFC 3161 timestamp authority URL, or a named set.
                   Default: http://timestamp.sectigo.com/qualified.
@@ -132,21 +132,21 @@ pub struct DocumentSignArgs {
     /// Optional substring match against reader names (`--reader`).
     pub reader_filter: Option<String>,
     /// Add an archive timestamp over the finished document: level
-    /// LTA. Set for the formats whose archive construction exists.
+    /// LTA. Always set; a release build signs at no other level.
     ///
     /// `PAdES` archives with a document timestamp revision; `ASiC-E`
-    /// with `CAdES` archives with a second manifest and a token over
-    /// it. The other formats archive through signature attributes this
-    /// crate does not build.
+    /// with `CAdES` with a second manifest and a token over it; `ASiC-E`
+    /// with `XAdES` with an `ArchiveTimeStamp`; `CAdES` with an
+    /// `archive-time-stamp-v3` attribute.
     pub archive: bool,
     /// Draw the seal asking the reader to check the document's
     /// electronic signature, its middle lines in the language of the
     /// process locale (default; `--no-stamp` leaves the signature
     /// invisible). Only `PAdES` has a page.
     pub stamp: bool,
-    /// Embed the chain and revocation answers: level LT. Always set;
-    /// every signature carries the evidence to check it after the
-    /// certificate expires.
+    /// Embed the chain and revocation answers, which LTA archives.
+    /// Always set; every signature carries the evidence to check it
+    /// after the certificate expires.
     pub long_term: bool,
     /// RFC 3161 Time Stamp Authority URLs (`--timestamp`, repeatable),
     /// never empty: the default authority stands in when none is
@@ -767,13 +767,10 @@ fn jobs_for(
     }
 }
 
-/// The level a format is signed at, as `(long_term, archive)`: LTA
-/// where the archive construction exists, `PAdES` and `ASiC-E` with
-/// `CAdES`; LT for the rest, whose archive attributes this crate does
-/// not build. Nothing lower is offered: a signature without embedded
-/// evidence decays with its certificates.
-const fn levels_for(format: Format) -> (bool, bool) {
-    (true, matches!(format, Format::Pades | Format::AsicECades))
+/// The level a format is signed at, as `(long_term, archive)`: LTA,
+/// for every format. A release build writes nothing else.
+const fn levels_for(_format: Format) -> (bool, bool) {
+    (true, true)
 }
 
 /// The format signed without `--format`: `PAdES` when every input is
@@ -1197,10 +1194,21 @@ mod tests {
     }
 
     #[test]
-    fn formats_without_archive_support_default_to_lt() -> TestResult {
+    fn every_format_asks_for_lta() -> TestResult {
         let a = DocumentSignArgs::parse(argv(&[TEXT]))?;
-        check(&a.archive, &false, "no archive construction for XAdES")?;
-        check(&a.long_term, &true, "still LT")
+        check(&a.format, &Format::AsicEXades, "a container")?;
+        check(&a.archive, &true, "LTA for an XAdES container")?;
+        check(&a.long_term, &true, "evidence embedded")?;
+        for format in ["cades", "cades-detached", "asice-cades", "bdoc"] {
+            let a = DocumentSignArgs::parse(argv(&[TEXT, "--format", format]))?;
+            check(&a.archive, &true, &format!("LTA asked for {format}"))?;
+            check(
+                &a.long_term,
+                &true,
+                &format!("evidence embedded for {format}"),
+            )?;
+        }
+        Ok(())
     }
 
     #[test]
