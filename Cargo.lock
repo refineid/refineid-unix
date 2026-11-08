@@ -2192,6 +2192,7 @@ name = "refineid-rapp-core"
 version = "26.11.8"
 dependencies = [
  "getrandom 0.4.3",
+ "libc",
  "refineid-dev-errors",
  "refineid-rapp",
  "rustix",

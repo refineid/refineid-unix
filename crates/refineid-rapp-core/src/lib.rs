@@ -10,6 +10,7 @@
 //! by `refineid_rapp`.
 
 pub mod addresses;
+pub mod ble;
 pub mod engine;
 pub mod file_store;
 pub mod ids;

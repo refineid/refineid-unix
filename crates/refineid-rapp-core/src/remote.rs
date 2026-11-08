@@ -1,5 +1,5 @@
 //! The workstation's remote card reader: pairing by code and sessions to
-//! the paired phone, over the stream tier.
+//! the paired phone, over the stream tier and, on FreeBSD, over BLE.
 //!
 //! This is the surface the CLI, the GUI, the TLS client, and the PKCS#11
 //! module use. Pairing browses for custodians in `mode=pairing` and tries
@@ -13,6 +13,13 @@
 //! `card_unavailable`, ends the search at once; the withdrawn instance is
 //! never dialed, and the pairing is dialed again only when a session
 //! record on another instance names it.
+//!
+//! On FreeBSD a round in which no stream service opened a session ends
+//! with one bounded BLE scan, the last resort of the hierarchy
+//! specification (section 3): the RAPP advertisers heard are dialed
+//! strongest first, each with a fresh BLE routing value (section 2.2.1),
+//! and one that does not hold the pairing closes the link. Pairing never
+//! runs over BLE, and no BLE address is kept past the round.
 //!
 //! The phone's word on the pairing comes only inside a session: a close
 //! carrying `pairing_revoked` revokes the pairing here at once (RAPP
@@ -60,7 +67,7 @@ use crate::stream::{
     browse, browse_stream_services, dial,
 };
 use crate::transport::FrameTransport;
-use crate::transport::TcpFrameTransport;
+use crate::transport::{TcpFrameTransport, TransportError};
 use refineid_rapp::{
     DISPLAY_NAME_MAX_BYTES, DiscoveryKey, DisplayName, PairingState, ProfileName,
     QUIT_WITHDRAWAL_BOUND_MS, RequesterSessionEnd, RoutingKey, TransportProfile, WithdrawalKey,
@@ -78,9 +85,9 @@ const BACKLOG_LOSS_HOLD: Duration = Duration::from_secs(30);
 /// into sight and open a session: long enough for a phone that is
 /// asleep in the holder's pocket when the search starts.
 ///
-/// This host finds the phone over the local network only (mDNS and
-/// DNS-SD, hierarchy specification section 3.2); it has no BLE
-/// transport. The terms, longest first:
+/// This host finds the phone over the local network (mDNS and DNS-SD,
+/// hierarchy specification section 3.2), and on FreeBSD over BLE as the
+/// last resort of each round. The terms, longest first:
 ///
 /// - The holder picks the phone up, unlocks it and brings the RefineID
 ///   app forward to serve. This is human time no specification
@@ -96,12 +103,11 @@ const BACKLOG_LOSS_HOLD: Duration = Duration::from_secs(30);
 ///   `BROWSE_ROUND`, to the group and to the phone's remembered
 ///   address, so at most one round, two seconds.
 ///
-/// The sum is about 25 seconds; 30 leaves margin. For comparison on
-/// the transport this host lacks: Apple's accessory guidelines have a
-/// BLE peripheral advertise every 20 ms for its first 30 seconds, and
-/// Android's slowest advertising mode is about one advertisement a
-/// second, so a waking phone found over BLE is in sight well within the
-/// same bound. The dial and handshake that follow have their own
+/// The sum is about 25 seconds; 30 leaves margin. Over BLE: Apple's
+/// accessory guidelines have a BLE peripheral advertise every 20 ms for
+/// its first 30 seconds, and Android's slowest advertising mode is about
+/// one advertisement a second, so a waking phone found over BLE is in
+/// sight well within the same bound. The dial and handshake that follow have their own
 /// deadlines (`SESSION_RECEIVE_DEADLINE`).
 pub const PHONE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long pairing waits for each custodian message; the holder may be
@@ -116,20 +122,58 @@ const CARD_REPORT_WAIT: Duration = Duration::from_secs(5);
 /// The lifetime each request asks for unless the caller bounds it
 /// (section 8.1 item 2).
 const OPERATION_LIFETIME: Duration = Duration::from_millis(300_000);
-/// The transport label a failed session names: this host reaches the
-/// phone over the local network stream tier only.
+/// The transport label of the local network stream tier.
 #[cfg(debug_assertions)]
-pub(crate) const SESSION_TRANSPORT_LABEL: &str = "network";
+const STREAM_TRANSPORT_LABEL: &str = "network";
+/// The transport label of BLE.
+#[cfg(debug_assertions)]
+const BLE_TRANSPORT_LABEL: &str = "bluetooth";
+/// The label of a search no attempt of which reached a phone: the tiers
+/// searched, none of which carried anything.
+#[cfg(all(debug_assertions, target_os = "freebsd"))]
+const SEARCHED_TIERS_LABEL: &str = "searched network and bluetooth";
+/// The label of a search no attempt of which reached a phone.
+#[cfg(all(debug_assertions, not(target_os = "freebsd")))]
+const SEARCHED_TIERS_LABEL: &str = "searched network";
+/// How long the BLE scan of one round listens: as long as one browse
+/// round, enough to hear a phone in Android's slowest advertising mode,
+/// about one advertisement a second.
+#[cfg(target_os = "freebsd")]
+const BLE_SCAN_WINDOW: Duration = Duration::from_secs(2);
 /// The peer a failed session names when its pair record cannot be read.
 pub(crate) const UNKNOWN_PAIRING_LABEL: &str = "unknown pairing";
 
+/// The tier a phone session runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionTier {
+    /// The local network stream tier (`fi.refineid.stream`).
+    Stream,
+    /// BLE GATT (`fi.refineid.rapp.ble`), on FreeBSD.
+    Ble,
+}
+
+impl SessionTier {
+    /// The label a failure on this tier names in the debug error sink.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stream => STREAM_TRANSPORT_LABEL,
+            Self::Ble => BLE_TRANSPORT_LABEL,
+        }
+    }
+}
+
 /// A failed session's cause with its peer and transport: `case` is the
 /// error's case name or a fixed text, `peer` the pair record's
-/// `peer_display_name` (a device label, never a holder name).
+/// `peer_display_name` (a device label, never a holder name), and `tier`
+/// the tier that carried the failure, or `None` when no attempt reached a
+/// phone, which names the tiers searched.
 #[cfg(debug_assertions)]
 #[must_use]
-pub(crate) fn session_failure_message(case: &str, peer: &str) -> String {
-    format!("{case}, {peer}, {SESSION_TRANSPORT_LABEL}")
+pub(crate) fn session_failure_message(case: &str, peer: &str, tier: Option<SessionTier>) -> String {
+    let transport = tier.map_or(SEARCHED_TIERS_LABEL, SessionTier::label);
+    format!("{case}, {peer}, {transport}")
 }
 
 /// The peer a failed session names: the pair record's display name, or
@@ -153,37 +197,171 @@ pub(crate) fn pairing_peer_label(store: &impl PairingStore, pair_id: PairId) -> 
     UNKNOWN_PAIRING_LABEL.to_owned()
 }
 
-/// Reports a failed session naming its peer and transport; in a release
-/// build this borrows its inputs and writes nothing.
+/// Reports a failed session naming its peer and the tier that carried
+/// it (see [`session_failure_message`]); in a release build this borrows
+/// its inputs and writes nothing.
 #[cfg(debug_assertions)]
-fn report_session_error(event: &'static str, peer: &str, error: &impl core::fmt::Debug) {
+fn report_session_error(
+    event: &'static str,
+    peer: &str,
+    tier: Option<SessionTier>,
+    error: &impl core::fmt::Debug,
+) {
     let case = refineid_dev_errors::Cause::case(error);
-    let message = session_failure_message(case.as_str(), peer);
+    let message = session_failure_message(case.as_str(), peer, tier);
     refineid_dev_errors::report!(Rapp, event, name message.as_str());
 }
 
-/// Reports a failed session naming its peer and transport; in a release
-/// build this borrows its inputs and writes nothing.
+/// Reports a failed session naming its peer and the tier that carried
+/// it; in a release build this borrows its inputs and writes nothing.
 #[cfg(not(debug_assertions))]
-fn report_session_error(event: &'static str, peer: &str, error: &impl core::fmt::Debug) {
-    let _ = (event, peer, error);
+fn report_session_error(
+    event: &'static str,
+    peer: &str,
+    tier: Option<SessionTier>,
+    error: &impl core::fmt::Debug,
+) {
+    let _ = (event, peer, tier, error);
 }
 
 /// Reports a failed session with a fixed text cause, naming its peer and
-/// transport; in a release build this borrows its inputs and writes
-/// nothing.
+/// the tier that carried it; in a release build this borrows its inputs
+/// and writes nothing.
 #[cfg(debug_assertions)]
-fn report_session_text(event: &'static str, peer: &str, text: &'static str) {
-    let message = session_failure_message(text, peer);
+fn report_session_text(
+    event: &'static str,
+    peer: &str,
+    tier: Option<SessionTier>,
+    text: &'static str,
+) {
+    let message = session_failure_message(text, peer, tier);
     refineid_dev_errors::report!(Rapp, event, name message.as_str());
 }
 
 /// Reports a failed session with a fixed text cause, naming its peer and
-/// transport; in a release build this borrows its inputs and writes
-/// nothing.
+/// the tier that carried it; in a release build this borrows its inputs
+/// and writes nothing.
 #[cfg(not(debug_assertions))]
-fn report_session_text(event: &'static str, peer: &str, text: &'static str) {
-    let _ = (event, peer, text);
+fn report_session_text(
+    event: &'static str,
+    peer: &str,
+    tier: Option<SessionTier>,
+    text: &'static str,
+) {
+    let _ = (event, peer, tier, text);
+}
+
+/// Why a search opened no session, and the tier of the attempt whose
+/// error it is: `None` when no attempt reached a phone.
+struct SearchFailure {
+    error: RemoteError,
+    tier: Option<SessionTier>,
+}
+
+impl From<RemoteError> for SearchFailure {
+    fn from(error: RemoteError) -> Self {
+        Self { error, tier: None }
+    }
+}
+
+/// One bounded BLE scan for RAPP advertisers. This crate's unit tests
+/// hear nothing, so they never scan the computer's adapter or dial a
+/// phone in reach.
+#[cfg(target_os = "freebsd")]
+fn scan_ble(
+    window: Duration,
+) -> Result<Vec<crate::ble::advertising::RappAdvertiser>, crate::ble::hci::ScanError> {
+    #[cfg(not(test))]
+    return crate::ble::freebsd::scan(window);
+    #[cfg(test)]
+    {
+        let _ = window;
+        Ok(Vec::new())
+    }
+}
+
+/// The transport a phone session runs on.
+#[derive(Debug)]
+enum PhoneTransport {
+    /// The local network stream tier.
+    Stream(TcpFrameTransport),
+    /// BLE GATT (`fi.refineid.rapp.ble`).
+    #[cfg(target_os = "freebsd")]
+    Ble(crate::ble::transport::BleFrameTransport<crate::ble::freebsd::AttSocket>),
+}
+
+/// Runs `$body` on the transport inside `$transport`.
+macro_rules! on_transport {
+    ($transport:expr, $inner:ident => $body:expr) => {
+        match $transport {
+            PhoneTransport::Stream($inner) => $body,
+            #[cfg(target_os = "freebsd")]
+            PhoneTransport::Ble($inner) => $body,
+        }
+    };
+}
+
+impl PhoneTransport {
+    /// The tier this transport is.
+    const fn tier(&self) -> SessionTier {
+        match self {
+            Self::Stream(_) => SessionTier::Stream,
+            #[cfg(target_os = "freebsd")]
+            Self::Ble(_) => SessionTier::Ble,
+        }
+    }
+}
+
+impl FrameTransport for PhoneTransport {
+    fn send_frame(&mut self, frame: &[u8]) -> Result<(), TransportError> {
+        on_transport!(self, inner => inner.send_frame(frame))
+    }
+
+    fn receive_frame(&mut self) -> Result<Vec<u8>, TransportError> {
+        on_transport!(self, inner => inner.receive_frame())
+    }
+
+    fn set_receive_deadline(&mut self, deadline: Duration) -> Result<Duration, TransportError> {
+        on_transport!(self, inner => inner.set_receive_deadline(deadline))
+    }
+
+    fn profile(&self) -> &str {
+        on_transport!(self, inner => FrameTransport::profile(inner))
+    }
+
+    fn candidate_id(&self) -> &str {
+        on_transport!(self, inner => FrameTransport::candidate_id(inner))
+    }
+}
+
+impl refineid_rapp::FrameTransport for PhoneTransport {
+    type Error = TransportError;
+
+    fn candidate_id(&self) -> &str {
+        FrameTransport::candidate_id(self)
+    }
+
+    fn send(&mut self, frame: refineid_rapp::BinaryFrame) -> Result<(), Self::Error> {
+        on_transport!(self, inner => refineid_rapp::FrameTransport::send(inner, frame))
+    }
+
+    fn receive(&mut self) -> Result<Option<refineid_rapp::BinaryFrame>, Self::Error> {
+        on_transport!(self, inner => refineid_rapp::FrameTransport::receive(inner))
+    }
+
+    fn close(&mut self) -> Result<(), Self::Error> {
+        on_transport!(self, inner => refineid_rapp::FrameTransport::close(inner))
+    }
+}
+
+/// How one dialed connection ended its part in a search.
+enum Attempt {
+    /// A session that reported its card as the search waits for.
+    Opened(Box<Session<PhoneTransport>>),
+    /// The phone's word, or a card it reports absent, ends the search.
+    Ends(SearchFailure),
+    /// This connection failed; the next one is tried.
+    Failed(SearchFailure),
 }
 
 /// What a new session waits for before it is handed over.
@@ -220,10 +398,10 @@ impl PairingKeys {
         })
     }
 
-    /// A session preamble with a fresh routing value.
-    fn session_preamble(&self) -> Result<RoutingPreamble, RemoteError> {
+    /// A session preamble for `profile` with a fresh routing value.
+    fn session_preamble(&self, profile: TransportProfile) -> Result<RoutingPreamble, RemoteError> {
         self.routing
-            .route(TransportProfile::Stream, |nonce| {
+            .route(profile, |nonce| {
                 getrandom::fill(nonce).map_err(|_| refineid_rapp::RandomUnavailable)
             })
             .map(RoutingPreamble::Session)
@@ -561,7 +739,8 @@ impl PairSummary {
 /// The route a revocation-backlog appearance arrived on (section 4.6 item
 /// 6): one connection per appearance, by the route that appeared, never
 /// both in one appearance. This host finds the phone over the local
-/// network only; the Bluetooth route is named for the rule it obeys.
+/// network only, over the stream tier; the Bluetooth route is named for
+/// the rule it obeys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum BacklogRoute {
     /// An mDNS `mode=session` record carrying the pairing's discovery
@@ -655,7 +834,8 @@ pub struct RemoteReader {
 /// pairing's lock is held with it.
 #[derive(Debug)]
 pub struct RemoteSession {
-    session: Session<TcpFrameTransport>,
+    session: Session<PhoneTransport>,
+    tier: SessionTier,
     _lock: SessionLock,
 }
 
@@ -708,6 +888,12 @@ impl RemoteSession {
     #[must_use]
     pub const fn pair_id(&self) -> PairId {
         self.session.pair_id()
+    }
+
+    /// The tier that carries this session.
+    #[must_use]
+    pub const fn tier(&self) -> SessionTier {
+        self.tier
     }
 
     /// How this computer treats the session's end (section 4.5 item 6),
@@ -1129,12 +1315,17 @@ impl RemoteReader {
         now_ms: u64,
     ) -> bool {
         let wait = Duration::from_millis(QUIT_WITHDRAWAL_BOUND_MS);
-        let Ok(preamble) = keys.session_preamble() else {
+        let Ok(preamble) = keys.session_preamble(TransportProfile::Stream) else {
             return false;
         };
         let dial = self.dial;
         let Ok(transport) = dial(&service.endpoints, STREAM_CANDIDATE_ID, wait, &preamble) else {
-            report_session_text("revocation close not delivered", peer, "no session");
+            report_session_text(
+                "revocation close not delivered",
+                peer,
+                Some(SessionTier::Stream),
+                "no session",
+            );
             return false;
         };
         match self.requester.send_revocation_notice(
@@ -1145,11 +1336,21 @@ impl RemoteReader {
         ) {
             Ok(true) => true,
             Ok(false) => {
-                report_session_text("revocation close not acknowledged", peer, "no echo");
+                report_session_text(
+                    "revocation close not acknowledged",
+                    peer,
+                    Some(SessionTier::Stream),
+                    "no echo",
+                );
                 false
             }
             Err(error) => {
-                report_session_error("revocation close not delivered", peer, &error);
+                report_session_error(
+                    "revocation close not delivered",
+                    peer,
+                    Some(SessionTier::Stream),
+                    &error,
+                );
                 false
             }
         }
@@ -1325,8 +1526,14 @@ impl RemoteReader {
         #[cfg(not(debug_assertions))]
         let peer = UNKNOWN_PAIRING_LABEL.to_owned();
         self.establish_unreported(pair_id, discovery_timeout, wait)
-            .inspect_err(|error| {
-                report_session_error("phone session not opened", &peer, error);
+            .map_err(|failure| {
+                report_session_error(
+                    "phone session not opened",
+                    &peer,
+                    failure.tier,
+                    &failure.error,
+                );
+                failure.error
             })
     }
 
@@ -1336,7 +1543,7 @@ impl RemoteReader {
         pair_id: Option<PairId>,
         discovery_timeout: Duration,
         wait: CardWait,
-    ) -> Result<RemoteSession, RemoteError> {
+    ) -> Result<RemoteSession, SearchFailure> {
         self.may_dial()?;
         let pair_id = match pair_id {
             Some(pair_id) => pair_id,
@@ -1348,7 +1555,7 @@ impl RemoteReader {
             .get(pair_id)
             .map_err(|_| RemoteError::NotPaired)?;
         if record.state() != PairingState::PairedDisconnected {
-            return Err(RemoteError::NotPaired);
+            return Err(RemoteError::NotPaired.into());
         }
         let peer = record.peer_display_name().as_str().to_owned();
         let keys = PairingKeys::derive(record)?;
@@ -1357,7 +1564,7 @@ impl RemoteReader {
             pair_id,
         ))?;
         let deadline = Instant::now() + discovery_timeout;
-        let mut last = RemoteError::NotFound;
+        let mut last = SearchFailure::from(RemoteError::NotFound);
         // One round at least, so a dial given no time to browse further
         // tries the phones in sight once.
         let mut first_round = true;
@@ -1370,66 +1577,166 @@ impl RemoteReader {
                     &service.endpoints,
                     STREAM_CANDIDATE_ID,
                     SESSION_RECEIVE_DEADLINE,
-                    &keys.session_preamble()?,
+                    &keys.session_preamble(TransportProfile::Stream)?,
                 ) else {
                     continue;
                 };
-                let mut session = match self.requester.connect(pair_id, transport) {
-                    Ok(session) => {
-                        self.remember_address(pair_id, &service);
-                        session
-                    }
-                    // The phone's word ends the dial (section 4.5 item 6), as
-                    // does its authenticated violation, which opens no redial.
-                    Err(error @ SessionError::Violation) => {
-                        return Err(RemoteError::Session(error));
-                    }
-                    Err(error @ SessionError::ClosedByPeer(reason)) if ends_the_dial(reason) => {
-                        return Err(session_error(error));
-                    }
-                    Err(error) => {
-                        report_session_error("phone session attempt failed", &peer, &error);
-                        last = RemoteError::Session(error);
-                        continue;
-                    }
-                };
-                let reported = match wait {
-                    CardWait::Present => self.requester.await_card_present(
-                        &mut session,
-                        deadline
-                            .saturating_duration_since(Instant::now())
-                            .max(CARD_REPORT_WAIT),
-                    ),
-                    CardWait::Report => self
-                        .requester
-                        .await_card_report(&mut session, CARD_REPORT_WAIT),
-                };
-                match reported {
-                    Ok(true) => {
+                match self.attempt(
+                    pair_id,
+                    &peer,
+                    PhoneTransport::Stream(transport),
+                    wait,
+                    deadline,
+                    |reader| reader.remember_address(pair_id, &service),
+                ) {
+                    Attempt::Opened(session) => {
                         return Ok(RemoteSession {
-                            session,
+                            session: *session,
+                            tier: SessionTier::Stream,
                             _lock: lock,
                         });
                     }
-                    Ok(false) => {
-                        let request = CardRequest::of(session.card_status());
-                        self.requester.disconnect(&mut session, CloseReason::Normal);
-                        return Err(RemoteError::CardAbsent(request));
-                    }
-                    Err(error @ SessionError::Violation) => {
-                        return Err(RemoteError::Session(error));
-                    }
-                    Err(error @ SessionError::ClosedByPeer(reason)) if ends_the_dial(reason) => {
-                        return Err(session_error(error));
-                    }
-                    Err(error) => {
-                        report_session_error("phone card report not received", &peer, &error);
-                        last = RemoteError::Session(error);
-                    }
+                    Attempt::Ends(failure) => return Err(failure),
+                    Attempt::Failed(failure) => last = failure,
                 }
+            }
+            #[cfg(target_os = "freebsd")]
+            if let Some(session) =
+                self.ble_round(pair_id, &peer, &keys, wait, deadline, &mut last)?
+            {
+                return Ok(RemoteSession {
+                    session,
+                    tier: SessionTier::Ble,
+                    _lock: lock,
+                });
             }
         }
         Err(last)
+    }
+
+    /// The BLE part of one search round (hierarchy specification section
+    /// 3): one bounded scan, then each RAPP advertiser heard, strongest
+    /// first, with a fresh BLE routing value per connection (section
+    /// 2.2.1). A phone that does not hold the pairing closes the link and
+    /// the next is tried; a failed attempt leaves its cause in `last`.
+    #[cfg(target_os = "freebsd")]
+    fn ble_round(
+        &mut self,
+        pair_id: PairId,
+        peer: &str,
+        keys: &PairingKeys,
+        wait: CardWait,
+        deadline: Instant,
+        last: &mut SearchFailure,
+    ) -> Result<Option<Session<PhoneTransport>>, SearchFailure> {
+        self.may_dial()?;
+        let advertisers = match scan_ble(BLE_SCAN_WINDOW) {
+            Ok(advertisers) => advertisers,
+            Err(error) => {
+                report_session_error(
+                    "phone BLE scan failed",
+                    peer,
+                    Some(SessionTier::Ble),
+                    &error,
+                );
+                return Ok(None);
+            }
+        };
+        for advertiser in &advertisers {
+            self.may_dial()?;
+            let preamble = keys.session_preamble(TransportProfile::Ble)?;
+            let transport =
+                match crate::ble::freebsd::dial(advertiser, &preamble, SESSION_RECEIVE_DEADLINE) {
+                    Ok(transport) => transport,
+                    Err(error) => {
+                        report_session_error(
+                            "phone BLE connection failed",
+                            peer,
+                            Some(SessionTier::Ble),
+                            &error,
+                        );
+                        continue;
+                    }
+                };
+            match self.attempt(
+                pair_id,
+                peer,
+                PhoneTransport::Ble(transport),
+                wait,
+                deadline,
+                |_| {},
+            ) {
+                Attempt::Opened(session) => return Ok(Some(*session)),
+                Attempt::Ends(failure) => return Err(failure),
+                Attempt::Failed(failure) => *last = failure,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Connects the session on `transport` and waits for its card as
+    /// `wait` says; `connected` runs once the handshake succeeded.
+    fn attempt(
+        &mut self,
+        pair_id: PairId,
+        peer: &str,
+        transport: PhoneTransport,
+        wait: CardWait,
+        deadline: Instant,
+        connected: impl FnOnce(&Self),
+    ) -> Attempt {
+        let tier = transport.tier();
+        let failure = |error| SearchFailure {
+            error,
+            tier: Some(tier),
+        };
+        let mut session = match self.requester.connect(pair_id, transport) {
+            Ok(session) => {
+                connected(self);
+                session
+            }
+            // The phone's word ends the dial (section 4.5 item 6), as
+            // does its authenticated violation, which opens no redial.
+            Err(error @ SessionError::Violation) => {
+                return Attempt::Ends(failure(RemoteError::Session(error)));
+            }
+            Err(error @ SessionError::ClosedByPeer(reason)) if ends_the_dial(reason) => {
+                return Attempt::Ends(failure(session_error(error)));
+            }
+            Err(error) => {
+                report_session_error("phone session attempt failed", peer, Some(tier), &error);
+                return Attempt::Failed(failure(RemoteError::Session(error)));
+            }
+        };
+        let reported = match wait {
+            CardWait::Present => self.requester.await_card_present(
+                &mut session,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(CARD_REPORT_WAIT),
+            ),
+            CardWait::Report => self
+                .requester
+                .await_card_report(&mut session, CARD_REPORT_WAIT),
+        };
+        match reported {
+            Ok(true) => Attempt::Opened(Box::new(session)),
+            Ok(false) => {
+                let request = CardRequest::of(session.card_status());
+                self.requester.disconnect(&mut session, CloseReason::Normal);
+                Attempt::Ends(failure(RemoteError::CardAbsent(request)))
+            }
+            Err(error @ SessionError::Violation) => {
+                Attempt::Ends(failure(RemoteError::Session(error)))
+            }
+            Err(error @ SessionError::ClosedByPeer(reason)) if ends_the_dial(reason) => {
+                Attempt::Ends(failure(session_error(error)))
+            }
+            Err(error) => {
+                report_session_error("phone card report not received", peer, Some(tier), &error);
+                Attempt::Failed(failure(RemoteError::Session(error)))
+            }
+        }
     }
 
     /// Runs one operation on an open session with the default lifetime.
@@ -1457,6 +1764,7 @@ impl RemoteReader {
         lifetime: Duration,
     ) -> Result<CardOperationResult, RemoteError> {
         let peer = pairing_peer_label(self.requester.store(), session.pair_id());
+        let tier = session.tier();
         execute_on_session(
             &mut self.requester,
             &mut session.session,
@@ -1464,7 +1772,7 @@ impl RemoteReader {
             lifetime,
         )
         .inspect_err(|error| {
-            report_session_error("card operation failed", &peer, error);
+            report_session_error("card operation failed", &peer, Some(tier), error);
         })
     }
 
@@ -1483,11 +1791,12 @@ impl RemoteReader {
         wait: Duration,
     ) -> Result<(), RemoteError> {
         let peer = pairing_peer_label(self.requester.store(), session.pair_id());
+        let tier = session.tier();
         self.requester
             .service(&mut session.session, wait)
             .map_err(session_error)
             .inspect_err(|error| {
-                report_session_error("phone session ended", &peer, error);
+                report_session_error("phone session ended", &peer, Some(tier), error);
             })
     }
 
@@ -1568,9 +1877,10 @@ impl RemoteReader {
         held: Option<&[u8]>,
     ) -> Result<Vec<u8>, RemoteError> {
         let peer = pairing_peer_label(self.requester.store(), session.pair_id());
+        let tier = session.tier();
         self.confirmed_auth_cert_unreported(session, held)
             .inspect_err(|error| {
-                report_session_error("certificate not confirmed", &peer, error);
+                report_session_error("certificate not confirmed", &peer, Some(tier), error);
             })
     }
 
@@ -1609,20 +1919,20 @@ impl RemoteReader {
 mod tests {
     use refineid_rapp::{
         AnnouncementCandidate, DiscoveryKey, InstanceName, PairId, PairingState, ResultError,
-        RoutingKey, WithdrawalKey, WithdrawnRecord, X25519_KEY_SIZE, discovery_epoch,
-        withdrawal_counter,
+        RoutingKey, TransportProfile, WithdrawalKey, WithdrawnRecord, X25519_KEY_SIZE,
+        discovery_epoch, withdrawal_counter,
     };
 
     use std::time::{Duration, Instant};
 
     use super::{
-        AdmissionError, BACKLOG_LOSS_HOLD, BROWSE_ROUND, BacklogRoute, BacklogSightings,
-        CardOperationResult, CardPresence, CardReader, CardRequest, CardStatusMessage,
-        CertificateFingerprint, OperationOutcome, PairingKeys, PairingSearchError, RemoteError,
-        RemoteReader, RoutingPreamble, SESSION_TRANSPORT_LABEL, SessionError, StreamError,
-        StreamService, TcpFrameTransport, UNKNOWN_PAIRING_LABEL, Withdrawal, current_time_ms,
-        lifetime_ms, operation_result, pairing_peer_label, session_failure_message, sessions_for,
-        unix_seconds,
+        AdmissionError, BACKLOG_LOSS_HOLD, BLE_TRANSPORT_LABEL, BROWSE_ROUND, BacklogRoute,
+        BacklogSightings, CardOperationResult, CardPresence, CardReader, CardRequest,
+        CardStatusMessage, CertificateFingerprint, OperationOutcome, PairingKeys,
+        PairingSearchError, RemoteError, RemoteReader, RoutingPreamble, SEARCHED_TIERS_LABEL,
+        STREAM_TRANSPORT_LABEL, SessionError, SessionTier, StreamError, StreamService,
+        TcpFrameTransport, UNKNOWN_PAIRING_LABEL, Withdrawal, current_time_ms, lifetime_ms,
+        operation_result, pairing_peer_label, session_failure_message, sessions_for, unix_seconds,
     };
     use crate::file_store::{FilePairingStore, path_for};
     use crate::session_lock::{SessionLock, ceremony_lock_path, session_lock_path};
@@ -2578,8 +2888,12 @@ mod tests {
     fn every_session_preamble_is_fresh() {
         let mine = keys(MINE);
         assert_ne!(
-            mine.session_preamble().unwrap(),
-            mine.session_preamble().unwrap()
+            mine.session_preamble(TransportProfile::Stream).unwrap(),
+            mine.session_preamble(TransportProfile::Stream).unwrap()
+        );
+        assert_ne!(
+            mine.session_preamble(TransportProfile::Ble).unwrap(),
+            mine.session_preamble(TransportProfile::Ble).unwrap()
         );
     }
 
@@ -2590,21 +2904,39 @@ mod tests {
         let pair_id = PairId::from_array(PAIR_ID);
         let peer = pairing_peer_label(reader.requester.store(), pair_id);
         assert_eq!(peer, PHONE_NAME);
-        let line = session_failure_message("Session(HandshakeFailed)", &peer);
+        let line =
+            session_failure_message("Session(HandshakeFailed)", &peer, Some(SessionTier::Stream));
         assert!(line.contains(&peer));
-        assert!(line.contains(SESSION_TRANSPORT_LABEL));
         assert_eq!(
             line,
-            format!("Session(HandshakeFailed), {peer}, {SESSION_TRANSPORT_LABEL}")
+            format!("Session(HandshakeFailed), {peer}, {STREAM_TRANSPORT_LABEL}")
         );
         let unknown = pairing_peer_label(
             reader.requester.store(),
             PairId::from_array(UNKNOWN_PAIR_ID),
         );
         assert_eq!(unknown, UNKNOWN_PAIRING_LABEL);
-        let unknown_line = session_failure_message("Session(Transport)", &unknown);
+        let unknown_line =
+            session_failure_message("Session(Transport)", &unknown, Some(SessionTier::Stream));
         assert!(unknown_line.contains(UNKNOWN_PAIRING_LABEL));
-        assert!(unknown_line.contains(SESSION_TRANSPORT_LABEL));
+        assert!(unknown_line.contains(STREAM_TRANSPORT_LABEL));
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_failure_names_the_tier_that_carried_it_or_the_tiers_searched() {
+        assert_eq!(
+            session_failure_message("RevokedByPhone", PHONE_NAME, Some(SessionTier::Ble)),
+            format!("RevokedByPhone, {PHONE_NAME}, {BLE_TRANSPORT_LABEL}")
+        );
+        let unreached = session_failure_message("NotFound", PHONE_NAME, None);
+        assert_eq!(
+            unreached,
+            format!("NotFound, {PHONE_NAME}, {SEARCHED_TIERS_LABEL}")
+        );
+        assert_ne!(
+            unreached,
+            session_failure_message("NotFound", PHONE_NAME, Some(SessionTier::Stream))
+        );
     }
 }

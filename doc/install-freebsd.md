@@ -71,6 +71,24 @@ lookup answers SERVFAIL and pkg cannot resolve its mirrors; a file
 `/var/unbound/conf.d/no-dnssec.conf` with `module-config: "iterator"`
 and `service local_unbound restart` fixes it.
 
+### Bluetooth
+
+Without a shared network RefineID reaches the phone over Bluetooth Low
+Energy ([ble-transport-plan.md](ble-transport-plan.md)). A normal user
+can scan and connect once root has set the adapter up, after each boot:
+
+```sh
+kldload ng_l2cap ng_btsocket
+service bluetooth start ubt0
+hccontrol write_le_host_support 1
+hccontrol le_enable enable
+```
+
+The adapter's firmware must be loaded first (for Intel adapters,
+iwmbtfw(8)). `hccontrol le_enable enable` sets the LE event mask; without
+it no advertising reports arrive. RefineID uses the first USB adapter,
+`ubt0hci`.
+
 For automatic network link failover between wired Ethernet and Wi-Fi on
 laptops or workstations, see [freebsd-network-failover.md](freebsd-network-failover.md).
 
