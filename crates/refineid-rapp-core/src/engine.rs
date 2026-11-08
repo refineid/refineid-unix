@@ -429,6 +429,41 @@ impl SessionEnd {
     }
 }
 
+/// What the wait for the echo of this side's close found (section 7.1
+/// item 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EchoOutcome {
+    /// The peer answered the close, with its echo or with a close that
+    /// crossed it.
+    echoed: bool,
+    /// A close of the peer's that crossed this side's, which the caller
+    /// acts on.
+    crossing: Option<CloseReason>,
+}
+
+impl EchoOutcome {
+    /// The close left and the peer answered it, crossing with `crossing`.
+    const fn answered(crossing: Option<CloseReason>) -> Self {
+        Self {
+            echoed: true,
+            crossing,
+        }
+    }
+
+    /// The close never left, or no answer arrived: the peer was not told.
+    const fn unanswered() -> Self {
+        Self {
+            echoed: false,
+            crossing: None,
+        }
+    }
+
+    /// The close never left; as [`Self::unanswered`].
+    const fn unsent() -> Self {
+        Self::unanswered()
+    }
+}
+
 /// One healthy session: its transport, its runtime with the liveness
 /// clock, and its operation engine.
 pub struct Session<Transport: FrameTransport> {
@@ -500,37 +535,46 @@ impl<Transport: FrameTransport> Session<Transport> {
     /// Delivers a sealed close, best effort, waits for its echo within
     /// [`CLOSE_ECHO_WAIT`] (section 7.1 item 7), and finishes the session
     /// as `end`, or as the phone's own close when one crossed it. Returns
-    /// the reason of a crossing close, which the caller acts on.
-    fn close_with(&mut self, notice: Option<BinaryFrame>, end: SessionEnd) -> Option<CloseReason> {
+    /// what the wait found, which the caller acts on.
+    fn close_with(&mut self, notice: Option<BinaryFrame>, end: SessionEnd) -> EchoOutcome {
         let sent =
             notice.is_some_and(|notice| self.transport.send_frame(notice.as_bytes()).is_ok());
-        let crossing = if sent { self.await_echo() } else { None };
-        self.finish(crossing.map_or(end, SessionEnd::PeerClose));
-        crossing
+        let outcome = if sent {
+            self.await_echo()
+        } else {
+            EchoOutcome::unsent()
+        };
+        self.finish(outcome.crossing.map_or(end, SessionEnd::PeerClose));
+        outcome
     }
 
     /// Reads the phone's frames until the echo of this side's close
     /// arrives or [`CLOSE_ECHO_WAIT`] passes, ignoring everything but a
-    /// close; never answers it. Returns the reason of a close that
-    /// crossed this side's.
-    fn await_echo(&mut self) -> Option<CloseReason> {
+    /// close; never answers it. A close that crossed this side's counts as
+    /// the echo: the peer answered, with its own reason.
+    fn await_echo(&mut self) -> EchoOutcome {
         let deadline = Instant::now() + CLOSE_ECHO_WAIT;
         while self.runtime.awaits_close_echo() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() || self.transport.set_receive_deadline(remaining).is_err() {
-                return None;
+                return EchoOutcome::unanswered();
             }
-            let frame = BinaryFrame::reconstruct(self.transport.receive_frame().ok()?).ok()?;
+            let Ok(bytes) = self.transport.receive_frame() else {
+                return EchoOutcome::unanswered();
+            };
+            let Ok(frame) = BinaryFrame::reconstruct(bytes) else {
+                return EchoOutcome::unanswered();
+            };
             let now_ms = self.clock_ms();
             match self.runtime.receive(&frame, now_ms) {
                 Ok(RuntimeReceive::CloseAcknowledged { reason, crossing }) => {
-                    return crossing.then_some(reason);
+                    return EchoOutcome::answered(crossing.then_some(reason));
                 }
                 Ok(RuntimeReceive::IgnoredWhileClosing) => {}
-                _ => return None,
+                _ => return EchoOutcome::unanswered(),
             }
         }
-        None
+        EchoOutcome::unanswered()
     }
 }
 
@@ -1106,19 +1150,27 @@ impl<Store: PairingStore> Requester<Store> {
     /// Tells the custodian that this computer forgot the pairing (section
     /// 4.6 items 2 and 6): completes the session handshake, sends
     /// `session.close` with reason `pairing_revoked` as the session's first
-    /// message, waits for the custodian's echo until `deadline` (section
-    /// 7.1 item 7), and destroys the pairing's key. No card session starts.
+    /// message, and waits for the custodian's echo until `deadline`
+    /// (section 7.1 item 7). No card session starts. The pairing's key and
+    /// record go only on the echo; without it they stay in the revocation
+    /// backlog until the pairing's idle expiry would have passed (item 3).
     /// Returns whether the echo arrived.
+    ///
+    /// `now_ms` is the wall clock: a record whose notice expired then sends
+    /// nothing and is revoked untold (item 3), as
+    /// [`Self::expire_revocation_notices`] does in the sweep.
     ///
     /// # Errors
     /// [`SessionError`] on an unknown pairing, one that was not forgotten,
-    /// a failed handshake or transport loss before the close was sent; the
-    /// key stays until the attempt's bound passes.
+    /// one whose notice expired at `now_ms`, or a failed handshake or
+    /// transport loss before the close was sent; the record stays in the
+    /// backlog in every case but the echo and the expiry, which destroy it.
     pub fn send_revocation_notice<Transport: FrameTransport>(
         &mut self,
         pair_id: PairId,
         mut transport: Transport,
         deadline: Instant,
+        now_ms: u64,
     ) -> Result<bool, SessionError> {
         let record = self
             .store
@@ -1126,6 +1178,10 @@ impl<Store: PairingStore> Requester<Store> {
             .map_err(|_| SessionError::UnknownPairing)?;
         if record.state() != PairingState::Revoking {
             return Err(SessionError::NotPaired(record.state()));
+        }
+        if record.pairing().revocation_notice_expired(now_ms) {
+            let _ = self.store.remove(pair_id);
+            return Err(SessionError::UnknownPairing);
         }
         let mut authentication = self.authenticate(pair_id, &mut transport)?;
         let notice = authentication
@@ -1135,7 +1191,9 @@ impl<Store: PairingStore> Requester<Store> {
             .send_frame(notice.as_bytes())
             .map_err(SessionError::Transport)?;
         let echo = await_close_echo(&mut authentication, &mut transport, deadline);
-        let _ = self.store.remove(pair_id);
+        if echo.is_some() {
+            let _ = self.store.remove(pair_id);
+        }
         Ok(echo.is_some())
     }
 
@@ -1266,7 +1324,7 @@ impl<Store: PairingStore> Requester<Store> {
             return;
         }
         let notice = session.runtime.close_with_reason(reason).ok();
-        if let Some(crossing) = session.close_with(notice, SessionEnd::LocalClose) {
+        if let Some(crossing) = session.close_with(notice, SessionEnd::LocalClose).crossing {
             self.apply_peer_close_reason(session.pair_id, crossing);
         }
         self.note_end(session);
@@ -1276,8 +1334,9 @@ impl<Store: PairingStore> Requester<Store> {
     /// pairing (section 4.6 items 1 and 6): sends `session.close` with
     /// reason `pairing_revoked`, waits at most the quit bound for the
     /// echo, and closes the session; the key of a record the store durably
-    /// holds as forgotten is then destroyed (item 3). A session that
-    /// already ended leaves the record to the attempt's bound.
+    /// holds as forgotten is destroyed only on the echo (item 3), and kept
+    /// in the revocation backlog otherwise. A session that already ended
+    /// leaves the record to the backlog.
     pub fn revoke_in_session<Transport: FrameTransport>(
         &mut self,
         session: &mut Session<Transport>,
@@ -1289,10 +1348,9 @@ impl<Store: PairingStore> Requester<Store> {
             .runtime
             .close_with_reason(CloseReason::PairingRevoked)
             .ok();
-        let sent = notice.is_some();
-        let _ = session.close_with(notice, SessionEnd::LocalClose);
+        let outcome = session.close_with(notice, SessionEnd::LocalClose);
         self.note_end(session);
-        if sent {
+        if outcome.echoed {
             let _ = self.store.update(session.pair_id, &mut |record| {
                 (record.state() != PairingState::Revoking).then_some(record)
             });
@@ -1470,7 +1528,7 @@ impl<Store: PairingStore> Requester<Store> {
         session: &mut Session<Transport>,
         notice: Option<BinaryFrame>,
     ) -> Result<Option<RequesterDispatch>, SessionError> {
-        if let Some(crossing) = session.close_with(notice, SessionEnd::Violation) {
+        if let Some(crossing) = session.close_with(notice, SessionEnd::Violation).crossing {
             self.apply_peer_close_reason(session.pair_id, crossing);
         }
         Err(SessionError::Violation)
@@ -1572,10 +1630,10 @@ impl<Store: PairingStore> Requester<Store> {
             })
     }
 
-    /// Destroys, untold, every forgotten pairing whose key has waited the
-    /// notice window for a session since its user forgot it (section 4.6
-    /// item 3); `now_ms` is the wall clock. Returns how many were
-    /// destroyed.
+    /// Destroys, untold, every forgotten pairing whose idle expiry would
+    /// have passed: 30 days after its latest established session, or its
+    /// creation while it had none (section 4.6 item 3); `now_ms` is the
+    /// wall clock. Returns how many were destroyed.
     pub fn expire_revocation_notices(&mut self, now_ms: u64) -> usize {
         self.remove_where(|record| record.pairing().revocation_notice_expired(now_ms))
     }

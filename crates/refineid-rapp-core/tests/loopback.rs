@@ -30,10 +30,10 @@ use refineid_rapp::{
     DisplayName, EndpointRole, EstablishedSessionRuntime, LIVENESS_CHALLENGE_SIZE,
     LIVENESS_PING_AFTER_SILENCE_MS, OFFER_ID_SIZE, OfferId, OperationId, OperationRequest,
     OperationResultMessage, PAIRING_BUSY_RETRY_AFTER_MIN_MS, PAIRING_CANDIDATES_MAX,
-    PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, PairingBusy, PairingCode, PairingHandshake,
-    PairingOffer, PairingState, PingChallenge, ProfileName, ProgressEvent, ProtocolErrorMessage,
-    ProxyDispatch, ProxyFailure, ProxyOperationEngine, QUIT_WITHDRAWAL_BOUND_MS,
-    REVOCATION_ATTEMPT_BOUND_MS, RecordStoreError, RequesterSessionEnd, ResultError, RuntimePoll,
+    PAIRING_IDLE_EXPIRY_DAYS, PAIRING_IDLE_EXPIRY_MS, PairId, PairRecord, PairingBusy, PairingCode,
+    PairingHandshake, PairingOffer, PairingState, PingChallenge, ProfileName, ProgressEvent,
+    ProtocolErrorMessage, ProxyDispatch, ProxyFailure, ProxyOperationEngine,
+    QUIT_WITHDRAWAL_BOUND_MS, RecordStoreError, RequesterSessionEnd, ResultError, RuntimePoll,
     RuntimeReceive, SESSION_READY_NONCE_SIZE, SessionHandshake, SignatureAlgorithm, SweepOutcome,
     TransportProfile, TypedMessage, UserApproval, decode_pair_record, encode_pair_record,
     generate_pair_key_material, standard_pairing_context_v2,
@@ -867,7 +867,17 @@ fn a_pairing_forgotten_while_disconnected_tells_the_phone_first_and_loses_its_ke
     let granted = [ProfileName::CardStatus];
     let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
     requester.forget(pair_id, current_time_ms()).unwrap();
-    // Section 4.6 item 2: the forgotten record serves nothing.
+    // Section 4.6 item 2: the forgotten record serves nothing: no
+    // session, no identity, no operation.
+    assert!(
+        requester
+            .store()
+            .get(pair_id)
+            .unwrap()
+            .pairing()
+            .serving_profiles()
+            .is_empty()
+    );
     let (unused, _other) = MemoryTransport::pair(CANDIDATE, DEADLINE);
     assert!(matches!(
         requester.connect(pair_id, unused),
@@ -880,7 +890,12 @@ fn a_pairing_forgotten_while_disconnected_tells_the_phone_first_and_loses_its_ke
     });
     // The phone echoes the close (section 7.1 item 7).
     assert_eq!(
-        requester.send_revocation_notice(pair_id, requester_transport, Instant::now() + DEADLINE),
+        requester.send_revocation_notice(
+            pair_id,
+            requester_transport,
+            Instant::now() + DEADLINE,
+            current_time_ms()
+        ),
         Ok(true)
     );
     proxy.join().unwrap();
@@ -975,24 +990,216 @@ fn a_session_handshake_that_fails_changes_nothing_stored() {
     std::fs::remove_dir_all(&directory).unwrap();
 }
 
+/// One day, from the pairing's idle expiry of thirty.
+fn day_ms() -> u64 {
+    PAIRING_IDLE_EXPIRY_MS / PAIRING_IDLE_EXPIRY_DAYS
+}
+
 #[test]
-fn a_forgotten_pairing_untold_within_its_attempt_loses_its_key() {
+fn a_forgotten_pairing_whose_phone_never_appears_goes_at_last_session_plus_thirty_days() {
     let mut requester = test_requester();
     let granted = [ProfileName::CardStatus];
-    let (pair_id, _proxy) = paired(&mut requester, &granted);
-    let forgotten_at = current_time_ms();
-    requester.forget(pair_id, forgotten_at).unwrap();
-    let window = REVOCATION_ATTEMPT_BOUND_MS;
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (mut session, proxy) =
+        connected(&mut requester, pair_id, proxy_pairing, |mut custodian| {
+            assert_eq!(custodian.receive_close(), CloseReason::Normal);
+        });
+    requester.disconnect(&mut session, CloseReason::Normal);
+    proxy.join().unwrap();
+    let last = last_session(&requester, pair_id).unwrap();
+    requester.forget(pair_id, current_time_ms()).unwrap();
+    // Section 4.6 item 3: the notice waits in the backlog, counted from
+    // the last session and not from the forget.
     assert_eq!(
-        requester.expire_revocation_notices(forgotten_at + window - 1),
+        requester.expire_revocation_notices(last + PAIRING_IDLE_EXPIRY_MS - 1),
         0
     );
     assert!(requester.store().get(pair_id).is_ok());
     assert_eq!(
-        requester.expire_revocation_notices(forgotten_at + window),
+        requester.expire_revocation_notices(last + PAIRING_IDLE_EXPIRY_MS),
         1
     );
     assert!(requester.store().get(pair_id).is_err());
+}
+
+#[test]
+fn a_forgotten_pairing_whose_phone_appears_five_days_later_is_destroyed_on_the_echo() {
+    let mut requester = test_requester();
+    let granted = [ProfileName::CardStatus];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let proxy_copy = copy_of(&proxy_pairing);
+    let (mut session, proxy) =
+        connected(&mut requester, pair_id, proxy_pairing, |mut custodian| {
+            assert_eq!(custodian.receive_close(), CloseReason::Normal);
+        });
+    requester.disconnect(&mut session, CloseReason::Normal);
+    proxy.join().unwrap();
+    let last = last_session(&requester, pair_id).unwrap();
+    requester.forget(pair_id, current_time_ms()).unwrap();
+    let appeared_ms = last + 5 * day_ms();
+    assert_eq!(
+        requester.expire_revocation_notices(appeared_ms),
+        0,
+        "the forgotten pairing still waits in the backlog"
+    );
+    // Section 4.6 item 6: the phone appears, one session carries the close
+    // as its first message, and the echo destroys the key and the record.
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut custodian = custodian_with_card(&proxy_copy, proxy_transport);
+        assert_eq!(custodian.receive_close(), CloseReason::PairingRevoked);
+    });
+    assert_eq!(
+        requester.send_revocation_notice(
+            pair_id,
+            requester_transport,
+            Instant::now() + DEADLINE,
+            current_time_ms()
+        ),
+        Ok(true)
+    );
+    proxy.join().unwrap();
+    assert!(requester.store().get(pair_id).is_err());
+}
+
+#[test]
+fn a_forgotten_pairing_is_told_while_another_pairing_is_active_and_in_session() {
+    let mut requester = test_requester();
+    let granted = [ProfileName::CardStatus];
+    let (first_id, first_proxy) = paired(&mut requester, &granted);
+    let (second_id, second_proxy) = paired(&mut requester, &granted);
+    // The active pairing holds an open session while the other pairing is
+    // forgotten.
+    let (mut session, proxy) = connected(&mut requester, first_id, first_proxy, |mut custodian| {
+        assert_eq!(custodian.receive_close(), CloseReason::Normal);
+    });
+    requester.forget(second_id, current_time_ms()).unwrap();
+    // Section 4.6 item 6: the forgotten pairing is told on its own
+    // connection while the active pairing's session stands.
+    let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let second = std::thread::spawn(move || {
+        let mut custodian = custodian_with_card(&second_proxy, proxy_transport);
+        assert_eq!(custodian.receive_close(), CloseReason::PairingRevoked);
+    });
+    assert_eq!(
+        requester.send_revocation_notice(
+            second_id,
+            requester_transport,
+            Instant::now() + DEADLINE,
+            current_time_ms()
+        ),
+        Ok(true)
+    );
+    second.join().unwrap();
+    assert!(requester.store().get(second_id).is_err());
+    // The active pairing and its session stand undisturbed.
+    assert!(requester.store().get(first_id).is_ok());
+    assert_eq!(session.end(), None);
+    requester.disconnect(&mut session, CloseReason::Normal);
+    proxy.join().unwrap();
+    assert!(requester.store().get(first_id).is_ok());
+}
+
+#[test]
+fn a_forgotten_pairing_past_its_idle_expiry_sends_nothing() {
+    let mut requester = test_requester();
+    let granted = [ProfileName::CardStatus];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    let (mut session, proxy) =
+        connected(&mut requester, pair_id, proxy_pairing, |mut custodian| {
+            assert_eq!(custodian.receive_close(), CloseReason::Normal);
+        });
+    requester.disconnect(&mut session, CloseReason::Normal);
+    proxy.join().unwrap();
+    let last = last_session(&requester, pair_id).unwrap();
+    requester.forget(pair_id, current_time_ms()).unwrap();
+    // Past the idle expiry the notice owes nothing: no handshake message
+    // leaves, and the record goes untold.
+    let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        assert!(proxy_transport.receive_frame().is_err());
+    });
+    assert_eq!(
+        requester.send_revocation_notice(
+            pair_id,
+            requester_transport,
+            Instant::now() + DEADLINE,
+            last + PAIRING_IDLE_EXPIRY_MS
+        ),
+        Err(SessionError::UnknownPairing)
+    );
+    proxy.join().unwrap();
+    assert!(requester.store().get(pair_id).is_err());
+}
+
+#[test]
+fn two_forgotten_pairings_pending_at_once_both_resolve() {
+    let mut requester = test_requester();
+    let granted = [ProfileName::CardStatus];
+    let (first_id, first_proxy) = paired(&mut requester, &granted);
+    let (second_id, second_proxy) = paired(&mut requester, &granted);
+    requester.forget(first_id, current_time_ms()).unwrap();
+    requester.forget(second_id, current_time_ms()).unwrap();
+    for (pair_id, proxy_pairing) in [(first_id, first_proxy), (second_id, second_proxy)] {
+        let (requester_transport, proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+        let proxy = std::thread::spawn(move || {
+            let mut custodian = custodian_with_card(&proxy_pairing, proxy_transport);
+            assert_eq!(custodian.receive_close(), CloseReason::PairingRevoked);
+        });
+        assert_eq!(
+            requester.send_revocation_notice(
+                pair_id,
+                requester_transport,
+                Instant::now() + DEADLINE,
+                current_time_ms()
+            ),
+            Ok(true)
+        );
+        proxy.join().unwrap();
+    }
+    assert!(requester.store().get(first_id).is_err());
+    assert!(requester.store().get(second_id).is_err());
+}
+
+#[test]
+fn a_forgotten_pairing_unreached_keeps_its_key() {
+    let mut requester = test_requester();
+    let granted = [ProfileName::CardStatus];
+    let (pair_id, proxy_pairing) = paired(&mut requester, &granted);
+    requester.forget(pair_id, current_time_ms()).unwrap();
+    // The phone's handshake answers but its echo never arrives: the close
+    // is not known to have been delivered, so the record stays.
+    let (requester_transport, mut proxy_transport) = MemoryTransport::pair(CANDIDATE, DEADLINE);
+    let proxy = std::thread::spawn(move || {
+        let mut handshake =
+            SessionHandshake::begin_proxy(&proxy_pairing, TransportProfile::Stream).unwrap();
+        let m1 = BinaryFrame::reconstruct(proxy_transport.receive_frame().unwrap()).unwrap();
+        handshake.read_message(&m1).unwrap();
+        let m2 = handshake.write_message().unwrap();
+        proxy_transport.send_frame(m2.as_bytes()).unwrap();
+        let mut authentication = handshake.into_authentication().unwrap();
+        let ready = authentication
+            .send_ready(READY_NONCE, &name(CUSTODIAN_NAME))
+            .unwrap();
+        proxy_transport.send_frame(ready.as_bytes()).unwrap();
+        let close = BinaryFrame::reconstruct(proxy_transport.receive_frame().unwrap()).unwrap();
+        let mut runtime =
+            EstablishedSessionRuntime::new(authentication.into_established().unwrap(), 0);
+        let RuntimeReceive::PeerClosed { .. } = runtime.receive(&close, 0).unwrap() else {
+            panic!("expected the requester's revocation close");
+        };
+    });
+    assert_eq!(
+        requester.send_revocation_notice(
+            pair_id,
+            requester_transport,
+            Instant::now() + Duration::from_millis(200),
+            current_time_ms()
+        ),
+        Ok(false)
+    );
+    proxy.join().unwrap();
+    assert!(requester.store().get(pair_id).is_ok());
 }
 
 /// A second copy of the custodian's `record`, for a second session.

@@ -37,8 +37,12 @@
 //! and is not dialed until it announces itself again (section 4.5 item 6);
 //! a request meanwhile is refused at once. A pairing forgotten on this
 //! computer while the thread holds its session is told to the phone on
-//! that session (section 4.6 item 1); the program that forgot it makes the
-//! attempt otherwise. The thread sweeps the pairings for idle expiry when
+//! that session (section 4.6 item 1); the program that forgot it tells the
+//! phone when it appears otherwise, from the revocation backlog (item 6).
+//! The backlog runs alongside the active pairing while remote use is on,
+//! and alone while a local card suspends remote use or no pairing is
+//! usable.
+//! The thread sweeps the pairings for idle expiry when
 //! it starts and daily (section 4.6 item 5); a pairing that expires takes
 //! its slot with it, silently.
 //!
@@ -70,7 +74,7 @@ use refineid_rapp_core::operations::{
     CardKeyProfile, CardOperation, CardOperationResult, SignatureAlgorithm,
 };
 use refineid_rapp_core::remote::{
-    PairSummary, RemoteError, RemoteReader, RemoteSession, local_host_name,
+    BacklogSightings, PairSummary, RemoteError, RemoteReader, RemoteSession, local_host_name,
 };
 use refineid_rapp_core::store::PairingState;
 use refineid_rapp_core::view::{ConsumerAnswer, CustodianView};
@@ -92,14 +96,19 @@ const BUSY_PAUSE: Duration = Duration::from_secs(5);
 /// The pause while no usable pairing record exists.
 const UNPAIRED_PAUSE: Duration = Duration::from_secs(3);
 
+/// How often a held session lets the revocation backlog look for its
+/// phones (section 4.6 item 6): often enough to tell a phone that
+/// appears, seldom enough to leave the held session alone.
+const BACKLOG_DURING_SESSION: Duration = Duration::from_secs(30);
+
 /// How long a held session waits for a browser request, and then for the
 /// phone's traffic, in turn: the phone's pings and card reports are read
 /// within one step.
 const SERVICE_STEP: Duration = Duration::from_millis(250);
 
 /// Between readings of the record another program keeps, which may have
-/// forgotten the held pairing: well within the revocation attempt's bound,
-/// so the close leaves on the held session.
+/// forgotten the held pairing: the close then leaves on the held session,
+/// within the quit bound (section 4.6 items 1 and 6).
 const RECORD_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long the token stands on a confirmed certificate while no session
@@ -641,6 +650,10 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
     // The store as last read, and its signature then: read again only
     // when the directory says something changed.
     let mut opened: Option<(StoreSignature, RemoteReader)> = None;
+    // In-sight memory for the revocation backlog (section 4.6 item 6): it
+    // lives as long as the thread, across reader reopens, so a phone that
+    // stays in sight is dialed once.
+    let mut sightings = BacklogSightings::default();
     while !shared.stopped() {
         // A pairing that expires is gone: the round below finds no phone
         // and the slot goes. A refused store is swept again on the next
@@ -655,6 +668,12 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
         if (shared.local_card)() {
             unpaired(shared, requests);
             viewed = None;
+            // A local card suspends remote use but not the revocation
+            // backlog, which is then the only remote activity (section
+            // 4.6 item 6).
+            if let Ok(mut backlog) = RemoteReader::open_local_without_sweep(store) {
+                backlog.tell_forgotten_phones(&mut sightings);
+            }
             pause(shared, SUSPENDED_PAUSE);
             continue;
         }
@@ -672,10 +691,18 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
             continue;
         };
         let Some(phone) = reader.phone() else {
+            // No usable pairing: the revocation backlog is the only remote
+            // activity (section 4.6 item 6).
+            reader.tell_forgotten_phones(&mut sightings);
             unpaired(shared, requests);
             viewed = None;
             continue;
         };
+        // A usable pairing does not stop the revocation backlog: a
+        // forgotten phone is still told when it appears, on its own
+        // connection, without disturbing the active pairing (section 4.6
+        // item 6).
+        reader.tell_forgotten_phones(&mut sightings);
         let Some(slot) = slot_id(&phone) else {
             unpaired(shared, requests);
             viewed = None;
@@ -700,7 +727,16 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
             Ok(session) => {
                 view.dial_succeeded();
                 shared.in_session.store(true, Ordering::Release);
-                let held = hold(shared, requests, store, reader, session, &phone, slot);
+                let held = hold(
+                    shared,
+                    requests,
+                    store,
+                    reader,
+                    session,
+                    &phone,
+                    slot,
+                    &mut sightings,
+                );
                 shared.in_session.store(false, Ordering::Release);
                 match held.after {
                     After::Grace => shared.token(|offering| offering.unconfirmed(Instant::now())),
@@ -857,6 +893,10 @@ fn ended_by(error: &RemoteError) -> Option<After> {
 /// Keeps `session` while the record stays usable and the phone in sight,
 /// following the phone's card reports, answering the browser's requests
 /// on it and serving it between them (sections 8.3 and 8.4).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the held session carries its thread, channel, store, reader, session, phone, slot and backlog sightings"
+)]
 fn hold(
     shared: &Shared,
     requests: &Receiver<SignRequest>,
@@ -865,6 +905,7 @@ fn hold(
     mut session: RemoteSession,
     phone: &PairSummary,
     slot: RemoteSlotId,
+    sightings: &mut BacklogSightings,
 ) -> Held {
     let mut confirmed: Option<Confirmed> = None;
     // The card a confirmation was last tried for: a failed read is not
@@ -874,6 +915,9 @@ fn hold(
     // The store as last signed here: empty at first, so the first check
     // reads the record once, and after that only a changed store does.
     let mut record_seen = StoreSignature::default();
+    // The backlog last looked while this session stands: the round above
+    // looked before the dial, so the first look here waits its turn.
+    let mut backlog_checked = Instant::now();
     loop {
         if shared.stopped() {
             reader.withdraw_session(session);
@@ -1043,6 +1087,13 @@ fn hold(
                     };
                 }
             }
+        }
+        // The revocation backlog runs while the active pairing's session
+        // stands, on its own connection: a forgotten phone that appears is
+        // told without disturbing this session (section 4.6 item 6).
+        if backlog_checked.elapsed() >= BACKLOG_DURING_SESSION {
+            backlog_checked = Instant::now();
+            reader.tell_forgotten_phones(sightings);
         }
         match reader.service(&mut session, SERVICE_STEP) {
             Ok(()) => {}

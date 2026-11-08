@@ -423,8 +423,8 @@ impl RefineIdController {
     }
 
     /// Forgets the paired phone: it goes from the window at once, and the
-    /// one bounded attempt to tell it (RAPP v26.11.2 section 4.6 item 6)
-    /// runs in the background.
+    /// phone is told when it appears, from the revocation backlog
+    /// (RAPP v26.11.2 section 4.6 item 6), in the background.
     fn forget_phone(self: &Arc<Self>) {
         let Some((pair_id, name)) = self
             .state()

@@ -17,10 +17,13 @@
 //! The phone's word on the pairing comes only inside a session: a close
 //! carrying `pairing_revoked` revokes the pairing here at once (RAPP
 //! v26.11.2 section 4.6 item 4). A pairing forgotten here is told to the
-//! phone the same way: by the session that holds it, or by one bounded
-//! attempt of [`refineid_rapp::REVOCATION_ATTEMPT_BOUND_MS`] that opens one
-//! session whose first message is the close (items 1 and 6). The key goes
-//! when the phone's echo arrives or the attempt ends.
+//! phone the same way: by the session that holds it, or on the next
+//! session with the phone, whose first message is the close (items 1, 2
+//! and 6). The record keeps its static key for the close alone, serves
+//! nothing else, and waits in the revocation backlog: each time the phone
+//! appears for the pairing one connection opens for it, and the key and
+//! the record go only on the phone's echo, or untold once the pairing's
+//! idle expiry would have passed (item 3).
 //!
 //! An open session reports which card the phone holds, if any (section
 //! 8.4); an operation is sent only on a session that reports one, and the
@@ -34,7 +37,8 @@
 //! not yet open closes without a notice, nothing more is dialed, and every
 //! pairing stays.
 
-use std::net::SocketAddrV4;
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -45,25 +49,31 @@ use crate::engine::{
     PairingSearchError, Requester, RequesterConfig, Session, SessionEnd, SessionError, Withdrawal,
     current_time_ms,
 };
-use crate::file_store::FilePairingStore;
+use crate::file_store::{FilePairingStore, read_record};
 use crate::ids::{CertificateFingerprint, PairId};
 use crate::message::{CardPresence, CardReader, CardStatusMessage, CloseReason};
 use crate::operations::{CardOperation, CardOperationResult, CertificateKind};
 use crate::session_lock::{LockError, SessionLock, ceremony_lock_path, session_lock_path};
 use crate::store::{PairingRecord, PairingStore, StoreError};
 use crate::stream::{
-    DiscoveryMode, HintMatch, RoutingPreamble, STREAM_CANDIDATE_ID, StreamService, browse,
-    browse_stream_services, dial,
+    DiscoveryMode, HintMatch, RoutingPreamble, STREAM_CANDIDATE_ID, StreamError, StreamService,
+    browse, browse_stream_services, dial,
 };
 use crate::transport::FrameTransport;
 use crate::transport::TcpFrameTransport;
 use refineid_rapp::{
     DISPLAY_NAME_MAX_BYTES, DiscoveryKey, DisplayName, PairingState, ProfileName,
-    REVOCATION_ATTEMPT_BOUND_MS, RequesterSessionEnd, RoutingKey, TransportProfile, WithdrawalKey,
+    QUIT_WITHDRAWAL_BOUND_MS, RequesterSessionEnd, RoutingKey, TransportProfile, WithdrawalKey,
 };
 
 /// How long one discovery round listens for answers.
 const BROWSE_ROUND: Duration = Duration::from_secs(2);
+/// How long a completed round must have missed a forgotten pairing before
+/// its next listing is an appearance (section 4.6 item 6): a missed round
+/// bridges a phone that briefly drops out, while a phone that stays listed
+/// is never dialed again. The Apple and Android Requesters hold their
+/// sightings for the same thirty seconds.
+const BACKLOG_LOSS_HOLD: Duration = Duration::from_secs(30);
 /// How long a command-line search waits for the paired phone to come
 /// into sight and open a session: long enough for a phone that is
 /// asleep in the holder's pocket when the search starts.
@@ -221,7 +231,7 @@ impl PairingCandidateSource for PairingServices {
 /// for the pairing and no session record on another instance names it.
 fn sessions_for(
     keys: &PairingKeys,
-    services: Vec<StreamService>,
+    services: &[StreamService],
 ) -> Result<Vec<StreamService>, RemoteError> {
     let now = unix_seconds();
     let withdrawn: Vec<String> = services
@@ -235,8 +245,8 @@ fn sessions_for(
             continue;
         }
         match service.hint_match(&keys.discovery, now) {
-            HintMatch::Named => named.push(service),
-            HintMatch::Unhinted => unhinted.push(service),
+            HintMatch::Named => named.push(service.clone()),
+            HintMatch::Unhinted => unhinted.push(service.clone()),
             HintMatch::Other => {}
         }
     }
@@ -479,10 +489,97 @@ impl PairSummary {
     }
 }
 
+/// The route a revocation-backlog appearance arrived on (section 4.6 item
+/// 6): one connection per appearance, by the route that appeared, never
+/// both in one appearance. This host finds the phone over the local
+/// network only; the Bluetooth route is named for the rule it obeys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum BacklogRoute {
+    /// An mDNS `mode=session` record carrying the pairing's discovery
+    /// hint, or naming no hints.
+    Stream,
+}
+
+/// In-sight memory for the revocation backlog (section 4.6 item 6): one
+/// sighting per forgotten pairing and route, with when a completed round
+/// last missed it. A listing is an appearance only when the pairing was
+/// never sighted on that route, or when it was missed by a completed
+/// round and the loss hold below has passed since the miss. Time between
+/// rounds without a completed round that missed it is never absence, so a
+/// phone that stays listed is dialed once, however far apart the rounds
+/// run, and never again until a round misses it and it reappears. An mDNS
+/// record that is lost or removed ends the sighting at once, as leaving
+/// the backlog does (the pairing's echo or idle expiry destroyed the
+/// record); nothing is ever purged by elapsed time. The memory lives as
+/// long as the owning process; a restart treats the first sighting as an
+/// appearance.
+#[derive(Debug, Default)]
+pub struct BacklogSightings {
+    sightings: HashMap<(PairId, BacklogRoute), Sighting>,
+}
+
+/// What one completed round last said of a forgotten pairing on a route:
+/// in sight, or missed since `absent_since`.
+#[derive(Debug)]
+struct Sighting {
+    absent_since: Option<Instant>,
+}
+
+impl BacklogSightings {
+    /// Notes that a completed round listed `pair_id` on `route` at `now`:
+    /// whether the listing is an appearance. A listing clears the absence
+    /// a missed round noted; a pairing never sighted on the route appears
+    /// at its first listing.
+    fn appearance(&mut self, pair_id: PairId, route: BacklogRoute, now: Instant) -> bool {
+        match self.sightings.get_mut(&(pair_id, route)) {
+            None => {
+                self.sightings
+                    .insert((pair_id, route), Sighting { absent_since: None });
+                true
+            }
+            Some(sighting) => {
+                let appeared = sighting.absent_since.is_some_and(|absent| {
+                    now.saturating_duration_since(absent) >= BACKLOG_LOSS_HOLD
+                });
+                sighting.absent_since = None;
+                appeared
+            }
+        }
+    }
+
+    /// Notes that a completed round did not list `pair_id` on `route` at
+    /// `now`: absence starts then, unless an earlier missed round already
+    /// started it. A pairing never sighted stays unknown: its first
+    /// listing is still an appearance.
+    fn missed(&mut self, pair_id: PairId, route: BacklogRoute, now: Instant) {
+        if let Some(sighting) = self.sightings.get_mut(&(pair_id, route))
+            && sighting.absent_since.is_none()
+        {
+            sighting.absent_since = Some(now);
+        }
+    }
+
+    /// Ends the sighting of `pair_id`, as an mDNS record's loss or removal
+    /// does and as leaving the backlog does: the pairing's echo or idle
+    /// expiry destroyed the record, so its next listing is an appearance.
+    fn drop_pairing(&mut self, pair_id: PairId) {
+        self.sightings.retain(|key, _| key.0 != pair_id);
+    }
+
+    /// Drops the sightings of pairings no longer in the backlog, as a lost
+    /// or removed record ends them: only `forgotten` still owes a notice.
+    fn drop_left_backlog(&mut self, forgotten: &[PairId]) {
+        self.sightings.retain(|key, _| forgotten.contains(&key.0));
+    }
+}
+
 /// The workstation's remote reader over its durable pairing store.
 #[derive(Debug)]
 pub struct RemoteReader {
     requester: Requester<FilePairingStore>,
+    /// Opens the session a backlog appearance dials. Tests replace it to
+    /// count dial attempts without a network.
+    dial: fn(&[String], &str, Duration, &RoutingPreamble) -> Result<TcpFrameTransport, StreamError>,
 }
 
 /// One open session to a phone that reported a card it can serve; the
@@ -675,6 +772,7 @@ impl RemoteReader {
                 },
                 store,
             ),
+            dial,
         }
     }
 
@@ -699,8 +797,8 @@ impl RemoteReader {
 
     /// The owning program's sweep of the store: pairings without a session
     /// for the idle limit expire and lose their keys (section 4.6 items 5
-    /// and 6), forgotten records whose revocation attempt's bound passed
-    /// lose theirs (item 6), and,
+    /// and 6), forgotten records whose idle expiry would have passed lose
+    /// theirs untold (item 3), and,
     /// while no pairing ceremony runs on this computer, records a past
     /// ceremony left unconfirmed are revoked (section 4.3 item 4). A
     /// running ceremony's record is unconfirmed until its phone answers. A
@@ -757,12 +855,12 @@ impl RemoteReader {
     }
 
     /// Forgets the paired phone at its user's word (section 4.6 item 6):
-    /// the pairing serves nothing from now on, and one attempt of at most
-    /// [`REVOCATION_ATTEMPT_BOUND_MS`] opens one session to the phone,
-    /// sends the `pairing_revoked` close as its first message and waits
-    /// for the echo; the key goes when the echo arrives or the attempt
-    /// ends. A pairing whose session another program here holds is told
-    /// by that program. Returns whether the phone echoed the close.
+    /// the pairing serves nothing from now on and joins the revocation
+    /// backlog, keeping its key for the `pairing_revoked` close alone. The
+    /// phone is told when it appears for the pairing; the key and the
+    /// record go on its echo, or untold at the pairing's idle expiry. A
+    /// pairing whose session another program here holds is told by that
+    /// program. Returns whether the phone echoed the close.
     ///
     /// # Errors
     /// [`RemoteError::NotPaired`] when no phone is paired, and
@@ -772,10 +870,10 @@ impl RemoteReader {
         self.forget_and_tell(pair_id)
     }
 
-    /// Forgets the pairing `pair_id` now at its user's word and makes its
-    /// one revocation attempt, as [`Self::forget`] does for the paired
-    /// phone; for a caller that must forget the pairing it saw, not
-    /// whichever is paired by the time it runs.
+    /// Forgets the pairing `pair_id` now at its user's word and tells the
+    /// phone when it appears for the pairing, as [`Self::forget`] does for
+    /// the paired phone; for a caller that must forget the pairing it saw,
+    /// not whichever is paired by the time it runs.
     ///
     /// # Errors
     /// As [`Self::forget`].
@@ -786,91 +884,208 @@ impl RemoteReader {
             .inspect_err(|error| {
                 refineid_dev_errors::report!(Rapp, "pairing not forgotten", error);
             })?;
-        Ok(self.tell_forgotten_phone(pair_id))
+        // The forget itself is an appearance for the backlog: the phone in
+        // sight now is told at once, from this process's first sighting.
+        let services = self.browse_for(pair_id);
+        Ok(self.tell_forgotten_phone(
+            pair_id,
+            &services,
+            &mut BacklogSightings::default(),
+            Instant::now(),
+        ))
     }
 
-    /// The one attempt to tell the phone holding the forgotten `pair_id`
-    /// that this computer forgot it (section 4.6 item 6): within
-    /// [`REVOCATION_ATTEMPT_BOUND_MS`] of the forget it browses for the
-    /// phone, opens one session to the first instance found for the
-    /// pairing, sends the `pairing_revoked` close as its first message and
-    /// waits for the echo until the bound ends. The key goes when the echo
-    /// arrives or the attempt ends, whatever ended it. It runs whether or
-    /// not this computer withdrew or the phone announced its withdrawal,
-    /// offers no identity and starts no operation. A pairing whose session
-    /// another program on this computer holds is left to that program,
-    /// which tells the phone in session, and to the sweep that ends the
-    /// bound. Returns whether the phone echoed the close.
-    fn tell_forgotten_phone(&mut self, pair_id: PairId) -> bool {
-        let Ok(record) = self.requester.store().get(pair_id) else {
-            return false;
-        };
-        let Some(forgotten_at) = record.pairing().forgotten_at_ms() else {
-            return false;
-        };
-        let elapsed = Duration::from_millis(current_time_ms().saturating_sub(forgotten_at));
-        let deadline = Instant::now()
-            + Duration::from_millis(REVOCATION_ATTEMPT_BOUND_MS).saturating_sub(elapsed);
-        let Ok(keys) = PairingKeys::derive(record) else {
+    /// Tells the phone of every forgotten pairing when it appears for it
+    /// (section 4.6 item 6): one connection per pairing, by the route that
+    /// appeared, the close as its first message, at most the quit bound of
+    /// waiting for each echo. Only an appearance dials: a phone never
+    /// sighted for the pairing, or listed again after a completed round
+    /// missed it and the loss hold passed since the miss. A phone that
+    /// stays listed is never dialed again, however far apart the rounds
+    /// run: time between rounds without a completed round that missed it
+    /// is never absence. A pairing told, or with no phone in sight, or
+    /// whose session another program holds, stays in the backlog for the
+    /// next appearance or its idle expiry. It runs whether or not this
+    /// computer withdrew or the phone announced its withdrawal, offers no
+    /// identity and starts no operation, and runs alongside the active
+    /// pairing's discovery while remote use is on. Returns how many phones
+    /// echoed the close.
+    pub fn tell_forgotten_phones(&mut self, sightings: &mut BacklogSightings) -> usize {
+        let mut forgotten: Vec<PairId> = self
+            .pairs()
+            .into_iter()
+            .filter(|pair| pair.state == PairingState::Revoking)
+            .map(|pair| pair.pair_id)
+            .collect();
+        // Whatever the store read before says, the disk decides: a pairing
+        // gone or no longer forgotten owes nothing, and one whose notice
+        // expired is revoked untold (item 3) and dials nothing. A pairing
+        // that left the backlog drops its sightings, as a lost or removed
+        // mDNS record ends them; what stays forgotten keeps its sightings
+        // across backlog changes, so a phone that stays in sight is not
+        // dialed again when another pairing is forgotten.
+        forgotten.retain(|pair_id| {
+            if self.owed_notice(*pair_id).is_some() {
+                return true;
+            }
+            sightings.drop_pairing(*pair_id);
+            false
+        });
+        if forgotten.is_empty() {
+            return 0;
+        }
+        // Sightings of pairings a sweep destroyed meanwhile end too.
+        sightings.drop_left_backlog(&forgotten);
+        // One browse round for the whole backlog: every forgotten pairing
+        // reads the same round, and each appearance dials once.
+        let services = self.browse_for_backlog(&forgotten);
+        let now = Instant::now();
+        forgotten
+            .into_iter()
+            .filter(|pair_id| self.tell_forgotten_phone(*pair_id, &services, sightings, now))
+            .count()
+    }
+
+    /// The disk-fresh record of the forgotten `pair_id` when it still owes
+    /// its notice (section 4.6 items 3 and 6): `None` when the pairing is
+    /// gone or no longer forgotten, which owe nothing. A record whose
+    /// notice expired is revoked untold here, and none of these dials.
+    fn owed_notice(&mut self, pair_id: PairId) -> Option<PairingRecord> {
+        let directory = self.requester.store().directory().to_path_buf();
+        let record = read_record(&directory, pair_id)?;
+        if record.state() != PairingState::Revoking {
+            return None;
+        }
+        if record
+            .pairing()
+            .revocation_notice_expired(current_time_ms())
+        {
             let _ = self.requester.store_mut().remove(pair_id);
+            return None;
+        }
+        Some(record)
+    }
+
+    /// The one connection that tells the phone holding the forgotten
+    /// `pair_id` that this computer forgot it (section 4.6 item 6), when
+    /// the phone appears for the pairing: one session to the first service
+    /// in sight carries the `pairing_revoked` close as its first message,
+    /// by the route that appeared, and the echo is awaited at most the quit
+    /// bound. The key and the record go only on the echo; without one, or
+    /// with no phone in sight, they stay in the backlog until the next
+    /// appearance or the pairing's idle expiry (item 3). A pairing whose
+    /// session another program on this computer holds is left to that
+    /// program, which tells the phone in session. Returns whether the phone
+    /// echoed the close.
+    fn tell_forgotten_phone(
+        &mut self,
+        pair_id: PairId,
+        services: &[StreamService],
+        sightings: &mut BacklogSightings,
+        now: Instant,
+    ) -> bool {
+        // Right before the dial the record is read again as the disk holds
+        // it: a pairing gone meanwhile sends nothing, and one whose idle
+        // expiry passed meanwhile is revoked untold.
+        let Some(record) = self.owed_notice(pair_id) else {
+            sightings.drop_pairing(pair_id);
             return false;
         };
+        let Ok(keys) = PairingKeys::derive(&record) else {
+            return false;
+        };
+        // A pairing whose session another program on this computer holds is
+        // left to that program, which tells the phone in session: a round
+        // that cannot dial notes neither sight nor absence.
         let Ok(_lock) = take_lock(&session_lock_path(
             self.requester.store().directory(),
             pair_id,
         )) else {
             return false;
         };
-        let echoed = self.attempt_revocation(pair_id, &keys, deadline);
-        if !echoed {
-            refineid_dev_errors::report!(Rapp, "revocation close not acknowledged", "no echo");
+        let found = sessions_for(&keys, services)
+            .ok()
+            .and_then(|matched| matched.into_iter().next());
+        let Some(service) = found else {
+            // The completed round did not list the pairing: absence starts
+            // now, unless an earlier miss already started it.
+            sightings.missed(pair_id, BacklogRoute::Stream, now);
+            return false;
+        };
+        // The round listed the pairing, by the stream route: only an
+        // appearance dials, never a phone that stays listed.
+        if !sightings.appearance(pair_id, BacklogRoute::Stream, now) {
+            return false;
         }
-        // The attempt is over: no forgotten pairing outlives it.
-        let _ = self.requester.store_mut().remove(pair_id);
-        echoed
+        let told = self.deliver_to_appearance(pair_id, &keys, &service, current_time_ms());
+        // The echo destroys the record; an expiry the dial found destroys
+        // it untold. Either ends the sighting.
+        let stays = self
+            .requester
+            .store()
+            .get(pair_id)
+            .is_ok_and(|record| record.state() == PairingState::Revoking);
+        if told || !stays {
+            sightings.drop_pairing(pair_id);
+        }
+        told
     }
 
-    /// Browses for the forgotten `pair_id` until a phone holding it is in
-    /// sight or `deadline` passes, and delivers the close on one session to
-    /// the first one found; whether the phone echoed it.
-    fn attempt_revocation(
+    /// One browse round for the revocation backlog: the service instances
+    /// in sight, asking the remembered addresses of every forgotten
+    /// pairing as well as the network.
+    fn browse_for_backlog(&self, forgotten: &[PairId]) -> Vec<StreamService> {
+        let directory = self.requester.store().directory();
+        let mut remembered: Vec<Ipv4Addr> = Vec::new();
+        for pair_id in forgotten {
+            for address in addresses::remembered(directory, *pair_id) {
+                if !remembered.contains(&address) {
+                    remembered.push(address);
+                }
+            }
+        }
+        browse_stream_services(BROWSE_ROUND, &remembered)
+    }
+
+    /// Opens one session to the appeared `service` for the forgotten
+    /// `pair_id` and delivers the close on it; whether the phone echoed
+    /// it. Without the echo the record stays in the backlog.
+    fn deliver_to_appearance(
         &mut self,
         pair_id: PairId,
         keys: &PairingKeys,
-        deadline: Instant,
+        service: &StreamService,
+        now_ms: u64,
     ) -> bool {
-        while Instant::now() < deadline {
-            let found = sessions_for(keys, self.browse_for(pair_id))
-                .ok()
-                .and_then(|services| services.into_iter().next());
-            let Some(service) = found else {
-                continue;
-            };
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return false;
+        let wait = Duration::from_millis(QUIT_WITHDRAWAL_BOUND_MS);
+        let Ok(preamble) = keys.session_preamble() else {
+            return false;
+        };
+        let dial = self.dial;
+        let Ok(transport) = dial(&service.endpoints, STREAM_CANDIDATE_ID, wait, &preamble) else {
+            refineid_dev_errors::report!(Rapp, "revocation close not delivered", "no session");
+            return false;
+        };
+        match self.requester.send_revocation_notice(
+            pair_id,
+            transport,
+            Instant::now() + wait,
+            now_ms,
+        ) {
+            Ok(true) => true,
+            Ok(false) => {
+                refineid_dev_errors::report!(Rapp, "revocation close not acknowledged", "no echo");
+                false
             }
-            let Ok(preamble) = keys.session_preamble() else {
-                return false;
-            };
-            let Ok(transport) = dial(
-                &service.endpoints,
-                STREAM_CANDIDATE_ID,
-                remaining,
-                &preamble,
-            ) else {
-                return false;
-            };
-            return self
-                .requester
-                .send_revocation_notice(pair_id, transport, deadline)
-                .unwrap_or(false);
+            Err(error) => {
+                refineid_dev_errors::report!(Rapp, "revocation close not delivered", error);
+                false
+            }
         }
-        false
     }
 
-    /// Forgets every usable pairing but `kept`, each with its revocation
-    /// attempt, so one phone is paired (section 4.6 item 6).
+    /// Forgets every usable pairing but `kept`, telling each phone when it
+    /// appears, so one phone is paired (section 4.6 item 6).
     fn supersede_others(&mut self, kept: PairId) {
         let older: Vec<PairId> = self
             .pairs()
@@ -949,7 +1164,7 @@ impl RemoteReader {
             .get(pair_id)
             .map_err(|_| RemoteError::NotPaired)?;
         let keys = PairingKeys::derive(record)?;
-        sessions_for(&keys, self.browse_for(pair_id)).map(|services| {
+        sessions_for(&keys, &self.browse_for(pair_id)).map(|services| {
             services
                 .into_iter()
                 .map(|service| service.instance)
@@ -1066,7 +1281,7 @@ impl RemoteReader {
         while first_round || Instant::now() < deadline {
             first_round = false;
             self.may_dial()?;
-            for service in sessions_for(&keys, self.browse_for(pair_id))? {
+            for service in sessions_for(&keys, &self.browse_for(pair_id))? {
                 self.may_dial()?;
                 let Ok(transport) = dial(
                     &service.endpoints,
@@ -1205,9 +1420,9 @@ impl RemoteReader {
 
     /// Closes `session` telling the phone that this computer forgot the
     /// pairing (section 4.6 item 1), for the session holder that finds the
-    /// record forgotten by another program on this computer; once the
-    /// echo arrived or the quit bound passed, the pairing's key is
-    /// destroyed.
+    /// record forgotten by another program on this computer; the pairing's
+    /// key and record go only on the echo, and stay in the revocation
+    /// backlog otherwise (item 3).
     pub fn revoke_in_session(&mut self, mut session: RemoteSession) {
         self.requester.revoke_in_session(&mut session.session);
     }
@@ -1311,11 +1526,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        AdmissionError, BROWSE_ROUND, CardOperationResult, CardPresence, CardReader, CardRequest,
-        CardStatusMessage, CertificateFingerprint, OperationOutcome, PairingKeys,
-        PairingSearchError, REVOCATION_ATTEMPT_BOUND_MS, RemoteError, RemoteReader, SessionError,
-        StreamService, Withdrawal, current_time_ms, lifetime_ms, operation_result, sessions_for,
-        unix_seconds,
+        AdmissionError, BACKLOG_LOSS_HOLD, BROWSE_ROUND, BacklogRoute, BacklogSightings,
+        CardOperationResult, CardPresence, CardReader, CardRequest, CardStatusMessage,
+        CertificateFingerprint, OperationOutcome, PairingKeys, PairingSearchError, RemoteError,
+        RemoteReader, RoutingPreamble, SessionError, StreamError, StreamService, TcpFrameTransport,
+        Withdrawal, current_time_ms, lifetime_ms, operation_result, sessions_for, unix_seconds,
     };
     use crate::file_store::{FilePairingStore, path_for};
     use crate::session_lock::{SessionLock, ceremony_lock_path, session_lock_path};
@@ -1430,13 +1645,12 @@ mod tests {
     }
 
     #[test]
-    fn a_forgotten_phone_serves_nothing_and_goes_when_its_attempt_ends() {
+    fn a_forgotten_phone_serves_nothing_and_waits_in_the_backlog() {
         let directory = scratch();
         let mut reader = reader_with_pairing(&directory);
         let pair_id = PairId::from_array(PAIR_ID);
-        // Forgotten a whole attempt ago: the attempt has no time left.
-        let forgotten_at = current_time_ms().saturating_sub(REVOCATION_ATTEMPT_BOUND_MS);
-        reader.requester.forget(pair_id, forgotten_at).unwrap();
+        note_session(&mut reader, pair_id);
+        reader.requester.forget(pair_id, current_time_ms()).unwrap();
         assert_eq!(reader.phone(), None);
         assert_eq!(reader.forget(), Err(RemoteError::NotPaired));
         let summary = reader.pairs().into_iter().next().unwrap();
@@ -1446,9 +1660,15 @@ mod tests {
             reader.open_session(Some(pair_id), Duration::ZERO).err(),
             Some(RemoteError::NotPaired)
         );
-        assert!(!reader.tell_forgotten_phone(pair_id));
-        assert!(reader.pairs().is_empty());
-        assert!(!path_for(&directory, pair_id).exists());
+        // Nothing in sight: nothing is dialed and the record stays, key
+        // and all, for the next appearance or its idle expiry.
+        let mut sightings = BacklogSightings::default();
+        assert!(!reader.tell_forgotten_phone(pair_id, &[], &mut sightings, Instant::now()));
+        // No phone in sight on the test network either: no dial, and the
+        // record stays.
+        assert_eq!(reader.tell_forgotten_phones(&mut sightings), 0);
+        assert_eq!(reader.pairs().len(), 1);
+        assert!(path_for(&directory, pair_id).exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -1457,9 +1677,15 @@ mod tests {
         let directory = scratch();
         let mut reader = reader_with_pairing(&directory);
         let pair_id = PairId::from_array(PAIR_ID);
+        note_session(&mut reader, pair_id);
         reader.requester.forget(pair_id, current_time_ms()).unwrap();
         let held = SessionLock::acquire(&session_lock_path(&directory, pair_id)).unwrap();
-        assert!(!reader.tell_forgotten_phone(pair_id));
+        assert!(!reader.tell_forgotten_phone(
+            pair_id,
+            &[],
+            &mut BacklogSightings::default(),
+            Instant::now()
+        ));
         assert_eq!(reader.pairs().len(), 1);
         drop(held);
         let _ = std::fs::remove_dir_all(directory);
@@ -1480,15 +1706,345 @@ mod tests {
     }
 
     #[test]
-    fn a_forgotten_phone_untold_for_the_notice_window_loses_its_key() {
+    fn a_forgotten_phone_untold_until_its_idle_expiry_loses_its_key() {
         let directory = scratch();
-        let forgotten = record(PairId::from_array(PAIR_ID))
-            .forgotten(current_time_ms().saturating_sub(REVOCATION_ATTEMPT_BOUND_MS));
+        // The fixture's pairing was made over thirty days ago, so its
+        // idle expiry has passed: the forgotten record goes untold.
+        let forgotten = record(PairId::from_array(PAIR_ID)).forgotten(current_time_ms());
         let mut reader = reader_with(&directory, vec![forgotten]);
         assert_eq!(reader.pairs().len(), 1);
         reader.sweep();
         assert!(reader.pairs().is_empty());
         assert!(!path_for(&directory, PairId::from_array(PAIR_ID)).exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn two_forgotten_phones_wait_in_the_backlog_together() {
+        let directory = scratch();
+        let pair_ids = [PAIR_ID, UNKNOWN_PAIR_ID].map(PairId::from_array);
+        let mut reader = reader_with(
+            &directory,
+            pair_ids.iter().map(|pair_id| record(*pair_id)).collect(),
+        );
+        for pair_id in pair_ids {
+            note_session(&mut reader, pair_id);
+        }
+        for pair_id in pair_ids {
+            reader.requester.forget(pair_id, current_time_ms()).unwrap();
+        }
+        assert_eq!(reader.phone(), None);
+        // No phone in sight: no dial, both records stay.
+        assert_eq!(
+            reader.tell_forgotten_phones(&mut BacklogSightings::default()),
+            0
+        );
+        assert_eq!(reader.pairs().len(), 2);
+        for pair_id in pair_ids {
+            assert!(path_for(&directory, pair_id).exists());
+        }
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// The gap between a listing and a relisting soon after.
+    const SIGHTING_STEP: Duration = Duration::from_secs(1);
+    /// Rounds further apart than the loss hold: staying listed across
+    /// them is still not absence.
+    const ROUND_STEP: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_phone_first_listed_is_an_appearance() {
+        let mut sightings = BacklogSightings::default();
+        assert!(sightings.appearance(
+            PairId::from_array(PAIR_ID),
+            BacklogRoute::Stream,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn a_phone_that_stays_listed_appears_once() {
+        let mut sightings = BacklogSightings::default();
+        let pair_id = PairId::from_array(PAIR_ID);
+        let mut now = Instant::now();
+        assert!(sightings.appearance(pair_id, BacklogRoute::Stream, now));
+        // Round after round lists the same phone, however far apart the
+        // rounds run: elapsed time without a completed round that missed
+        // it is never absence, so none is an appearance and none dials.
+        for _ in 0..3 {
+            now += ROUND_STEP;
+            assert!(!sightings.appearance(pair_id, BacklogRoute::Stream, now));
+        }
+    }
+
+    #[test]
+    fn a_phone_missed_by_a_completed_round_and_listed_after_the_hold_appears_again() {
+        let mut sightings = BacklogSightings::default();
+        let pair_id = PairId::from_array(PAIR_ID);
+        let first = Instant::now();
+        assert!(sightings.appearance(pair_id, BacklogRoute::Stream, first));
+        // A completed round that does not list the phone starts its
+        // absence; listed again once the hold passed since the miss, the
+        // phone appears again.
+        let missed_at = first + ROUND_STEP;
+        sightings.missed(pair_id, BacklogRoute::Stream, missed_at);
+        assert!(sightings.appearance(
+            pair_id,
+            BacklogRoute::Stream,
+            missed_at + BACKLOG_LOSS_HOLD + SIGHTING_STEP
+        ));
+    }
+
+    #[test]
+    fn a_phone_listed_soon_after_one_missed_round_is_still_in_sight() {
+        let mut sightings = BacklogSightings::default();
+        let pair_id = PairId::from_array(PAIR_ID);
+        let first = Instant::now();
+        assert!(sightings.appearance(pair_id, BacklogRoute::Stream, first));
+        let missed_at = first + ROUND_STEP;
+        sightings.missed(pair_id, BacklogRoute::Stream, missed_at);
+        // Listed again before the hold passed since the miss: the same
+        // sighting, so no dial.
+        assert!(!sightings.appearance(
+            pair_id,
+            BacklogRoute::Stream,
+            missed_at + BACKLOG_LOSS_HOLD - SIGHTING_STEP
+        ));
+    }
+
+    #[test]
+    fn a_miss_without_a_sighting_leaves_the_first_listing_an_appearance() {
+        let mut sightings = BacklogSightings::default();
+        let pair_id = PairId::from_array(PAIR_ID);
+        let now = Instant::now();
+        sightings.missed(pair_id, BacklogRoute::Stream, now);
+        assert!(sightings.appearance(pair_id, BacklogRoute::Stream, now));
+    }
+
+    #[test]
+    fn sightings_tell_pairings_apart() {
+        let mut sightings = BacklogSightings::default();
+        let now = Instant::now();
+        assert!(sightings.appearance(PairId::from_array(PAIR_ID), BacklogRoute::Stream, now));
+        assert!(sightings.appearance(
+            PairId::from_array(UNKNOWN_PAIR_ID),
+            BacklogRoute::Stream,
+            now
+        ));
+        assert!(!sightings.appearance(PairId::from_array(PAIR_ID), BacklogRoute::Stream, now));
+    }
+
+    #[test]
+    fn a_pairing_that_left_the_backlog_appears_at_its_next_listing() {
+        let mut sightings = BacklogSightings::default();
+        let pair_id = PairId::from_array(PAIR_ID);
+        let now = Instant::now();
+        assert!(sightings.appearance(pair_id, BacklogRoute::Stream, now));
+        // The pairing's echo destroyed the record and ended the sighting,
+        // as an mDNS loss or removal does: its next listing is a new
+        // appearance.
+        sightings.drop_pairing(pair_id);
+        assert!(sightings.appearance(pair_id, BacklogRoute::Stream, now));
+    }
+
+    #[test]
+    fn dropping_a_pairing_that_left_keeps_the_other_sightings() {
+        let mut sightings = BacklogSightings::default();
+        let pair_id = PairId::from_array(PAIR_ID);
+        let other = PairId::from_array(UNKNOWN_PAIR_ID);
+        let now = Instant::now();
+        assert!(sightings.appearance(pair_id, BacklogRoute::Stream, now));
+        assert!(sightings.appearance(other, BacklogRoute::Stream, now));
+        // Only the pairing that left the backlog ends its sighting; the
+        // phone that stays listed is still the same sighting.
+        sightings.drop_left_backlog(&[other]);
+        assert!(sightings.appearance(pair_id, BacklogRoute::Stream, now));
+        assert!(!sightings.appearance(other, BacklogRoute::Stream, now));
+    }
+
+    /// Notes a session to `pair_id` in `reader` now, so the pairing it then
+    /// forgets waits in the backlog instead of expiring at once (section
+    /// 4.6 item 3 counts from the latest established session, not from the
+    /// forget).
+    fn note_session(reader: &mut RemoteReader, pair_id: PairId) {
+        reader
+            .requester
+            .store_mut()
+            .sweep(pair_id, current_time_ms(), true)
+            .unwrap();
+    }
+
+    /// A service instance on `endpoints`, publishing an unhinted
+    /// `mode=session` record: any pairing's phone may serve it.
+    fn unhinted_service(endpoints: Vec<String>) -> StreamService {
+        StreamService {
+            instance: "synthetic-instance".to_owned(),
+            endpoints,
+            txt: vec![
+                ("v".to_owned(), "1".to_owned()),
+                ("mode".to_owned(), "session".to_owned()),
+            ],
+        }
+    }
+
+    /// A dial that opens nothing, for the test named in its counter: counts
+    /// the attempt and reports no session, so the record stays in the
+    /// backlog.
+    fn dial_nothing_once(
+        _: &[String],
+        _: &str,
+        _: Duration,
+        _: &RoutingPreamble,
+    ) -> Result<TcpFrameTransport, StreamError> {
+        DIALS_ONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(StreamError::Unreachable)
+    }
+
+    /// As [`dial_nothing_once`], for the reappearance test.
+    fn dial_nothing_again(
+        _: &[String],
+        _: &str,
+        _: Duration,
+        _: &RoutingPreamble,
+    ) -> Result<TcpFrameTransport, StreamError> {
+        DIALS_AGAIN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(StreamError::Unreachable)
+    }
+
+    /// As [`dial_nothing_once`], for the expired-record test.
+    fn dial_nothing_expired(
+        _: &[String],
+        _: &str,
+        _: Duration,
+        _: &RoutingPreamble,
+    ) -> Result<TcpFrameTransport, StreamError> {
+        DIALS_EXPIRED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(StreamError::Unreachable)
+    }
+
+    /// As [`dial_nothing_once`], for the soon-after-a-miss test.
+    fn dial_nothing_soon(
+        _: &[String],
+        _: &str,
+        _: Duration,
+        _: &RoutingPreamble,
+    ) -> Result<TcpFrameTransport, StreamError> {
+        DIALS_SOON.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(StreamError::Unreachable)
+    }
+
+    /// The dial attempts the staying-in-sight test opened.
+    static DIALS_ONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// The dial attempts the reappearance test opened.
+    static DIALS_AGAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// The dial attempts the expired-record test opened.
+    static DIALS_EXPIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// The dial attempts the soon-after-a-miss test opened.
+    static DIALS_SOON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    fn a_phone_that_stays_in_sight_is_dialed_once() {
+        use std::sync::atomic::Ordering;
+        let directory = scratch();
+        let mut reader = reader_with_pairing(&directory);
+        let pair_id = PairId::from_array(PAIR_ID);
+        note_session(&mut reader, pair_id);
+        reader.requester.forget(pair_id, current_time_ms()).unwrap();
+        reader.dial = dial_nothing_once;
+        let services = vec![unhinted_service(vec!["198.51.100.7:1".to_owned()])];
+        let mut sightings = BacklogSightings::default();
+        let mut now = Instant::now();
+        // The first listing is the appearance: one connection opens, its
+        // handshake fails without an answer, and the record stays for the
+        // next appearance.
+        assert!(!reader.tell_forgotten_phone(pair_id, &services, &mut sightings, now));
+        assert_eq!(DIALS_ONCE.load(Ordering::SeqCst), 1);
+        assert_eq!(reader.pairs().len(), 1);
+        // Round after round lists the same phone, further apart than the
+        // loss hold: elapsed time without a completed round that missed it
+        // is never absence, so nothing dials again.
+        for _ in 0..3 {
+            now += ROUND_STEP;
+            assert!(!reader.tell_forgotten_phone(pair_id, &services, &mut sightings, now));
+        }
+        assert_eq!(DIALS_ONCE.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_phone_missed_by_a_round_and_back_after_the_hold_is_dialed_again() {
+        use std::sync::atomic::Ordering;
+        let directory = scratch();
+        let mut reader = reader_with_pairing(&directory);
+        let pair_id = PairId::from_array(PAIR_ID);
+        note_session(&mut reader, pair_id);
+        reader.requester.forget(pair_id, current_time_ms()).unwrap();
+        reader.dial = dial_nothing_again;
+        let services = vec![unhinted_service(vec!["198.51.100.7:1".to_owned()])];
+        let mut sightings = BacklogSightings::default();
+        let now = Instant::now();
+        assert!(!reader.tell_forgotten_phone(pair_id, &services, &mut sightings, now));
+        assert_eq!(DIALS_AGAIN.load(Ordering::SeqCst), 1);
+        // A completed round that does not list the phone starts its
+        // absence: nothing dials for a round with no phone in sight.
+        let missed_at = now + ROUND_STEP;
+        let no_services: Vec<StreamService> = Vec::new();
+        assert!(!reader.tell_forgotten_phone(pair_id, &no_services, &mut sightings, missed_at));
+        assert_eq!(DIALS_AGAIN.load(Ordering::SeqCst), 1);
+        assert_eq!(reader.pairs().len(), 1);
+        // Listed again once the hold passed since the missed round: the
+        // appearance dials again.
+        let back = missed_at + BACKLOG_LOSS_HOLD + SIGHTING_STEP;
+        assert!(!reader.tell_forgotten_phone(pair_id, &services, &mut sightings, back));
+        assert_eq!(DIALS_AGAIN.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_phone_listed_soon_after_one_missed_round_is_not_dialed_again() {
+        use std::sync::atomic::Ordering;
+        let directory = scratch();
+        let mut reader = reader_with_pairing(&directory);
+        let pair_id = PairId::from_array(PAIR_ID);
+        note_session(&mut reader, pair_id);
+        reader.requester.forget(pair_id, current_time_ms()).unwrap();
+        reader.dial = dial_nothing_soon;
+        let services = vec![unhinted_service(vec!["198.51.100.7:1".to_owned()])];
+        let mut sightings = BacklogSightings::default();
+        let now = Instant::now();
+        assert!(!reader.tell_forgotten_phone(pair_id, &services, &mut sightings, now));
+        assert_eq!(DIALS_SOON.load(Ordering::SeqCst), 1);
+        // One completed round misses the phone, but it is listed again
+        // before the hold passed since the miss: the same sighting, so no
+        // dial, and the record stays in the backlog.
+        let missed_at = now + ROUND_STEP;
+        let no_services: Vec<StreamService> = Vec::new();
+        assert!(!reader.tell_forgotten_phone(pair_id, &no_services, &mut sightings, missed_at));
+        let soon = missed_at + BACKLOG_LOSS_HOLD - SIGHTING_STEP;
+        assert!(!reader.tell_forgotten_phone(pair_id, &services, &mut sightings, soon));
+        assert_eq!(DIALS_SOON.load(Ordering::SeqCst), 1);
+        assert_eq!(reader.pairs().len(), 1);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn an_expired_record_is_revoked_untold_and_never_dialed() {
+        use std::sync::atomic::Ordering;
+        let directory = scratch();
+        // The fixture's pairing was made over thirty days ago, so its idle
+        // expiry has passed: the forgotten record owes no notice.
+        let forgotten = record(PairId::from_array(PAIR_ID)).forgotten(current_time_ms());
+        let mut reader = reader_with(&directory, vec![forgotten]);
+        let pair_id = PairId::from_array(PAIR_ID);
+        reader.dial = dial_nothing_expired;
+        let services = vec![unhinted_service(vec!["198.51.100.7:1".to_owned()])];
+        let mut sightings = BacklogSightings::default();
+        // Even with the phone in sight nothing dials: the record goes
+        // untold instead.
+        assert!(!reader.tell_forgotten_phone(pair_id, &services, &mut sightings, Instant::now()));
+        assert_eq!(DIALS_EXPIRED.load(Ordering::SeqCst), 0);
+        assert!(reader.pairs().is_empty());
+        assert!(!path_for(&directory, pair_id).exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -1687,7 +2243,8 @@ mod tests {
         seed_certificate(&directory, pair_id);
         let store = FilePairingStore::open(&directory).unwrap();
         let mut reader = RemoteReader::with_store(desk(), "Linux", store);
-        // Held here, the lock leaves the record to its holder and the bound.
+        note_session(&mut reader, pair_id);
+        // Held here, the lock leaves the record to its holder and the backlog.
         let held = SessionLock::acquire(&session_lock_path(&directory, pair_id)).unwrap();
         assert_eq!(reader.forget_and_tell(pair_id), Ok(false));
         assert!(path_for(&directory, pair_id).exists());
@@ -1817,7 +2374,7 @@ mod tests {
         let epoch = discovery_epoch(unix_seconds());
         let ordered = sessions_for(
             &mine,
-            vec![
+            &[
                 session("refineid-unhinted", None),
                 session(
                     "refineid-foreign",
@@ -1836,7 +2393,7 @@ mod tests {
         assert_eq!(
             sessions_for(
                 &mine,
-                vec![
+                &[
                     withdrawn("refineid-gone", &mine.withdrawal),
                     session("refineid-unhinted", None),
                 ],
@@ -1852,7 +2409,7 @@ mod tests {
         let epoch = discovery_epoch(unix_seconds());
         let found = sessions_for(
             &mine,
-            vec![
+            &[
                 withdrawn("refineid-old", &mine.withdrawal),
                 session("refineid-new", Some(hex(&mine.discovery.hint(epoch)))),
             ],
@@ -1866,7 +2423,7 @@ mod tests {
         let mine = keys(MINE);
         let found = sessions_for(
             &mine,
-            vec![
+            &[
                 withdrawn("refineid-other", &keys(THEIRS).withdrawal),
                 session("refineid-unhinted", None),
             ],
@@ -1883,7 +2440,7 @@ mod tests {
         assert_eq!(
             sessions_for(
                 &mine,
-                vec![withdrawn("refineid-gone", &mine.withdrawal), stale]
+                &[withdrawn("refineid-gone", &mine.withdrawal), stale]
             )
             .map(|found| found.len()),
             Err(RemoteError::Withdrawn)

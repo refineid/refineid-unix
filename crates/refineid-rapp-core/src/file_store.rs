@@ -201,8 +201,10 @@ pub(crate) fn path_for(directory: &Path, pair_id: PairId) -> PathBuf {
     directory.join(name).with_extension(RECORD_EXTENSION)
 }
 
-/// The record of `pair_id` as its file holds it, if it reads.
-fn read_record(directory: &Path, pair_id: PairId) -> Option<PairingRecord> {
+/// The record of `pair_id` as its file holds it now, if it reads: what
+/// another program on this computer wrote since this store read it, or
+/// nothing when the pairing is gone.
+pub(crate) fn read_record(directory: &Path, pair_id: PairId) -> Option<PairingRecord> {
     let bytes = fs::read(path_for(directory, pair_id))
         .map(Zeroizing::new)
         .ok()?;
