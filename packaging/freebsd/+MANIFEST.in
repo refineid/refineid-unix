@@ -14,3 +14,24 @@ prefix: "/usr/local"
 categories: [security]
 licenselogic: single
 licenses: [APACHE20]
+messages: [
+  { type: install, message: <<EOD
+Run once as root, or reboot, to start pcscd and load the devd rule that
+enables Bluetooth LE on USB Bluetooth adapters:
+  service pcscd restart
+  service devd restart
+EOD
+  },
+  { type: upgrade, message: <<EOD
+Run once as root, or reboot, to start pcscd and load the devd rule that
+enables Bluetooth LE on USB Bluetooth adapters:
+  service pcscd restart
+  service devd restart
+EOD
+  },
+  { type: remove, message: <<EOD
+Run once as root, or reboot, to drop the Bluetooth LE devd rule:
+  service devd restart
+EOD
+  }
+]

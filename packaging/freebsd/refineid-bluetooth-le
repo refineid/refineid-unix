@@ -1,0 +1,54 @@
+#!/bin/sh
+# Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
+
+# Enables Bluetooth LE on the USB Bluetooth adapter named by the one
+# argument (ubtN): waits until rc.d/bluetooth has reset and initialized
+# the adapter's HCI node, then sets LE Host Support and the HCI and LE
+# event masks the BLE session transport needs. A normal user cannot send
+# either command. Runs as root from the devd rule refineid-bluetooth.conf
+# and the package's +POST_INSTALL. Silent and idempotent; exits non-zero
+# on a name that is not ubtN, a node that does not become ready in time,
+# or a failed command.
+set -u
+
+# Upper bound on the wait for the HCI node, and the poll interval, in
+# seconds.
+READY_TIMEOUT=30
+POLL_INTERVAL=1
+# NG_HCI_UNIT_READY = NG_HCI_UNIT_CONNECTED | NG_HCI_UNIT_INITED
+# (netgraph/bluetooth/include/ng_hci.h); hccontrol initialize, the last
+# step of rc.d/bluetooth, sets INITED.
+UNIT_READY=0x3
+# Write LE Host Support parameter LE_Supported_Host: enabled.
+LE_SUPPORTED_HOST=1
+
+[ "$#" -eq 1 ] || exit 1
+dev="$1"
+case "$dev" in
+    ubt | ubt*[!0-9]*) exit 1 ;;
+    ubt*) ;;
+    *) exit 1 ;;
+esac
+node="${dev}hci"
+
+node_ready() {
+    state="$(hccontrol -n "$node" read_node_state 2>/dev/null |
+        sed -n 's/^State: //p')"
+    case "$state" in
+        0x | 0x*[!0-9a-fA-F]*) return 1 ;;
+        0x*) [ "$((state & UNIT_READY))" -eq "$((UNIT_READY))" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+waited=0
+until node_ready; do
+    [ "$waited" -lt "$READY_TIMEOUT" ] || exit 1
+    sleep "$POLL_INTERVAL"
+    waited=$((waited + POLL_INTERVAL))
+done
+
+hccontrol -n "$node" write_le_host_support "$LE_SUPPORTED_HOST" \
+    >/dev/null 2>&1 || exit 1
+hccontrol -n "$node" le_enable enable >/dev/null 2>&1 || exit 1
+exit 0
