@@ -242,20 +242,15 @@ goes into one container under one signature.
 PIN2 and the qualified-signature key are used by default, and the PIN
 is asked once for the whole run, when everything else is in order.
 With no card in a reader, the paired phone signs, and PIN2 is typed on the phone.
-Signs at the highest level the format supports: LTA, embedded
-evidence plus an archive timestamp, for
-.Cm pades
-and
-.Cm asice-cades ;
-LT, embedded evidence, for the rest.
-There is no lower level.
+Signs at LTA, embedded evidence plus an archive timestamp, for every
+format; a release build writes no other level.
 The evidence's chain may end at the card's CA certificates, read from
 the card in the reader or cached, or at the certificate-issuing
 services the EU trusted lists name; with none of these at hand the
 signing is refused before the card is used, and a chain that can never
 reach one is refused before PIN2 is sent.
-When the evidence cannot be collected after signing, nothing is
-written.
+When the evidence or the archive timestamp cannot be had after
+signing, nothing is written.
 A development build instead writes the highest level it reached, B-LT,
 B-T or B-B, under a name ending in
 .Ql -dev- Ns Ar level
