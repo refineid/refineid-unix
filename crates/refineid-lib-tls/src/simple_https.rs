@@ -19,6 +19,13 @@
 //! authentication, not FINEID client-certificate authentication. This
 //! module never configures a client certificate or private-key
 //! callback.
+//!
+//! The server's certificate is judged by the platform's trust store
+//! (`rustls-platform-verifier`): the Security framework's trust
+//! settings on macOS, and on the other Unix systems the roots
+//! `rustls-native-certs` finds (`SSL_CERT_FILE`, `SSL_CERT_DIR`, then
+//! the system bundle). The software ships no TLS root (AGENTS.md,
+//! "Certificates and trust").
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -29,7 +36,6 @@ use zeroize::Zeroizing;
 
 use crate::framing::{Framing, FramingError};
 use crate::http::HttpParseError;
-use crate::policy::TransportPolicy;
 
 /// Connect/read/write timeout for one simple HTTPS request.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -251,14 +257,13 @@ fn request(
     if url.scheme() != Scheme::Https {
         return Err(HttpsError::UnsupportedScheme);
     }
-    let policy = TransportPolicy::client_auth();
     #[cfg(feature = "tls-rustls")]
     {
-        request_with_rustls(url, body, max_bytes, user_agent, &policy, address)
+        request_with_rustls(url, body, max_bytes, user_agent, address)
     }
     #[cfg(not(feature = "tls-rustls"))]
     {
-        let _unused = (body, max_bytes, user_agent, policy, address);
+        let _unused = (body, max_bytes, user_agent, address);
         Err(HttpsError::NoTlsBackend)
     }
 }
@@ -269,32 +274,11 @@ fn request_with_rustls(
     body: RequestBody<'_>,
     max_bytes: usize,
     user_agent: &str,
-    policy: &TransportPolicy,
     address: Option<SocketAddr>,
 ) -> Result<SimpleResponse, HttpsError> {
     use std::sync::Arc;
 
-    // The platform CA bundle, read here rather than handed to the
-    // library: rustls takes roots as parsed certificates, not as a path.
-    use rustls::pki_types::pem::PemObject as _;
-
-    let ca_path = ca_bundle_path(policy)?;
-    let file = std::fs::File::open(&ca_path)
-        .map_err(|e| HttpsError::Tls(format!("open({ca_path}): {e}")))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut roots = rustls::RootCertStore::empty();
-    // PEM parsing comes from rustls-pki-types rather than
-    // rustls-pemfile: the latter is archived upstream and is now a
-    // wrapper around exactly this code (RUSTSEC-2025-0134).
-    for entry in rustls::pki_types::CertificateDer::pem_reader_iter(&mut reader) {
-        let cert = entry.map_err(|e| HttpsError::Tls(format!("{ca_path}: parse: {e}")))?;
-        roots
-            .add(cert)
-            .map_err(|e| HttpsError::Tls(format!("{ca_path}: root rejected: {e}")))?;
-    }
-    if roots.is_empty() {
-        return Err(HttpsError::Tls(format!("{ca_path}: no usable roots")));
-    }
+    use rustls_platform_verifier::BuilderVerifierExt as _;
 
     // rustls speaks 1.2 and 1.3 only, so the TLS 1.2 floor holds by
     // construction. The ceiling is an escape hatch for a server that
@@ -308,7 +292,8 @@ fn request_with_rustls(
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)
         .map_err(|e| HttpsError::Tls(format!("protocol versions: {e}")))?
-        .with_root_certificates(roots)
+        .with_platform_verifier()
+        .map_err(|e| HttpsError::Tls(format!("platform trust store: {e}")))?
         .with_no_client_auth();
 
     let host = url.host().to_string();
@@ -408,20 +393,6 @@ fn tcp_connect(url: &Uri, address: Option<SocketAddr>) -> Result<TcpStream, Http
         .set_write_timeout(Some(IO_TIMEOUT))
         .map_err(|e| HttpsError::Connect(format!("set_write_timeout: {e}")))?;
     Ok(stream)
-}
-
-pub(crate) fn ca_bundle_path(policy: &TransportPolicy) -> Result<String, HttpsError> {
-    if let Ok(path) = std::env::var("REFINEID_CA_BUNDLE")
-        && !path.trim().is_empty()
-    {
-        return Ok(path);
-    }
-    policy
-        .ca_bundle_paths
-        .iter()
-        .find(|path| path.is_file())
-        .map(|path| path.to_string_lossy().into_owned())
-        .ok_or_else(|| HttpsError::Tls("no CA bundle found".to_owned()))
 }
 
 fn authority(url: &Uri) -> String {

@@ -236,6 +236,9 @@ record for RAPP and its applications.
   trusted lists"). The card's issuing CA and root are cached until
   they expire (`crates/refineid-client/src/ca_certificates.rs`;
   refineid-core's `doc/security/certificate-custody.md`).
+- A TLS server is judged by the platform's trust store
+  (`rustls-platform-verifier`, `crates/refineid-lib-tls`); no TLS root
+  is shipped or bundled.
 - No other certificate, fingerprint, pin or trust policy is added
   without the owner's decision (decision 2026-11-07).
 - Describe what the code does and cite the source; ask the owner before

@@ -21,12 +21,10 @@
 //!
 //! [`http`] hosts the TLS-agnostic HTTP/1.1 protocol types (cookie
 //! jar, response parser, URL parts, form encoding); [`framing`] the
-//! response body framing; [`policy`] the per-destination transport
-//! policy (TLS floor, redirect and size limits).
+//! response body framing.
 
 #[cfg(feature = "tls-rustls")]
 pub mod client_auth;
 pub mod framing;
 pub mod http;
-pub mod policy;
 pub mod simple_https;

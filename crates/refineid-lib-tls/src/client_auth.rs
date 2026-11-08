@@ -10,7 +10,6 @@
 
 extern crate alloc;
 
-use crate::policy::TransportPolicy;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -33,9 +32,9 @@ use refineid_rapp_core::remote::{RemoteReader, RemoteSession};
 
 use rustls::client::ResolvesClientCert;
 use rustls::pki_types::CertificateDer;
-use rustls::pki_types::pem::PemObject as _;
 use rustls::sign::{CertifiedKey, Signer, SigningKey};
 use rustls::{SignatureAlgorithm, SignatureScheme};
+use rustls_platform_verifier::BuilderVerifierExt as _;
 
 use crate::simple_https::HttpsError;
 
@@ -240,20 +239,8 @@ pub fn get_with_rapp_client_auth(url: &Uri, pair: PairId) -> Result<String, Http
     let port = url.port();
     let origin = format!("https://{host}");
 
-    // The CA roots come from the same bundle every other HTTPS client
-    // in this crate reads, found by the transport policy.
-    let ca_path = crate::simple_https::ca_bundle_path(&TransportPolicy::client_auth())?;
-    let file = std::fs::File::open(&ca_path)
-        .map_err(|e| HttpsError::Tls(format!("open({ca_path}): {e}")))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut roots = rustls::RootCertStore::empty();
-    for entry in CertificateDer::pem_reader_iter(&mut reader) {
-        let cert = entry.map_err(|e| HttpsError::Tls(format!("{ca_path}: parse: {e}")))?;
-        roots
-            .add(cert)
-            .map_err(|e| HttpsError::Tls(format!("{ca_path}: root rejected: {e}")))?;
-    }
-
+    // The server is judged by the platform's trust store, as every
+    // other HTTPS client in this crate judges it.
     let versions: &[&rustls::SupportedProtocolVersion] =
         &[&rustls::version::TLS13, &rustls::version::TLS12];
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -262,7 +249,8 @@ pub fn get_with_rapp_client_auth(url: &Uri, pair: PairId) -> Result<String, Http
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)
         .map_err(|e| HttpsError::Tls(format!("protocol versions: {e}")))?
-        .with_root_certificates(roots)
+        .with_platform_verifier()
+        .map_err(|e| HttpsError::Tls(format!("platform trust store: {e}")))?
         .with_client_cert_resolver(shared_resolver(&resolver));
 
     let server_name = rustls::pki_types::ServerName::try_from(host.clone())

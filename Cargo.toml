@@ -56,6 +56,10 @@ gtk4 = "0.11"
 # ring builds with cc alone where aws-lc-rs wants cmake, so the build
 # needs neither a C++ toolchain nor a system OpenSSL.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# The platform's trust store judges a server certificate: the Security
+# framework on macOS, rustls-native-certs elsewhere. It adds no crypto
+# provider of its own; rustls's ring provider verifies.
+rustls-platform-verifier = "0.7.1"
 
 # SHA-256 digests; HMAC; hex encoding for diagnostic output.
 sha2 = "0.11"
