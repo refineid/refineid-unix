@@ -50,7 +50,7 @@ use crate::exit_status::ExitStatus;
 
 /// How long the signer browses for the paired phone and waits for its
 /// card, as `phone auth` does.
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const DISCOVERY_TIMEOUT: Duration = refineid_rapp_core::remote::PHONE_DISCOVERY_TIMEOUT;
 
 /// Where a signing runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

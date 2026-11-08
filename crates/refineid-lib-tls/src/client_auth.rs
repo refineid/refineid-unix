@@ -40,7 +40,7 @@ use rustls::{SignatureAlgorithm, SignatureScheme};
 use crate::simple_https::HttpsError;
 
 /// How long the signer browses for the paired phone.
-const REMOTE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_DISCOVERY_TIMEOUT: Duration = refineid_rapp_core::remote::PHONE_DISCOVERY_TIMEOUT;
 
 /// The one signature scheme the phone's authentication key signs under.
 const SUPPORTED_SCHEME: SignatureScheme = SignatureScheme::ECDSA_NISTP384_SHA384;

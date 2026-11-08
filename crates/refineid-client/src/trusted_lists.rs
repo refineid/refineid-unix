@@ -28,8 +28,10 @@
 //! On each run the cached lists are read back, every signature
 //! verified again, and used as they are while none is due: the lists
 //! are fetched afresh when there is no cache, a cached list no longer
-//! reads, one is past its `NextUpdate`, the cache is older than
-//! [`REFRESH_AFTER`], or the caller asks ([`Refresh::Now`]). A national
+//! reads, the Finnish list is missing, one is past its `NextUpdate`,
+//! the cache is older than [`REFRESH_AFTER`], or the caller asks
+//! ([`Refresh::Now`]). A fetch that leaves them due is not tried again
+//! for [`RETRY_AFTER`], recorded in an `attempted-at` file. A national
 //! list that fails in a refresh keeps its last cached copy; a list of
 //! the lists that fails leaves every cached list in use and the report
 //! says how old they are. With no list at all there is no anchor, and
@@ -42,11 +44,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::thread::JoinHandle;
 
 use refineid_doc_sign::uri::Uri;
 use refineid_doc_sign::verification::trusted_list::{
-    CachedList, LOTL_LOCATION, NationalList, TrustedListError, TrustedLists, fetch_over_http,
-    lotl_signers,
+    CachedList, LOTL_LOCATION, ListFailure, ListPointer, NationalList, TrustedList,
+    TrustedListError, TrustedLists, fetch_over_http, lotl_signers,
 };
 use refineid_doc_sign::verification::{AnchorRole, TrustAnchors};
 use refineid_doc_sign::x509::{DateTime, OwnedCert};
@@ -64,6 +69,17 @@ const REFRESH_AFTER_DAYS: u64 = 30;
 /// often monthly; a month-old cache therefore misses a withdrawal the
 /// list's own schedule would announce only later.
 pub const REFRESH_AFTER: Duration = Duration::from_secs(REFRESH_AFTER_DAYS * SECONDS_PER_DAY);
+/// Seconds in an hour.
+const SECONDS_PER_HOUR: u64 = 3_600;
+/// How long after a fetch a run that finds the lists still due uses
+/// them as they are instead of fetching again. A fetch can leave them
+/// due through no fault of this computer: an operator late with its
+/// next list keeps a list past its `NextUpdate`, and a list that does
+/// not arrive keeps its old copy. Without this pause every run would
+/// download every list again, some 30 MB, until the operator or the
+/// network recovered; an hour bounds that to one download an hour,
+/// far inside the [`REFRESH_AFTER`] a fresh cache is trusted for.
+pub const RETRY_AFTER: Duration = Duration::from_secs(SECONDS_PER_HOUR);
 
 /// The XDG base-directory cache variable.
 const XDG_CACHE_HOME: &str = "XDG_CACHE_HOME";
@@ -79,6 +95,14 @@ const LISTS_DIRECTORY: &str = "trusted-lists";
 const LIST_EXTENSION: &str = "list";
 /// File extension of a list being written.
 const TEMPORARY_EXTENSION: &str = "tmp";
+/// How many national lists are downloaded at once. One after another
+/// the thirty-odd EU lists, some 30 MB, take as long as their sum,
+/// tens of seconds; eight at a time bring that near the slowest
+/// server's time without opening a connection to every operator at
+/// once.
+const PARALLEL_FETCHES: usize = 8;
+/// The file holding when the lists were last fetched or tried.
+const ATTEMPT_FILE: &str = "attempted-at";
 /// Owner-only directory permissions.
 const DIRECTORY_MODE: u32 = 0o700;
 /// Owner-only file permissions.
@@ -99,6 +123,51 @@ const LISTS_OF_THE_LISTS: usize = 1;
 /// What ends the record, its last line and one blank line, and starts
 /// the list's bytes.
 const RECORD_END: &[u8] = b"\n\n";
+
+/// The `SchemeTerritory` of Finland's national list: the ISO 3166-1
+/// alpha-2 code `ETSI TS 119 612` clause 5.3.10 names a member
+/// state's list by. FINEID cards chain to the services it lists.
+pub const FINNISH_TERRITORY: &str = "FI";
+
+/// Why the Finnish national list gave no anchors while other lists
+/// did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinnishListGap {
+    /// The list of the lists points at no Finnish list.
+    NotPointedAt,
+    /// The list it points at did not arrive or read.
+    Failed(ListFailure),
+}
+
+impl core::fmt::Display for FinnishListGap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotPointedAt => f.write_str("the list of the lists points at none"),
+            Self::Failed(failure) => write!(f, "{failure}"),
+        }
+    }
+}
+
+/// Why the Finnish list in `lists` gave no anchors, or `None` when it
+/// read.
+fn finnish_gap(lists: &TrustedLists) -> Option<FinnishListGap> {
+    let mut gap = Some(FinnishListGap::NotPointedAt);
+    for list in lists
+        .national()
+        .iter()
+        .filter(|list| list.territory() == FINNISH_TERRITORY)
+    {
+        match list.outcome() {
+            Ok(_) => return None,
+            Err(failure) => {
+                if gap == Some(FinnishListGap::NotPointedAt) {
+                    gap = Some(FinnishListGap::Failed(failure));
+                }
+            }
+        }
+    }
+    gap
+}
 
 /// When a run fetches the lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +226,9 @@ pub struct RunAnchors {
     pub anchors: TrustAnchors,
     /// Where they came from.
     pub source: AnchorSource,
+    /// Why the Finnish list gave no anchors when other lists are at
+    /// hand; `None` when it read or when no list is at hand at all.
+    pub finnish_gap: Option<FinnishListGap>,
 }
 
 /// The lists' cache directory.
@@ -222,6 +294,28 @@ impl ListCache {
         Ok(())
     }
 
+    /// When a fetch was last tried into this cache, if one was and
+    /// its record reads.
+    fn attempted_at(&self) -> Option<DateTime> {
+        let bytes = fs::read(self.directory.join(ATTEMPT_FILE)).ok()?;
+        core::str::from_utf8(&bytes).ok()?.trim().parse().ok()
+    }
+
+    /// Record that a fetch was tried at `now`.
+    ///
+    /// # Errors
+    /// The I/O error of the write.
+    fn mark_attempt(&self, now: DateTime) -> std::io::Result<()> {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(DIRECTORY_MODE)
+            .create(&self.directory)?;
+        write_atomically(
+            &self.directory.join(ATTEMPT_FILE),
+            now.to_string().as_bytes(),
+        )
+    }
+
     /// The file of the list at `location`: the SHA-256 of the location
     /// in lowercase hex.
     fn path_for(&self, location: &Uri) -> PathBuf {
@@ -234,9 +328,10 @@ impl ListCache {
 ///
 /// The lists in `cache` are read under `signers`, every signature
 /// verified again, and used as they are unless a fetch is due:
-/// `refresh` is [`Refresh::Now`], there are no lists, one no longer
-/// reads, one is past its `NextUpdate`, or the cache is older than
-/// [`REFRESH_AFTER`]. A due fetch reads the lists again with `get` and
+/// `refresh` is [`Refresh::Now`], there are no lists, or, unless a
+/// fetch was tried within [`RETRY_AFTER`], one no longer reads, the
+/// Finnish list is missing, one is past its `NextUpdate`, or the cache
+/// is older than [`REFRESH_AFTER`]. A due fetch reads the lists again with `get` and
 /// the cache takes the result; a list of the lists that does not
 /// arrive or read leaves the cached lists in use. Under
 /// [`Refresh::CacheOnly`] nothing is fetched and `get` is never
@@ -262,15 +357,20 @@ pub fn run_anchors(
         Refresh::Now => true,
         Refresh::CacheOnly => false,
         Refresh::WhenDue => {
-            lists.is_stale(now)
-                || age(lists.fetched_at(), now) > REFRESH_AFTER
-                || read_count(lists) != records.len()
+            let recently_tried = cache
+                .and_then(ListCache::attempted_at)
+                .is_some_and(|at| at <= now && age(at, now) < RETRY_AFTER);
+            !recently_tried
+                && (lists.is_stale(now)
+                    || age(lists.fetched_at(), now) > REFRESH_AFTER
+                    || read_count(lists) != records.len()
+                    || finnish_gap(lists).is_some())
         }
     };
     let lists = match cached {
         Some(lists) if !due(&lists) => Ok(lists),
         None if refresh == Refresh::CacheOnly => Err(TrustedListError::NotFetched),
-        cached => match fetch(get, now, signers, &records) {
+        cached => match fetch_and_mark(cache, get, now, signers, &records) {
             Ok((lists, fetched)) => {
                 if let Some(cache) = cache
                     && let Err(error) = cache.store(&fetched)
@@ -293,10 +393,12 @@ pub fn run_anchors(
                 fetched_at: lists.fetched_at(),
                 stale: lists.is_stale(now),
             },
+            finnish_gap: finnish_gap(&lists),
         },
         Err(error) => RunAnchors {
             anchors: without_lists(),
             source: AnchorSource::Unavailable(error),
+            finnish_gap: None,
         },
     }
 }
@@ -324,6 +426,27 @@ pub fn certificate_issuing_ders(anchors: &TrustAnchors, now: DateTime) -> Vec<Ve
 /// How long ago `then` was at `now`; nothing when `then` is later.
 fn age(then: DateTime, now: DateTime) -> Duration {
     now.unix_duration().saturating_sub(then.unix_duration())
+}
+
+/// [`fetch`], then record in `cache` that a fetch was tried at `now`,
+/// whatever came of it, when the cache holds lists to fall back on:
+/// with none, every run tries again.
+fn fetch_and_mark(
+    cache: Option<&ListCache>,
+    get: impl FnMut(&Uri) -> Option<Vec<u8>>,
+    now: DateTime,
+    signers: &[OwnedCert],
+    previous: &[CachedList],
+) -> Result<(TrustedLists, Vec<CachedList>), TrustedListError> {
+    let fetched = fetch(get, now, signers, previous);
+    if let Some(cache) = cache
+        && (fetched.is_ok() || !previous.is_empty())
+        && let Err(error) = cache.mark_attempt(now)
+    {
+        let kind = error.kind();
+        refineid_dev_errors::report!(Cli, "trusted-list fetch time not recorded", kind);
+    }
+    fetched
 }
 
 /// Fetch the lists afresh with `get` at `now`: the list of the lists
@@ -372,19 +495,98 @@ fn fetch(
     Ok((lists, records))
 }
 
+/// Held by every run over the user's cache in this process that may
+/// fetch, so a background fetch ([`fetch_in_background`]) and a run
+/// that needs the lists meanwhile fetch them once: the later run
+/// waits, then reads what the first stored. A [`Refresh::CacheOnly`]
+/// run, the GUI's card readout, never waits: every file is replaced
+/// by an atomic rename, so it reads whole lists, old or new.
+static USER_CACHE: Mutex<()> = Mutex::new(());
+
 /// [`run_anchors`] over the user's cache, the Official Journal's
 /// list-signing certificates core ships and this crate's HTTP
-/// transport.
+/// transport, one fetching run at a time in this process.
 #[must_use]
 pub fn user_anchors(now: DateTime, refresh: Refresh) -> RunAnchors {
+    let _one_at_a_time = (refresh != Refresh::CacheOnly)
+        .then(|| USER_CACHE.lock().unwrap_or_else(PoisonError::into_inner));
     crate::doc_sign_http::install();
+    let signers = lotl_signers();
     run_anchors(
         ListCache::user().as_ref(),
         now,
         refresh,
-        &lotl_signers(),
-        fetch_over_http,
+        &signers,
+        parallel_http(&signers),
     )
+}
+
+/// [`fetch_over_http`], except that fetching the list of the lists
+/// also downloads every national list it points at, [`PARALLEL_FETCHES`]
+/// at a time, for the requests that follow to take. Only a list of the
+/// lists that verifies under `signers` is followed.
+fn parallel_http(signers: &[OwnedCert]) -> impl FnMut(&Uri) -> Option<Vec<u8>> + '_ {
+    let mut prefetched: Vec<(Uri, Option<Vec<u8>>)> = Vec::new();
+    move |location| {
+        if location.to_string() == LOTL_LOCATION {
+            let lotl = fetch_over_http(location)?;
+            prefetched = TrustedList::read(lotl.clone(), signers)
+                .map(|list| prefetch(&national_locations(&list), fetch_over_http))
+                .unwrap_or_default();
+            return Some(lotl);
+        }
+        match prefetched.iter().position(|(at, _)| at == location) {
+            Some(index) => prefetched.swap_remove(index).1,
+            None => fetch_over_http(location),
+        }
+    }
+}
+
+/// The locations of the national lists `lotl` points at, as
+/// [`TrustedLists::read`] follows them.
+fn national_locations(lotl: &TrustedList) -> Vec<Uri> {
+    lotl.pointers()
+        .iter()
+        .filter(|pointer| pointer.names_national_list())
+        .filter_map(ListPointer::location)
+        .cloned()
+        .collect()
+}
+
+/// Each of `locations` with what `get` returned for it, fetched by
+/// [`PARALLEL_FETCHES`] threads at once.
+fn prefetch(
+    locations: &[Uri],
+    get: impl Fn(&Uri) -> Option<Vec<u8>> + Sync,
+) -> Vec<(Uri, Option<Vec<u8>>)> {
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(Uri, Option<Vec<u8>>)>> = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..PARALLEL_FETCHES.min(locations.len()) {
+            scope.spawn(|| {
+                while let Some(location) = locations.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let bytes = get(location);
+                    results
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((location.clone(), bytes));
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Bring the user's lists up to date on a thread of their own when a
+/// fetch is due ([`Refresh::WhenDue`]), so that the first signing or
+/// verification after an install, or after the cache went stale, finds
+/// them at hand instead of waiting for the download. A run that needs
+/// the lists before the thread is done waits for it and fetches
+/// nothing again.
+pub fn fetch_in_background() -> JoinHandle<()> {
+    std::thread::spawn(|| {
+        let _run = user_anchors(refineid_doc_sign::now_date_time(), Refresh::WhenDue);
+    })
 }
 
 /// How many of `lists` read: the list of the lists and every national

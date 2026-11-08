@@ -231,9 +231,12 @@ impl RefineIdController {
 
     /// Start the background card presence monitor and inspect cards.
     ///
-    /// The stored pairings are read first: their cards are listed
-    /// beside the local readers.
+    /// The trusted lists are fetched on a thread of their own when due,
+    /// so a fresh install's first signing does not wait for them. The
+    /// stored pairings are read first: their cards are listed beside
+    /// the local readers.
     pub fn start(self: &Arc<Self>) {
+        drop(refineid_client::trusted_lists::fetch_in_background());
         self.refresh_phones();
         self.refresh_cards();
 

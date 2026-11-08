@@ -231,6 +231,15 @@ impl Offering {
     }
 }
 
+/// Whether a reader of this computer holds a card, which suspends remote
+/// use. The module asks PC/SC ([`card_in_a_reader`]); tests give their own.
+type LocalCardCheck = fn() -> bool;
+
+/// Whether any PC/SC reader of this computer holds a card.
+fn card_in_a_reader() -> bool {
+    refineid_lib_pcsc::presence_signature().is_ok_and(|sig| sig.iter().any(|(_, present)| *present))
+}
+
 /// What the session thread shares with the module's calls.
 struct Shared {
     offer: Mutex<Option<Offering>>,
@@ -245,6 +254,8 @@ struct Shared {
     in_session: AtomicBool,
     context: DisplayText,
     spoken: (Mutex<bool>, Condvar),
+    /// Whether a local card suspends remote use just now.
+    local_card: LocalCardCheck,
 }
 
 impl Shared {
@@ -392,12 +403,14 @@ impl PhoneSource {
     #[must_use]
     pub fn for_this_user() -> Option<Self> {
         let store = FilePairingStore::default_directory()?;
-        store_is_ours(StoreOwner::of(&store), effective_uid()).then(|| Self::over_store(store))
+        store_is_ours(StoreOwner::of(&store), effective_uid())
+            .then(|| Self::over_store(store, card_in_a_reader))
     }
 
     /// A source over the pairing store in `store` that starts its session
-    /// thread at the first reading that may wait.
-    fn over_store(store: PathBuf) -> Self {
+    /// thread at the first reading that may wait, with `local_card` telling
+    /// it when a card in a reader suspends remote use.
+    fn over_store(store: PathBuf, local_card: LocalCardCheck) -> Self {
         Self {
             shared: Arc::new(Shared {
                 offer: Mutex::new(None),
@@ -407,6 +420,7 @@ impl PhoneSource {
                 in_session: AtomicBool::new(false),
                 context: computer_context(),
                 spoken: (Mutex::new(false), Condvar::new()),
+                local_card,
             }),
             worker: Mutex::new(None),
             store,
@@ -638,9 +652,7 @@ fn serve(shared: &Shared, requests: &Receiver<SignRequest>, store: &Path) {
         }
         // A connected card reader with a card overrides RAPP: remote use
         // is suspended, and resumes with a fresh look when the card goes.
-        if refineid_lib_pcsc::presence_signature()
-            .is_ok_and(|sig| sig.iter().any(|(_, present)| *present))
-        {
+        if (shared.local_card)() {
             unpaired(shared, requests);
             viewed = None;
             pause(shared, SUSPENDED_PAUSE);
@@ -1439,7 +1451,18 @@ mod tests {
             in_session: AtomicBool::new(false),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
+            local_card: no_local_card,
         }
+    }
+
+    /// A computer whose readers hold no card.
+    const fn no_local_card() -> bool {
+        false
+    }
+
+    /// A computer with a card in one of its readers.
+    const fn a_local_card() -> bool {
+        true
     }
 
     /// When the offered token goes, if it is on a grace.
@@ -1524,6 +1547,7 @@ mod tests {
             in_session: AtomicBool::new(false),
             context: DisplayText::new("alpha-desk".to_owned()).expect("short"),
             spoken: (Mutex::new(false), Condvar::new()),
+            local_card: no_local_card,
         };
         let started = Instant::now();
         shared.await_first_word(Duration::from_millis(50));
@@ -1582,6 +1606,7 @@ mod tests {
             in_session: AtomicBool::new(false),
             context: computer_context(),
             spoken: (Mutex::new(false), Condvar::new()),
+            local_card: no_local_card,
         };
         let started = Instant::now();
         pause(&shared, Duration::from_secs(5));
@@ -1708,16 +1733,8 @@ mod tests {
     /// certificate is on the computer.
     #[test]
     fn before_the_phone_connects_the_slot_has_no_token() {
-        let store = scratch_store();
-        FilePairingStore::open(&store)
-            .expect("the test's store")
-            .insert(pairing_made_at(current_time_ms()))
-            .expect("the pairing is stored");
-        // Held here, the pairing's session lock keeps the thread's dial
-        // from reaching a phone.
-        let session = SessionLock::acquire(&session_lock_path(&store, PairId::from_array(PAIR_ID)))
-            .expect("the pairing's session lock");
-        let source = PhoneSource::over_store(store.clone());
+        let (store, session) = a_paired_store_out_of_reach();
+        let source = PhoneSource::over_store(store.clone(), no_local_card);
         let started = Instant::now();
         let offer = source.offered(REMOTE_WAKE_WAIT).expect("the phone's slot");
         assert!(started.elapsed() < REMOTE_WAKE_WAIT + SCHEDULING_SLACK);
@@ -1730,6 +1747,34 @@ mod tests {
         source.stop();
         drop(session);
         std::fs::remove_dir_all(&store).expect("the test's store is removed");
+    }
+
+    /// A card in a reader of this computer suspends remote use: the
+    /// browser sees no phone slot, within the wait the reading was granted.
+    #[test]
+    fn before_the_phone_connects_a_local_card_suspends_the_slot() {
+        let (store, session) = a_paired_store_out_of_reach();
+        let source = PhoneSource::over_store(store.clone(), a_local_card);
+        let started = Instant::now();
+        assert!(source.offered(REMOTE_WAKE_WAIT).is_none());
+        assert!(started.elapsed() < REMOTE_WAKE_WAIT + SCHEDULING_SLACK);
+        source.stop();
+        drop(session);
+        std::fs::remove_dir_all(&store).expect("the test's store is removed");
+    }
+
+    /// A store holding a fresh pairing, and the pairing's session lock,
+    /// which held by the test keeps the thread's dial from reaching a
+    /// phone.
+    fn a_paired_store_out_of_reach() -> (PathBuf, SessionLock) {
+        let store = scratch_store();
+        FilePairingStore::open(&store)
+            .expect("the test's store")
+            .insert(pairing_made_at(current_time_ms()))
+            .expect("the pairing is stored");
+        let session = SessionLock::acquire(&session_lock_path(&store, PairId::from_array(PAIR_ID)))
+            .expect("the pairing's session lock");
+        (store, session)
     }
 
     /// The slot of [`PAIR_ID`].
@@ -1750,7 +1795,7 @@ mod tests {
             .expect("the pairing is stored");
         let session = SessionLock::acquire(&session_lock_path(&store, PairId::from_array(PAIR_ID)))
             .expect("the pairing's session lock");
-        let source = PhoneSource::over_store(store.clone());
+        let source = PhoneSource::over_store(store.clone(), no_local_card);
         let started = Instant::now();
         assert!(source.offered(Duration::ZERO).is_none());
         assert!(started.elapsed() < SCHEDULING_SLACK);
@@ -1855,7 +1900,7 @@ mod tests {
     #[test]
     fn a_source_over_a_missing_store_offers_nothing_and_creates_nothing() {
         let store = scratch_store();
-        let source = PhoneSource::over_store(store.clone());
+        let source = PhoneSource::over_store(store.clone(), no_local_card);
         let started = Instant::now();
         assert!(source.offered(SHORT_WAIT).is_none());
         assert!(started.elapsed() < SHORT_WAIT + SCHEDULING_SLACK);
@@ -1875,7 +1920,7 @@ mod tests {
         // dialing for the pairing.
         let session = SessionLock::acquire(&session_lock_path(&store, PairId::from_array(PAIR_ID)))
             .expect("the pairing's session lock");
-        let source = PhoneSource::over_store(store.clone());
+        let source = PhoneSource::over_store(store.clone(), no_local_card);
         let _ = source.offered(REMOTE_WAKE_WAIT);
         assert!(source.worker.lock().expect("worker").is_some());
         // The thread swept the test's store at its start: the pairing idle

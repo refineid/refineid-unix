@@ -56,7 +56,11 @@ Citations are BibTeX keys in [`references.md`](references.md).
   thirty days old (`REFRESH_AFTER`): TS 119 612 clause 5.3.15 lets an
   operator announce the next update up to six months ahead, while a
   withdrawal is published by reissuing the list at once, so a month
-  bounds how long a withdrawal goes unseen; `--refresh-trust` fetches
+  bounds how long a withdrawal goes unseen; a cache missing the
+  Finnish list is fetched again too. A fetch that leaves the lists due,
+  an operator late with its next list or a list that did not arrive,
+  is not tried again for an hour (`RETRY_AFTER`), so a late list costs
+  one download an hour, not one per command; `--refresh-trust` fetches
   at once. A fetch that fails leaves the cached lists in use, and the
   `trust-lists:` line under `-v` carries their fetch time and `stale`
   when one is overdue; with no list at all the record says `trusted
@@ -71,8 +75,11 @@ Citations are BibTeX keys in [`references.md`](references.md).
   on-card root (`EF.4334`) is path material, never an anchor by
   itself: the software ships no root (`AGENTS.md`, "Certificates and
   trust"; owner's decision of 2026-11-07). With no list cached the row
-  reads `skipped (not anchored: trusted lists not fetched)`, a state
-  of this computer and not a failure of the card; `--offline` uses the
+  reads `skipped (not anchored: trusted lists not fetched)`, and with
+  lists cached but the Finnish one not among them, `skipped (Finnish
+  trusted list unavailable: <reason>)`: states of this computer and
+  not failures of the card. `FAILED` is kept for a chain that does
+  not verify, or that the Finnish list does not name; `--offline` uses the
   cached lists as they are and fetches nothing. The card's issuing CA
   and root are kept under `$XDG_CACHE_HOME/refineid/ca-certificates/`
   until they expire, the directory refineid-core's PKCS#11 module

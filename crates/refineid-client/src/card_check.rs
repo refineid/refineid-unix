@@ -101,6 +101,10 @@ const NO_INTERMEDIATE: &str =
 /// Why a chain is reported unanchored when no trusted list is at
 /// hand: a state of this computer, not of the card.
 const NOT_ANCHORED_NO_LISTS: &str = "not anchored: trusted lists not fetched";
+/// What a chain check that ran without the Finnish list says before
+/// the list's own failure: the lists that did arrive cannot speak for
+/// a FINEID chain, and a download failure says nothing about the card.
+const FINNISH_LIST_UNAVAILABLE: &str = "Finnish trusted list unavailable";
 /// Why a chain fails when the lists at hand name nothing on it.
 const NOT_ANCHORED: &str = "not anchored: no certificate on the chain is a certificate-issuing service the trusted lists name";
 
@@ -1084,9 +1088,11 @@ fn build_cert_report(
 /// material, never an anchor by itself.
 ///
 /// Returns `Ok` when every hop verifies and the chain is anchored;
-/// `Skipped` when no trusted list is at hand or no intermediate is,
-/// states of this computer and not of the card; `Failed` when a hop
-/// does not verify, or the lists at hand name nothing on the chain.
+/// `Skipped` when no trusted list is at hand, the Finnish one is not
+/// among those that are, or no intermediate is, states of this
+/// computer and not of the card; `Failed` when a hop does not verify,
+/// or the lists at hand, the Finnish one among them, name nothing on
+/// the chain.
 fn run_chain_check(
     leaf: &Certificate<'_>,
     intermediate_cert: &AiaIssuerCertStatus,
@@ -1128,9 +1134,14 @@ fn run_chain_check(
     {
         return SignatureCheck::Ok;
     }
-    match ctx.anchors.source {
-        AnchorSource::Unavailable(_) => SignatureCheck::Skipped(NOT_ANCHORED_NO_LISTS.to_owned()),
-        AnchorSource::Lists { .. } => SignatureCheck::Failed(NOT_ANCHORED.to_owned()),
+    match (ctx.anchors.source, ctx.anchors.finnish_gap) {
+        (AnchorSource::Unavailable(_), _) => {
+            SignatureCheck::Skipped(NOT_ANCHORED_NO_LISTS.to_owned())
+        }
+        (AnchorSource::Lists { .. }, Some(gap)) => {
+            SignatureCheck::Skipped(format!("{FINNISH_LIST_UNAVAILABLE}: {gap}"))
+        }
+        (AnchorSource::Lists { .. }, None) => SignatureCheck::Failed(NOT_ANCHORED.to_owned()),
     }
 }
 
@@ -2158,13 +2169,14 @@ mod tests {
     use super::AnchorCert;
     use super::{
         AiaIssuerCert, AiaIssuerCertStatus, CardCheckError, CardCheckHelpers, CheckOutcome,
-        CheckOutcomeSection, NO_INTERMEDIATE, NOT_ANCHORED, NOT_ANCHORED_NO_LISTS, SignatureCheck,
-        VerifyContext, days_between, fmt_check_outcome, now_date_time, run_chain_check, verify_crl,
+        CheckOutcomeSection, FINNISH_LIST_UNAVAILABLE, NO_INTERMEDIATE, NOT_ANCHORED,
+        NOT_ANCHORED_NO_LISTS, SignatureCheck, VerifyContext, days_between, fmt_check_outcome,
+        now_date_time, run_chain_check, verify_crl,
     };
     use crate::test_util::{TestResult, check, check_true};
-    use crate::trusted_lists::{AnchorSource, RunAnchors};
+    use crate::trusted_lists::{AnchorSource, FinnishListGap, RunAnchors};
     use alloc::fmt;
-    use refineid_doc_sign::verification::trusted_list::TrustedListError;
+    use refineid_doc_sign::verification::trusted_list::{ListFailure, TrustedListError};
     use refineid_doc_sign::verification::{AnchorRole, GrantedPeriod, TrustAnchor, TrustAnchors};
     use refineid_lib_core::aa::AaOutcome;
     use refineid_lib_core::apdu::status_word::PinRetries;
@@ -2408,6 +2420,15 @@ mod tests {
                 fetched_at: fixture_now()?,
                 stale: false,
             },
+            finnish_gap: None,
+        })
+    }
+
+    /// Lists at hand without the Finnish one, which did not arrive.
+    fn listed_without_finnish(ders: &[&[u8]]) -> Result<RunAnchors, String> {
+        Ok(RunAnchors {
+            finnish_gap: Some(FinnishListGap::Failed(ListFailure::NotFetched)),
+            ..listed(ders)?
         })
     }
 
@@ -2416,6 +2437,7 @@ mod tests {
         RunAnchors {
             anchors: TrustAnchors::default(),
             source: AnchorSource::Unavailable(TrustedListError::NotFetched),
+            finnish_gap: None,
         }
     }
 
@@ -2623,6 +2645,45 @@ mod tests {
         let outcome = run_chain_check(&leaf_owned.view(), &fetched(&un)?, &ctx);
         if let SignatureCheck::Failed(why) = &outcome {
             check(why, &NOT_ANCHORED.to_owned(), "names the unanchored chain")
+        } else {
+            Err(format!("expected Failed, got {outcome:?}").into())
+        }
+    }
+
+    #[test]
+    fn chain_check_skipped_when_only_the_finnish_list_is_missing() -> TestResult {
+        // The hop verifies and other lists are at hand, but the
+        // Finnish one did not arrive: no word on the card, so the row
+        // is skipped with the list's reason, not FAILED.
+        let un = un_root_der()?;
+        let leaf_owned = parse(&un)?;
+        let root_owned = parse(DVV_ROOT_RSA_DER)?;
+        let anchors = listed_without_finnish(&[DVV_ROOT_ECC_DER])?;
+        let ctx = ctx(Some(&root_owned), None, &anchors)?;
+        let outcome = run_chain_check(&leaf_owned.view(), &fetched(&un)?, &ctx);
+        check(
+            &CardCheckHelpers::fmt_signature_check(&outcome),
+            &format!(
+                "skipped ({FINNISH_LIST_UNAVAILABLE}: {})",
+                ListFailure::NotFetched
+            ),
+            "the row names the missing Finnish list and why",
+        )
+    }
+
+    #[test]
+    fn chain_check_failed_on_a_broken_hop_without_the_finnish_list() -> TestResult {
+        // A leaf its intermediate did not sign fails whatever the
+        // lists hold: a genuine chain failure stays FAILED.
+        let leaf_owned = parse(DVV_ROOT_RSA_DER)?;
+        let anchors = listed_without_finnish(&[DVV_ROOT_ECC_DER])?;
+        let ctx = ctx(None, None, &anchors)?;
+        let outcome = run_chain_check(&leaf_owned.view(), &fetched(DVV_ROOT_ECC_DER)?, &ctx);
+        if let SignatureCheck::Failed(why) = &outcome {
+            check_true(
+                why.contains("leaf -> intermediate"),
+                "names the failing hop",
+            )
         } else {
             Err(format!("expected Failed, got {outcome:?}").into())
         }
