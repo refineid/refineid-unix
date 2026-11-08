@@ -17,15 +17,18 @@
 use core::fmt::Debug;
 
 /// The cause of a reported failure: a fixed text or the case of an error
-/// value. Nothing a value carries passes, so no secret, count or label
-/// can reach the log through it.
+/// value, optionally named with its paired peer and transport. Nothing a
+/// value carries passes, so no secret, count or label can reach the log
+/// through it, except for the paired peer display name (a device label)
+/// and the transport label a session failure names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cause(String);
 
 impl Cause {
-    /// A fixed description.
+    /// A fixed description, or a session failure naming its peer and
+    /// transport.
     #[must_use]
-    pub fn text(text: &'static str) -> Self {
+    pub fn text(text: &str) -> Self {
         Self(text.to_owned())
     }
 

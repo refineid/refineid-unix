@@ -116,6 +116,75 @@ const CARD_REPORT_WAIT: Duration = Duration::from_secs(5);
 /// The lifetime each request asks for unless the caller bounds it
 /// (section 8.1 item 2).
 const OPERATION_LIFETIME: Duration = Duration::from_millis(300_000);
+/// The transport label a failed session names: this host reaches the
+/// phone over the local network stream tier only.
+#[cfg(debug_assertions)]
+pub(crate) const SESSION_TRANSPORT_LABEL: &str = "network";
+/// The peer a failed session names when its pair record cannot be read.
+pub(crate) const UNKNOWN_PAIRING_LABEL: &str = "unknown pairing";
+
+/// A failed session's cause with its peer and transport: `case` is the
+/// error's case name or a fixed text, `peer` the pair record's
+/// `peer_display_name` (a device label, never a holder name).
+#[cfg(debug_assertions)]
+#[must_use]
+pub(crate) fn session_failure_message(case: &str, peer: &str) -> String {
+    format!("{case}, {peer}, {SESSION_TRANSPORT_LABEL}")
+}
+
+/// The peer a failed session names: the pair record's display name, or
+/// [`UNKNOWN_PAIRING_LABEL`] when the record cannot be read. In a release
+/// build this names nothing without reading the store.
+#[cfg(debug_assertions)]
+#[must_use]
+pub(crate) fn pairing_peer_label(store: &impl PairingStore, pair_id: PairId) -> String {
+    store
+        .get(pair_id)
+        .map(|record| record.peer_display_name().as_str().to_owned())
+        .unwrap_or_else(|_| UNKNOWN_PAIRING_LABEL.to_owned())
+}
+
+/// The peer a failed session names: in a release build nothing is read and
+/// [`UNKNOWN_PAIRING_LABEL`] is named without a store lookup.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub(crate) fn pairing_peer_label(store: &impl PairingStore, pair_id: PairId) -> String {
+    let _ = (store, pair_id);
+    UNKNOWN_PAIRING_LABEL.to_owned()
+}
+
+/// Reports a failed session naming its peer and transport; in a release
+/// build this borrows its inputs and writes nothing.
+#[cfg(debug_assertions)]
+fn report_session_error(event: &'static str, peer: &str, error: &impl core::fmt::Debug) {
+    let case = refineid_dev_errors::Cause::case(error);
+    let message = session_failure_message(case.as_str(), peer);
+    refineid_dev_errors::report!(Rapp, event, name message.as_str());
+}
+
+/// Reports a failed session naming its peer and transport; in a release
+/// build this borrows its inputs and writes nothing.
+#[cfg(not(debug_assertions))]
+fn report_session_error(event: &'static str, peer: &str, error: &impl core::fmt::Debug) {
+    let _ = (event, peer, error);
+}
+
+/// Reports a failed session with a fixed text cause, naming its peer and
+/// transport; in a release build this borrows its inputs and writes
+/// nothing.
+#[cfg(debug_assertions)]
+fn report_session_text(event: &'static str, peer: &str, text: &'static str) {
+    let message = session_failure_message(text, peer);
+    refineid_dev_errors::report!(Rapp, event, name message.as_str());
+}
+
+/// Reports a failed session with a fixed text cause, naming its peer and
+/// transport; in a release build this borrows its inputs and writes
+/// nothing.
+#[cfg(not(debug_assertions))]
+fn report_session_text(event: &'static str, peer: &str, text: &'static str) {
+    let _ = (event, peer, text);
+}
 
 /// What a new session waits for before it is handed over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1017,7 +1086,8 @@ impl RemoteReader {
         if !sightings.appearance(pair_id, BacklogRoute::Stream, now) {
             return false;
         }
-        let told = self.deliver_to_appearance(pair_id, &keys, &service, current_time_ms());
+        let peer = record.peer_display_name().as_str().to_owned();
+        let told = self.deliver_to_appearance(pair_id, &peer, &keys, &service, current_time_ms());
         // The echo destroys the record; an expiry the dial found destroys
         // it untold. Either ends the sighting.
         let stays = self
@@ -1053,6 +1123,7 @@ impl RemoteReader {
     fn deliver_to_appearance(
         &mut self,
         pair_id: PairId,
+        peer: &str,
         keys: &PairingKeys,
         service: &StreamService,
         now_ms: u64,
@@ -1063,7 +1134,7 @@ impl RemoteReader {
         };
         let dial = self.dial;
         let Ok(transport) = dial(&service.endpoints, STREAM_CANDIDATE_ID, wait, &preamble) else {
-            refineid_dev_errors::report!(Rapp, "revocation close not delivered", "no session");
+            report_session_text("revocation close not delivered", peer, "no session");
             return false;
         };
         match self.requester.send_revocation_notice(
@@ -1074,11 +1145,11 @@ impl RemoteReader {
         ) {
             Ok(true) => true,
             Ok(false) => {
-                refineid_dev_errors::report!(Rapp, "revocation close not acknowledged", "no echo");
+                report_session_text("revocation close not acknowledged", peer, "no echo");
                 false
             }
             Err(error) => {
-                refineid_dev_errors::report!(Rapp, "revocation close not delivered", error);
+                report_session_error("revocation close not delivered", peer, &error);
                 false
             }
         }
@@ -1242,9 +1313,20 @@ impl RemoteReader {
         discovery_timeout: Duration,
         wait: CardWait,
     ) -> Result<RemoteSession, RemoteError> {
+        #[cfg(debug_assertions)]
+        let peer = pair_id.map_or_else(
+            || {
+                self.phone()
+                    .map(|phone| phone.peer_display_name)
+                    .unwrap_or_else(|| UNKNOWN_PAIRING_LABEL.to_owned())
+            },
+            |pair_id| pairing_peer_label(self.requester.store(), pair_id),
+        );
+        #[cfg(not(debug_assertions))]
+        let peer = UNKNOWN_PAIRING_LABEL.to_owned();
         self.establish_unreported(pair_id, discovery_timeout, wait)
             .inspect_err(|error| {
-                refineid_dev_errors::report!(Rapp, "phone session not opened", error)
+                report_session_error("phone session not opened", &peer, error);
             })
     }
 
@@ -1268,6 +1350,7 @@ impl RemoteReader {
         if record.state() != PairingState::PairedDisconnected {
             return Err(RemoteError::NotPaired);
         }
+        let peer = record.peer_display_name().as_str().to_owned();
         let keys = PairingKeys::derive(record)?;
         let lock = take_lock(&session_lock_path(
             self.requester.store().directory(),
@@ -1305,7 +1388,7 @@ impl RemoteReader {
                         return Err(session_error(error));
                     }
                     Err(error) => {
-                        refineid_dev_errors::report!(Rapp, "phone session attempt failed", error);
+                        report_session_error("phone session attempt failed", &peer, &error);
                         last = RemoteError::Session(error);
                         continue;
                     }
@@ -1340,7 +1423,7 @@ impl RemoteReader {
                         return Err(session_error(error));
                     }
                     Err(error) => {
-                        refineid_dev_errors::report!(Rapp, "phone card report not received", error);
+                        report_session_error("phone card report not received", &peer, &error);
                         last = RemoteError::Session(error);
                     }
                 }
@@ -1373,13 +1456,16 @@ impl RemoteReader {
         operation: &CardOperation,
         lifetime: Duration,
     ) -> Result<CardOperationResult, RemoteError> {
+        let peer = pairing_peer_label(self.requester.store(), session.pair_id());
         execute_on_session(
             &mut self.requester,
             &mut session.session,
             operation,
             lifetime,
         )
-        .inspect_err(|error| refineid_dev_errors::report!(Rapp, "card operation failed", error))
+        .inspect_err(|error| {
+            report_session_error("card operation failed", &peer, error);
+        })
     }
 
     /// Serves an open session for `wait`: answers the phone's pings,
@@ -1396,10 +1482,13 @@ impl RemoteReader {
         session: &mut RemoteSession,
         wait: Duration,
     ) -> Result<(), RemoteError> {
+        let peer = pairing_peer_label(self.requester.store(), session.pair_id());
         self.requester
             .service(&mut session.session, wait)
             .map_err(session_error)
-            .inspect_err(|error| refineid_dev_errors::report!(Rapp, "phone session ended", error))
+            .inspect_err(|error| {
+                report_session_error("phone session ended", &peer, error);
+            })
     }
 
     /// Closes a session deliberately; an already ended session is left
@@ -1478,9 +1567,10 @@ impl RemoteReader {
         session: &mut RemoteSession,
         held: Option<&[u8]>,
     ) -> Result<Vec<u8>, RemoteError> {
+        let peer = pairing_peer_label(self.requester.store(), session.pair_id());
         self.confirmed_auth_cert_unreported(session, held)
             .inspect_err(|error| {
-                refineid_dev_errors::report!(Rapp, "certificate not confirmed", error)
+                report_session_error("certificate not confirmed", &peer, error);
             })
     }
 
@@ -1529,13 +1619,15 @@ mod tests {
         AdmissionError, BACKLOG_LOSS_HOLD, BROWSE_ROUND, BacklogRoute, BacklogSightings,
         CardOperationResult, CardPresence, CardReader, CardRequest, CardStatusMessage,
         CertificateFingerprint, OperationOutcome, PairingKeys, PairingSearchError, RemoteError,
-        RemoteReader, RoutingPreamble, SessionError, StreamError, StreamService, TcpFrameTransport,
-        Withdrawal, current_time_ms, lifetime_ms, operation_result, sessions_for, unix_seconds,
+        RemoteReader, RoutingPreamble, SESSION_TRANSPORT_LABEL, SessionError, StreamError,
+        StreamService, TcpFrameTransport, UNKNOWN_PAIRING_LABEL, Withdrawal, current_time_ms,
+        lifetime_ms, operation_result, pairing_peer_label, session_failure_message, sessions_for,
+        unix_seconds,
     };
     use crate::file_store::{FilePairingStore, path_for};
     use crate::session_lock::{SessionLock, ceremony_lock_path, session_lock_path};
     use crate::store::PairingStore as _;
-    use crate::store::fixtures::{CREATED_AT_MS, record};
+    use crate::store::fixtures::{CREATED_AT_MS, PHONE_NAME, record};
 
     /// The pairing every reader holds.
     const PAIR_ID: [u8; refineid_rapp::PAIR_ID_SIZE] = *b"synthetic-pair-1";
@@ -2489,5 +2581,30 @@ mod tests {
             mine.session_preamble().unwrap(),
             mine.session_preamble().unwrap()
         );
+    }
+
+    #[test]
+    fn a_failed_session_names_its_peer_and_transport() {
+        let directory = scratch();
+        let reader = reader_with_pairing(&directory);
+        let pair_id = PairId::from_array(PAIR_ID);
+        let peer = pairing_peer_label(reader.requester.store(), pair_id);
+        assert_eq!(peer, PHONE_NAME);
+        let line = session_failure_message("Session(HandshakeFailed)", &peer);
+        assert!(line.contains(&peer));
+        assert!(line.contains(SESSION_TRANSPORT_LABEL));
+        assert_eq!(
+            line,
+            format!("Session(HandshakeFailed), {peer}, {SESSION_TRANSPORT_LABEL}")
+        );
+        let unknown = pairing_peer_label(
+            reader.requester.store(),
+            PairId::from_array(UNKNOWN_PAIR_ID),
+        );
+        assert_eq!(unknown, UNKNOWN_PAIRING_LABEL);
+        let unknown_line = session_failure_message("Session(Transport)", &unknown);
+        assert!(unknown_line.contains(UNKNOWN_PAIRING_LABEL));
+        assert!(unknown_line.contains(SESSION_TRANSPORT_LABEL));
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

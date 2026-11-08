@@ -83,6 +83,54 @@ use refineid_remote::{DisplayText, RemoteKeyProfile, RemoteSignatureAlgorithm, S
 /// How long one dial browses for the phone beyond its first round: none,
 /// so a dial tries the phones in sight once.
 const DIAL_BROWSE: Duration = Duration::ZERO;
+/// The transport label a failed session names: the phone is reached over
+/// the local network stream tier only.
+#[cfg(debug_assertions)]
+const SESSION_TRANSPORT_LABEL: &str = "network";
+/// The peer a failed session names when no paired phone is served.
+const UNKNOWN_PAIRING_LABEL: &str = "unknown pairing";
+
+/// A failed session's cause with its peer and transport: `case` is the
+/// error's case name or a fixed text, `peer` the paired phone's display
+/// name (a device label, never a holder name).
+#[cfg(debug_assertions)]
+#[must_use]
+fn session_failure_message(case: &str, peer: &str) -> String {
+    format!("{case}, {peer}, {SESSION_TRANSPORT_LABEL}")
+}
+
+/// Reports a failed signature request naming its peer and transport; in a
+/// release build this borrows its inputs and writes nothing.
+#[cfg(debug_assertions)]
+fn report_signature_failure(peer: &str, error: &RemoteSignError) {
+    let case = refineid_dev_errors::Cause::case(error);
+    let message = session_failure_message(case.as_str(), peer);
+    refineid_dev_errors::report!(Pkcs11, "signature request failed", name message.as_str());
+}
+
+/// Reports a failed signature request naming its peer and transport; in a
+/// release build this borrows its inputs and writes nothing.
+#[cfg(not(debug_assertions))]
+fn report_signature_failure(peer: &str, error: &RemoteSignError) {
+    let _ = (peer, error);
+}
+
+/// Reports a failed session event with a fixed text cause, naming its peer
+/// and transport; in a release build this borrows its inputs and writes
+/// nothing.
+#[cfg(debug_assertions)]
+fn report_session_text(event: &'static str, peer: &str, text: &'static str) {
+    let message = session_failure_message(text, peer);
+    refineid_dev_errors::report!(Pkcs11, event, name message.as_str());
+}
+
+/// Reports a failed session event with a fixed text cause, naming its peer
+/// and transport; in a release build this borrows its inputs and writes
+/// nothing.
+#[cfg(not(debug_assertions))]
+fn report_session_text(event: &'static str, peer: &str, text: &'static str) {
+    let _ = (event, peer, text);
+}
 
 /// The pause between looks for the phone while no session is held.
 const LOOK_PAUSE: Duration = Duration::from_secs(1);
@@ -798,7 +846,11 @@ fn dial_due(
     let asked = wanted && view.consumer_request() == ConsumerAnswer::Dial;
     if wanted && !asked {
         while let Ok(request) = requests.try_recv() {
-            refuse(&request, RemoteSignError::Withdrawn);
+            refuse(
+                &request,
+                RemoteSignError::Withdrawn,
+                &phone.peer_display_name,
+            );
         }
     }
     appeared || redial || asked
@@ -817,14 +869,15 @@ fn unpaired(shared: &Shared, requests: &Receiver<SignRequest>) {
     shared.withdraw_slot();
     shared.wanted.store(false, Ordering::Release);
     while let Ok(request) = requests.try_recv() {
-        refuse(&request, RemoteSignError::Withdrawn);
+        refuse(&request, RemoteSignError::Withdrawn, UNKNOWN_PAIRING_LABEL);
     }
     pause(shared, UNPAIRED_PAUSE);
 }
 
-/// Answers `request` with `error`, the module's failure for the browser.
-fn refuse(request: &SignRequest, error: RemoteSignError) {
-    refineid_dev_errors::report!(Pkcs11, "signature request failed", error);
+/// Answers `request` with `error`, the module's failure for the browser,
+/// naming the paired `peer` and the transport.
+fn refuse(request: &SignRequest, error: RemoteSignError, peer: &str) {
+    report_signature_failure(peer, &error);
     let _ = request.reply.send(Err(error));
 }
 
@@ -982,7 +1035,11 @@ fn hold(
                 );
             }
             Ok(request) if request.pair_id != slot => {
-                refuse(&request, RemoteSignError::Withdrawn);
+                refuse(
+                    &request,
+                    RemoteSignError::Withdrawn,
+                    &phone.peer_display_name,
+                );
             }
             Ok(request) => match &confirmed {
                 // No card this session confirmed: absence, or a card whose
@@ -993,7 +1050,7 @@ fn hold(
                     } else {
                         RemoteSignError::CardAbsent
                     };
-                    refuse(&request, error);
+                    refuse(&request, error, &phone.peer_display_name);
                 }
                 Some(card) => {
                     let signed = sign(reader, &mut session, &request);
@@ -1006,12 +1063,16 @@ fn hold(
                         // read: the token goes with its certificate, and the
                         // next session reads the card again.
                         Err(Failure::Mismatch) => {
-                            refineid_dev_errors::report!(
-                                Pkcs11,
+                            report_session_text(
                                 "signature not handed on",
-                                "it does not verify under the confirmed certificate"
+                                &phone.peer_display_name,
+                                "it does not verify under the confirmed certificate",
                             );
-                            refuse(&request, RemoteSignError::Ambiguous);
+                            refuse(
+                                &request,
+                                RemoteSignError::Ambiguous,
+                                &phone.peer_display_name,
+                            );
                             reader.close_session(session);
                             return Held {
                                 after: After::Withdraw,
@@ -1024,7 +1085,7 @@ fn hold(
                             let _ = request.reply.send(Err(RemoteSignError::Unsupported));
                         }
                         Err(Failure::Sign(error)) => {
-                            refuse(&request, error);
+                            refuse(&request, error, &phone.peer_display_name);
                             match error {
                                 // The phone stopped serving or forgot this
                                 // computer: its presence goes at once.

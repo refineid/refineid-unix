@@ -32,8 +32,10 @@
 //! A cause is a name and nothing else: the case of an error value with
 //! every payload that is not itself a case dropped, or a fixed text. An
 //! entry never carries a PIN, PUK or card access number, their length or
-//! digits, a name, certificate content, an APDU or ATR, an address, a
-//! host, reader or device name, a serial number or a path.
+//! digits, a holder name, certificate content, an APDU or ATR, an address,
+//! a live host, reader or serial number, a path, or an ATR. A session that
+//! ends as a failure names its paired peer display name (a device label,
+//! never a holder name) and its transport label alongside the case.
 //!
 //! A release build compiles none of this: [`report!`] expands to nothing,
 //! so no sink, socket or message text reaches the binary. A `cargo test`
@@ -107,7 +109,9 @@ macro_rules! report {
 #[macro_export]
 macro_rules! report {
     ($component:ident, $event:expr, $cause:literal) => {{}};
-    ($component:ident, $event:expr, name $name:expr) => {{}};
+    ($component:ident, $event:expr, name $name:expr) => {{
+        let _ = $name;
+    }};
     ($component:ident, $event:expr, $cause:ident) => {{
         let _ = &$cause;
     }};
