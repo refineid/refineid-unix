@@ -123,17 +123,17 @@ const CARD_REPORT_WAIT: Duration = Duration::from_secs(5);
 /// (section 8.1 item 2).
 const OPERATION_LIFETIME: Duration = Duration::from_millis(300_000);
 /// The transport label of the local network stream tier.
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 const STREAM_TRANSPORT_LABEL: &str = "network";
 /// The transport label of BLE.
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 const BLE_TRANSPORT_LABEL: &str = "bluetooth";
 /// The label of a search no attempt of which reached a phone: the tiers
 /// searched, none of which carried anything.
-#[cfg(all(debug_assertions, target_os = "freebsd"))]
+#[cfg(all(any(debug_assertions, test), target_os = "freebsd"))]
 const SEARCHED_TIERS_LABEL: &str = "searched network and bluetooth";
 /// The label of a search no attempt of which reached a phone.
-#[cfg(all(debug_assertions, not(target_os = "freebsd")))]
+#[cfg(all(any(debug_assertions, test), not(target_os = "freebsd")))]
 const SEARCHED_TIERS_LABEL: &str = "searched network";
 /// How long the BLE scan of one round listens: as long as one browse
 /// round, enough to hear a phone in Android's slowest advertising mode,
@@ -154,7 +154,7 @@ pub enum SessionTier {
 
 impl SessionTier {
     /// The label a failure on this tier names in the debug error sink.
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -169,7 +169,7 @@ impl SessionTier {
 /// `peer_display_name` (a device label, never a holder name), and `tier`
 /// the tier that carried the failure, or `None` when no attempt reached a
 /// phone, which names the tiers searched.
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 #[must_use]
 pub(crate) fn session_failure_message(case: &str, peer: &str, tier: Option<SessionTier>) -> String {
     let transport = tier.map_or(SEARCHED_TIERS_LABEL, SessionTier::label);
@@ -179,7 +179,7 @@ pub(crate) fn session_failure_message(case: &str, peer: &str, tier: Option<Sessi
 /// The peer a failed session names: the pair record's display name, or
 /// [`UNKNOWN_PAIRING_LABEL`] when the record cannot be read. In a release
 /// build this names nothing without reading the store.
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 #[must_use]
 pub(crate) fn pairing_peer_label(store: &impl PairingStore, pair_id: PairId) -> String {
     store
@@ -190,7 +190,7 @@ pub(crate) fn pairing_peer_label(store: &impl PairingStore, pair_id: PairId) -> 
 
 /// The peer a failed session names: in a release build nothing is read and
 /// [`UNKNOWN_PAIRING_LABEL`] is named without a store lookup.
-#[cfg(not(debug_assertions))]
+#[cfg(not(any(debug_assertions, test)))]
 #[must_use]
 pub(crate) fn pairing_peer_label(store: &impl PairingStore, pair_id: PairId) -> String {
     let _ = (store, pair_id);
