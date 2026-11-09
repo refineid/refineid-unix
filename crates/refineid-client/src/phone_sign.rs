@@ -449,12 +449,18 @@ fn sign_over<Link: PhoneLink>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(debug_assertions)]
     use std::path::PathBuf;
 
+    #[cfg(debug_assertions)]
     use refineid_doc_sign::cades::SigningTime;
+    #[cfg(debug_assertions)]
     use refineid_doc_sign::document::Format;
+    #[cfg(debug_assertions)]
     use refineid_doc_sign::pades::SignatureMetadata;
+    #[cfg(debug_assertions)]
     use refineid_doc_sign::service::{DocumentRequest, SignOutput, SigningDevice};
+    #[cfg(debug_assertions)]
     use refineid_doc_sign::testkit::{
         CertificateSpec, KEY_USAGE_NON_REPUDIATION, KEY_USAGE_NON_REPUDIATION_UNUSED, TestCurve,
         TestKey, certificate, day, key_usage, minimal_pdf,
@@ -463,15 +469,21 @@ mod tests {
     use refineid_rapp_core::store::PairingState;
 
     use super::*;
-    use crate::test_util::{TempDir, TestResult, check, check_true};
+    #[cfg(debug_assertions)]
+    use crate::test_util::{TempDir, check_true};
+    use crate::test_util::{TestResult, check};
 
     /// First day of the fixture certificate's validity.
+    #[cfg(debug_assertions)]
     const NOT_BEFORE: u8 = 1;
     /// Last day of the fixture certificate's validity.
+    #[cfg(debug_assertions)]
     const NOT_AFTER: u8 = 28;
     /// Serial of the phone's signature certificate.
+    #[cfg(debug_assertions)]
     const SIGNER_SERIAL: u8 = 7;
     /// The claimed signing time, inside the fixture validity.
+    #[cfg(debug_assertions)]
     const SIGNING_TIME: SigningTime = SigningTime {
         year: 2026,
         month: 6,
@@ -484,6 +496,7 @@ mod tests {
     const PAIR_ID: [u8; 16] = *b"synthetic-pair-1";
 
     /// What the scripted phone answers to a signing request.
+    #[cfg(debug_assertions)]
     #[derive(Debug, Clone)]
     enum Answer {
         /// Signs every digest.
@@ -495,6 +508,7 @@ mod tests {
     /// A paired phone whose card holds a P-384 key, answering
     /// `read_certificate` with its certificate and a signing request as
     /// `answer` says. Records every operation it was asked.
+    #[cfg(debug_assertions)]
     struct ScriptedPhone {
         key: TestKey,
         certificate: Vec<u8>,
@@ -502,6 +516,7 @@ mod tests {
         seen: Vec<CardOperation>,
     }
 
+    #[cfg(debug_assertions)]
     impl ScriptedPhone {
         fn new(answer: Answer) -> Self {
             let key = TestKey::derive(TestCurve::P384, b"phone-signature");
@@ -527,6 +542,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     impl PhoneLink for &mut ScriptedPhone {
         fn run(&mut self, operation: &CardOperation) -> Result<CardOperationResult, RemoteError> {
             self.seen.push(operation.clone());
@@ -553,6 +569,7 @@ mod tests {
 
     /// A level-B request: no authority is reached, so only a
     /// development build signs it.
+    #[cfg(debug_assertions)]
     fn request(format: Format) -> DocumentRequest {
         DocumentRequest {
             format,
@@ -569,6 +586,7 @@ mod tests {
     }
 
     /// One PDF named `name` in `dir`.
+    #[cfg(debug_assertions)]
     fn pdf(dir: &TempDir, name: &str) -> Result<PhoneSignOptions, std::io::Error> {
         Ok(PhoneSignOptions {
             input: dir.write(name, &minimal_pdf())?,
@@ -578,6 +596,7 @@ mod tests {
     }
 
     /// Where `documents` are written.
+    #[cfg(debug_assertions)]
     fn outputs(documents: &[PhoneSignOptions]) -> Vec<PathBuf> {
         documents
             .iter()
@@ -585,6 +604,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn one_document_is_one_sign_document_after_the_certificate() -> TestResult {
         let dir = TempDir::new("phone-one")?;
@@ -627,6 +647,7 @@ mod tests {
         )
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn several_documents_are_one_batch() -> TestResult {
         let dir = TempDir::new("phone-batch")?;
@@ -658,6 +679,7 @@ mod tests {
     }
 
     /// One `ASiC-E` package in `dir` over the files `names`, in order.
+    #[cfg(debug_assertions)]
     fn package(dir: &TempDir, names: &[&str]) -> Result<PhoneSignOptions, std::io::Error> {
         let mut inputs = names
             .iter()
@@ -674,6 +696,7 @@ mod tests {
         })
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_package_is_one_sign_document_listing_its_files_in_order() -> TestResult {
         let dir = TempDir::new("phone-package")?;
@@ -699,6 +722,7 @@ mod tests {
         )
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_package_among_several_documents_never_reaches_the_phone() -> TestResult {
         let dir = TempDir::new("phone-package-batch")?;
@@ -719,6 +743,7 @@ mod tests {
         check_true(!written.iter().any(|path| path.exists()), "nothing written")
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_refused_signing_writes_nothing_and_keeps_its_cause() -> TestResult {
         let dir = TempDir::new("phone-refused")?;
@@ -742,6 +767,7 @@ mod tests {
         check_true(!written.iter().any(|path| path.exists()), "nothing written")
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_phone_without_its_card_says_so() -> TestResult {
         let dir = TempDir::new("phone-no-card")?;
