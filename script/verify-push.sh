@@ -5,6 +5,8 @@ set -eu
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/script/test-documentation-gate.py"
+
 if ! command -v cargo >/dev/null 2>&1; then
     echo "verify-push: cargo not found on PATH" >&2
     exit 1
