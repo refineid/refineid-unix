@@ -20,6 +20,7 @@ _refineid() {
       local -a commands
       commands=(
         'card:read the card\: certificates, revocation, PINs'
+        'scs:serve the localhost signing service for browsers'
         'pin:activate, change or unblock a PIN'
         'document:sign or verify a document'
         'phone:show the paired phone'
@@ -34,10 +35,11 @@ _refineid() {
     arguments)
       # words[1] is the command word, possibly shortened.
       local group
-      group=$(_refineid_expand "$words[1]" card pin document phone verify cert reader expert help)
+      group=$(_refineid_expand "$words[1]" card scs pin document phone verify cert reader expert help)
       curcontext="${curcontext%:*:*}:refineid-$group:"
       case $group in
         card) _refineid_card && ret=0 ;;
+        scs) _refineid_scs && ret=0 ;;
         pin) _refineid_pin && ret=0 ;;
         document) _refineid_document && ret=0 ;;
         phone) _refineid_phone && ret=0 ;;
@@ -148,6 +150,9 @@ _refineid_card() {
         '--remote[read the card through the paired phone only]'
       ;;
   esac
+}
+
+_refineid_scs() {
 }
 
 _refineid_pin() {

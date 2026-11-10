@@ -96,6 +96,8 @@ pub enum VerbTag {
     PhoneUnpair,
     /// `phone auth` -- log in to a TLS site through the paired phone.
     PhoneAuth,
+    /// `scs` -- serve the localhost signing service for browsers.
+    Scs,
 }
 
 impl VerbTag {
@@ -125,6 +127,7 @@ impl VerbTag {
             Self::PhonePair => "phone pair",
             Self::PhoneUnpair => "phone unpair",
             Self::PhoneAuth => "phone auth",
+            Self::Scs => "scs",
         }
     }
 
@@ -139,6 +142,7 @@ impl VerbTag {
         Self::CardDecryptAuth,
         Self::CardPubkey,
         Self::CardExportAll,
+        Self::Scs,
         Self::PinActivate,
         Self::PinChange,
         Self::PinUnblock,
@@ -169,6 +173,7 @@ impl VerbTag {
             Self::CardDecryptAuth => "decrypt a file with the authentication key",
             Self::CardPubkey => "print a public key as SSH or PEM",
             Self::CardExportAll => "write every public artefact to a directory",
+            Self::Scs => "serve the localhost signing service for browsers",
             Self::DocumentSign => "sign files as PAdES, CAdES or ASiC-E",
             Self::DocumentVerify => "verify a signed document's signatures",
             Self::PhonePair => "pair with a phone",
@@ -197,6 +202,7 @@ impl VerbTag {
             Self::CardDecryptAuth => super::card_decrypt_auth::HELP,
             Self::CardPubkey => super::card_pubkey::HELP,
             Self::CardExportAll => super::card_export_all::HELP,
+            Self::Scs => super::scs::HELP,
             Self::DocumentSign => super::document_sign::HELP,
             Self::DocumentVerify => super::document_verify::HELP,
             Self::PhonePair => super::card_pair::PAIR_HELP,
@@ -277,6 +283,7 @@ impl VerbTag {
             Self::CardExportAll => {
                 Verb::CardExportAll(super::card_export_all::ExportAllArgs::parse(rest)?)
             }
+            Self::Scs => Verb::Scs(super::scs::ScsArgs::parse(rest)?),
             Self::PinActivate => Verb::PinActivate(super::pin_activate::ActivateArgs::parse(rest)?),
             Self::PinChange => Verb::PinChange(super::pin_change::ChangePinArgs::parse(rest)?),
             Self::PinUnblock => Verb::PinUnblock(super::pin_unblock::UnblockPinArgs::parse(rest)?),
@@ -350,6 +357,8 @@ pub enum Verb {
     PhoneUnpair(super::card_pair::UnpairArgs),
     /// `phone auth` -- log in to a TLS site through the paired phone.
     PhoneAuth(super::card_pair::AuthArgs),
+    /// `scs` -- serve the localhost signing service.
+    Scs(super::scs::ScsArgs),
 }
 
 impl Verb {
@@ -383,6 +392,7 @@ impl Verb {
             Self::PhoneCheck(_) => VerbTag::PhoneCheck,
             Self::PhoneUnpair(_) => VerbTag::PhoneUnpair,
             Self::PhoneAuth(_) => VerbTag::PhoneAuth,
+            Self::Scs(_) => VerbTag::Scs,
         }
     }
 
@@ -413,6 +423,7 @@ impl Verb {
             Self::PhoneCheck(a) => a.run(),
             Self::PhoneUnpair(a) => a.run(verbose),
             Self::PhoneAuth(a) => a.run(verbose),
+            Self::Scs(a) => a.run(verbose),
         }
     }
 }

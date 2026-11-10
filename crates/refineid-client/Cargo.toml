@@ -51,6 +51,7 @@ refineid-pace.workspace = true
 refineid-pcsc.workspace = true
 refineid-rapp-core.workspace = true
 refineid-remote.workspace = true
+refineid-scs.workspace = true
 refineid-lib-pcsc.workspace = true
 refineid-dev-errors.workspace = true
 refineid-lib-tls = { workspace = true, optional = true }
@@ -69,3 +70,11 @@ rustix = { workspace = true, features = ["process"] }
 # argv, env, or any log line.
 rpassword.workspace = true
 zeroize.workspace = true
+# TLS server for `scs`: the loopback HTTPS listener. Always
+# available, unlike the client fetches behind `tls-rustls`.
+rustls.workspace = true
+# P-256 for the SCS localhost identity (key, PKCS#8, ECDSA).
+p256.workspace = true
+pkcs8.workspace = true
+# Randomness for the SCS identity key and certificate serial.
+getrandom.workspace = true

@@ -48,6 +48,7 @@ refineid-pkcs11 = { git = "https://github.com/refineid/refineid-core.git", branc
 refineid-remote = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-doc-sign = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pace = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
+refineid-scs = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 fltk = "1.5.23"
 gtk4 = "0.11"
 
@@ -117,6 +118,15 @@ rpassword = "7"
 # PC/SC adapter for the desktop card backend.
 pcsc = "2.9"
 
+# P-256 for the SCS localhost identity: key generation, PKCS#8
+# storage, and the self-signed certificate's ECDSA signature. Same
+# version the core workspace pins; arithmetic-only there, signing
+# here.
+p256 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pkcs8"] }
+# PKCS#8 key encoding for the SCS identity: the traits behind the
+# P-256 key's storage form.
+pkcs8 = { version = "0.11", features = ["alloc"] }
+
 [workspace.lints.rust]
 meta_variable_misuse = "warn"
 missing_copy_implementations = "warn"
@@ -170,4 +180,11 @@ enum_glob_use = "deny"
 unwrap_used = "deny"
 allow_attributes_without_reason = "deny"
 chunks_exact_to_as_chunks = "allow"
+
+# TEMPORARY development patch, removed before merge: refineid-scs
+# lives on the core `scs` branch until that change merges, so local
+# builds resolve it from the sibling worktree. The git dependency
+# above is what ships; this branch merges after the core one.
+[patch."https://github.com/refineid/refineid-core.git"]
+refineid-scs = { path = "../refineid-core-scs/crates/scs" }
 

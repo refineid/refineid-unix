@@ -83,7 +83,8 @@ impl Block {
             | VerbTag::CardSignQualified
             | VerbTag::CardDecryptAuth
             | VerbTag::CardPubkey
-            | VerbTag::CardExportAll => Self::Card,
+            | VerbTag::CardExportAll
+            | VerbTag::Scs => Self::Card,
             VerbTag::PinActivate | VerbTag::PinChange | VerbTag::PinUnblock => Self::Pin,
             VerbTag::DocumentSign | VerbTag::DocumentVerify => Self::Document,
             VerbTag::PhonePair
@@ -127,6 +128,7 @@ impl Tier {
             | VerbTag::CardDecryptAuth
             | VerbTag::CardPubkey
             | VerbTag::CardExportAll
+            | VerbTag::Scs
             | VerbTag::PhoneAuth
             | VerbTag::Verify
             | VerbTag::CertShow

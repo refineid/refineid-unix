@@ -69,6 +69,9 @@ pub mod http;
 pub mod phone_sign;
 pub mod pin_source;
 pub mod reader_keyboard;
+pub mod scs_backend;
+pub mod scs_identity;
+pub mod scs_server;
 pub mod signer_anchors;
 #[cfg(test)]
 mod test_card;

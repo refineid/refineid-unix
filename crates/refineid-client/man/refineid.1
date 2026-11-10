@@ -598,6 +598,13 @@ serial number.
 Write every public artefact to
 .Ar dir .
 No PIN, no network.
+.It Cm scs
+Serve the Signature Creation Service on
+.Lk https://127.0.0.1:53952
+until interrupted: web pages sign through the local card.
+The first run generates the server identity and prints its
+certificate fingerprint; later runs reuse it.
+Every signature prompts for its PIN, naming the site and the digest.
 .It Cm phone auth Op Ar url
 Log in to a TLS site with the card in the paired phone and print the
 response's status line.
@@ -711,6 +718,21 @@ Without
 .Pa $HOME/.config/refineid/rapp-pairs/ ;
 under a Snap,
 .Pa $SNAP_USER_COMMON/.config/refineid/rapp-pairs/ .
+.It Pa $XDG_CONFIG_HOME/refineid/scs-identity/
+The SCS server identity: the P-256 private key
+.Pa ( key.p8 )
+and its self-signed certificate
+.Pa ( cert.der ) ,
+both owner-only, generated on the first
+.Cm scs
+run.
+Without
+.Ev XDG_CONFIG_HOME ,
+.Pa $HOME/.config/refineid/scs-identity/ ;
+under a Snap,
+.Pa $SNAP_USER_COMMON/.config/refineid/scs-identity/ .
+Deleting the directory makes the next run generate a new identity,
+which browsers must be told to trust again.
 .It Pa $XDG_CACHE_HOME/refineid/trusted-lists/
 The EU trusted lists
 .Cm document verify
