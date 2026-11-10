@@ -1,6 +1,52 @@
 #!/bin/sh
 # Copyright 2026 Petri Koistinen. Licensed under the Apache License, Version 2.0.
+#
+# Mandatory pre-push gate; enabled per clone by script/install-hooks.sh.
+# Bypassing it (--no-verify or otherwise) is prohibited for every
+# contributor, human or AI agent alike.
+#
+# The gate verifies the commit being pushed, not whatever happens to be
+# checked out: when the pushed commit is the clean HEAD of this tree it
+# runs here, and otherwise in a temporary worktree of that commit, with
+# a build cache of its own under this tree's target directory, so no
+# binary built there is ever reused here.
 set -eu
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-exec "$REPO_ROOT/script/verify-push.sh"
+root=$(git rev-parse --show-toplevel)
+updates=$(mktemp "${TMPDIR:-/tmp}/refineid-push-updates.XXXXXX")
+trap 'rm -f "$updates"' EXIT INT TERM
+cat > "$updates"
+if python3 "$root/script/documentation-gate.py" push "${1:-origin}" < "$updates"; then
+    exit 0
+else
+    status=$?
+    [ "$status" -eq 1 ] || exit "$status"
+fi
+
+zero=0000000000000000000000000000000000000000
+head=$(git rev-parse HEAD)
+# git-common-dir identifies the main clone even from a task worktree.
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+worktrees=$(dirname "$(dirname "$common")")/wt
+mkdir -p "$worktrees"
+if [ ! -s "$updates" ]; then
+    "$root/script/verify-push.sh"
+    exit $?
+fi
+
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+    if [ "$local_sha" = "$zero" ]; then
+        continue
+    fi
+    if [ "$local_sha" = "$head" ] && git diff --quiet && git diff --cached --quiet; then
+        "$root/script/verify-push.sh"
+        continue
+    fi
+    tmp=$(mktemp -d "$worktrees/refineid-unix-push.XXXXXX")
+    git worktree add --detach --quiet "$tmp" "$local_sha"
+    trap 'git worktree remove --force "$tmp"; rm -f "$updates"' EXIT INT TERM
+    echo "pre-push: verifying $(git rev-parse --short "$local_sha") in a clean worktree"
+    (cd "$tmp" && CARGO_TARGET_DIR="$root/target/pushed-commit" "$tmp/script/verify-push.sh")
+    git worktree remove --force "$tmp"
+    trap 'rm -f "$updates"' EXIT INT TERM
+done < "$updates"

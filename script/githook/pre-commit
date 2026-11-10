@@ -5,6 +5,14 @@ set -eu
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+# Only an entirely prose-only staged change takes the documentation lane.
+if python3 "$REPO_ROOT/script/documentation-gate.py" commit; then
+    exit 0
+else
+    status=$?
+    [ "$status" -eq 1 ] || exit "$status"
+fi
+
 # RefineID's own crates are never pinned: every commit builds the head of
 # refineid-core main. Without the network the lock file keeps its core
 # revision, and the daily track-core-main job moves it later. This comes
