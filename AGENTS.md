@@ -64,11 +64,12 @@ The front agent owns task decomposition, integration, publication, and
 installation under the owner's standing authorization, including the
 authorizations stated in this document, and may complete small
 or tightly coupled changes itself rather than delegating. An
-implementation agent owns only its assigned worktree and brief. General instructions in this
-document to commit, push, merge, file issues, or install apply to the
-front agent. An explicit owner order may delegate commit and push for
-one run, with the commit and scan rules in the brief; opening pull
-requests, review, issue filing,
+implementation agent owns only its assigned worktree and brief.
+General instructions in this document to commit, push, open pull
+requests, merge, review, file issues, or install apply to the
+front agent. An explicit owner order may delegate commit on and push
+to the assigned task branch for one run, with the commit and scan
+rules in the brief; opening pull requests, review, issue filing,
 installation, and merge are never delegated to an implementation
 agent. Workers report deferred findings in their handoff for the
 front agent to file. Where independence is required, the front
@@ -143,7 +144,8 @@ in `doc/`, not here.
 
 - Commits are cheap backups. The front agent makes small, focused commits
   often, without asking for permission, once the required commit checks
-  pass. Workers commit only under an explicit owner order in the brief.
+  pass. Workers commit and push only under an explicit owner order in
+  the brief.
 - Complete the integration without waiting for another instruction
   (this instruction applies to the front agent; workers follow their
   brief): push
@@ -265,15 +267,46 @@ record for RAPP and its applications.
 - Describe what the code does and cite the source; ask the owner before
   changing trust behavior.
 
+## Validation follows the change
+
+- Mandatory hooks select the validation lane; agents never bypass them.
+  Only explicitly allowlisted prose-only changes qualify for documentation
+  checks: whitespace and applicable repository-local links. Keep shared
+  working-method copies identical across the five active implementation repos.
+- Code, tests, dependencies, build configuration, gate scripts, mixed changes
+  and unknown paths retain the existing strict engineering gates. Agent skill
+  or confidence never waives those checks. Executable documentation and build
+  inputs do not qualify as prose merely because they use Markdown.
+- Commit classification covers the staged change. Push classification covers
+  every outgoing commit and ref, including changes later reverted. Uncertain
+  classification takes the full lane; a failed documentation check fails the
+  hook. Changing the classifier or its hooks requires the full lane itself.
+- Review and validation are separate: consequential policy changes need
+  independent review, but prose alone needs no application build, signing,
+  installation or hardware test. Install and hardware instructions apply only
+  when the change affects the relevant application or card behavior.
+
 ## Independent review
 
 - Review is tiered per the working method. Before a pull request
-  merges, review its diff independently with the `agy` CLI and the
-  `gemini-3.8-flash-high` model, unless the change is eligible for
-  self-review.
-- Run `agy` headless in its sandbox and plan mode, from an empty directory,
-  with the diff pasted into the prompt and no tool use. Frame the request as
-  a code review from the project's author.
+  merges, review its diff independently with the first working
+  reviewer below from a different family than the one that wrote
+  it, unless the change is eligible for self-review. Try in this
+  order, strongest model each offers (see each CLI's model list):
+  the `codex` CLI (only when the maintainer has already authorized
+  its use), a Claude model via `agy`, DeepSeek via OpenCode,
+  Gemini via `agy`, and finally the `muse` CLI. Skip any reviewer
+  sharing the author's family or lacking authorization,
+  availability, or quota. If none remains, stop and report to the
+  owner instead of merging unreviewed.
+- A model family is the organization that trained the model. When
+  family membership is uncertain, treat the reviewer as
+  same-family and skip it.
+- Run the reviewer headless from an empty directory, with the diff
+  pasted into the prompt and no tool use; use each CLI's sandbox
+  and plan (no-edit) mode where it offers one, and never run a
+  reviewer with tools enabled. Frame the request as a code review
+  from the project's author.
 - Check every finding against the code. Fix the real ones and list the
   rejected ones, with the reason, in the pull request description.
 

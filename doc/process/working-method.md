@@ -21,6 +21,16 @@ activity. When a simpler workflow provides sufficient assurance, use it.
 Simplification applies only to default practices; it never removes
 required assurance or alters authority limits.
 
+An owner-decided change is not a design task. When the owner states
+the exact change, apply it faithfully, verify the diff contains
+nothing else, and land it once its review tier is satisfied.
+Do not re-litigate the decision; report defects found while
+verifying, and escalate before acting when the decision violates
+an invariant or contradicts a specification.
+Hook-maintained lockfile and version-stamp refreshes under a change
+are expected side effects, not scope expansion; confirm they change
+only versions and revisions, and investigate any new source.
+
 Instructions fall into three categories:
 
 - **Invariants**: unconditional requirements, namely the shared
@@ -28,7 +38,7 @@ Instructions fall into three categories:
   network, and PIN codes, PUK, CAN, PIN data, candidate lengths, and
   character offsets are never logged. Unconditional rules in AGENTS.md
   bind equally. Zero exceptions, regardless of change size.
-- **Required assurance**: at minimum, the repository's full gate floor,
+- **Required assurance**: at minimum, the repository's gate floor selected by change scope,
   independent review where required below, STPA sized to the change
   for any change with a control structure to analyse, and hardware
   verification where AGENTS.md requires it.
@@ -48,8 +58,9 @@ developer or an agent. The loops are:
 - **The owner tries the change on real devices** and says what is wrong.
 - **Development builds show every error** on screen and in the system log
   (this repository's AGENTS.md). Release builds log nothing.
-- **Gates** run at commit and push: format, lint, build, tests. Never skip
-  them. Continuous integration reports problems after the merge; it never
+- **Gates** run at commit and push. Allowlisted prose-only changes run
+  documentation checks; code, mixed changes and unknown paths run the strict
+  engineering floor. Never bypass the hooks. Continuous integration reports problems after the merge; it never
   gates one.
 - **Review** reads every diff before it merges: trivial changes may be
   self-reviewed; consequential diffs need independent review by a model
@@ -89,10 +100,11 @@ protocol requires.
 
 Delegate when the task has no open interpretation, a bounded change
 surface, and an independently checkable result. The front agent retains
-unresolved
-specification interpretation, security policy, cross-repository design,
+unresolved specification interpretation, security policy,
+cross-repository design,
 and acceptance decisions. Small or tightly coupled changes may be
-completed by the front agent itself rather than delegating.
+completed by the front agent itself rather than delegating; no brief
+is needed for work the front agent does itself.
 
 Assign implementation agents by demonstrated capability on the
 task class, not permanent model rankings. Every assignee follows
@@ -124,7 +136,7 @@ the implementation agent rules.
    expansion, two failed attempts at the same problem without new
    evidence (an attempt is one edit-and-verify cycle; new evidence is
    a new fact changing the diagnosis, not a different symptom of the
-   same cause), or four failed attempts at the same problem in total.
+   same cause), or four failed attempts in total across the brief.
 10. Evidence required: base revision, commands, exit status,
     untested items.
 11. What to report: files changed, decisions made, results with commands,
@@ -148,16 +160,17 @@ the implementation agent rules.
   issues, or install. It leaves the change uncommitted and reports
   findings in its handoff for the front agent to file. An explicit
   owner order may grant
-  commit and push rights for one run only, with the commit and scan
-  rules in the brief; opening pull requests, review, issue filing,
+  commit on and push to the assigned task branch, for one run only,
+  with the commit and scan rules in the brief; opening pull requests,
+  review, issue filing,
   installation, and the merge stay with the front agent.
 - Resolves local implementation choices itself when they preserve all
   invariants, security policy, and settled decisions. Escalates
-  anything touching security policy, anything ambiguous, and anything
-  that changes the brief's contract.
+  anything beyond the brief touching security policy, anything
+  ambiguous, and anything that changes the brief's contract.
 - After two unsuccessful attempts at the same problem without new
-  evidence, or four unsuccessful attempts at the same problem in
-  total, stop work and report the smallest reproduction, what was
+  evidence, or four unsuccessful attempts in total across the
+  brief, stop work and report the smallest reproduction, what was
   tried, what uncommitted changes remain, and the unresolved
   question. Never weaken a check or test to complete the brief.
 - Reports decisions and ambiguities instead of guessing; the front agent
@@ -188,13 +201,14 @@ the implementation agent rules.
   proceeds to merge only after it passes. Merging first and filing a
   follow-up issue instead is not allowed.
 - Commits, pushes through the gates, opens the pull request, merges it
-  by squash without rebasing onto main first, and installs the merged
-  main on the owner's devices when the change affects a shipped
-  application (its code, build, dependencies, or behavior); when in
-  doubt, install. The squash carries a body
-  composed from the branch's commits, passed explicitly, so no footer
-  reaches history, with the sole exception of the required
-  `Self-reviewed:` marker for self-reviewed trivial changes.
+  by squash without rebasing onto main first and, where AGENTS.md
+  defines installation, installs the merged main on the owner's
+  devices when the change affects a shipped application (its code,
+  build, dependencies, or behavior); when in doubt, install. The
+  squash carries a body composed from the branch's commits, passed
+  explicitly, so no footer reaches history, with the sole exception
+  of the required `Self-reviewed:` marker for self-reviewed trivial
+  changes.
 - Removes the worktree and deletes the branch only after the merge is
   confirmed, each in its own step. Destructive commands are never
   chained after other commands. Signing secrets are never copied or
@@ -225,8 +239,10 @@ independent review, run as this repository's AGENTS.md describes.
 - Self-review for trivial changes: the front agent self-reviews a
   trivial change whose complete effect is readily apparent from the
   diff and that changes none of the following: executable behavior,
-  security policy, protocol meaning, dependencies, build or release
-  behavior, or instructions governing agent authority.
+  security policy, protocol meaning, dependencies (their identity,
+  versions, sources, features, or overrides), build or release
+  behavior, gates, verification commands, or instructions governing
+  agent authority or review procedure.
   - Eligible cases (exhaustive): comment prose corrections
     (excluding doctests, doc attributes, code blocks, and tool
     directives such as lint suppressions or formatter controls,
@@ -238,8 +254,11 @@ independent review, run as this repository's AGENTS.md describes.
     (such as sentences carrying MUST, SHALL, SHOULD, REQUIRED,
     always, never, do not, cannot, prohibited, or not allowed, in
     any letter case), and changes no program text such as UI
-    strings, log formats, error messages, or test-asserted text.
-  - Run the repository's full gate floor; another agent's review is not
+    strings, log formats, error messages, or test-asserted text;
+    and owner-stated exact changes applied verbatim with no other
+    diff apart from hook-maintained lockfile and version-stamp
+    refreshes.
+  - Run the repository's scope-selected gate floor; another agent's review is not
     required. For delegated trivial work, the front agent's inspection
     completes the review; do not recruit a third agent. Only the front
     agent may self-review.
