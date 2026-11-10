@@ -301,7 +301,7 @@ pub const fn arguments(tag: VerbTag) -> Arguments {
                 value: Value::None,
             }],
         },
-        VerbTag::PhoneCheck | VerbTag::PhonePair | VerbTag::PhoneUnpair => NOTHING,
+        VerbTag::PhoneCheck | VerbTag::PhonePair | VerbTag::PhoneUnpair | VerbTag::Scs => NOTHING,
         VerbTag::PhoneAuth => Arguments {
             positionals: &[Positional {
                 name: "url",

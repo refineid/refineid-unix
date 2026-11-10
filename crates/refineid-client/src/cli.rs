@@ -100,6 +100,7 @@ pub mod pin_activate;
 pub mod pin_change;
 pub mod pin_unblock;
 pub mod reader_keyboard;
+pub mod scs;
 pub(crate) mod util;
 mod verb;
 pub(crate) mod word;

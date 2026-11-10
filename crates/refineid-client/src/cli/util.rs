@@ -363,7 +363,7 @@ pub(super) fn prompt_new_pin_pair(
 /// # Errors
 /// Returns the prompt failure or stdin read failure as a
 /// human-readable string. The caller maps it to an exit code.
-pub(super) fn read_pin(prompt: &str) -> Result<PinBytes, String> {
+pub(crate) fn read_pin(prompt: &str) -> Result<PinBytes, String> {
     let pin_str = if IsTerminal::is_terminal(&io::stdin()) {
         rpassword::prompt_password(prompt).map_err(|e| format!("PIN prompt failed: {e}"))?
     } else {
