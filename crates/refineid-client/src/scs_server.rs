@@ -194,6 +194,9 @@ fn server_config(
         .key
         .to_pkcs8_der()
         .map_err(|_| "encode identity key".to_owned())?;
+    // Moved into the key (From<Vec<u8>> takes ownership), so this
+    // is the one live copy; it must stay for the server's lifetime
+    // and rustls exposes no hook to scrub it at shutdown.
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(encoded.as_bytes().to_vec()));
     rustls::ServerConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()

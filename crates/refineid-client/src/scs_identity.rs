@@ -29,6 +29,8 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zeroize::Zeroizing;
+
 /// The Snap user-common directory variable.
 const SNAP_USER_COMMON: &str = "SNAP_USER_COMMON";
 /// The XDG base-directory configuration variable.
@@ -222,10 +224,10 @@ fn load(directory: &Path) -> Result<Option<ScsIdentity>, IdentityError> {
 
 /// Generate a fresh identity.
 fn generate() -> Result<ScsIdentity, IdentityError> {
-    let mut secret = [0_u8; SECRET_LENGTH];
+    let mut secret = Zeroizing::new([0_u8; SECRET_LENGTH]);
     let key = loop {
-        getrandom::fill(&mut secret).map_err(|_| IdentityError::RandomUnusable)?;
-        if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&secret) {
+        getrandom::fill(&mut *secret).map_err(|_| IdentityError::RandomUnusable)?;
+        if let Ok(key) = p256::ecdsa::SigningKey::from_slice(secret.as_slice()) {
             break key;
         }
     };
