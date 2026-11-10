@@ -364,7 +364,7 @@ mod tests {
     fn sign_round_trip() -> TestResult {
         let body = "{\"content\":\"eA==\",\"contentType\":\"data\",\"selector\":{\"keyusages\":[\"nonRepudiation\"]}}";
         let request = format!(
-            "POST /sign HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /sign HTTP/1.1\r\nOrigin: https://example.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
         );

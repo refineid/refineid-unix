@@ -181,10 +181,4 @@ unwrap_used = "deny"
 allow_attributes_without_reason = "deny"
 chunks_exact_to_as_chunks = "allow"
 
-# TEMPORARY development patch, removed before merge: refineid-scs
-# lives on the core `scs` branch until that change merges, so local
-# builds resolve it from the sibling worktree. The git dependency
-# above is what ships; this branch merges after the core one.
-[patch."https://github.com/refineid/refineid-core.git"]
-refineid-scs = { path = "../refineid-core-scs/crates/scs" }
 
