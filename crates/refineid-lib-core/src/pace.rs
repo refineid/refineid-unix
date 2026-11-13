@@ -526,7 +526,7 @@ fn get_encrypted_nonce<T: CardTransport>(
     // K_pi = KDF(CAN, c=3). The CAN bytes are ASCII digits per BSI
     // TR-03110-3 §A.5.1.1; we just hand them to the KDF as-is.
     let k_pi = kdf_aes256(can.as_bytes(), KdfParam::Password);
-    // ^ `can.as_bytes()` returns &[u8; 6]; coerces to &[u8] for the KDF.
+    // ^ `can.as_bytes()` returns &[u8] (4..=12 bytes); passed to the KDF.
     // The PACE step-2 encrypted nonce is an AES-CBC ciphertext;
     // wrap into the typed container before decrypt.
     let cipher = Ciphertext::<AesCbc>::new(inner.value.to_vec());
