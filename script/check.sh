@@ -30,6 +30,7 @@ run() {
 
 run cargo build --workspace --all-targets
 run cargo test --workspace
+run cargo test --workspace --examples
 run cargo clippy --workspace --all-targets -- -D warnings
 run cargo fmt --all --check
 

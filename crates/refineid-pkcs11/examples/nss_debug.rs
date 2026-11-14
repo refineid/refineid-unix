@@ -18,9 +18,10 @@
 //! GUI: it `dlopen`s the module exactly like NSS / p11-kit would and
 //! replays NSS's own discovery sequence -- including the probes most
 //! modules never think about (the vendor-defined NSS builtin-root
-//! class and the v3.0 `CKO_PROFILE` object, which this module must
-//! answer with ZERO matches; see the eager-PIN1 rule on
-//! `ObjectKind` in `refineid-core`'s `pkcs11::token`).
+//! class and the v3.0 `CKO_PROFILE` object, where this module presents
+//! only `CKP_PUBLIC_CERTIFICATES_TOKEN` and never
+//! `CKP_AUTHENTICATION_TOKEN`; see `ObjectKind` in `refineid-core`'s
+//! `pkcs11::token`).
 //!
 //! Usage (needs a card in a reader; read-only unless flags given):
 //!
@@ -56,19 +57,13 @@ mod probe {
     use refineid_lib_core::pin::PinBytes;
     use refineid_pkcs11::ck::{
         CK_TRUE, CK_UNAVAILABLE_INFORMATION, CKA_ALWAYS_AUTHENTICATE, CKA_CLASS, CKA_EXTRACTABLE,
-        CKA_ID, CKA_ISSUER, CKA_KEY_TYPE, CKA_LABEL, CKA_NEVER_EXTRACTABLE, CKA_SERIAL_NUMBER,
-        CKA_SIGN, CKA_SUBJECT, CKA_TOKEN, CKF_SERIAL_SESSION, CKM_RSA_PKCS, CKO_CERTIFICATE,
-        CKO_PRIVATE_KEY, CKO_PUBLIC_KEY, CKR_OK, CKU_USER, CkAttribute, CkAttributeType, CkBbool,
+        CKA_ID, CKA_ISSUER, CKA_KEY_TYPE, CKA_LABEL, CKA_NEVER_EXTRACTABLE, CKA_PROFILE_ID,
+        CKA_SERIAL_NUMBER, CKA_SIGN, CKA_SUBJECT, CKA_TOKEN, CKF_SERIAL_SESSION, CKM_RSA_PKCS,
+        CKO_CERTIFICATE, CKO_PRIVATE_KEY, CKO_PROFILE, CKO_PUBLIC_KEY, CKP_AUTHENTICATION_TOKEN,
+        CKP_PUBLIC_CERTIFICATES_TOKEN, CKR_OK, CKU_USER, CkAttribute, CkAttributeType, CkBbool,
         CkFunctionList, CkFunctionListPtr, CkInfo, CkMechanism, CkMechanismType, CkObjectHandle,
-        CkRv, CkSessionHandle, CkSlotId, CkTokenInfo, CkUlong,
+        CkProfileId, CkRv, CkSessionHandle, CkSlotId, CkTokenInfo, CkUlong,
     };
-
-    /// PKCS#11 v3.0 `CKO_PROFILE` object class. Not part of the
-    /// crate's v2.40 `ck` transcription; probed here because NSS
-    /// searches for it and this module must never expose one (a
-    /// `CKP_AUTHENTICATION_TOKEN` profile makes NSS prompt PIN1
-    /// eagerly at browser startup).
-    const CKO_PROFILE: CkUlong = 0x0000_0009;
 
     /// NSS's vendor-defined "builtin root list" object class:
     /// `CKO_VENDOR_DEFINED (0x8000_0000) | NSSCK_VENDOR_NSS
@@ -580,11 +575,22 @@ mod probe {
         }
 
         let profile = find_by_class(f, session, "NSS profile (CKO_PROFILE)", CKO_PROFILE)?;
-        if !profile.is_empty() {
-            println!(
-                "WARNING: CKO_PROFILE matched -- NSS will prompt PIN1 eagerly at startup \
-                 (see the eager-PIN1 rule on ObjectKind)"
-            );
+        let mut profile_ids = Vec::with_capacity(profile.len());
+        let mut profile_read_failed = false;
+        for object in &profile {
+            match read_profile_id(f, session, *object) {
+                Ok(id) => {
+                    println!("  profile {object}: profile_id = {id:#010x}");
+                    profile_ids.push(id);
+                }
+                Err(error) => {
+                    println!("WARNING: {error}");
+                    profile_read_failed = true;
+                }
+            }
+        }
+        if let Some(warning) = profile_warning(&profile_ids, profile_read_failed) {
+            println!("{warning}");
         }
         find_by_class(
             f,
@@ -662,6 +668,85 @@ mod probe {
             firmware_version: refineid_pkcs11::ck::CkVersion { major: 0, minor: 0 },
             utc_time: [0; 16],
         }
+    }
+
+    /// Read `CKA_PROFILE_ID` from a `CKO_PROFILE` object handle.
+    fn read_profile_id(
+        f: &CkFunctionList,
+        session: CkSessionHandle,
+        object: CkObjectHandle,
+    ) -> Result<CkProfileId, String> {
+        let bytes = read_attr(f, session, object, CKA_PROFILE_ID)
+            .map_err(|rv| format!("profile {object}: CKA_PROFILE_ID rv={rv:#06x}"))?;
+        let raw: [u8; size_of::<CkProfileId>()] = bytes.try_into().map_err(|bad: Vec<u8>| {
+            format!(
+                "profile {object}: CKA_PROFILE_ID had {} byte(s), expected {}",
+                bad.len(),
+                size_of::<CkProfileId>()
+            )
+        })?;
+        Ok(CkProfileId::from_ne_bytes(raw))
+    }
+
+    /// Validate the `CKA_PROFILE_ID` values exposed by `CKO_PROFILE`
+    /// objects against `ObjectKind`'s single-profile rule: the token
+    /// must expose one `CKP_PUBLIC_CERTIFICATES_TOKEN` and never
+    /// `CKP_AUTHENTICATION_TOKEN`.
+    pub(super) fn profile_warning(
+        profile_ids: &[CkProfileId],
+        read_failed: bool,
+    ) -> Option<String> {
+        if profile_ids.contains(&CKP_AUTHENTICATION_TOKEN) {
+            return Some(
+                "WARNING: CKO_PROFILE answered CKP_AUTHENTICATION_TOKEN -- NSS will prompt PIN1 \
+                 eagerly at startup (see ObjectKind in refineid-core's pkcs11::token)"
+                    .to_owned(),
+            );
+        }
+        if !read_failed && profile_ids != [CKP_PUBLIC_CERTIFICATES_TOKEN] {
+            return Some(format!(
+                "WARNING: expected one CKP_PUBLIC_CERTIFICATES_TOKEN \
+                 ({CKP_PUBLIC_CERTIFICATES_TOKEN:#010x}) profile object, got {profile_ids:?}"
+            ));
+        }
+        None
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use refineid_pkcs11::ck::{CKP_AUTHENTICATION_TOKEN, CKP_PUBLIC_CERTIFICATES_TOKEN};
+
+    use super::probe::profile_warning;
+
+    #[test]
+    fn single_public_certificates_profile_emits_no_warning() {
+        assert_eq!(
+            profile_warning(&[CKP_PUBLIC_CERTIFICATES_TOKEN], false),
+            None
+        );
+    }
+
+    #[test]
+    fn authentication_or_unexpected_profile_set_emits_warning() {
+        assert!(profile_warning(&[], false).is_some());
+        assert!(profile_warning(&[CKP_AUTHENTICATION_TOKEN], false).is_some());
+        assert!(profile_warning(&[CKP_AUTHENTICATION_TOKEN], true).is_some());
+        assert!(
+            profile_warning(
+                &[CKP_PUBLIC_CERTIFICATES_TOKEN, CKP_AUTHENTICATION_TOKEN],
+                false
+            )
+            .is_some()
+        );
+        assert!(
+            profile_warning(
+                &[CKP_PUBLIC_CERTIFICATES_TOKEN, CKP_PUBLIC_CERTIFICATES_TOKEN],
+                false
+            )
+            .is_some()
+        );
+        assert_eq!(profile_warning(&[], true), None);
     }
 }
 
