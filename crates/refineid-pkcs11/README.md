@@ -18,26 +18,36 @@ Implemented:
   `C_GetTokenInfo`, `C_GetMechanismList`, `C_GetMechanismInfo`, `C_WaitForSlotEvent` (non-blocking: reports card insertion / removal events, so NSS notices a card without a browser restart).
 - Sessions: `C_OpenSession` (serial, read-only), `C_CloseSession`, `C_CloseAllSessions`, `C_GetSessionInfo`.
 - Login: `C_Login` (`CKU_USER` only), `C_Logout`.
-  On success the module best-effort forwards PIN1 over a local
-  pin-channel socket to the RefineID signature-creation-service
-  daemon when one is running (a separate component), and reports
-  card removal the same way, so that daemon neither prompts a
-  second time nor serves a stale cache. Forwards run detached;
-  failure is a diagnostic line, never an error to NSS.
-  PIN1 is validated as 4..=12 ASCII digits and cached in memory for
-  at most five minutes;
-  it is verified on the card inside each sign, never logged, and zeroized on logout, session close, or finalize.
+  PIN1 is validated as 4..=12 ASCII digits and verified on the card once its retry floor allows the attempt.
+  An accepted `VERIFY` restores PIN1's retry counter to its five-try limit (FINEID S1 v4.2 section 3.5),
+  and the confirmed PIN1 is held in this process's memory with no idle window or login bridge,
+  until the card is removed or replaced, the card refuses it, any later pre-operation probe reports other than five tries left or verified,
+  a card or reader state read fails,
+  or `C_Logout`, the last `C_CloseSession` or `C_Finalize` ends the login.
+  It is presented to the card inside each sign, never logged, and never written to storage
+  (see `refineid-core`'s [credential custody](https://github.com/refineid/refineid-core/blob/main/doc/security/credential-custody.md)).
 - Objects: `C_FindObjectsInit` / `C_FindObjects` / `C_FindObjectsFinal` and `C_GetAttributeValue` over
   the authentication certificate (`CKO_CERTIFICATE`, `CKC_X_509`),
   its public key (`CKO_PUBLIC_KEY`, from the certificate SPKI, for
   consumers such as p11tool / libp11 that enumerate public keys),
   its private key (`CKO_PRIVATE_KEY`, `CKK_RSA` or `CKK_EC`),
-  the CA certificates the card carries, and one NSS trust record per
-  CA certificate (see [NSS trust records](#nss-trust-records)).
+  the CA certificates the card carries (`CKO_CERTIFICATE`,
+  `CK_CERTIFICATE_CATEGORY_AUTHORITY`), one NSS trust record
+  (`CKO_NSS_TRUST`) per CA certificate, and one profile object
+  (`CKO_PROFILE`, `CKP_PUBLIC_CERTIFICATES_TOKEN`) declaring the
+  certificates readable without a login (see
+  [NSS trust records](#nss-trust-records)).
   The three authentication objects share one `CKA_ID` so NSS pairs them.
   The private key answers `CKA_EXTRACTABLE` false and
   `CKA_NEVER_EXTRACTABLE` / `CKA_ALWAYS_SENSITIVE` true -- the FINEID
   key never leaves the card.
+  On a card in a local reader the private key is a private object
+  (`CKA_PRIVATE` true) and the token reports `CKF_LOGIN_REQUIRED`.
+  On a card served by a paired phone the phone verifies PIN 1 and asks
+  the holder for each signature, so the token reports
+  `CKF_PROTECTED_AUTHENTICATION_PATH` without `CKF_LOGIN_REQUIRED`, every
+  object is public, `C_Sign` needs no login, and `C_Login` (null PIN)
+  succeeds without contacting the phone.
 - Signing: `C_SignInit` / `C_Sign` (single-part).
   `CKM_RSA_PKCS` takes a DER `DigestInfo` (SHA-256 only) on the RSA-3072 card;
   `CKM_ECDSA` takes a raw digest of any hash on the ECC P-384 card and returns raw `r || s`.
@@ -75,8 +85,9 @@ once per process.
 `examples/nss_debug.rs` answers "why doesn't Firefox see the card"
 without launching Firefox: it dlopens the built module exactly like
 NSS and replays NSS's discovery probes, including the vendor-defined
-builtin-root class and the `CKO_PROFILE` search this module must
-answer with zero matches (the eager-PIN1 rule). Run
+builtin-root class and the `CKO_PROFILE` search (this module presents
+only `CKP_PUBLIC_CERTIFICATES_TOKEN` and never `CKP_AUTHENTICATION_TOKEN`,
+so NSS does not prompt PIN1 eagerly at browser startup). Run
 `cargo run -p refineid-unix-pkcs11 --example nss_debug` with a card
 present; add `--login` (PIN1 from `REFINEID_PIN1`) and
 `--sign-probe` for the key path.
