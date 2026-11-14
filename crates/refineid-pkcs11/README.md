@@ -20,8 +20,8 @@ Implemented:
 - Login: `C_Login` (`CKU_USER` only), `C_Logout`.
   PIN1 is validated as 4..=12 ASCII digits and verified on the card once its retry floor allows the attempt.
   An accepted `VERIFY` restores PIN1's retry counter to its five-try limit (FINEID S1 v4.2 section 3.5),
-  and the confirmed PIN1 is held in this process's memory with no idle window or login bridge,
-  until the card is removed or replaced, the card refuses it, any later pre-operation probe reports other than five tries left or verified,
+  and the confirmed PIN1 is held in a zeroizing buffer in this process's memory with no idle window or login bridge,
+  until it is zeroized and dropped when the card is removed or replaced, the card refuses it, any later pre-operation probe reports other than five tries left or verified,
   a card or reader state read fails,
   or `C_Logout`, the last `C_CloseSession` or `C_Finalize` ends the login.
   It is presented to the card inside each sign, never logged, and never written to storage
@@ -125,7 +125,11 @@ the card, lasts only while a card is in the reader, needs no policy
 file and no root privilege, and reaches every NSS application that
 loads the module: Firefox, Thunderbird, and Chrome on Linux, which takes
 its client certificates from NSS. `certutil -L -h <token>` shows each CA
-with the trust string `T,C,`. The attribute table and the NSS source
+with the trust string `T,C,`. The token also presents one public
+`CKO_PROFILE` object (`CKA_PROFILE_ID = CKP_PUBLIC_CERTIFICATES_TOKEN`)
+so NSS marks the slot friendly (`PK11_IsFriendly`) and reads its public
+certificates and trust records before any login while keeping the local
+private key `CKA_PRIVATE`. The attribute table and the NSS source
 references are in the core crate's
 [README](https://github.com/refineid/refineid-core/blob/main/crates/pkcs11/README.md#nss-trust-records).
 
