@@ -1216,5 +1216,40 @@ fn a_cache_with_a_future_fetch_time_is_fetched_again() -> TestResult {
             .iter()
             .all(|record| record.fetched_at() == day(FETCHED)),
         "every record carries the current fetch time",
+    )?;
+
+    let national = Uri::parse(NATIONAL_LOCATION.to_owned())?;
+    let mixed: Vec<CachedList> = world
+        .serve(day(LATER))?
+        .1
+        .into_iter()
+        .map(|record| {
+            let stamp = if *record.location() == national {
+                day(FETCHED)
+            } else {
+                record.fetched_at()
+            };
+            CachedList::new(
+                record.location().clone(),
+                stamp,
+                record.next_update(),
+                record.bytes().to_vec(),
+            )
+        })
+        .collect();
+    cache.store(&mixed)?;
+    cache.mark_attempt(day(LATER))?;
+    let mixed_calls = Cell::new(NOT_FETCHED);
+    let _mixed_run = run_anchors(
+        Some(&cache),
+        day(FETCHED),
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &mixed_calls),
+    );
+    check(
+        &mixed_calls.get(),
+        &FETCHED_ONCE,
+        "mixed cache with one future-dated record refreshes",
     )
 }

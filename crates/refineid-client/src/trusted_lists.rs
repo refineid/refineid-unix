@@ -375,7 +375,7 @@ pub fn run_anchors(
                 .is_some_and(|at| at <= now && age(at, now) < RETRY_AFTER);
             !recently_tried
                 && (lists.is_stale(now)
-                    || lists.fetched_at() > now
+                    || records.iter().any(|record| record.fetched_at() > now)
                     || age(lists.fetched_at(), now) > REFRESH_AFTER
                     || read_count(lists) != records.len()
                     || finnish_gap(lists).is_some())
