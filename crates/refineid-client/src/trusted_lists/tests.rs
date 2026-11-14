@@ -1185,3 +1185,71 @@ fn national_locations_are_the_pointers_the_lists_follow() -> TestResult {
         "the national list's location",
     )
 }
+
+#[test]
+fn a_cache_with_a_future_fetch_time_is_fetched_again() -> TestResult {
+    let world = World::new();
+    let dir = TempDir::new("trusted-lists-future-fetched-at")?;
+    let cache = ListCache::at(dir.path().to_path_buf());
+    cache.store(&world.serve(day(LATER))?.1)?;
+    cache.mark_attempt(day(LATER))?;
+    let calls = Cell::new(NOT_FETCHED);
+    let run = run_anchors(
+        Some(&cache),
+        day(FETCHED),
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &calls),
+    );
+    check(&calls.get(), &FETCHED_ONCE, "future-dated cache refreshes")?;
+    check(
+        &run.source,
+        &AnchorSource::Lists {
+            fetched_at: day(FETCHED),
+            stale: false,
+        },
+        "source",
+    )?;
+    let loaded = cache.load();
+    check_true(
+        loaded
+            .iter()
+            .all(|record| record.fetched_at() == day(FETCHED)),
+        "every record carries the current fetch time",
+    )?;
+
+    let national = Uri::parse(NATIONAL_LOCATION.to_owned())?;
+    let mixed: Vec<CachedList> = world
+        .serve(day(LATER))?
+        .1
+        .into_iter()
+        .map(|record| {
+            let stamp = if *record.location() == national {
+                day(FETCHED)
+            } else {
+                record.fetched_at()
+            };
+            CachedList::new(
+                record.location().clone(),
+                stamp,
+                record.next_update(),
+                record.bytes().to_vec(),
+            )
+        })
+        .collect();
+    cache.store(&mixed)?;
+    cache.mark_attempt(day(LATER))?;
+    let mixed_calls = Cell::new(NOT_FETCHED);
+    let _mixed_run = run_anchors(
+        Some(&cache),
+        day(FETCHED),
+        Refresh::WhenDue,
+        &world.signers()?,
+        online(&world, &mixed_calls),
+    );
+    check(
+        &mixed_calls.get(),
+        &FETCHED_ONCE,
+        "mixed cache with one future-dated record refreshes",
+    )
+}
