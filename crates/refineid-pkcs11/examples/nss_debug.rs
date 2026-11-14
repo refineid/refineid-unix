@@ -576,12 +576,20 @@ mod probe {
 
         let profile = find_by_class(f, session, "NSS profile (CKO_PROFILE)", CKO_PROFILE)?;
         let mut profile_ids = Vec::with_capacity(profile.len());
+        let mut profile_read_failed = false;
         for object in &profile {
-            let id = read_profile_id(f, session, *object)?;
-            println!("  profile {object}: profile_id = {id:#010x}");
-            profile_ids.push(id);
+            match read_profile_id(f, session, *object) {
+                Ok(id) => {
+                    println!("  profile {object}: profile_id = {id:#010x}");
+                    profile_ids.push(id);
+                }
+                Err(error) => {
+                    println!("WARNING: {error}");
+                    profile_read_failed = true;
+                }
+            }
         }
-        if let Some(warning) = profile_warning(&profile_ids) {
+        if let Some(warning) = profile_warning(&profile_ids, profile_read_failed) {
             println!("{warning}");
         }
         find_by_class(
@@ -684,7 +692,10 @@ mod probe {
     /// objects against `ObjectKind`'s single-profile rule: the token
     /// must expose one `CKP_PUBLIC_CERTIFICATES_TOKEN` and never
     /// `CKP_AUTHENTICATION_TOKEN`.
-    pub(super) fn profile_warning(profile_ids: &[CkProfileId]) -> Option<String> {
+    pub(super) fn profile_warning(
+        profile_ids: &[CkProfileId],
+        read_failed: bool,
+    ) -> Option<String> {
         if profile_ids.contains(&CKP_AUTHENTICATION_TOKEN) {
             return Some(
                 "WARNING: CKO_PROFILE answered CKP_AUTHENTICATION_TOKEN -- NSS will prompt PIN1 \
@@ -692,7 +703,7 @@ mod probe {
                     .to_owned(),
             );
         }
-        if profile_ids != [CKP_PUBLIC_CERTIFICATES_TOKEN] {
+        if !read_failed && profile_ids != [CKP_PUBLIC_CERTIFICATES_TOKEN] {
             return Some(format!(
                 "WARNING: expected one CKP_PUBLIC_CERTIFICATES_TOKEN \
                  ({CKP_PUBLIC_CERTIFICATES_TOKEN:#010x}) profile object, got {profile_ids:?}"
@@ -710,20 +721,32 @@ mod tests {
 
     #[test]
     fn single_public_certificates_profile_emits_no_warning() {
-        assert_eq!(profile_warning(&[CKP_PUBLIC_CERTIFICATES_TOKEN]), None);
+        assert_eq!(
+            profile_warning(&[CKP_PUBLIC_CERTIFICATES_TOKEN], false),
+            None
+        );
     }
 
     #[test]
     fn authentication_or_unexpected_profile_set_emits_warning() {
-        assert!(profile_warning(&[]).is_some());
-        assert!(profile_warning(&[CKP_AUTHENTICATION_TOKEN]).is_some());
+        assert!(profile_warning(&[], false).is_some());
+        assert!(profile_warning(&[CKP_AUTHENTICATION_TOKEN], false).is_some());
+        assert!(profile_warning(&[CKP_AUTHENTICATION_TOKEN], true).is_some());
         assert!(
-            profile_warning(&[CKP_PUBLIC_CERTIFICATES_TOKEN, CKP_AUTHENTICATION_TOKEN]).is_some()
+            profile_warning(
+                &[CKP_PUBLIC_CERTIFICATES_TOKEN, CKP_AUTHENTICATION_TOKEN],
+                false
+            )
+            .is_some()
         );
         assert!(
-            profile_warning(&[CKP_PUBLIC_CERTIFICATES_TOKEN, CKP_PUBLIC_CERTIFICATES_TOKEN])
-                .is_some()
+            profile_warning(
+                &[CKP_PUBLIC_CERTIFICATES_TOKEN, CKP_PUBLIC_CERTIFICATES_TOKEN],
+                false
+            )
+            .is_some()
         );
+        assert_eq!(profile_warning(&[], true), None);
     }
 }
 

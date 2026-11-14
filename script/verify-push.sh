@@ -20,6 +20,7 @@ cargo build --workspace --all-targets
 
 echo "== verify-push: unit tests =="
 cargo test --workspace
+cargo test --workspace --examples
 
 echo "== verify-push: clippy =="
 cargo clippy --workspace --all-targets -- -D warnings
