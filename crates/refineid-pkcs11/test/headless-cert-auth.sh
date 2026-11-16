@@ -75,21 +75,33 @@ HOST="${HOST:-card.refineid.fi}"
 PORT="${PORT:-443}"
 REQUEST_PATH="${REQUEST_PATH:-/}"
 NICKNAME="${NICKNAME:-RefineID-FINEID-auth}"
-WORK="${WORKDIR:-$(mktemp -d -t refineid-headless-cert-auth.XXXXXX)}"
+WORK="${WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/refineid-headless-cert-auth.XXXXXX")}"
 
 # Platform-portable cdylib extension + builtin-CA module location.
 case "$(uname -s)" in
   Darwin)
     LIBEXT=dylib
-    NSSCKBI_CANDIDATES="/opt/homebrew/opt/nss/lib/libnssckbi.dylib /usr/local/opt/nss/lib/libnssckbi.dylib"
+    NSSCKBI_CANDIDATES="/opt/homebrew/opt/nss/lib/libnssckbi.dylib /usr/local/opt/nss/lib/libnssckbi.dylib /opt/local/lib/nss/libnssckbi.dylib"
     ;;
   Linux)
     LIBEXT=so
     NSSCKBI_CANDIDATES="/usr/lib/$(uname -m)-linux-gnu/libnssckbi.so /usr/lib64/libnssckbi.so /usr/lib/libnssckbi.so /usr/lib64/nss/libnssckbi.so"
     ;;
+  FreeBSD | OpenBSD | DragonFly)
+    LIBEXT=so
+    NSSCKBI_CANDIDATES="/usr/local/lib/nss/libnssckbi.so /usr/local/lib/libnssckbi.so"
+    ;;
+  NetBSD)
+    LIBEXT=so
+    NSSCKBI_CANDIDATES="/usr/pkg/lib/nss/libnssckbi.so /usr/pkg/lib/libnssckbi.so"
+    ;;
+  SunOS)
+    LIBEXT=so
+    NSSCKBI_CANDIDATES="/usr/lib/mps/64/libnssckbi.so /usr/lib/64/libnssckbi.so /usr/lib/mps/libnssckbi.so"
+    ;;
   *)
-    echo "unsupported platform: $(uname -s)" >&2
-    exit 2
+    LIBEXT=so
+    NSSCKBI_CANDIDATES="/usr/local/lib/nss/libnssckbi.so /usr/local/lib/libnssckbi.so /usr/lib/libnssckbi.so"
     ;;
 esac
 # NSSCKBI overrides discovery: required on NixOS, where library
@@ -110,7 +122,7 @@ LEGACY="${REFINEID_LEGACY_DYLIB:-}"
 
 for cmd in tstclnt certutil modutil pkcs11-tool; do
   command -v "$cmd" >/dev/null 2>&1 || {
-    echo "missing: $cmd (Fedora: nss-tools opensc; Debian: libnss3-tools opensc; brew: nss opensc)" >&2
+    echo "missing: $cmd (Fedora: nss-tools opensc; Debian: libnss3-tools opensc; pkg/pkgin/brew: nss opensc)" >&2
     exit 2
   }
 done
