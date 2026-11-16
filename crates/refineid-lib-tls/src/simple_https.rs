@@ -12,13 +12,14 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! Small server-authenticated HTTPS client.
+//! Small address-pinned, server-authenticated HTTPS client.
 //!
 //! Public infrastructure fetches such as EU trusted-list downloads,
 //! RFC 3161 TSA calls, and validator APIs need ordinary HTTPS server
 //! authentication, not FINEID client-certificate authentication. This
 //! module never configures a client certificate or private-key
-//! callback.
+//! callback, and never resolves DNS itself: every entry point requires a
+//! caller-vetted [`SocketAddr`].
 //!
 //! The server's certificate is judged by the platform's trust store
 //! (`rustls-platform-verifier`): the Security framework's trust
@@ -39,6 +40,10 @@ use crate::http::HttpParseError;
 
 /// Connect/read/write timeout for one simple HTTPS request.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Base64 quantum length in characters (RFC 4648 section 4).
+const BASE64_QUANTUM_LEN: usize = 4;
+/// Maximum `=` padding characters in a valid Base64 quantum (RFC 4648 section 4).
+const BASE64_MAX_PADDING_LEN: usize = 2;
 
 /// What failed while fetching over server-authenticated HTTPS.
 #[derive(Debug)]
@@ -46,9 +51,16 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum HttpsError {
     /// URL was not `https://`.
     UnsupportedScheme,
+    /// Vetted destination address port did not match the URL port.
+    PortMismatch {
+        /// Port of the caller-supplied [`SocketAddr`].
+        address_port: u16,
+        /// Port parsed from the target [`Uri`].
+        url_port: u16,
+    },
     /// The crate was built without a TLS backend feature.
     NoTlsBackend,
-    /// DNS resolution or TCP connection failed.
+    /// TCP connection or socket configuration failed.
     Connect(String),
     /// TLS configuration or handshake failed.
     Tls(String),
@@ -56,21 +68,18 @@ pub enum HttpsError {
     Framing(FramingError),
     /// HTTP response parsing failed.
     Http(HttpParseError),
-    /// Server returned a non-2xx status.
-    HttpStatus {
-        /// HTTP status code.
-        code: u16,
-    },
     /// An authorization value was not a single RFC 7617 Basic header value.
     InvalidAuthorization,
+    /// A caller-supplied request header value contained CR, LF, or NUL bytes.
+    InvalidHeaderValue,
 }
 
-/// One response from the deliberately small HTTPS client.
+/// One response from the address-pinned HTTPS client.
 ///
-/// Unlike [`get`] and [`post`], the address-pinned entry points return
-/// redirect responses to their caller. The caller owns redirect policy
-/// because only it knows whether the URL came from a certificate, a
-/// trusted list, or an explicit user configuration.
+/// Redirect and non-2xx responses are returned as data so the caller can
+/// apply context-specific redirect and status policy depending on whether
+/// the URL came from a certificate, a trusted list, or explicit user
+/// configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpleResponse {
     /// HTTP status code.
@@ -81,29 +90,24 @@ pub struct SimpleResponse {
     pub body: Vec<u8>,
 }
 
-impl SimpleResponse {
-    /// Return the body of a successful response, or a typed HTTP-status
-    /// error for every other status class.
-    fn success_body(self) -> Result<Vec<u8>, HttpsError> {
-        if (200..300).contains(&self.status) {
-            Ok(self.body)
-        } else {
-            Err(HttpsError::HttpStatus { code: self.status })
-        }
-    }
-}
-
 impl core::fmt::Display for HttpsError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::UnsupportedScheme => f.write_str("URL is not https://"),
+            Self::PortMismatch {
+                address_port,
+                url_port,
+            } => write!(
+                f,
+                "vetted address port {address_port} does not match URL port {url_port}"
+            ),
             Self::NoTlsBackend => f.write_str("no TLS backend compiled into this build"),
             Self::Connect(detail) => write!(f, "connect: {detail}"),
             Self::Tls(detail) => write!(f, "TLS: {detail}"),
             Self::Framing(error) => write!(f, "HTTP framing: {error}"),
             Self::Http(error) => write!(f, "HTTP parse: {error}"),
-            Self::HttpStatus { code } => write!(f, "HTTP {code}"),
             Self::InvalidAuthorization => f.write_str("invalid Basic authorization value"),
+            Self::InvalidHeaderValue => f.write_str("request header value contains control bytes"),
         }
     }
 }
@@ -131,16 +135,6 @@ impl From<HttpParseError> for HttpsError {
     }
 }
 
-/// HTTPS GET, returning the response body for a 2xx response.
-///
-/// # Errors
-/// [`HttpsError`] on unsupported scheme, missing TLS backend,
-/// connection/TLS failure, malformed HTTP, oversized body, or non-2xx
-/// HTTP status.
-pub fn get(url: &Uri, max_bytes: usize, user_agent: &str) -> Result<Vec<u8>, HttpsError> {
-    request(url, RequestBody::None, max_bytes, user_agent, None)?.success_body()
-}
-
 /// HTTPS GET through an already-vetted destination address.
 ///
 /// DNS is not consulted by this function. TLS authentication and the
@@ -149,9 +143,9 @@ pub fn get(url: &Uri, max_bytes: usize, user_agent: &str) -> Result<Vec<u8>, Htt
 /// between address policy and connection.
 ///
 /// # Errors
-/// [`HttpsError`] on a port mismatch, missing TLS backend,
-/// connection/TLS failure, malformed HTTP, or an oversized body. HTTP
-/// redirects and other non-success statuses are returned in
+/// [`HttpsError`] on unsupported scheme, a port mismatch, missing TLS
+/// backend, connection/TLS failure, malformed HTTP, or an oversized body.
+/// HTTP redirects and other non-success statuses are returned in
 /// [`SimpleResponse`] for the caller to apply policy.
 pub fn get_to(
     url: &Uri,
@@ -159,32 +153,7 @@ pub fn get_to(
     max_bytes: usize,
     user_agent: &str,
 ) -> Result<SimpleResponse, HttpsError> {
-    request(url, RequestBody::None, max_bytes, user_agent, Some(address))
-}
-
-/// HTTPS POST, returning the response body for a 2xx response.
-///
-/// # Errors
-/// [`HttpsError`] as for [`get`].
-pub fn post(
-    url: &Uri,
-    content_type: &str,
-    body: &[u8],
-    max_bytes: usize,
-    user_agent: &str,
-) -> Result<Vec<u8>, HttpsError> {
-    request(
-        url,
-        RequestBody::Bytes {
-            content_type,
-            body,
-            authorization: None,
-        },
-        max_bytes,
-        user_agent,
-        None,
-    )
-    .and_then(SimpleResponse::success_body)
+    request(url, RequestBody::None, max_bytes, user_agent, address)
 }
 
 /// HTTPS POST through an already-vetted destination address.
@@ -212,7 +181,7 @@ pub fn post_to(
         },
         max_bytes,
         user_agent,
-        Some(address),
+        address,
     )
 }
 
@@ -243,7 +212,7 @@ pub fn post_to_authorized(
         },
         max_bytes,
         user_agent,
-        Some(address),
+        address,
     )
 }
 
@@ -252,10 +221,14 @@ fn request(
     body: RequestBody<'_>,
     max_bytes: usize,
     user_agent: &str,
-    address: Option<SocketAddr>,
+    address: SocketAddr,
 ) -> Result<SimpleResponse, HttpsError> {
     if url.scheme() != Scheme::Https {
         return Err(HttpsError::UnsupportedScheme);
+    }
+    validate_request_header_value(user_agent)?;
+    if let RequestBody::Bytes { content_type, .. } = body {
+        validate_request_header_value(content_type)?;
     }
     #[cfg(feature = "tls-rustls")]
     {
@@ -274,7 +247,7 @@ fn request_with_rustls(
     body: RequestBody<'_>,
     max_bytes: usize,
     user_agent: &str,
-    address: Option<SocketAddr>,
+    address: SocketAddr,
 ) -> Result<SimpleResponse, HttpsError> {
     use std::sync::Arc;
 
@@ -318,6 +291,7 @@ fn send_request<S: Read + Write>(
 ) -> Result<SimpleResponse, HttpsError> {
     use core::fmt::Write as _;
 
+    validate_request_header_value(user_agent)?;
     let method = body.method();
     let mut request = Zeroizing::new(String::new());
     let _fmt: core::fmt::Result = write!(request, "{method} {} HTTP/1.1\r\n", request_target(url));
@@ -332,6 +306,7 @@ fn send_request<S: Read + Write>(
         authorization,
     } = body
     {
+        validate_request_header_value(content_type)?;
         if let Some(authorization) = authorization {
             validate_basic_authorization(authorization)?;
             let _fmt: core::fmt::Result = write!(request, "Authorization: {authorization}\r\n");
@@ -356,35 +331,18 @@ fn send_request<S: Read + Write>(
         .map_err(|e| HttpsError::Tls(format!("HTTP flush: {e}")))?;
 
     let raw = Framing::read_response(stream, max_bytes)?;
-    let response = crate::http::Response::parse(raw, url)?;
-    Ok(SimpleResponse {
-        status: response.status.code(),
-        location: response.headers.get("location").cloned(),
-        body: response.body,
-    })
+    Ok(crate::http::parse_response(raw)?)
 }
 
-fn tcp_connect(url: &Uri, address: Option<SocketAddr>) -> Result<TcpStream, HttpsError> {
-    use std::net::ToSocketAddrs as _;
-
+fn tcp_connect(url: &Uri, address: SocketAddr) -> Result<TcpStream, HttpsError> {
+    if address.port() != url.port() {
+        return Err(HttpsError::PortMismatch {
+            address_port: address.port(),
+            url_port: url.port(),
+        });
+    }
     let host = url.host().to_string();
-    let socket_addr = if let Some(address) = address {
-        if address.port() != url.port() {
-            return Err(HttpsError::Connect(format!(
-                "vetted address port {} does not match URL port {}",
-                address.port(),
-                url.port()
-            )));
-        }
-        address
-    } else {
-        (host.as_str(), url.port())
-            .to_socket_addrs()
-            .map_err(|e| HttpsError::Connect(format!("{host}:{} resolve: {e}", url.port())))?
-            .next()
-            .ok_or_else(|| HttpsError::Connect(format!("{host}:{}: no address", url.port())))?
-    };
-    let stream = TcpStream::connect_timeout(&socket_addr, IO_TIMEOUT)
+    let stream = TcpStream::connect_timeout(&address, IO_TIMEOUT)
         .map_err(|e| HttpsError::Connect(format!("{host}:{}: {e}", url.port())))?;
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
@@ -430,15 +388,25 @@ impl RequestBody<'_> {
     }
 }
 
+fn validate_request_header_value(value: &str) -> Result<(), HttpsError> {
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() && byte != b'\t')
+    {
+        return Err(HttpsError::InvalidHeaderValue);
+    }
+    Ok(())
+}
+
 fn validate_basic_authorization(value: &str) -> Result<(), HttpsError> {
     let Some(encoded) = value.strip_prefix("Basic ") else {
         return Err(HttpsError::InvalidAuthorization);
     };
-    if encoded.is_empty() || encoded.len() % 4 != 0 {
+    if encoded.is_empty() || encoded.len() % BASE64_QUANTUM_LEN != 0 {
         return Err(HttpsError::InvalidAuthorization);
-    }
+    };
     let first_padding = encoded.find('=').unwrap_or(encoded.len());
-    if encoded[first_padding..].len() > 2
+    if encoded[first_padding..].len() > BASE64_MAX_PADDING_LEN
         || !encoded[..first_padding]
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
@@ -452,6 +420,14 @@ fn validate_basic_authorization(value: &str) -> Result<(), HttpsError> {
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    const SCRIPTED_MAX_BYTES: usize = 1024;
+    const EXPECTED_AUTH_HEADER_COUNT: usize = 1;
+    /// RFC 5737 TEST-NET-1 documentation IPv4 address (`192.0.2.1`).
+    const TEST_NET_HOST: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+    const DEFAULT_HTTPS_PORT: u16 = 443;
+    const MISMATCHED_PORT: u16 = 8443;
 
     struct ScriptedIo {
         response: Cursor<Vec<u8>>,
@@ -476,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn basic_authorization_rejects_header_injection() {
+    fn basic_authorization_and_header_values_reject_header_injection() {
         let valid_auth = format!(
             "Basic {}",
             refineid_lib_core::base64::encode(b"test-user:test-pass")
@@ -489,21 +465,47 @@ mod tests {
         );
         assert!(super::validate_basic_authorization(&injection).is_err());
         assert!(super::validate_basic_authorization("Basic abc=def=").is_err());
+        assert!(super::validate_request_header_value("refineid/1.0").is_ok());
+        assert!(matches!(
+            super::validate_request_header_value("agent\r\nX-Evil: yes"),
+            Err(super::HttpsError::InvalidHeaderValue)
+        ));
     }
 
     #[test]
     fn transient_https_errors_are_narrowly_classified() {
         assert!(super::HttpsError::Connect("timeout".to_owned()).is_transient());
+        assert!(
+            !super::HttpsError::PortMismatch {
+                address_port: MISMATCHED_PORT,
+                url_port: DEFAULT_HTTPS_PORT,
+            }
+            .is_transient()
+        );
         assert!(!super::HttpsError::Tls("certificate rejected".to_owned()).is_transient());
         assert!(!super::HttpsError::InvalidAuthorization.is_transient());
+        assert!(!super::HttpsError::InvalidHeaderValue.is_transient());
+    }
+
+    #[test]
+    fn tcp_connect_rejects_mismatched_vetted_port_without_dialing() {
+        let url = refineid_lib_core::text::Uri::parse("https://example.com/resource".to_owned())
+            .expect("test URL");
+        let address = SocketAddr::new(IpAddr::V4(TEST_NET_HOST), MISMATCHED_PORT);
+        let result = super::tcp_connect(&url, address);
+        assert!(matches!(
+            result,
+            Err(super::HttpsError::PortMismatch {
+                address_port: MISMATCHED_PORT,
+                url_port: DEFAULT_HTTPS_PORT,
+            })
+        ));
     }
 
     #[test]
     fn authorized_post_writes_one_basic_header() {
-        let url = refineid_lib_core::text::Uri::parse(
-            "https://timestamp.sectigo.com/qualified".to_owned(),
-        )
-        .expect("test URL");
+        let url = refineid_lib_core::text::Uri::parse("https://example.com/qualified".to_owned())
+            .expect("test URL");
         let mut io = ScriptedIo {
             response: Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()),
             written: Vec::new(),
@@ -520,12 +522,15 @@ mod tests {
                 body: b"DER",
                 authorization: Some(&auth_header),
             },
-            1024,
+            SCRIPTED_MAX_BYTES,
             "test",
         )
         .expect("scripted response");
         let request = String::from_utf8(io.written).expect("ASCII request");
-        assert_eq!(request.matches("Authorization:").count(), 1);
+        assert_eq!(
+            request.matches("Authorization:").count(),
+            EXPECTED_AUTH_HEADER_COUNT
+        );
         assert!(request.contains(&format!("Authorization: {auth_header}\r\n")));
         assert!(request.ends_with("\r\n\r\nDER"));
     }
@@ -535,11 +540,7 @@ mod tests {
     ///
     /// Ignored by default because it needs the network and a third
     /// party's uptime, neither of which belongs in a check that gates
-    /// a commit. It is here because a TLS backend that compiles proves
-    /// nothing: what has to be true is that the handshake completes
-    /// against a live server with the platform CA bundle, and that the
-    /// answer comes back framed correctly. Sectigo is the target
-    /// because it is the primary qualified timestamp authority.
+    /// a commit.
     ///
     /// Run it with:
     ///   cargo test -p refineid-lib-tls --features tls-rustls -- --ignored --nocapture
@@ -547,29 +548,50 @@ mod tests {
     #[ignore = "needs the network and a live timestamp authority"]
     #[cfg(feature = "tls-rustls")]
     fn rustls_reaches_a_live_timestamp_authority() {
+        use std::net::ToSocketAddrs as _;
+
         use refineid_doc_sign::cades::DigestAlgorithm;
         use refineid_lib_core::text::Uri;
+
+        const PROBE_MAX_BYTES: usize = 65_536;
+        const DER_SEQUENCE_TAG: u8 = 0x30;
+        const MIN_EXPECTED_TOKEN_BYTES: usize = 1000;
+        const HTTP_OK: u16 = 200;
 
         let algorithm = DigestAlgorithm::Sha256;
         let digest = algorithm.digest(b"refineid rustls backend probe");
         let request = refineid_doc_sign::timestamp::request(&digest, algorithm, None, true);
         let url = Uri::parse("https://timestamp.sectigo.com/qualified".to_owned())
             .expect("the probe URL parses");
+        let host = url.host().to_string();
+        let address = (host.as_str(), url.port())
+            .to_socket_addrs()
+            .expect("authority host resolves")
+            .next()
+            .expect("at least one socket address");
 
-        let response = super::post(
+        let response = super::post_to(
             &url,
+            address,
             "application/timestamp-query",
             &request,
-            64 * 1024,
+            PROBE_MAX_BYTES,
             "refineid-rustls-probe",
         )
         .expect("the authority answers over TLS");
 
-        // A DER SEQUENCE, and big enough to be a token rather than a
-        // rejection: proof the handshake completed and the framing held.
-        assert_eq!(response.first(), Some(&0x30), "a DER SEQUENCE came back");
-        assert!(response.len() > 1000, "got {} bytes", response.len());
-        let token = refineid_doc_sign::timestamp::token(&response, &digest, algorithm, None)
+        assert_eq!(response.status, HTTP_OK);
+        assert_eq!(
+            response.body.first(),
+            Some(&DER_SEQUENCE_TAG),
+            "a DER SEQUENCE came back"
+        );
+        assert!(
+            response.body.len() > MIN_EXPECTED_TOKEN_BYTES,
+            "got {} bytes",
+            response.body.len()
+        );
+        let token = refineid_doc_sign::timestamp::token(&response.body, &digest, algorithm, None)
             .expect("the token binds to the digest we asked about");
         assert!(!token.is_empty(), "a token came back");
     }

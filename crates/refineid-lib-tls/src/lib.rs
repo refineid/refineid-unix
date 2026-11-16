@@ -14,14 +14,13 @@
 
 //! TLS surface for refineid.
 //!
-//! [`simple_https`] is the server-authenticated HTTPS client used
-//! for public-infrastructure fetches (timestamp authorities, EU
-//! trusted lists, validator APIs), backed by `rustls` behind the
+//! [`simple_https`] is the address-pinned, server-authenticated HTTPS
+//! client used for public-infrastructure fetches (timestamp authorities,
+//! EU trusted lists, validator APIs), backed by `rustls` behind the
 //! `tls-rustls` feature.
 //!
-//! [`http`] hosts the TLS-agnostic HTTP/1.1 protocol types (cookie
-//! jar, response parser, URL parts, form encoding); [`framing`] the
-//! response body framing.
+//! [`http`] parses the HTTP/1.1 response status line and `Location`
+//! header; [`framing`] reads bounded response bodies.
 
 #[cfg(feature = "tls-rustls")]
 pub mod client_auth;
