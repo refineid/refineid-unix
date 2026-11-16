@@ -1,6 +1,6 @@
 [package]
 name = "refineid-lib-tls"
-description = "Server-authenticated HTTPS client for refineid (rustls) plus the TLS-agnostic HTTP/1.1 protocol types."
+description = "Address-pinned, server-authenticated HTTPS client for refineid (rustls)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
