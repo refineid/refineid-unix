@@ -79,7 +79,7 @@ command -v pkcs11-tool >/dev/null || { echo "ERROR: pkcs11-tool missing (opensc)
 command -v openssl >/dev/null || { echo "ERROR: openssl missing" >&2; exit 3; }
 command -v python3 >/dev/null || { echo "ERROR: python3 missing (ECDSA DER wrap)" >&2; exit 3; }
 
-WORK="$(mktemp -d -t refineid-pkcs11-suite.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/refineid-pkcs11-suite.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 PASS=0
