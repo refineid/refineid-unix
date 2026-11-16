@@ -270,20 +270,26 @@ out of scope by construction.
 > software products and network services SHALL perform Basic
 > Path Validation as described in RFC 5280, §6.1."
 
-This is the spec authority for the cert state lattice
-typestate planned in
-[`doc/typing-discipline.md`](typing-discipline.md):
+This is the spec authority for the certificate validation pipeline
+enforced across [`crates/refineid-lib-core/src/cert_state.rs`](../crates/refineid-lib-core/src/cert_state.rs),
+[`x509.rs`](../crates/refineid-lib-core/src/x509.rs),
+[`crl.rs`](../crates/refineid-lib-core/src/crl.rs),
+[`ocsp.rs`](../crates/refineid-lib-core/src/ocsp.rs), and
+[`crates/refineid-client/src/card_check.rs`](../crates/refineid-client/src/card_check.rs)
+(see [`doc/typing-discipline.md`](typing-discipline.md)):
 
 ```
-RawDer
-  -> ParsedCertificate          -- syntax check + signature alg recognised
-  -> PathValidatedCertificate   -- RFC 5280 §6.1 basic path validation
-  -> RevocationCheckedCertificate -- CRL or OCSP, against valid issuer
-  -> PurposeBoundTrustedCertificate<Purpose>  -- KeyUsage + EKU + policy bound to a typed purpose
+CertDer
+  -> x509::OwnedCert / Certificate  -- X.509 v3 syntax + signature alg parsed
+  -> RFC 5280 §6.1 path check       -- issuer chain signatures, validity, BasicConstraints
+  -> VerifiedCrl / VerifiedOcspResponse -- signature-verified CRL or OCSP status
+  -> KeyUsage slot check            -- Auth/Enc vs Non-Repudiation bit pattern separation
 ```
 
-Each transition is a constructor that consumes the
-predecessor; bypassing a stage is a compile error.
+Unvalidated `CertDer` bytes cannot be inspected as certificate fields
+without crossing the X.509 parser, and revocation evidence can only be
+constructed from a signature-verified `VerifiedCrl` or
+`VerifiedOcspResponse`.
 
 ### CRL / OCSP / ARL discipline (S2 §2)
 
@@ -372,7 +378,7 @@ each with its S2 citation:
   the card model side: which physical cards we accept and
   why.
 - [`doc/typing-discipline.md`](typing-discipline.md) -- the
-  cert state lattice this profile binds to.
+  typed parse-at-boundary rules this profile binds to.
 - [`doc/observability.md`](observability.md) -- the JSON
   Lines wire shape for cert-validation events.
 - [`doc/dvv-terminology.md`](dvv-terminology.md) -- DVV

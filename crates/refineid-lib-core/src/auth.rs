@@ -38,11 +38,10 @@
 pub mod commands;
 
 pub use refineid_auth::{
-    ActivationReport, ActivationScheme, CACHE_FINGERPRINT_KEY_LEN, CACHE_FINGERPRINT_LEN,
-    CardActivationNeeds, CardPinLengths, CredentialHealthReport, CredentialLengths,
-    FlooredCredential, ManageOutcome, PasswordLengthRange, PinChangeRecord, PinManageOps,
-    RetryFloorRefusal, classify_manage_sw, pin1_status_permits_reusable_cache,
-    read_pin_change_record, read_puk_status_from_container,
+    ActivationReport, ActivationScheme, CardActivationNeeds, CardPinLengths,
+    CredentialHealthReport, CredentialLengths, FlooredCredential, ManageOutcome,
+    PasswordLengthRange, PinChangeRecord, PinManageOps, RetryFloorRefusal, classify_manage_sw,
+    pin1_status_permits_reusable_cache, read_pin_change_record, read_puk_status_from_container,
 };
 
 use core::ops::RangeInclusive;

@@ -18,15 +18,16 @@
 //! enumerates readers, opens a transport, may reset a card, and
 //! moves APDU bytes -- but it must not grow business policy.
 //!
-//! [`ReaderId`], [`ReaderInfo`], and [`ReaderAccessCap`] live with
-//! the [`crate::card`] Session API and land when that module ports.
+//! [`ReaderId`], [`ReaderInfo`], and [`ReaderAccessCap`] model
+//! reader identity, presence metadata, and the requested open mode
+//! at the [`ReaderBackend`] boundary.
 
 use crate::transport::CardTransport;
 
 /// Identifier for a PC/SC reader.
 ///
-/// A minimal newtype so the [`ReaderBackend`] trait signature can
-/// be expressed without pulling the whole `card` module in.
+/// Typed wrapper distinguishing platform-reported reader names from
+/// arbitrary strings at the [`ReaderBackend`] boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReaderId(pub String);
 

@@ -17,33 +17,38 @@ types that closes the gap.
 This is read-only design. No code changes here; it is the blueprint
 to design before pouring.
 
-## The exemplar: the certificate lattice (already correct)
+## The exemplar: owned provenance + validating parse + verified view
 
-`crates/refineid-lib-core/src/cert_state.rs` is the template. A
-6-stage typestate lattice, each stage a type whose constructor
-validates one more guarantee, the type system forbidding any skip:
+`crates/refineid-lib-core/src/cert_state.rs`, `x509.rs`, `ocsp.rs`, and
+`crl.rs` follow the same staged pattern:
 
 ```
 CertDer (owned, card-read)        provenance only, honestly unvalidated
-  -> RawDer<'a>                   borrowed view
-  -> ParsedCert<'a>               X.509 syntax validated
-  -> PathValidatedCert<'a>        chain validated
-  -> RevocationCheckedCert<'a>    revocation checked
-  -> PurposeBoundCert<'a, P>      bound to Auth / NonRep
+  -> OwnedCert / Certificate<'a>  X.509 v3 syntax validated
+
+OwnedOcspResponse (parsed DER)    OCSP syntax validated
+  -> VerifiedOcspResponse::verify responder signature checked
+  -> VerifiedOcspResponse<'a>     unforgeable verified OCSP verdict
+
+OwnedCrl (parsed DER)             CRL syntax validated
+  -> VerifiedCrl::verify          issuer signature checked
+  -> VerifiedCrl<'a>              unforgeable verified CRL
 ```
 
-A `PurposeBoundCert<AuthPurpose>` is unforgeable proof that every
-prior check passed. `CertDer`'s "no syntactic check" is *honest*:
-it does not claim validity, it exists as the **owned backing store**
-that the borrowed `ParsedCert<'a>` views (Rust lifetimes: something
-must own the bytes the parsed view borrows), and the type system
-**forbids** using a `CertDer` where a validated cert is required.
-Validation happens at first parse (`RawDer::parse`), exactly as it
-should; the unvalidated entry stage cannot masquerade as trusted.
+A `VerifiedOcspResponse` or `VerifiedCrl` is unforgeable proof that
+both syntax parsing and issuer/responder signature verification
+passed. `CertDer`'s "no syntactic check" is *honest*: it does not
+claim validity, it exists as the **owned provenance wrapper** for raw
+bytes read off a PKCS#15 certificate slot or trust bundle, and the
+type system **forbids** using a `CertDer` where a parsed `Certificate`
+is required. Validation happens at first parse
+(`OwnedCert::from_der` / `Certificate::from_der`), so the unvalidated
+entry wrapper cannot masquerade as parsed X.509 data.
 
-**This is the pattern to replicate.** Owned provenance wrapper at
-the door -> `.parse()` is the single validating boundary ->
-borrowed validated view -> further stages for further guarantees.
+**This is the pattern across trust-bearing DER.** Owned provenance or
+parsed-DER lifetime anchor at the door -> `.from_der()` is the
+validating syntax boundary -> borrowed view -> `.verify*()` constructs
+the signature-verified proof type.
 
 ## Front doors (where untrusted DER enters)
 
@@ -115,8 +120,8 @@ guarantees:
    model). No generic `Pkcs15Error<E>` leaked into a pure parser.
 
 `SpkiDer<'a>` already exists and is the model for the borrowed
-validated view; `CertDer` / `RawDer` are the model for the owned
-wrapper + borrowed view split.
+validated view; `CertDer` + `OwnedCert` / `Certificate<'a>` are the
+model for the owned provenance wrapper + parsed borrowed view split.
 
 ## Sequencing (deliberate, test-backed, core-first)
 
@@ -142,10 +147,11 @@ byte-crunchers (Rule E21: genuine local byte math, raw is correct).
 
 ## Why not validate at the very first construction?
 
-Because the validated views borrow their bytes (`ParsedCert<'a>`,
+Because the validated views borrow their bytes (`Certificate<'a>`,
 `OcspResponse<'a>`), something must *own* the bytes for the view to
-borrow. So the owned wrapper (`CertDer` / `OcspResponseDer`) holds
-them and `.parse()` is one cheap call away -- and the type system
-forbids using the unparsed owned wrapper where a validated value is
-required. Validation still happens at first parse; the owned stage
-is the lifetime anchor, not a trust gap.
+borrow. So the owned wrapper (`CertDer` / `OwnedCert` /
+`OwnedOcspResponse`) holds them and `.from_der()` / `.view()` keeps
+lifetime management explicit -- while the type system forbids using an
+unparsed `CertDer` where a parsed `Certificate` is required.
+Validation happens at first parse; the owned stage is the lifetime
+anchor, not a trust gap.
