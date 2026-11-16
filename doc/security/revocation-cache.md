@@ -62,10 +62,9 @@ verdict) and the trust-by-construction model in
 The cache/field answers *"what do we currently know?"*. It never
 *grants* trust by itself: a consumer that wants to act on
 "non-revoked" reads the field, and checks it is `Some`, **fresh**,
-and (by construction) **verified**. The trust *decision* still climbs
-the cert-state typestate (`... -> RevocationCheckedCert ->
-PurposeBoundCert`). The cache is evidence; the decision is a
-deliberate step.
+and (by construction) **verified** alongside RFC 5280 path validation
+and expected `KeyUsage` checks. The cache is evidence; the trust
+decision is a deliberate step.
 
 ## Status
 

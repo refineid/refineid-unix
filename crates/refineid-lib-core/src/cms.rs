@@ -12,85 +12,65 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! CMS `SignedData` parser (RFC 5652), scoped to one-signer
-//! verification and to reading the eMRTD EF.SOD data-group
-//! inventory.
+//! Structural CMS `SignedData` and ICAO 9303 `EF.SOD` parser (RFC 5652).
 //!
 //! Surface:
 //!
-//! - `parse_signed_data` -- accepts either the bare
-//!   `SignedData` SEQUENCE, the outer `ContentInfo`-wrapped
-//!   form, or ICAO 9303's `[APPLICATION 23] IMPLICIT` form
-//!   (the byte stream you get when you read EF.SOD off an
-//!   eMRTD).
-//! - [`SignedData`] holds the encapsulated content when attached
-//!   (`econtent_der` = the `LDSSecurityObject` bytes for an
-//!   eMRTD SOD), the embedded certificates, and the sole
-//!   signerInfo's signature material.
-//! - [`SignedData::verify`] verifies the signerInfo's signature
-//!   against a supplied signer public key. Handles
-//!   both the "signedAttrs present" path (sign over DER(SET OF
-//!   attrs)) and the "signedAttrs absent" path (sign over
-//!   eContent directly).
+//! - [`OwnedSignedData`] and `SignedData::parse` -- accept the bare
+//!   `SignedData` SEQUENCE, the outer `ContentInfo`-wrapped form, or
+//!   ICAO 9303's `[APPLICATION 23] IMPLICIT` form (the byte stream
+//!   read from `EF.SOD` on an eMRTD).
+//! - [`SignedData`] exposes the encapsulated content type OID, the
+//!   attached `eContent` bytes (`LDSSecurityObject` DER for an eMRTD
+//!   SOD), and the embedded X.509 certificates while validating the
+//!   surrounding CMS and single-signer `SignerInfo` grammar (covering
+//!   RSA PKCS#1 v1.5, `id-RSASSA-PSS`, and ECDSA `AlgorithmIdentifier`
+//!   encodings).
+//! - [`LdsSecurityObject`] decodes the ICAO Doc 9303-10 `EF.SOD`
+//!   data-group hash inventory.
 //!
-//! Not in scope: countersignatures and non-X.509 certificate
-//! choices. Multiple signerInfos are rejected because every
-//! caller in this crate verifies one unambiguous signer.
+//! Not in scope: countersignatures, multiple `SignerInfo` entries, and
+//! non-X.509 `CertificateChoices` variants.
 
 use crate::ber::{BerTag, BerTlv, BerTlvAny, BerTlvIter, Integer, OctetString, Oid, Sequence, Set};
+use crate::oid::known;
 
-/// `[APPLICATION 23]` IMPLICIT (tag 0x77) -- EF.SOD's outer
-/// wrapper. ICAO 9303-10 §4.6.2 mandates this wrapper for an
-/// eMRTD's Document Security Object.
+/// `[APPLICATION 23]` IMPLICIT (tag `0x77`) -- `EF.SOD` outer wrapper
+/// per ICAO Doc 9303-10 sec. 4.6.2.
 #[derive(Debug, Clone, Copy)]
-pub struct EfSodWrapper;
+struct EfSodWrapper;
 impl BerTag for EfSodWrapper {
     const TAG: u16 = 0x77;
 }
 
-/// `[0] EXPLICIT` (tag 0xA0).
-///
-/// The CMS context-specific wrapper used in
-/// `ContentInfo.content`, `SignedData.certificates`, and
-/// `SignerInfo.signedAttrs` (RFC 5652 §3 / §5). The byte is
-/// the same in all three contexts; the parent structure
-/// decides the semantic.
+/// `[0] EXPLICIT` / `[0] IMPLICIT` constructed context-specific tag
+/// (`0xA0`) used in `ContentInfo.content`, `SignedData.certificates`,
+/// and `SignerInfo.signedAttrs` (RFC 5652 sec. 3 / sec. 5).
 #[derive(Debug, Clone, Copy)]
-pub struct Asn1ContentExplicit0;
+struct Asn1ContentExplicit0;
 impl BerTag for Asn1ContentExplicit0 {
     const TAG: u16 = 0xA0;
 }
 
-/// `[1] IMPLICIT` (tag `0xA1`).
+/// `[1] IMPLICIT` constructed context-specific tag (`0xA1`) used in
+/// `SignedData.crls` and `SignerInfo.unsignedAttrs`.
 #[derive(Debug, Clone, Copy)]
 struct Asn1ContentImplicit1;
 impl BerTag for Asn1ContentImplicit1 {
     const TAG: u16 = 0xA1;
 }
 
-/// `SignerIdentifier.subjectKeyIdentifier [0] IMPLICIT OCTET STRING`.
+/// `SignerIdentifier.subjectKeyIdentifier [0] IMPLICIT OCTET STRING`
+/// (tag `0x80`).
 #[derive(Debug, Clone, Copy)]
 struct SignerSubjectKeyIdentifier;
 impl BerTag for SignerSubjectKeyIdentifier {
     const TAG: u16 = 0x80;
 }
-use crate::crypto::container::{
-    EcdsaDer, RsaPkcs1Sha256, RsaPkcs1Sha384, RsaPkcs1Sha512, Signature,
-};
-use crate::crypto::ecdsa::{self, EcdsaError};
-use crate::crypto::rsa::{
-    RsaPublicKey, RsaVerifyError, verify_pkcs1v15_sha384, verify_pkcs1v15_sha512,
-};
-use crate::oid::known;
-use crate::x509::{X509Error, extract_rsa_public_key};
-use sha2::{Digest as _, Sha256, Sha384, Sha512};
 
-// OID values are the typed `oid::known` constants (single source of
-// truth); CMS compares them at the byte level via `.as_bytes()`.
+// ----- Hash algorithm OID mapping -----
 
-// ----- Hash algorithm dispatch -----
-
-/// Hash algorithm dispatch for CMS signer verification.
+/// SHA-2 digest algorithm recorded in `LDSSecurityObject`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashAlgorithm {
     /// SHA-256 (OID `2.16.840.1.101.3.4.2.1`).
@@ -102,9 +82,8 @@ pub enum HashAlgorithm {
 }
 
 impl HashAlgorithm {
-    /// Decode an OID body into the typed enum. `None` for any
-    /// OID that isn't one of the three SHA-2 variants refineid
-    /// supports.
+    /// Decode an OID body into the typed enum. Returns `None` for any
+    /// OID outside SHA-256, SHA-384, and SHA-512.
     #[must_use]
     #[inline]
     pub fn from_oid<B: AsRef<[u8]>>(oid: B) -> Option<Self> {
@@ -116,97 +95,31 @@ impl HashAlgorithm {
             _ => None,
         }
     }
-
-    /// Compute the digest of `data` under this algorithm.
-    /// Returns the raw output bytes (32 / 48 / 64 bytes
-    /// respectively).
-    #[must_use]
-    #[inline]
-    pub fn digest<B: AsRef<[u8]>>(self, data: B) -> Vec<u8> {
-        let bytes = data.as_ref();
-        match self {
-            Self::Sha256 => {
-                let mut h = Sha256::new();
-                h.update(bytes);
-                h.finalize().to_vec()
-            }
-            Self::Sha384 => {
-                let mut h = Sha384::new();
-                h.update(bytes);
-                h.finalize().to_vec()
-            }
-            Self::Sha512 => {
-                let mut h = Sha512::new();
-                h.update(bytes);
-                h.finalize().to_vec()
-            }
-        }
-    }
-
-    /// Human-readable label ("SHA-256" / "SHA-384" / "SHA-512")
-    /// used for diagnostic output.
-    #[must_use]
-    #[inline]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Sha256 => "SHA-256",
-            Self::Sha384 => "SHA-384",
-            Self::Sha512 => "SHA-512",
-        }
-    }
 }
 
 // ----- SignedData public surface -----
 
-/// Error returned from the CMS parser / verifier.
+/// Error returned from the structural CMS / `EF.SOD` parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect(
     variant_size_differences,
-    reason = "`UnexpectedStructure(&'static str)` carries a 16 B fat pointer; the next-largest variant is `Ber(BerError)` (~8 B), tripping the >3x heuristic. Boxing the static-str pointer would add an indirection without meaningfully shrinking the type's stack footprint (16 B -> 8 B), and the message-naming-the-shape pattern is consistent with X509Error / EmrtdError elsewhere in the crate."
+    reason = "`UnexpectedStructure(&'static str)` carries a 16 B fat pointer while `Ber(BerError)` and `UnsupportedDigestAlgorithm` are smaller; keeping a compile-time &'static str shape diagnostic matches X509Error and EmrtdError without heap indirection."
 )]
 pub enum CmsError {
     /// BER / TLV decode failure during structural parse.
     Ber(crate::ber::BerError),
-    /// Structural shape mismatch (wrong tag, wrong nesting,
-    /// missing required field). Tier 0 `&'static str` from a
-    /// fixed compile-time set naming the unexpected sub-shape.
+    /// Structural shape mismatch (wrong tag, wrong nesting, or missing
+    /// required field).
     UnexpectedStructure(&'static str),
-    /// `digestAlgorithm` OID didn't match the SHA-2 variants
-    /// refineid supports ([`HashAlgorithm`]).
+    /// `LDSSecurityObject.hashAlgorithm` OID is not one of the
+    /// supported SHA-2 variants ([`HashAlgorithm`]).
     UnsupportedDigestAlgorithm,
-    /// `signatureAlgorithm` OID didn't match the RSA / ECDSA
-    /// variants refineid supports.
-    UnsupportedSignatureAlgorithm,
-    /// Signer cert exists but its SPKI didn't parse into a
-    /// supported RSA / ECDSA key.
-    BadSignerKey,
-    /// `messageDigest` signed attribute didn't equal
-    /// `Hash(eContent)`. Signature wasn't verified after this
-    /// check failed (one of two PA preconditions per RFC 5652).
-    SignerHashMismatch,
-    /// `eContent` OCTET STRING was missing where the operation needs
-    /// it -- the content of a detached `SignedData` is not in the
-    /// structure (eMRTD SOD always carries eContent).
-    DetachedNotSupported,
-    /// RSA signature verification (against the signer's
-    /// PKCS#1 v1.5 key) failed.
-    Rsa(RsaVerifyError),
-    /// ECDSA signature verification (against the signer's
-    /// SEC1 uncompressed point) failed.
-    Ecdsa(EcdsaError),
 }
 
 impl From<crate::ber::BerError> for CmsError {
     #[inline]
     fn from(e: crate::ber::BerError) -> Self {
         Self::Ber(e)
-    }
-}
-
-impl From<X509Error> for CmsError {
-    #[inline]
-    fn from(_e: X509Error) -> Self {
-        Self::UnexpectedStructure("x509 sub-parse failed")
     }
 }
 
@@ -217,139 +130,67 @@ impl core::fmt::Display for CmsError {
             Self::Ber(e) => write!(f, "CMS BER: {e}"),
             Self::UnexpectedStructure(s) => write!(f, "CMS: {s}"),
             Self::UnsupportedDigestAlgorithm => write!(f, "CMS: unsupported digest algorithm"),
-            Self::UnsupportedSignatureAlgorithm => {
-                write!(f, "CMS: unsupported signature algorithm")
-            }
-            Self::BadSignerKey => write!(f, "CMS: signer key did not parse as RSA"),
-            Self::SignerHashMismatch => write!(f, "CMS: messageDigest attr != hash(eContent)"),
-            Self::DetachedNotSupported => write!(f, "CMS: detached SignedData not supported"),
-            Self::Rsa(e) => write!(f, "CMS: RSA verify: {e}"),
-            Self::Ecdsa(e) => write!(f, "CMS: ECDSA verify: {e}"),
         }
     }
 }
 
 impl core::error::Error for CmsError {}
 
-/// Parsed subset of a CMS `SignedData` value sufficient for
-/// one-signer verification.
+/// Structurally validated view of a single-signer CMS `SignedData`.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SignedData<'a> {
-    /// Inner `EncapsulatedContentInfo.eContentType` OID.
-    /// Typed via [`crate::oid::Oid`] -- the BER parser validates
-    /// the OID structure at the trust boundary, so consumers
-    /// never compare against arbitrary `&[u8]`.
+    /// Inner `EncapsulatedContentInfo.eContentType` OID, validated at
+    /// the BER boundary via [`crate::oid::Oid`].
     pub econtent_type_oid: crate::oid::Oid<'a>,
-    /// Inner `eContent` OCTET STRING value bytes, `None` for a
-    /// detached `SignedData` (RFC 5652 sec.5.2: `eContent` is
-    /// OPTIONAL). For an eMRTD SOD this is the DER encoding of
-    /// `LDSSecurityObject`.
+    /// Inner `eContent` OCTET STRING value bytes, or `None` for a
+    /// detached `SignedData` (RFC 5652 sec. 5.2). For an eMRTD `EF.SOD`
+    /// this holds the DER encoding of `LDSSecurityObject`.
     pub econtent_der: Option<&'a [u8]>,
-    /// Embedded certificates (typically just the Document
-    /// Signing Certificate). Each entry is the raw DER of one
-    /// cert SEQUENCE.
+    /// Embedded X.509 certificates (for `EF.SOD`, typically the
+    /// Document Signer Certificate). Each slice is the full DER of one
+    /// certificate `SEQUENCE`.
     pub certificates_der: Vec<&'a [u8]>,
-    /// The sole signerInfo's fields.
-    pub signer: SignerInfo<'a>,
 }
 
-/// CMS `SignerIdentifier` (RFC 5652 sec.5.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignerIdentifier<'a> {
-    /// Issuer `Name` DER and certificate serial-number INTEGER body.
-    IssuerAndSerialNumber {
-        /// Full DER encoding of the issuer `Name`.
-        issuer_der: &'a [u8],
-        /// INTEGER value bytes of the certificate serial number.
-        serial_number: &'a [u8],
-    },
-    /// Subject-key-identifier extension value.
-    SubjectKeyIdentifier(&'a [u8]),
-}
-
-/// Parsed subset of CMS `SignerInfo` (RFC 5652 §5.3) required
-/// to verify a signature against the embedded signer cert.
-#[derive(Debug, Clone)]
-pub struct SignerInfo<'a> {
-    /// Certificate identifier carried by the signerInfo.
-    pub signer_identifier: SignerIdentifier<'a>,
-    /// `digestAlgorithm` OID body. Typed via [`crate::oid::Oid`].
-    pub digest_algorithm_oid: crate::oid::Oid<'a>,
-    /// `signatureAlgorithm` OID body. Typed via [`crate::oid::Oid`].
-    pub signature_algorithm_oid: crate::oid::Oid<'a>,
-    /// Signature value bytes (raw, no BIT STRING wrapper).
-    pub signature: &'a [u8],
-    /// If `signedAttrs` was present, the DER bytes of the
-    /// **re-tagged** `SET OF Attribute` -- exactly the data the
-    /// signature was computed over (RFC 5652 sec.5.4). `None`
-    /// means "signature was computed directly over eContent".
-    pub signed_data_to_verify: Option<Vec<u8>>,
-    /// `messageDigest` attribute value, when `signedAttrs` was
-    /// present. Used to cross-check that the signer's commitment
-    /// to the eContent hash matches what we'd compute ourselves.
-    pub message_digest: Option<&'a [u8]>,
-}
-
-/// Parse a CMS `SignedData` from any of the three wrappings we
-/// see in the wild:
+/// Owning wrapper around a validated CMS `SignedData` buffer.
 ///
-/// - bare `SignedData` SEQUENCE (tag `0x30`),
-/// - `ContentInfo` wrapper (tag `0x30` outer, OID `id-signedData`
-///   inside, then `[0] EXPLICIT` `SignedData`),
-/// - ICAO 9303 `[APPLICATION 23] IMPLICIT SignedData` (tag
-///   `0x77` -- this is what EF.SOD always begins with).
-///
-/// # Errors
-/// BER decode failures or shape mismatches.
-/// Owning wrapper around a parsed CMS `SignedData`.
-///
-/// Same pattern as [`crate::x509::OwnedCert`] /
-/// [`crate::crl::OwnedCrl`] / [`crate::ocsp::OwnedOcspResponse`]:
-/// holds the input DER plus a re-parseable view. Public entry
-/// point under typing-discipline rule D; free `parse_signed_data`
-/// is `pub(crate)` because it returns a borrowed view tied to
-/// the input.
+/// Follows the same lifetime-anchor pattern as
+/// [`crate::x509::OwnedCert`], [`crate::crl::OwnedCrl`], and
+/// [`crate::ocsp::OwnedOcspResponse`]: validates the DER on
+/// construction and hands out borrowed [`SignedData`] views on demand.
 #[derive(Debug, Clone)]
 pub struct OwnedSignedData {
-    /// `der` field.
+    /// Validated raw DER bytes.
     der: Vec<u8>,
 }
 
 impl OwnedSignedData {
-    /// Parse `der` as a CMS `SignedData` (accepting the
-    /// bare-SEQUENCE, ContentInfo-wrapped, and EF.SOD-wrapped
-    /// forms), allocating an owned copy.
+    /// Parse `der` as a CMS `SignedData` (accepting the bare-SEQUENCE,
+    /// `ContentInfo`-wrapped, and `EF.SOD`-wrapped forms) and retain an
+    /// owned copy.
     ///
     /// # Errors
-    /// [`CmsError`] from the CMS parser.
+    /// [`CmsError`] if `der` fails BER or CMS structural validation.
     #[inline]
     pub fn from_der<B: AsRef<[u8]>>(der: B) -> Result<Self, CmsError> {
         let bytes = der.as_ref().to_vec();
-        // Validate-only parse: the borrowed `SignedData` is
-        // discarded immediately; we'll re-parse on every `view()`
-        // call so the borrowed shape stays tied to `self.der`.
-        // Explicit `drop` (instead of `let _ =`) names what's
-        // happening to the value owning the certificate-slice
-        // `Vec` and the SignerInfo allocations.
         drop(SignedData::parse(&bytes)?);
         Ok(Self { der: bytes })
     }
 
-    /// Re-parse the owned DER and hand back the borrowed view.
+    /// Re-parse the owned DER and return a borrowed [`SignedData`] view.
     ///
     /// # Performance
-    /// Parses the DER on **every call** (O(n) in the DER length). For
-    /// repeated field access bind the view once (`let sd = owned.view();`)
-    /// and reuse it, rather than calling `view()` per field.
+    /// Parses the DER on every call (`O(n)` in the DER length). Bind
+    /// the returned view once when reading multiple fields.
     ///
     /// # Panics
-    /// Never -- [`from_der`] validated at construction.
-    ///
-    /// [`from_der`]: Self::from_der.
+    /// Never -- [`Self::from_der`] validated `self.der` at construction.
     #[must_use]
     #[expect(
         clippy::expect_used,
-        reason = "from_der validated the DER at construction; the re-parse cannot fail unless the owned Vec was tampered with through unsafe, which #![deny(unsafe_code)] forbids in this crate. Acceptable construction invariant in production code."
+        reason = "from_der validated the DER at construction; re-parsing the immutable Vec cannot fail under #![deny(unsafe_code)]."
     )]
     #[inline]
     pub fn view(&self) -> SignedData<'_> {
@@ -357,7 +198,7 @@ impl OwnedSignedData {
             .expect("OwnedSignedData: from_der validated DER at construction")
     }
 
-    /// Raw DER bytes.
+    /// Borrow the underlying raw DER bytes.
     #[must_use]
     #[inline]
     pub fn as_der(&self) -> &[u8] {
@@ -366,36 +207,25 @@ impl OwnedSignedData {
 }
 
 impl<'a> SignedData<'a> {
-    /// Parse a CMS `SignedData` from raw DER, transparently handling
-    /// the three wrappings seen in FINEID / eMRTD deployments.
+    /// Parse a CMS `SignedData` from raw DER across the three wrappings
+    /// seen in FINEID and eMRTD deployments (RFC 5652 sec. 3 / sec. 5.1
+    /// and ICAO Doc 9303-10 sec. 4.6.2.2):
     ///
-    /// RFC 5652 §5.1 (`SignedData`) and ICAO 9303 Part 10 §4.6.2.2
-    /// (EF.SOD's `[APPLICATION 23]` wrap). Accepts:
-    ///   1. Bare `SignedData` SEQUENCE,
-    ///   2. `ContentInfo` wrapping `SignedData` (RFC 5652 §3),
-    ///   3. EF.SOD wrapper (`[APPLICATION 23]`) -> `ContentInfo` ->
-    ///      `SignedData` (ICAO 9303 Part 10).
-    ///
-    /// The detection is by the outer tag byte; the function never
-    /// touches the inner certificate / signature material beyond
-    /// borrowing slices from `input` (lifetime-tied output).
+    /// 1. Bare `SignedData` `SEQUENCE`,
+    /// 2. `ContentInfo` wrapping `SignedData`,
+    /// 3. `EF.SOD` wrapper (`[APPLICATION 23]`) wrapping `ContentInfo`.
     pub(crate) fn parse(input: &'a [u8]) -> Result<Self, CmsError> {
-        // `split_first` fuses the empty-input check and the first-byte
-        // peek into one pattern, leaving no bare indexing on `input[0]`.
         let Some((&first, _rest)) = input.split_first() else {
             return Err(CmsError::UnexpectedStructure("empty input"));
         };
         let signed_data_body = match u16::from(first) {
-            // [APPLICATION 23] IMPLICIT -- EF.SOD wrapping.
             <EfSodWrapper as BerTag>::TAG => {
                 let outer = CmsHelpers::parse_exact::<EfSodWrapper>(
                     input,
                     "trailing bytes after EF.SOD wrapper",
                 )?;
-                // Inside is ContentInfo (SEQUENCE) carrying SignedData.
                 CmsHelpers::decode_content_info(&ContentInfoDer { input: outer.value })?
             }
-            // SEQUENCE -- either ContentInfo or a bare SignedData.
             <Sequence as BerTag>::TAG => {
                 let outer =
                     CmsHelpers::parse_exact::<Sequence>(input, "trailing bytes after CMS value")?;
@@ -404,8 +234,6 @@ impl<'a> SignedData<'a> {
                 if first_any.tag == <Oid as BerTag>::TAG {
                     CmsHelpers::decode_content_info(&ContentInfoDer { input })?
                 } else {
-                    // A bare SignedData starts with its INTEGER version;
-                    // ContentInfo starts with an OID.
                     outer.value
                 }
             }
@@ -417,9 +245,7 @@ impl<'a> SignedData<'a> {
     }
 }
 
-/// Helpers hosted on a unit struct (typing-discipline: no
-/// free fns with borrowed parameters; see
-/// `doc/typing-discipline.md`).
+/// Structural CMS parser helpers hosted on a unit struct.
 struct CmsHelpers;
 
 /// `ContentInfo` DER wrapper for CMS parser helpers.
@@ -440,16 +266,8 @@ struct SignerInfoBody<'a> {
     body: &'a [u8],
 }
 
-/// Parsed mandatory fields from a signed-attribute set.
-struct ParsedSignedAttributes<'a> {
-    /// Unique `contentType` value.
-    content_type: Option<crate::oid::Oid<'a>>,
-    /// Unique `messageDigest` value.
-    message_digest: Option<&'a [u8]>,
-}
-
 impl CmsHelpers {
-    /// Parse one typed TLV and reject any bytes after it.
+    /// Parse one typed TLV and reject any trailing bytes after it.
     fn parse_exact<'a, T: BerTag>(
         input: &'a [u8],
         trailing: &'static str,
@@ -461,9 +279,8 @@ impl CmsHelpers {
         Ok(tlv)
     }
 
-    /// `decode_content_info` associated function.
+    /// Decode `ContentInfo ::= SEQUENCE { contentType OID, content [0] EXPLICIT SignedData }`.
     fn decode_content_info<'a>(content_info: &ContentInfoDer<'a>) -> Result<&'a [u8], CmsError> {
-        // ContentInfo ::= SEQUENCE { contentType OID, content [0] EXPLICIT ANY }
         let outer =
             Self::parse_exact::<Sequence>(content_info.input, "trailing bytes after ContentInfo")?;
         let mut it = BerTlvIter::new(outer.value);
@@ -499,10 +316,10 @@ impl CmsHelpers {
         Ok(inner_sd.value)
     }
 
-    /// `parse_signed_data_body` associated function.
+    /// Parse and validate a `SignedData` body and its sole `SignerInfo`.
     #[expect(
         clippy::too_many_lines,
-        reason = "the SignedData grammar is kept in field order so ordering and one-signer invariants remain auditable"
+        reason = "the SignedData grammar is validated in RFC 5652 field order so ordering and one-signer invariants stay auditable in one place"
     )]
     fn parse_signed_data_body<'a>(
         signed_data: &SignedDataBody<'a>,
@@ -626,13 +443,13 @@ impl CmsHelpers {
             }
             Some(Err(error)) => return Err(error.into()),
         }
-        let signer = Self::parse_signer_info(
+        let signer_digest_oid = Self::validate_signer_info(
             &SignerInfoBody {
                 body: signer_tlv.value,
             },
             econtent_type_oid,
         )?;
-        if !digest_algorithm_oids.contains(&signer.digest_algorithm_oid) {
+        if !digest_algorithm_oids.contains(&signer_digest_oid) {
             return Err(CmsError::UnexpectedStructure(
                 "signer digestAlgorithm absent from SignedData set",
             ));
@@ -642,11 +459,10 @@ impl CmsHelpers {
             econtent_type_oid,
             econtent_der,
             certificates_der,
-            signer,
         })
     }
 
-    /// Parse and validate every `AlgorithmIdentifier` in the digest set.
+    /// Parse and validate every `AlgorithmIdentifier` in `digestAlgorithms`.
     fn parse_digest_algorithms(
         digest_algorithms: &[u8],
     ) -> Result<Vec<crate::oid::Oid<'_>>, CmsError> {
@@ -666,7 +482,11 @@ impl CmsHelpers {
         Ok(algorithms)
     }
 
-    /// Parse an `AlgorithmIdentifier` and reject extra children.
+    /// Parse an `AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY OPTIONAL }`.
+    ///
+    /// Accepts parameterless forms (ECDSA), `NULL` parameters (RSA
+    /// PKCS#1 v1.5 / SHA-2), and structured `SEQUENCE` parameters such
+    /// as `RSASSA-PSS-params` on `id-RSASSA-PSS` (`1.2.840.113549.1.1.10`).
     fn parse_algorithm_identifier(
         algorithm: BerTlv<'_, Sequence>,
     ) -> Result<crate::oid::Oid<'_>, CmsError> {
@@ -696,7 +516,7 @@ impl CmsHelpers {
     }
 
     /// Collect direct X.509 `Certificate` choices and reject every other
-    /// `CertificateChoices` alternative rather than silently truncating.
+    /// `CertificateChoices` alternative.
     fn parse_certificates(certificates: &[u8]) -> Result<Vec<&[u8]>, CmsError> {
         if certificates.is_empty() {
             return Err(CmsError::UnexpectedStructure("empty certificates field"));
@@ -723,7 +543,7 @@ impl CmsHelpers {
         Ok(result)
     }
 
-    /// Require a constructed IMPLICIT field to contain complete TLVs.
+    /// Require a constructed IMPLICIT field to contain at least one complete TLV.
     fn validate_nonempty_tlv_stream(values: &[u8], empty: &'static str) -> Result<(), CmsError> {
         let mut count = 0_usize;
         for value in BerTlvIter::new(values) {
@@ -736,11 +556,13 @@ impl CmsHelpers {
         Ok(())
     }
 
-    /// `parse_signer_info` associated function.
-    fn parse_signer_info<'a>(
+    /// Validate a CMS `SignerInfo` (RFC 5652 sec. 5.3) and return its
+    /// `digestAlgorithm` OID so the caller can confirm membership in
+    /// `SignedData.digestAlgorithms`.
+    fn validate_signer_info<'a>(
         signer_info: &SignerInfoBody<'a>,
         expected_content_type: crate::oid::Oid<'a>,
-    ) -> Result<SignerInfo<'a>, CmsError> {
+    ) -> Result<crate::oid::Oid<'a>, CmsError> {
         let mut children = BerTlvIter::new(signer_info.body);
         let version = children
             .next()
@@ -752,7 +574,7 @@ impl CmsHelpers {
         let sid = children
             .next()
             .ok_or(CmsError::UnexpectedStructure("signerInfo missing sid"))??;
-        let signer_identifier = Self::parse_signer_identifier(sid, version.value)?;
+        Self::validate_signer_identifier(sid, version.value)?;
 
         let digest_alg_seq = children
             .next()
@@ -783,8 +605,8 @@ impl CmsHelpers {
                 .or(Err(CmsError::UnexpectedStructure(
                     "signatureAlgorithm not SEQUENCE",
                 )))?;
-        let signature_algorithm_oid = Self::parse_algorithm_identifier(sig_alg_seq)?;
-        let sig_octet = children
+        let _signature_algorithm_oid = Self::parse_algorithm_identifier(sig_alg_seq)?;
+        let _sig_octet = children
             .next()
             .ok_or(CmsError::UnexpectedStructure(
                 "signerInfo missing signature material",
@@ -793,7 +615,6 @@ impl CmsHelpers {
             .or(Err(CmsError::UnexpectedStructure(
                 "signature not OCTET STRING",
             )))?;
-        let signature = sig_octet.value;
 
         if let Some(unsigned_attrs) = children.next() {
             let unsigned_attrs = unsigned_attrs?;
@@ -810,42 +631,19 @@ impl CmsHelpers {
             ));
         }
 
-        // signedAttrs handling: per RFC 5652 sec.5.4, when present the
-        // signature is over DER(SET OF signed_attrs). The [0] IMPLICIT
-        // tag is re-encoded as a SET (tag 0x31) for digest purposes.
-        let (signed_data_to_verify, message_digest) = if let Some(attrs_value) = signed_attrs_value
-        {
-            // Re-encode as SET: 0x31 + length + value. `Set::TAG`
-            // is the spec value `0x31`; `to_be_bytes()` lets us
-            // grab the low byte directly without a fallible
-            // `u8::try_from(u16)`.
-            let [_high, set_tag_lo] = <Set as BerTag>::TAG.to_be_bytes();
-            let rebuilt = crate::ber::tlv(set_tag_lo, attrs_value);
-            let parsed = Self::parse_attributes(attrs_value, true)?;
-            if parsed.content_type != Some(expected_content_type) {
+        if let Some(attrs_value) = signed_attrs_value {
+            let content_type = Self::parse_attributes(attrs_value, true)?;
+            if content_type != Some(expected_content_type) {
                 return Err(CmsError::UnexpectedStructure(
                     "signed contentType does not match eContentType",
                 ));
             }
-            (Some(rebuilt), parsed.message_digest)
-        } else {
-            (None, None)
-        };
-        Ok(SignerInfo {
-            signer_identifier,
-            digest_algorithm_oid,
-            signature_algorithm_oid,
-            signature,
-            signed_data_to_verify,
-            message_digest,
-        })
+        }
+        Ok(digest_algorithm_oid)
     }
 
-    /// Parse a CMS `SignerIdentifier` and enforce its version coupling.
-    fn parse_signer_identifier<'a>(
-        sid: BerTlvAny<'a>,
-        version: &[u8],
-    ) -> Result<SignerIdentifier<'a>, CmsError> {
+    /// Validate `SignerIdentifier` syntax and RFC 5652 version coupling.
+    fn validate_signer_identifier(sid: BerTlvAny<'_>, version: &[u8]) -> Result<(), CmsError> {
         const VERSION_ISSUER_AND_SERIAL: u8 = 1;
         const VERSION_SUBJECT_KEY_IDENTIFIER: u8 = 3;
 
@@ -876,14 +674,11 @@ impl CmsHelpers {
                     "issuerAndSerialNumber malformed",
                 ));
             }
-            let issuer_der = sid
+            let _issuer_der = sid
                 .value
                 .get(..issuer.size)
                 .ok_or(CmsError::UnexpectedStructure("sid issuer truncated"))?;
-            Ok(SignerIdentifier::IssuerAndSerialNumber {
-                issuer_der,
-                serial_number: serial.value,
-            })
+            Ok(())
         } else if sid.tag == <SignerSubjectKeyIdentifier as BerTag>::TAG {
             if version != [VERSION_SUBJECT_KEY_IDENTIFIER] {
                 return Err(CmsError::UnexpectedStructure(
@@ -896,7 +691,7 @@ impl CmsHelpers {
                     "subjectKeyIdentifier is empty",
                 ));
             }
-            Ok(SignerIdentifier::SubjectKeyIdentifier(sid.value))
+            Ok(())
         } else {
             Err(CmsError::UnexpectedStructure(
                 "unsupported SignerIdentifier choice",
@@ -904,14 +699,15 @@ impl CmsHelpers {
         }
     }
 
-    /// Parse an Attribute set. Signed attributes require exactly one
-    /// `contentType` and one `messageDigest`, each with one typed value.
+    /// Parse an `Attribute` set. Signed attributes require exactly one
+    /// `contentType` OID and one `messageDigest` OCTET STRING; returns
+    /// the `contentType` OID when `require_mandatory_signed` is set.
     fn parse_attributes(
         attrs_value: &[u8],
         require_mandatory_signed: bool,
-    ) -> Result<ParsedSignedAttributes<'_>, CmsError> {
+    ) -> Result<Option<crate::oid::Oid<'_>>, CmsError> {
         let mut content_type = None;
-        let mut message_digest = None;
+        let mut has_message_digest = false;
 
         for attr in BerTlvIter::new(attrs_value) {
             let attr = attr?
@@ -954,16 +750,16 @@ impl CmsHelpers {
                     CmsError::UnexpectedStructure("contentType attribute OID malformed"),
                 ))?);
             } else if require_mandatory_signed && oid == known::MESSAGE_DIGEST {
-                if message_digest.is_some() {
+                if has_message_digest {
                     return Err(CmsError::UnexpectedStructure(
                         "duplicate signed messageDigest attribute",
                     ));
                 }
-                let value = Self::parse_exact::<OctetString>(
+                let _value = Self::parse_exact::<OctetString>(
                     values.value,
                     "messageDigest attribute has multiple values",
                 )?;
-                message_digest = Some(value.value);
+                has_message_digest = true;
             }
         }
 
@@ -972,203 +768,42 @@ impl CmsHelpers {
                 "signedAttrs missing contentType",
             ));
         }
-        if require_mandatory_signed && message_digest.is_none() {
+        if require_mandatory_signed && !has_message_digest {
             return Err(CmsError::UnexpectedStructure(
                 "signedAttrs missing messageDigest",
             ));
         }
-        Ok(ParsedSignedAttributes {
-            content_type,
-            message_digest,
-        })
+        Ok(content_type)
     }
-}
-
-impl SignedData<'_> {
-    /// Verify the signerInfo's signature against `signer_spki_der`
-    /// (the signer certificate's SPKI). When `signedAttrs` was present, also
-    /// verifies that the `messageDigest` attribute matches
-    /// `hash(eContent)`.
-    ///
-    /// # Errors
-    /// [`CmsError::DetachedNotSupported`] when the `SignedData` carries
-    /// no `eContent`; otherwise cross-check failure, unsupported
-    /// algorithm, or RSA verifier rejection.
-    #[inline]
-    pub fn verify<B: AsRef<[u8]>>(&self, signer_spki_der: B) -> Result<(), CmsError> {
-        let digest_alg = HashAlgorithm::from_oid(self.signer.digest_algorithm_oid.as_bytes())
-            .ok_or(CmsError::UnsupportedDigestAlgorithm)?;
-        let econtent = self.econtent_der.ok_or(CmsError::DetachedNotSupported)?;
-
-        // Signed attributes are only safe when they bind the eContent.
-        // The parser enforces this invariant; keep the check here too so
-        // callers constructing the public struct cannot bypass it.
-        if self.signer.signed_data_to_verify.is_some() {
-            let md = self
-                .signer
-                .message_digest
-                .ok_or(CmsError::UnexpectedStructure(
-                    "signedAttrs missing messageDigest",
-                ))?;
-            let expected = digest_alg.digest(econtent);
-            if expected != md {
-                return Err(CmsError::SignerHashMismatch);
-            }
-        }
-        // The data the signature covers is the re-tagged signedAttrs
-        // SET when present, else eContent directly.
-        let payload: &[u8] = self
-            .signer
-            .signed_data_to_verify
-            .as_deref()
-            .unwrap_or(econtent);
-        verify_dispatch(&SignatureDispatch {
-            sig_alg_oid: self.signer.signature_algorithm_oid,
-            digest_alg_fallback: digest_alg,
-            signer_spki_der: signer_spki_der.as_ref(),
-            payload,
-            signature: self.signer.signature,
-        })
-    }
-}
-
-// `known::EC_PUBLIC_KEY` is *sometimes* the signatureAlgorithm OID in
-// a signerInfo -- the hash then comes from the signerInfo's
-// digestAlgorithm (handled via the `digest_alg_fallback` arm below).
-
-/// Inputs for CMS signer signature verification.
-struct SignatureDispatch<'a> {
-    /// Signature algorithm OID.
-    sig_alg_oid: crate::oid::Oid<'a>,
-    /// Digest algorithm from `SignerInfo`.
-    digest_alg_fallback: HashAlgorithm,
-    /// Signer SPKI DER.
-    signer_spki_der: &'a [u8],
-    /// Payload covered by the signature.
-    payload: &'a [u8],
-    /// Signature bytes.
-    signature: &'a [u8],
-}
-
-/// RSA signature verification input.
-struct RsaVerifyInput<'a> {
-    /// RSA public key.
-    key: &'a RsaPublicKey,
-    /// Hash algorithm selected by CMS.
-    hash: HashAlgorithm,
-    /// Payload covered by the signature.
-    payload: &'a [u8],
-    /// Signature bytes.
-    signature: &'a [u8],
-}
-
-/// Verify a `SignerInfo` signature, dispatching on the signature
-/// algorithm OID over the prehashed `payload`.
-///
-/// RFC 5652 §5.4 (message-digest computation) and RFC 5754 (RSA /
-/// ECDSA signature algorithms). The `digest_alg_fallback` is used
-/// when the signature OID is the bare key-type OID (`id-ecPublicKey`
-/// or `rsaEncryption`) -- some signers encode it that
-/// way and the digest is taken from `signerInfo.digestAlgorithm`.
-///
-/// Returns `Err(UnsupportedSignatureAlgorithm)` when the OID is
-/// outside the SHA-256/384/512 × RSA-PKCS1v15/ECDSA matrix this
-/// build supports; no PSS, no DSA, no Ed25519 here.
-fn verify_dispatch(input: &SignatureDispatch<'_>) -> Result<(), CmsError> {
-    // RSA-PKCS1v15 path.
-    let hash_for_rsa = match input.sig_alg_oid.as_bytes() {
-        v if v == known::SHA256_WITH_RSA.as_bytes() => Some(HashAlgorithm::Sha256),
-        v if v == known::SHA384_WITH_RSA.as_bytes() => Some(HashAlgorithm::Sha384),
-        v if v == known::SHA512_WITH_RSA.as_bytes() => Some(HashAlgorithm::Sha512),
-        v if v == known::RSA_ENCRYPTION.as_bytes() => Some(input.digest_alg_fallback),
-        _ => None,
-    };
-    if let Some(hash) = hash_for_rsa {
-        let key = extract_rsa_public_key(input.signer_spki_der).ok_or(CmsError::BadSignerKey)?;
-        return rsa_verify_with_hash(&RsaVerifyInput {
-            key: &key,
-            hash,
-            payload: input.payload,
-            signature: input.signature,
-        });
-    }
-    // ECDSA path.
-    let hash_for_ecdsa = match input.sig_alg_oid.as_bytes() {
-        v if v == known::ECDSA_WITH_SHA256.as_bytes() => Some(HashAlgorithm::Sha256),
-        v if v == known::ECDSA_WITH_SHA384.as_bytes() => Some(HashAlgorithm::Sha384),
-        v if v == known::ECDSA_WITH_SHA512.as_bytes() => Some(HashAlgorithm::Sha512),
-        v if v == known::EC_PUBLIC_KEY.as_bytes() => Some(input.digest_alg_fallback),
-        _ => None,
-    };
-    if let Some(hash) = hash_for_ecdsa {
-        let (curve, pubkey) =
-            ecdsa::extract_ec_pubkey(input.signer_spki_der).ok_or(CmsError::BadSignerKey)?;
-        let digest = hash.digest(input.payload);
-        let sig = Signature::<EcdsaDer>::new(input.signature.to_vec());
-        return ecdsa::verify_prehashed(&curve, &pubkey, &sig, &digest).map_err(CmsError::Ecdsa);
-    }
-    Err(CmsError::UnsupportedSignatureAlgorithm)
-}
-
-/// Verify an RSASSA-PKCS1-v1_5 signature with a runtime-chosen
-/// hash algorithm.
-///
-/// RFC 8017 §8.2.2 (RSASSA-PKCS1-V1_5-VERIFY). The
-/// hash-algorithm-id step uses `HashAlgorithm` as a typed proxy
-/// so the verify path cannot mismatch SHA-256 emsa with SHA-384
-/// modulus padding etc. Returns `CmsError::BadRsaSignature` on
-/// verification failure rather than panicking, so a single bad
-/// signer info never aborts a multi-signer CMS verify.
-fn rsa_verify_with_hash(input: &RsaVerifyInput<'_>) -> Result<(), CmsError> {
-    // The hash-algorithm marker comes from the BER
-    // `signatureAlgorithm` OID -- known only at runtime, so the
-    // typed wrapper is built here. One allocation per signature
-    // is well-amortised against a CMS verify's other cost
-    // (modular exponentiation).
-    let res = match input.hash {
-        HashAlgorithm::Sha256 => {
-            let sig = Signature::<RsaPkcs1Sha256>::new(input.signature.to_vec());
-            input.key.verify_pkcs1v15_sha256(input.payload, &sig)
-        }
-        HashAlgorithm::Sha384 => {
-            let sig = Signature::<RsaPkcs1Sha384>::new(input.signature.to_vec());
-            verify_pkcs1v15_sha384(input.key, input.payload, &sig)
-        }
-        HashAlgorithm::Sha512 => {
-            let sig = Signature::<RsaPkcs1Sha512>::new(input.signature.to_vec());
-            verify_pkcs1v15_sha512(input.key, input.payload, &sig)
-        }
-    };
-    res.map_err(CmsError::Rsa)
 }
 
 // ----- LDSSecurityObject (the eContent for eMRTD SOD) -----
 
-/// Parsed eMRTD `LDSSecurityObject` (the eContent of an EF.SOD
-/// `SignedData`, ICAO Doc 9303-10 §4.6.2).
+/// Parsed eMRTD `LDSSecurityObject` (the `eContent` of an `EF.SOD`
+/// `SignedData`, ICAO Doc 9303-10 sec. 4.6.2).
 #[derive(Debug, Clone)]
 pub struct LdsSecurityObject<'a> {
-    /// `hashAlgorithm` OID body -- one of SHA-{256,384,512}.
+    /// `hashAlgorithm` OID mapped to SHA-256, SHA-384, or SHA-512.
     pub hash_algorithm: HashAlgorithm,
-    /// Per-DG `(dataGroupNumber, hash)` pairs.
+    /// Per-data-group `(dataGroupNumber, hash)` pairs.
     pub data_group_hashes: Vec<(u32, &'a [u8])>,
 }
 
 impl<'a> LdsSecurityObject<'a> {
-    /// Parse `LDSSecurityObject` (the inner content of an eMRTD
-    /// EF.SOD). Used after `parse_signed_data` returns the
-    /// `econtent_der`.
+    /// Parse `LDSSecurityObject` from the `econtent_der` slice of an
+    /// eMRTD `EF.SOD`.
     ///
     /// # Errors
-    /// BER decode failure or unsupported hash algorithm.
+    /// [`CmsError`] on BER decode failure, malformed structure, or
+    /// unsupported digest algorithm OID.
     pub(crate) fn parse(der: &'a [u8]) -> Result<Self, CmsError> {
+        const BITS_PER_BYTE: u32 = 8;
+
         let outer = BerTlv::<Sequence>::parse(der)?;
         let mut it = BerTlvIter::new(outer.value);
-        // version
         let _version = it.next().ok_or(CmsError::UnexpectedStructure(
             "LDSSecurityObject missing version",
         ))??;
-        // hashAlgorithm SEQUENCE { OID, params? }
         let hash_alg_seq = it
             .next()
             .ok_or(CmsError::UnexpectedStructure(
@@ -1183,7 +818,6 @@ impl<'a> LdsSecurityObject<'a> {
         ))?;
         let hash_algorithm = HashAlgorithm::from_oid(hash_oid_tlv.value)
             .ok_or(CmsError::UnsupportedDigestAlgorithm)?;
-        // dataGroupHashValues SEQUENCE OF DataGroupHash
         let dgh_seq = it
             .next()
             .ok_or(CmsError::UnexpectedStructure(
@@ -1207,10 +841,7 @@ impl<'a> LdsSecurityObject<'a> {
             };
             let mut num: u32 = 0;
             for &b in num_tlv.value {
-                // Big-endian byte accumulation; `wrapping_shl` is the
-                // protocol-defensive form for the >4-byte DG hash
-                // number case the spec forbids in practice.
-                num = num.wrapping_shl(8_u32) | u32::from(b);
+                num = num.wrapping_shl(BITS_PER_BYTE) | u32::from(b);
             }
             let hash_tlv = dit.next().ok_or(CmsError::UnexpectedStructure(
                 "DG hash missing OCTET STRING",
@@ -1229,33 +860,44 @@ impl<'a> LdsSecurityObject<'a> {
 
 #[cfg(test)]
 mod tests {
-
     use super::{
         CmsError, CmsHelpers, HashAlgorithm, LdsSecurityObject, OwnedSignedData, SignedData,
-        SignerIdentifier, SignerInfo,
     };
     use crate::ber::{BerTlv, BerTlvIter, Sequence, tlv};
     use crate::oid::{Oid, known};
     use crate::x509::Certificate;
 
-    // Committed CMS / SPKI fixtures. Generated offline with OpenSSL
-    // 3.x (refineid-lib-core never generates keys; the verifier is
-    // verify-only by design). The signed eContent is a minimal eMRTD
-    // LDSSecurityObject carrying two DataGroupHash entries (DG1, DG2):
+    const TAG_INTEGER: u8 = 0x02;
+    const TAG_OCTET_STRING: u8 = 0x04;
+    const TAG_NULL: u8 = 0x05;
+    const TAG_OID: u8 = 0x06;
+    const TAG_SEQUENCE: u8 = 0x30;
+    const TAG_SET: u8 = 0x31;
+    const TAG_EF_SOD: u8 = 0x77;
+    const TAG_SUBJECT_KEY_ID: u8 = 0x80;
+    const TAG_CONTEXT_0: u8 = 0xA0;
+    const TAG_CONTEXT_1: u8 = 0xA1;
+    const TAG_CONTEXT_2: u8 = 0xA2;
+
+    const VERSION_0: u8 = 0;
+    const VERSION_1: u8 = 1;
+    const VERSION_3: u8 = 3;
+    const SERIAL_ONE: u8 = 1;
+    const PSS_SALT_LEN_SHA256: u8 = 32;
+    const DG_NUMBER_1: u32 = 1;
+    const DG_NUMBER_2: u32 = 2;
+    const EXPECTED_DG_COUNT: usize = 2;
+    const EXPECTED_EMBEDDED_CERTS: usize = 1;
+    const SIGNER_COUNT_ZERO: usize = 0;
+    const SIGNER_COUNT_ONE: usize = 1;
+    const SIGNER_COUNT_TWO: usize = 2;
+    const TRAILING_ZERO_BYTE: u8 = 0;
+
+    // Committed OpenSSL-generated CMS fixtures carrying an eMRTD
+    // LDSSecurityObject with DG1 = SHA256("refineid-test-DG1") and
+    // DG2 = SHA256("refineid-test-DG2").
     //
-    //   # lds.der: version 0, SHA-256, DG1 = SHA256("refineid-test-DG1"),
-    //   #          DG2 = SHA256("refineid-test-DG2")
-    //   openssl genrsa -out k.pem 2048
-    //   openssl req -x509 -new -key k.pem -out c.pem -sha256 -subj /CN=...
-    //   openssl cms -sign -in lds.der -signer c.pem -inkey k.pem \
-    //       -outform DER -nodetach -binary -md sha256 \
-    //       -econtent_type 2.23.136.1.1.1 -out cms.der
-    //   openssl x509 -in c.pem -noout -pubkey | openssl pkey -pubin -outform DER
-    //
-    // The EC fixture is the same flow over prime256v1; the -noattr
-    // fixture drops signedAttrs so the signature is over eContent
-    // directly (signatureAlgorithm = rsaEncryption).
-    // RSA-2048/SHA-256 CMS SignedData, signedAttrs present; eContent is the LDSSecurityObject (1549 bytes).
+    // RSA-2048/SHA-256 CMS SignedData with signedAttrs present.
     const RSA_CMS_HEX: &str = "\
         3082060906092a864886f70d010702a08205fa308205f6020103310d300b0609\
         60864801650304020130700606678108010101a06604643062020100300d0609\
@@ -1307,20 +949,7 @@ mod tests {
         6613fd61ac2e60db8d4039844238e15e5e76de70305e2624d429ecf66c193b99\
         dda4b5a213bde6bd9e531be4d8";
 
-    // SubjectPublicKeyInfo of the RSA signer that signed RSA_CMS_HEX (294 bytes).
-    const RSA_SPKI_HEX: &str = "\
-        30820122300d06092a864886f70d01010105000382010f003082010a02820101\
-        00ed28349290c82f3dd4871eff7b2ec12d057a9d2dc9ba566cd8ce23a0b5fc55\
-        9ce4456738e2b69b57fd56f84d0f6a5ca91f22d36a3a64864c0c3c50f0d96af2\
-        a18ecd5a7c1f934c2f36385264d867982f70487004cd5105d16cd47a7ec61c20\
-        4a37d947c5d997ebf8e1eff6581823b15d753123991b308669ec5633214e7d75\
-        b35fbbdb937c6782f6e406aed8edca9b5a028297891acad926fecb3adaa806da\
-        af0bf886bb16c667762269c9ecf3f6edd3398d151cbbe8f1b50ba6b4f4365451\
-        ad21fbc4804ff2bc406d61db7041239b7bf53c4bfc5724302c2b392530e9b56c\
-        57c4d6072528fa2b3f95ed90d6144869d5c5e9f48f74da2b1babed1d9d2bb2ef\
-        130203010001";
-
-    // RSA CMS with NO signedAttrs (signature over eContent; sig-alg = rsaEncryption) (1321 bytes).
+    // RSA CMS with no signedAttrs (signature directly over eContent).
     const RSA_CMS_NOATTR_HEX: &str = "\
         3082052506092a864886f70d010702a082051630820512020103310d300b0609\
         60864801650304020130700606678108010101a06604643062020100300d0609\
@@ -1365,7 +994,7 @@ mod tests {
         30f8d4431d11aad7c4e093745b3637c5750e23abb9e74b702168c132a927be11\
         822c4f64257fc36736";
 
-    // ECDSA P-256/SHA-256 CMS SignedData, signedAttrs present (960 bytes).
+    // ECDSA P-256/SHA-256 CMS SignedData with signedAttrs present.
     const EC_CMS_HEX: &str = "\
         308203bc06092a864886f70d010702a08203ad308203a9020103310d300b0609\
         60864801650304020130700606678108010101a06604643062020100300d0609\
@@ -1398,37 +1027,17 @@ mod tests {
         26305b257a65ed479616b39b82d90d80e29ede124348caa561157599805c0220\
         20f1188ac93ef8dcfb94db3fb4e5288d57db45f5ad6cdf857003d68a7b5f903c";
 
-    // SubjectPublicKeyInfo of the EC P-256 signer that signed EC_CMS_HEX (91 bytes).
-    const EC_SPKI_HEX: &str = "\
-        3059301306072a8648ce3d020106082a8648ce3d03010703420004c82edd70fc\
-        6c5829254ff642c69c483feca07c0f57d5b5cd4bad59712052f4d553093ef814\
-        41b72a492198db93b5d58883510913a7fd0753e78ba5a9c42f9e2f";
-
-    // A different RSA-2048 SPKI -- proves RSA signature rejection (294 bytes).
-    const WRONG_RSA_SPKI_HEX: &str = "\
-        30820122300d06092a864886f70d01010105000382010f003082010a02820101\
-        00abe40664ffc72005ead92adb2cb06e5d5361c97dca0e3cb286de58c3e3af3f\
-        401e918d6f55fb529924c1099938a037a0561dc1280ee7f2b25d998441d9dd30\
-        cbbd635ebf7232a32cb827d5c9d3f232f3c0deba3249dcbbb0084ddd002a7516\
-        7202f6a2f482e63bb335214510bb42b2243303c99ce9b671ec99cf829d1c3f93\
-        b063825dc0de0c11cc0da4150509239017019f7880da2b4579b3b0a03a26ea2d\
-        1db411a0628aa76e11bb19cdc1a80fb240f7eab5e35bf4bbb78a49da8622f4f5\
-        73c371e8e244548ead4eac1ad79a72f43e2fef3d69e4c7742e5e8c084536bdc8\
-        639b0b22c847f8294212d1ab4583cdf55e84abbcb9a68ab87353ee6413412ade\
-        0d0203010001";
-
-    // A different EC P-256 SPKI -- proves ECDSA signature rejection (91 bytes).
-    const WRONG_EC_SPKI_HEX: &str = "\
-        3059301306072a8648ce3d020106082a8648ce3d030107034200042d1a8cbccb\
-        a942554de9f257947076b516026918bc8402f49399a1eee633d2410aeee5d913\
-        a24df630c8c709e50355160ba0997e872cc2106b1dba79a002ba7a";
-
-    // SHA256("refineid-test-DG1") -- DG1 hash baked into the fixture LDS.
+    // SHA256("refineid-test-DG1") baked into the fixture LDSSecurityObject.
     const DG1_HASH_HEX: &str = "40d486fedd456ab92c4d02b2704362570c096df55f421fee53945e70c6831bfd";
-    // SHA256("refineid-test-DG2").
+    // SHA256("refineid-test-DG2") baked into the fixture LDSSecurityObject.
     const DG2_HASH_HEX: &str = "72fc7341e3f5f8935e96be104329ea083e88d8f009bcb46a340be9968902c008";
 
-    // Decode a (possibly whitespace-wrapped) hex fixture.
+    /// MGF1 OID (`1.2.840.113549.1.1.8`) used inside `RSASSA-PSS-params`
+    /// (RFC 4055 sec. 2.1).
+    const MGF1_OID: Oid<'static> = Oid::const_new(
+        ::const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8").as_bytes(),
+    );
+
     fn unhex(hex_fixture: &str) -> Vec<u8> {
         let cleaned: String = hex_fixture
             .chars()
@@ -1437,76 +1046,79 @@ mod tests {
         hex::decode(cleaned).expect("fixture hex decodes")
     }
 
-    // Build a synthetic SignedData for verify() error-path tests (the
-    // struct fields are public). signedAttrs are treated as absent
-    // unless message_digest is Some.
-    fn synthetic<'a>(
-        econtent: &'a [u8],
-        digest_oid: &'a [u8],
-        sig_oid: &'a [u8],
-        message_digest: Option<&'a [u8]>,
-        signature: &'a [u8],
-    ) -> SignedData<'a> {
-        SignedData {
-            econtent_type_oid: known::ICAO_LDS_SECURITY_OBJECT,
-            econtent_der: Some(econtent),
-            certificates_der: Vec::new(),
-            signer: SignerInfo {
-                signer_identifier: SignerIdentifier::SubjectKeyIdentifier(b"synthetic"),
-                digest_algorithm_oid: Oid::new(digest_oid).expect("digest OID well-formed"),
-                signature_algorithm_oid: Oid::new(sig_oid).expect("sig OID well-formed"),
-                signature,
-                signed_data_to_verify: None,
-                message_digest,
-            },
-        }
+    fn alg_id_no_params(oid: Oid<'_>) -> Vec<u8> {
+        tlv(TAG_SEQUENCE, tlv(TAG_OID, oid.as_bytes()))
     }
 
-    /// Minimal structurally valid signerInfo, for parser cardinality
-    /// and attribute-invariant tests that do not exercise crypto.
+    fn alg_id_with_null(oid: Oid<'_>) -> Vec<u8> {
+        let mut body = tlv(TAG_OID, oid.as_bytes());
+        body.extend_from_slice(&tlv(TAG_NULL, b""));
+        tlv(TAG_SEQUENCE, body)
+    }
+
+    /// Build `AlgorithmIdentifier` for `id-RSASSA-PSS` carrying explicit
+    /// `RSASSA-PSS-params` (`hashAlgorithm`, `maskGenAlgorithm`, `saltLength`).
+    fn rsassa_pss_sha256_alg_id() -> Vec<u8> {
+        let hash_alg = alg_id_with_null(known::SHA256);
+        let mut mgf1_body = tlv(TAG_OID, MGF1_OID.as_bytes());
+        mgf1_body.extend_from_slice(&hash_alg);
+        let mgf_alg = tlv(TAG_SEQUENCE, mgf1_body);
+
+        let mut pss_params = tlv(TAG_CONTEXT_0, hash_alg);
+        pss_params.extend_from_slice(&tlv(TAG_CONTEXT_1, mgf_alg));
+        pss_params.extend_from_slice(&tlv(TAG_CONTEXT_2, tlv(TAG_INTEGER, [PSS_SALT_LEN_SHA256])));
+
+        let mut alg_body = tlv(TAG_OID, known::RSASSA_PSS.as_bytes());
+        alg_body.extend_from_slice(&tlv(TAG_SEQUENCE, pss_params));
+        tlv(TAG_SEQUENCE, alg_body)
+    }
+
+    /// Minimal structurally valid `SignerInfo` for parser cardinality
+    /// and structural-invariant tests.
+    fn minimal_signer_info_with_algs(digest_oid: Oid<'_>, sig_alg_der: &[u8]) -> Vec<u8> {
+        let mut sid = tlv(TAG_SEQUENCE, b"");
+        sid.extend_from_slice(&tlv(TAG_INTEGER, [SERIAL_ONE]));
+        let mut body = tlv(TAG_INTEGER, [VERSION_1]);
+        body.extend_from_slice(&tlv(TAG_SEQUENCE, sid));
+        body.extend_from_slice(&alg_id_no_params(digest_oid));
+        body.extend_from_slice(sig_alg_der);
+        body.extend_from_slice(&tlv(TAG_OCTET_STRING, b"signature"));
+        tlv(TAG_SEQUENCE, body)
+    }
+
     fn minimal_signer_info() -> Vec<u8> {
-        let mut sid = tlv(0x30, b"");
-        sid.extend_from_slice(&tlv(0x02, [0x01_u8]));
-        let mut body = tlv(0x02, [0x01_u8]);
-        body.extend_from_slice(&tlv(0x30, sid));
-        body.extend_from_slice(&tlv(0x30, tlv(0x06, known::SHA256.as_bytes())));
-        body.extend_from_slice(&tlv(0x30, tlv(0x06, known::SHA256_WITH_RSA.as_bytes())));
-        body.extend_from_slice(&tlv(0x04, b"signature"));
-        tlv(0x30, body)
+        let sig_alg = alg_id_no_params(known::SHA256_WITH_RSA);
+        minimal_signer_info_with_algs(known::SHA256, &sig_alg)
     }
 
     /// Minimal bare `SignedData` carrying `signer_count` identical
     /// `SignerInfo` values.
     fn minimal_signed_data(signer_count: usize) -> Vec<u8> {
-        let mut encap = tlv(0x06, known::DATA.as_bytes());
-        encap.extend_from_slice(&tlv(0xA0, tlv(0x04, b"content")));
-        let mut body = tlv(0x02, [0x01_u8]);
-        body.extend_from_slice(&tlv(0x31, tlv(0x30, tlv(0x06, known::SHA256.as_bytes()))));
-        body.extend_from_slice(&tlv(0x30, encap));
+        let mut encap = tlv(TAG_OID, known::DATA.as_bytes());
+        encap.extend_from_slice(&tlv(TAG_CONTEXT_0, tlv(TAG_OCTET_STRING, b"content")));
+        let mut body = tlv(TAG_INTEGER, [VERSION_1]);
+        body.extend_from_slice(&tlv(TAG_SET, alg_id_no_params(known::SHA256)));
+        body.extend_from_slice(&tlv(TAG_SEQUENCE, encap));
         let mut signers = Vec::new();
         for _ in 0..signer_count {
             signers.extend_from_slice(&minimal_signer_info());
         }
-        body.extend_from_slice(&tlv(0x31, signers));
-        tlv(0x30, body)
+        body.extend_from_slice(&tlv(TAG_SET, signers));
+        tlv(TAG_SEQUENCE, body)
     }
 
-    /// Encode one CMS Attribute with one already-encoded value.
+    /// Encode one CMS `Attribute` with one already-encoded value TLV.
     fn attribute(oid: Oid<'_>, value: &[u8]) -> Vec<u8> {
-        let mut body = tlv(0x06, oid.as_bytes());
-        body.extend_from_slice(&tlv(0x31, value));
-        tlv(0x30, body)
+        let mut body = tlv(TAG_OID, oid.as_bytes());
+        body.extend_from_slice(&tlv(TAG_SET, value));
+        tlv(TAG_SEQUENCE, body)
     }
 
-    /// `ContentInfo` fixture bytes.
     #[derive(Clone, Copy)]
     struct ContentInfoFixture<'a> {
-        /// `ContentInfo` DER bytes.
         der: &'a [u8],
     }
 
-    // Extract the inner SignedData SEQUENCE TLV from a ContentInfo-
-    // wrapped CMS (so the bare-SEQUENCE wrapper path can be exercised).
     fn inner_signed_data_seq(content_info: ContentInfoFixture<'_>) -> Vec<u8> {
         let ci = BerTlv::<Sequence>::parse(content_info.der).expect("ContentInfo SEQUENCE");
         let mut it = BerTlvIter::new(ci.value);
@@ -1521,7 +1133,7 @@ mod tests {
         explicit.value.to_vec()
     }
 
-    // ----- HashAlgorithm dispatch -----
+    // ----- HashAlgorithm OID mapping -----
 
     #[test]
     fn hash_algorithm_from_oid_maps_sha2_only() {
@@ -1537,102 +1149,112 @@ mod tests {
             HashAlgorithm::from_oid(known::SHA512.as_bytes()),
             Some(HashAlgorithm::Sha512)
         );
-        // A valid OID that is not one of the three SHA-2 variants.
         assert_eq!(
             HashAlgorithm::from_oid(known::RSA_ENCRYPTION.as_bytes()),
             None
         );
-        // Arbitrary non-OID bytes / empty.
-        assert_eq!(HashAlgorithm::from_oid([0x01_u8, 0x02, 0x03]), None);
+        assert_eq!(HashAlgorithm::from_oid(known::SHA1.as_bytes()), None);
         assert_eq!(HashAlgorithm::from_oid(b""), None);
     }
 
-    #[test]
-    fn hash_algorithm_digest_known_answers() {
-        // NIST FIPS 180-4 known-answer vectors for the input "abc".
-        assert_eq!(
-            HashAlgorithm::Sha256.digest(b"abc"),
-            unhex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
-        );
-        assert_eq!(
-            HashAlgorithm::Sha384.digest(b"abc"),
-            unhex(
-                "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
-            )
-        );
-        assert_eq!(
-            HashAlgorithm::Sha512.digest(b"abc"),
-            unhex(
-                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
-            )
-        );
-        // Output widths.
-        assert_eq!(HashAlgorithm::Sha256.digest(b"").len(), 32);
-        assert_eq!(HashAlgorithm::Sha384.digest(b"").len(), 48);
-        assert_eq!(HashAlgorithm::Sha512.digest(b"").len(), 64);
-    }
+    // ----- SignedData::parse: positive wrappings and algorithms -----
 
     #[test]
-    fn hash_algorithm_label() {
-        assert_eq!(HashAlgorithm::Sha256.label(), "SHA-256");
-        assert_eq!(HashAlgorithm::Sha384.label(), "SHA-384");
-        assert_eq!(HashAlgorithm::Sha512.label(), "SHA-512");
-    }
-
-    // ----- parse_signed_data: wrappers -----
-
-    #[test]
-    fn parses_contentinfo_wrapped_rsa() {
+    fn parses_contentinfo_wrapped_rsa_and_embedded_dsc() {
         let der = unhex(RSA_CMS_HEX);
         let sd = SignedData::parse(&der).expect("parse RSA CMS");
         assert_eq!(sd.econtent_type_oid, known::ICAO_LDS_SECURITY_OBJECT);
-        // eContent is the embedded LDSSecurityObject SEQUENCE.
         assert_eq!(
             sd.econtent_der.and_then(|content| content.first()),
-            Some(&0x30)
+            Some(&TAG_SEQUENCE)
         );
-        // Exactly the signer certificate was embedded.
-        assert_eq!(sd.certificates_der.len(), 1);
-        let cert = sd.certificates_der.first().expect("one cert");
-        assert_eq!(cert.first(), Some(&0x30));
-        // signedAttrs present: both algorithm OIDs and the
-        // messageDigest commitment decoded. OpenSSL emits the bare
-        // rsaEncryption OID as the SignerInfo signatureAlgorithm
-        // (RFC 5754); the digest comes from digestAlgorithm.
-        assert_eq!(
-            sd.signer.digest_algorithm_oid.as_bytes(),
-            known::SHA256.as_bytes()
+        assert_eq!(sd.certificates_der.len(), EXPECTED_EMBEDDED_CERTS);
+        let cert_der = sd.certificates_der.first().copied().expect("one cert");
+        Certificate::from_der(cert_der).expect("embedded DSC parses as X.509");
+    }
+
+    #[test]
+    fn parses_contentinfo_wrapped_ecdsa() {
+        let der = unhex(EC_CMS_HEX);
+        let sd = SignedData::parse(&der).expect("parse ECDSA CMS");
+        assert_eq!(sd.econtent_type_oid, known::ICAO_LDS_SECURITY_OBJECT);
+        assert_eq!(sd.certificates_der.len(), EXPECTED_EMBEDDED_CERTS);
+        let lds = LdsSecurityObject::parse(sd.econtent_der.expect("attached")).expect("LDS parses");
+        assert_eq!(lds.hash_algorithm, HashAlgorithm::Sha256);
+        assert_eq!(lds.data_group_hashes.len(), EXPECTED_DG_COUNT);
+    }
+
+    #[test]
+    fn parses_signer_info_without_signed_attrs() {
+        let der = unhex(RSA_CMS_NOATTR_HEX);
+        let sd = SignedData::parse(&der).expect("parse no-signedAttrs RSA CMS");
+        assert_eq!(sd.econtent_type_oid, known::ICAO_LDS_SECURITY_OBJECT);
+        assert_eq!(sd.certificates_der.len(), EXPECTED_EMBEDDED_CERTS);
+        assert!(sd.econtent_der.is_some());
+    }
+
+    #[test]
+    fn parses_ef_sod_signed_with_rsassa_pss() {
+        let rsa_fixture = unhex(RSA_CMS_HEX);
+        let rsa_sd = SignedData::parse(&rsa_fixture).expect("fixture parses");
+        let lds_der = rsa_sd.econtent_der.expect("fixture eContent");
+        let dsc_der = rsa_sd
+            .certificates_der
+            .first()
+            .copied()
+            .expect("fixture DSC");
+
+        let mut encap = tlv(TAG_OID, known::ICAO_LDS_SECURITY_OBJECT.as_bytes());
+        encap.extend_from_slice(&tlv(TAG_CONTEXT_0, tlv(TAG_OCTET_STRING, lds_der)));
+
+        let mut signed_attrs = attribute(
+            known::CONTENT_TYPE,
+            &tlv(TAG_OID, known::ICAO_LDS_SECURITY_OBJECT.as_bytes()),
         );
-        assert_eq!(
-            sd.signer.signature_algorithm_oid.as_bytes(),
-            known::RSA_ENCRYPTION.as_bytes()
-        );
-        assert!(sd.signer.signed_data_to_verify.is_some());
-        // messageDigest attr == SHA-256(eContent).
-        let md = sd.signer.message_digest.expect("messageDigest present");
-        assert_eq!(
-            md,
-            HashAlgorithm::Sha256
-                .digest(sd.econtent_der.expect("attached"))
-                .as_slice()
-        );
+        signed_attrs.extend_from_slice(&attribute(
+            known::MESSAGE_DIGEST,
+            &tlv(TAG_OCTET_STRING, b"refineid-pss-digest-commitment"),
+        ));
+
+        let mut signer_body = tlv(TAG_INTEGER, [VERSION_3]);
+        signer_body.extend_from_slice(&tlv(TAG_SUBJECT_KEY_ID, b"pss-dsc-ski"));
+        signer_body.extend_from_slice(&alg_id_with_null(known::SHA256));
+        signer_body.extend_from_slice(&tlv(TAG_CONTEXT_0, signed_attrs));
+        signer_body.extend_from_slice(&rsassa_pss_sha256_alg_id());
+        signer_body.extend_from_slice(&tlv(TAG_OCTET_STRING, b"rsassa-pss-signature"));
+        let signer_info = tlv(TAG_SEQUENCE, signer_body);
+
+        let mut sd_body = tlv(TAG_INTEGER, [VERSION_3]);
+        sd_body.extend_from_slice(&tlv(TAG_SET, alg_id_with_null(known::SHA256)));
+        sd_body.extend_from_slice(&tlv(TAG_SEQUENCE, encap));
+        sd_body.extend_from_slice(&tlv(TAG_CONTEXT_0, dsc_der));
+        sd_body.extend_from_slice(&tlv(TAG_SET, signer_info));
+        let sd_seq = tlv(TAG_SEQUENCE, sd_body);
+
+        let mut ci_body = tlv(TAG_OID, known::SIGNED_DATA.as_bytes());
+        ci_body.extend_from_slice(&tlv(TAG_CONTEXT_0, sd_seq));
+        let ef_sod = tlv(TAG_EF_SOD, tlv(TAG_SEQUENCE, ci_body));
+
+        let owned = OwnedSignedData::from_der(&ef_sod).expect("RSASSA-PSS EF.SOD parses");
+        let view = owned.view();
+        assert_eq!(view.econtent_type_oid, known::ICAO_LDS_SECURITY_OBJECT);
+        assert_eq!(view.econtent_der, Some(lds_der));
+        assert_eq!(view.certificates_der, vec![dsc_der]);
     }
 
     #[test]
     fn three_wrappings_decode_to_same_signeddata() {
         let content_info = unhex(RSA_CMS_HEX);
         let bare = inner_signed_data_seq(ContentInfoFixture { der: &content_info });
-        let ef_sod = tlv(0x77, &content_info);
+        let ef_sod = tlv(TAG_EF_SOD, &content_info);
 
         let from_ci = SignedData::parse(&content_info).expect("ContentInfo");
         let from_bare = SignedData::parse(&bare).expect("bare SignedData");
         let from_efsod = SignedData::parse(&ef_sod).expect("EF.SOD wrapper");
 
-        // All three expose identical signed material.
         for other in [&from_bare, &from_efsod] {
             assert_eq!(other.econtent_der, from_ci.econtent_der);
-            assert_eq!(other.signer.signature, from_ci.signer.signature);
-            assert_eq!(other.signer.message_digest, from_ci.signer.message_digest);
+            assert_eq!(other.certificates_der, from_ci.certificates_der);
             assert_eq!(
                 other.econtent_type_oid.as_bytes(),
                 from_ci.econtent_type_oid.as_bytes()
@@ -1640,7 +1262,19 @@ mod tests {
         }
     }
 
-    // ----- parse_signed_data: structural rejection -----
+    #[test]
+    fn detached_signeddata_parses_with_none_econtent() {
+        let encap = tlv(TAG_SEQUENCE, tlv(TAG_OID, known::DATA.as_bytes()));
+        let mut body = tlv(TAG_INTEGER, [VERSION_1]);
+        body.extend_from_slice(&tlv(TAG_SET, alg_id_no_params(known::SHA256)));
+        body.extend_from_slice(&encap);
+        body.extend_from_slice(&tlv(TAG_SET, minimal_signer_info()));
+        let sd_seq = tlv(TAG_SEQUENCE, &body);
+        let sd = SignedData::parse(&sd_seq).expect("detached SignedData parses");
+        assert!(sd.econtent_der.is_none());
+    }
+
+    // ----- SignedData::parse: structural rejection -----
 
     #[test]
     fn rejects_empty_input() {
@@ -1652,8 +1286,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_wrapper_tag() {
-        // Leading 0x02 (INTEGER) is neither SEQUENCE nor the EF.SOD tag.
-        let input = tlv(0x02, [0x00_u8]);
+        let input = tlv(TAG_INTEGER, [VERSION_0]);
         assert!(matches!(
             SignedData::parse(&input),
             Err(CmsError::UnexpectedStructure("unknown wrapper tag"))
@@ -1663,7 +1296,7 @@ mod tests {
     #[test]
     fn rejects_bytes_after_complete_cms_value() {
         let mut der = unhex(RSA_CMS_HEX);
-        der.push(0x00);
+        der.push(TRAILING_ZERO_BYTE);
         assert!(matches!(
             SignedData::parse(&der),
             Err(CmsError::UnexpectedStructure(
@@ -1674,13 +1307,13 @@ mod tests {
 
     #[test]
     fn requires_exactly_one_signer_info() {
-        SignedData::parse(&minimal_signed_data(1)).expect("one signer is accepted");
+        SignedData::parse(&minimal_signed_data(SIGNER_COUNT_ONE)).expect("one signer is accepted");
         assert!(matches!(
-            SignedData::parse(&minimal_signed_data(0)),
+            SignedData::parse(&minimal_signed_data(SIGNER_COUNT_ZERO)),
             Err(CmsError::UnexpectedStructure("signerInfos is empty"))
         ));
         assert!(matches!(
-            SignedData::parse(&minimal_signed_data(2)),
+            SignedData::parse(&minimal_signed_data(SIGNER_COUNT_TWO)),
             Err(CmsError::UnexpectedStructure(
                 "SignedData must contain exactly one signerInfo"
             ))
@@ -1688,8 +1321,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_signer_digest_absent_from_signed_data_set() {
+        let sig_alg = alg_id_no_params(known::SHA256_WITH_RSA);
+        let mismatched_signer = minimal_signer_info_with_algs(known::SHA384, &sig_alg);
+
+        let mut encap = tlv(TAG_OID, known::DATA.as_bytes());
+        encap.extend_from_slice(&tlv(TAG_CONTEXT_0, tlv(TAG_OCTET_STRING, b"content")));
+        let mut body = tlv(TAG_INTEGER, [VERSION_1]);
+        body.extend_from_slice(&tlv(TAG_SET, alg_id_no_params(known::SHA256)));
+        body.extend_from_slice(&tlv(TAG_SEQUENCE, encap));
+        body.extend_from_slice(&tlv(TAG_SET, mismatched_signer));
+
+        assert!(matches!(
+            SignedData::parse(&tlv(TAG_SEQUENCE, body)),
+            Err(CmsError::UnexpectedStructure(
+                "signer digestAlgorithm absent from SignedData set"
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_signer_identifier_version_mismatch() {
+        let mut ski_v1_signer = tlv(TAG_INTEGER, [VERSION_1]);
+        ski_v1_signer.extend_from_slice(&tlv(TAG_SUBJECT_KEY_ID, b"ski-bytes"));
+        ski_v1_signer.extend_from_slice(&alg_id_no_params(known::SHA256));
+        ski_v1_signer.extend_from_slice(&alg_id_no_params(known::SHA256_WITH_RSA));
+        ski_v1_signer.extend_from_slice(&tlv(TAG_OCTET_STRING, b"signature"));
+
+        let encap = tlv(TAG_SEQUENCE, tlv(TAG_OID, known::DATA.as_bytes()));
+        let mut body = tlv(TAG_INTEGER, [VERSION_3]);
+        body.extend_from_slice(&tlv(TAG_SET, alg_id_no_params(known::SHA256)));
+        body.extend_from_slice(&encap);
+        body.extend_from_slice(&tlv(TAG_SET, tlv(TAG_SEQUENCE, ski_v1_signer)));
+
+        assert!(matches!(
+            SignedData::parse(&tlv(TAG_SEQUENCE, body)),
+            Err(CmsError::UnexpectedStructure(
+                "subjectKeyIdentifier signerInfo version is not 3"
+            ))
+        ));
+    }
+
+    #[test]
     fn rejects_empty_sequence() {
-        let input = tlv(0x30, b"");
+        let input = tlv(TAG_SEQUENCE, b"");
         assert!(matches!(
             SignedData::parse(&input),
             Err(CmsError::UnexpectedStructure("empty"))
@@ -1698,12 +1373,10 @@ mod tests {
 
     #[test]
     fn efsod_rejects_non_signeddata_contentinfo() {
-        // ContentInfo whose contentType OID is rsaEncryption, not
-        // id-signedData -- reached through the EF.SOD wrapper branch.
-        let mut ci_body = tlv(0x06, known::RSA_ENCRYPTION.as_bytes());
-        ci_body.extend_from_slice(&tlv(0xA0, tlv(0x30, b"")));
-        let content_info = tlv(0x30, &ci_body);
-        let ef_sod = tlv(0x77, &content_info);
+        let mut ci_body = tlv(TAG_OID, known::RSA_ENCRYPTION.as_bytes());
+        ci_body.extend_from_slice(&tlv(TAG_CONTEXT_0, tlv(TAG_SEQUENCE, b"")));
+        let content_info = tlv(TAG_SEQUENCE, &ci_body);
+        let ef_sod = tlv(TAG_EF_SOD, &content_info);
         assert!(matches!(
             SignedData::parse(&ef_sod),
             Err(CmsError::UnexpectedStructure("ContentInfo not SignedData"))
@@ -1711,84 +1384,17 @@ mod tests {
     }
 
     #[test]
-    fn detached_signeddata_parses_and_refuses_attached_verification() {
-        /// Universal SEQUENCE.
-        const SEQUENCE: u8 = 0x30;
-        /// Universal SET.
-        const SET: u8 = 0x31;
-        /// Universal INTEGER.
-        const INTEGER: u8 = 0x02;
-        /// Universal OBJECT IDENTIFIER.
-        const OBJECT_IDENTIFIER: u8 = 0x06;
-        /// `SignedData` version 1 (RFC 5652 sec.5.1).
-        const VERSION_1: u8 = 0x01;
-        // SignedData whose encapContentInfo carries eContentType but
-        // no eContent OCTET STRING: the detached form.
-        let encap = tlv(SEQUENCE, tlv(OBJECT_IDENTIFIER, known::DATA.as_bytes()));
-        let mut body = tlv(INTEGER, [VERSION_1]);
-        body.extend_from_slice(&tlv(
-            SET,
-            tlv(SEQUENCE, tlv(OBJECT_IDENTIFIER, known::SHA256.as_bytes())),
-        ));
-        body.extend_from_slice(&encap);
-        body.extend_from_slice(&tlv(SET, minimal_signer_info()));
-        let sd_seq = tlv(SEQUENCE, &body);
-        let sd = SignedData::parse(&sd_seq).expect("detached SignedData parses");
-        assert!(sd.econtent_der.is_none());
-        assert!(matches!(
-            sd.verify(b"no key needed"),
-            Err(CmsError::DetachedNotSupported)
-        ));
-    }
-
-    // ----- parse_signer_info: signedAttrs present vs absent -----
-
-    #[test]
-    fn signer_info_without_signed_attrs() {
-        // -noattr fixture: no signedAttrs, so signing is over eContent
-        // directly and signatureAlgorithm is the bare rsaEncryption OID.
-        let der = unhex(RSA_CMS_NOATTR_HEX);
-        let sd = SignedData::parse(&der).expect("parse");
-        assert!(sd.signer.signed_data_to_verify.is_none());
-        assert!(sd.signer.message_digest.is_none());
-        assert_eq!(
-            sd.signer.digest_algorithm_oid.as_bytes(),
-            known::SHA256.as_bytes()
-        );
-        assert_eq!(
-            sd.signer.signature_algorithm_oid.as_bytes(),
-            known::RSA_ENCRYPTION.as_bytes()
-        );
-    }
-
-    #[test]
-    fn signer_identifier_is_retained_for_certificate_selection() {
-        let der = unhex(RSA_CMS_HEX);
-        let sd = SignedData::parse(&der).expect("parse");
-        let cert = Certificate::from_der(
-            sd.certificates_der
-                .first()
-                .copied()
-                .expect("embedded certificate"),
-        )
-        .expect("certificate parses");
-        assert_eq!(
-            sd.signer.signer_identifier,
-            SignerIdentifier::IssuerAndSerialNumber {
-                issuer_der: cert.issuer.as_der(),
-                serial_number: cert.serial_der,
-            }
-        );
-    }
-
-    #[test]
     fn signed_attributes_require_unique_content_type_and_message_digest() {
-        let content_type = attribute(known::CONTENT_TYPE, &tlv(0x06, known::DATA.as_bytes()));
-        let message_digest = attribute(known::MESSAGE_DIGEST, &tlv(0x04, [0x01_u8]));
+        let content_type = attribute(known::CONTENT_TYPE, &tlv(TAG_OID, known::DATA.as_bytes()));
+        let message_digest = attribute(
+            known::MESSAGE_DIGEST,
+            &tlv(TAG_OCTET_STRING, b"digest-bytes"),
+        );
 
         let mut valid = content_type.clone();
         valid.extend_from_slice(&message_digest);
-        CmsHelpers::parse_attributes(&valid, true).expect("mandatory attributes present");
+        let parsed = CmsHelpers::parse_attributes(&valid, true).expect("mandatory attrs present");
+        assert_eq!(parsed, Some(known::DATA));
 
         assert!(matches!(
             CmsHelpers::parse_attributes(&content_type, true),
@@ -1807,137 +1413,41 @@ mod tests {
         ));
     }
 
-    // ----- SignedData::verify: positive -----
-
     #[test]
-    fn verify_rsa_with_signed_attrs() {
-        let der = unhex(RSA_CMS_HEX);
-        let spki = unhex(RSA_SPKI_HEX);
-        let sd = SignedData::parse(&der).expect("parse");
-        sd.verify(&spki).expect("RSA signature verifies");
-    }
-
-    #[test]
-    fn verify_ecdsa_with_signed_attrs() {
-        let der = unhex(EC_CMS_HEX);
-        let spki = unhex(EC_SPKI_HEX);
-        let sd = SignedData::parse(&der).expect("parse");
-        sd.verify(&spki).expect("ECDSA signature verifies");
-    }
-
-    #[test]
-    fn verify_rsa_without_signed_attrs() {
-        // Exercises the payload = eContent branch and the rsaEncryption
-        // -> digestAlgorithm fallback inside verify_dispatch.
-        let der = unhex(RSA_CMS_NOATTR_HEX);
-        let spki = unhex(RSA_SPKI_HEX);
-        let sd = SignedData::parse(&der).expect("parse");
-        sd.verify(&spki)
-            .expect("RSA signature over eContent verifies");
-    }
-
-    // ----- SignedData::verify: negative -----
-
-    #[test]
-    fn verify_rejects_wrong_rsa_key() {
-        let der = unhex(RSA_CMS_HEX);
-        let wrong = unhex(WRONG_RSA_SPKI_HEX);
-        let sd = SignedData::parse(&der).expect("parse");
-        let err = sd.verify(&wrong).expect_err("wrong RSA key must fail");
-        assert!(matches!(err, CmsError::Rsa(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn verify_rejects_wrong_ecdsa_key() {
-        let der = unhex(EC_CMS_HEX);
-        let wrong = unhex(WRONG_EC_SPKI_HEX);
-        let sd = SignedData::parse(&der).expect("parse");
-        let err = sd.verify(&wrong).expect_err("wrong EC key must fail");
-        assert!(matches!(err, CmsError::Ecdsa(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn verify_rejects_mismatched_key_type() {
-        // RSA-signed CMS against an EC SPKI -> RSA key extraction fails
-        // -> BadSignerKey (and the symmetric EC-against-RSA case).
-        let rsa = unhex(RSA_CMS_HEX);
-        let ec = unhex(EC_CMS_HEX);
-        let rsa_spki = unhex(RSA_SPKI_HEX);
-        let ec_spki = unhex(EC_SPKI_HEX);
-        let rsa_sd = SignedData::parse(&rsa).expect("parse rsa");
-        let ec_sd = SignedData::parse(&ec).expect("parse ec");
-        assert!(matches!(
-            rsa_sd.verify(&ec_spki),
-            Err(CmsError::BadSignerKey)
+    fn signed_attributes_reject_mismatched_content_type() {
+        let mut attrs = attribute(known::CONTENT_TYPE, &tlv(TAG_OID, known::DATA.as_bytes()));
+        attrs.extend_from_slice(&attribute(
+            known::MESSAGE_DIGEST,
+            &tlv(TAG_OCTET_STRING, b"digest-bytes"),
         ));
-        assert!(matches!(
-            ec_sd.verify(&rsa_spki),
-            Err(CmsError::BadSignerKey)
-        ));
-    }
 
-    #[test]
-    fn verify_rejects_tampered_econtent() {
-        // signedAttrs commit to messageDigest = hash(eContent); swap
-        // eContent and the cross-check fails before any signature math.
-        let der = unhex(RSA_CMS_HEX);
-        let spki = unhex(RSA_SPKI_HEX);
-        let mut sd = SignedData::parse(&der).expect("parse");
-        sd.econtent_der = Some(b"tampered LDS content -- not what was signed");
-        assert!(matches!(
-            sd.verify(&spki),
-            Err(CmsError::SignerHashMismatch)
-        ));
-    }
+        let mut sid = tlv(TAG_SEQUENCE, b"");
+        sid.extend_from_slice(&tlv(TAG_INTEGER, [SERIAL_ONE]));
+        let mut signer = tlv(TAG_INTEGER, [VERSION_1]);
+        signer.extend_from_slice(&tlv(TAG_SEQUENCE, sid));
+        signer.extend_from_slice(&alg_id_no_params(known::SHA256));
+        signer.extend_from_slice(&tlv(TAG_CONTEXT_0, attrs));
+        signer.extend_from_slice(&alg_id_no_params(known::SHA256_WITH_RSA));
+        signer.extend_from_slice(&tlv(TAG_OCTET_STRING, b"signature"));
 
-    #[test]
-    fn verify_rejects_signed_attributes_without_message_digest() {
-        let der = unhex(RSA_CMS_HEX);
-        let spki = unhex(RSA_SPKI_HEX);
-        let mut sd = SignedData::parse(&der).expect("parse");
-        sd.signer.message_digest = None;
+        let encap = tlv(
+            TAG_SEQUENCE,
+            tlv(TAG_OID, known::ICAO_LDS_SECURITY_OBJECT.as_bytes()),
+        );
+        let mut body = tlv(TAG_INTEGER, [VERSION_1]);
+        body.extend_from_slice(&tlv(TAG_SET, alg_id_no_params(known::SHA256)));
+        body.extend_from_slice(&encap);
+        body.extend_from_slice(&tlv(TAG_SET, tlv(TAG_SEQUENCE, signer)));
+
         assert!(matches!(
-            sd.verify(&spki),
+            SignedData::parse(&tlv(TAG_SEQUENCE, body)),
             Err(CmsError::UnexpectedStructure(
-                "signedAttrs missing messageDigest"
+                "signed contentType does not match eContentType"
             ))
         ));
     }
 
-    #[test]
-    fn verify_rejects_unsupported_digest_algorithm() {
-        // digestAlgorithm OID is rsaEncryption -- not a SHA-2 variant.
-        let sd = synthetic(
-            b"x",
-            known::RSA_ENCRYPTION.as_bytes(),
-            known::SHA256_WITH_RSA.as_bytes(),
-            None,
-            b"",
-        );
-        assert!(matches!(
-            sd.verify(b""),
-            Err(CmsError::UnsupportedDigestAlgorithm)
-        ));
-    }
-
-    #[test]
-    fn verify_rejects_unsupported_signature_algorithm() {
-        // Valid SHA-256 digest OID, but a digest OID sits in the
-        // signatureAlgorithm slot -- outside the RSA/ECDSA matrix.
-        let sd = synthetic(
-            b"x",
-            known::SHA256.as_bytes(),
-            known::SHA256.as_bytes(),
-            None,
-            b"",
-        );
-        assert!(matches!(
-            sd.verify(b""),
-            Err(CmsError::UnsupportedSignatureAlgorithm)
-        ));
-    }
-
-    // ----- parse_lds_security_object -----
+    // ----- LdsSecurityObject::parse -----
 
     #[test]
     fn parses_lds_security_object_directly() {
@@ -1945,32 +1455,31 @@ mod tests {
         let sd = SignedData::parse(&der).expect("parse");
         let lds = LdsSecurityObject::parse(sd.econtent_der.expect("attached")).expect("LDS parses");
         assert_eq!(lds.hash_algorithm, HashAlgorithm::Sha256);
-        assert_eq!(lds.data_group_hashes.len(), 2);
+        assert_eq!(lds.data_group_hashes.len(), EXPECTED_DG_COUNT);
         let mut dgs = lds.data_group_hashes.iter();
         let dg1 = dgs.next().expect("DG1");
         let dg2 = dgs.next().expect("DG2");
-        assert_eq!(dg1.0, 1);
+        assert_eq!(dg1.0, DG_NUMBER_1);
         assert_eq!(dg1.1, unhex(DG1_HASH_HEX).as_slice());
-        assert_eq!(dg2.0, 2);
+        assert_eq!(dg2.0, DG_NUMBER_2);
         assert_eq!(dg2.1, unhex(DG2_HASH_HEX).as_slice());
     }
 
     #[test]
     fn lds_rejects_unsupported_hash_algorithm() {
-        // hashAlgorithm OID = SHA-1 -> unsupported.
-        let hash_alg = tlv(0x30, tlv(0x06, known::SHA1.as_bytes()));
-        let dgh = tlv(0x30, b"");
-        let mut body = tlv(0x02, [0x00_u8]); // version
+        let hash_alg = alg_id_no_params(known::SHA1);
+        let dgh = tlv(TAG_SEQUENCE, b"");
+        let mut body = tlv(TAG_INTEGER, [VERSION_0]);
         body.extend_from_slice(&hash_alg);
         body.extend_from_slice(&dgh);
-        let lds = tlv(0x30, &body);
+        let lds = tlv(TAG_SEQUENCE, &body);
         assert!(matches!(
             LdsSecurityObject::parse(&lds),
             Err(CmsError::UnsupportedDigestAlgorithm)
         ));
     }
 
-    // ----- Owned wrappers -----
+    // ----- OwnedSignedData -----
 
     #[test]
     fn owned_signed_data_roundtrips() {
@@ -1979,13 +1488,12 @@ mod tests {
         assert_eq!(owned.as_der(), der.as_slice());
         let view = owned.view();
         assert_eq!(view.econtent_type_oid, known::ICAO_LDS_SECURITY_OBJECT);
-        assert_eq!(view.certificates_der.len(), 1);
+        assert_eq!(view.certificates_der.len(), EXPECTED_EMBEDDED_CERTS);
     }
 
     #[test]
-    fn owned_signed_data_rejects_garbage() {
-        OwnedSignedData::from_der([0xDE_u8, 0xAD, 0xBE, 0xEF])
-            .expect_err("garbage bytes are not SignedData");
+    fn owned_signed_data_rejects_invalid_der() {
+        OwnedSignedData::from_der(b"not-cms-der").expect_err("non-DER bytes are rejected");
     }
 
     // ----- CmsError Display -----
@@ -2003,46 +1511,6 @@ mod tests {
         assert_eq!(
             CmsError::UnsupportedDigestAlgorithm.to_string(),
             "CMS: unsupported digest algorithm"
-        );
-        assert_eq!(
-            CmsError::UnsupportedSignatureAlgorithm.to_string(),
-            "CMS: unsupported signature algorithm"
-        );
-        assert_eq!(
-            CmsError::BadSignerKey.to_string(),
-            "CMS: signer key did not parse as RSA"
-        );
-        assert_eq!(
-            CmsError::SignerHashMismatch.to_string(),
-            "CMS: messageDigest attr != hash(eContent)"
-        );
-        assert_eq!(
-            CmsError::DetachedNotSupported.to_string(),
-            "CMS: detached SignedData not supported"
-        );
-    }
-
-    #[test]
-    fn cms_error_display_wraps_crypto_errors() {
-        // Capture the real Rsa / Ecdsa variants from wrong-key verifies
-        // and confirm the wrapper prefixes.
-        let rsa_der = unhex(RSA_CMS_HEX);
-        let rsa_err = SignedData::parse(&rsa_der)
-            .expect("parse")
-            .verify(unhex(WRONG_RSA_SPKI_HEX))
-            .expect_err("wrong key");
-        assert!(
-            rsa_err.to_string().starts_with("CMS: RSA verify:"),
-            "{rsa_err}"
-        );
-        let ec_der = unhex(EC_CMS_HEX);
-        let ec_err = SignedData::parse(&ec_der)
-            .expect("parse")
-            .verify(unhex(WRONG_EC_SPKI_HEX))
-            .expect_err("wrong key");
-        assert!(
-            ec_err.to_string().starts_with("CMS: ECDSA verify:"),
-            "{ec_err}"
         );
     }
 }

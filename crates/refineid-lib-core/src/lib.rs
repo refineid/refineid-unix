@@ -18,8 +18,8 @@
 //! Layered from the card edge upwards. The foundation modules
 //! ([`backend`], [`error`], [`transport`]) define the ports and
 //! types every higher layer depends on. The crypto, protocol, and
-//! use-case layers (PACE, secure messaging, eMRTD, the
-//! `Session` verb API) sit on top.
+//! use-case layers (PACE, secure messaging, eMRTD, PKCS#15, PIN,
+//! and signing operations) sit on top.
 //!
 //! ## Typing-discipline backbone
 //!
@@ -29,19 +29,15 @@
 //!
 //! - [`oid`] -- typed [`Oid<'a>`] wrapper over OBJECT
 //!   IDENTIFIER content bytes, plus a `known` submodule of
-//!   spec-cited static `Oid<'static>` constants. The `Oid` ->
-//!   bare-`&[u8]` migration is in progress; new code uses
-//!   `Oid` directly.
+//!   spec-cited static `Oid<'static>` constants.
 //! - [`fineid_card`] -- card-identity newtypes ([`Atr`],
 //!   [`Ats`], [`CardType`], [`CardVendor`], [`FineidCardModel`])
 //!   that project DVV's ATR/ATS technote and the wider FINEID
 //!   card-model taxonomy onto the type system. The classifier
 //!   refuses out-of-scope cards before any modify APDU.
-//! - [`cert_state`] -- cert state lattice typestate
-//!   ([`RawDer`] -> [`ParsedCert`] -> [`PathValidatedCert`] ->
-//!   [`RevocationCheckedCert`] -> [`PurposeBoundCert<P>`]).
-//!   Phase A landed the types and purpose markers; consumer
-//!   migration follows.
+//! - [`cert_state`] -- owned certificate provenance wrapper
+//!   ([`CertDer`]) separating raw card-slot DER reads from
+//!   parsed and verified X.509 certificate views in [`x509`].
 //!
 //! [`Oid<'a>`]: oid::Oid
 //! [`Atr`]: fineid_card::Atr
@@ -49,11 +45,7 @@
 //! [`CardType`]: fineid_card::CardType
 //! [`CardVendor`]: fineid_card::CardVendor
 //! [`FineidCardModel`]: fineid_card::FineidCardModel
-//! [`RawDer`]: cert_state::RawDer
-//! [`ParsedCert`]: cert_state::ParsedCert
-//! [`PathValidatedCert`]: cert_state::PathValidatedCert
-//! [`RevocationCheckedCert`]: cert_state::RevocationCheckedCert
-//! [`PurposeBoundCert<P>`]: cert_state::PurposeBoundCert
+//! [`CertDer`]: cert_state::CertDer
 //! [typing]: ../../../../doc/typing-discipline.md
 
 // `clippy::pub_use` fires on every `pub use submodule::Item;` at
@@ -78,7 +70,6 @@ pub mod base64;
 pub(crate) mod ber;
 pub mod ca;
 pub mod can;
-pub mod card;
 pub mod card_access;
 pub mod cert_state;
 pub mod cms;

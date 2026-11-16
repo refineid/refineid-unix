@@ -1106,592 +1106,221 @@ impl GivenNamesText {
     }
 }
 
-/// First given name -- the "Hi, X!" slot.
-///
-/// Conventionally the calling name (Finnish `kutsumanimi`).
-/// Some Finnish citizens identify by their second given name
-/// instead; refineid does not encode that preference here.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FirstName(String);
+/// Declarative generator for `FreeText`-validated holder-identity
+/// newtypes (`String` payload refined through `FreeText::parse`).
+macro_rules! free_text_newtype {
+    (
+        $(
+            $(#[$meta:meta])*
+            $struct_vis:vis struct $name:ident ($ctor_vis:vis new);
+        )+
+    ) => {
+        $(
+            $(#[$meta])*
+            #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+            $struct_vis struct $name(String);
 
-impl FirstName {
-    /// # Errors
-    /// [`FreeTextError::Empty`] if empty, [`FreeTextError::TooLong`]
-    /// if it exceeds [`FREE_TEXT_MAX_BYTES`].
-    pub fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
+            impl $name {
+                /// Validate `s` as non-empty bounded free-text and wrap it.
+                ///
+                /// # Errors
+                /// [`FreeTextError::Empty`] if `s` is empty,
+                /// [`FreeTextError::TooLong`] if `s` exceeds
+                /// [`FREE_TEXT_MAX_BYTES`].
+                $ctor_vis fn new(s: String) -> Result<Self, FreeTextError> {
+                    FreeText::parse(&s)?;
+                    Ok(Self(s))
+                }
 
-    /// Borrow the underlying first-name string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+                /// Borrow the underlying UTF-8 string slice verbatim.
+                #[must_use]
+                pub fn as_str(&self) -> &str {
+                    &self.0
+                }
+            }
 
-    /// Render as case-normalized [`NativeName`]. See
-    /// [`Surname::to_native`] for the heuristic.
-    #[must_use]
-    pub fn to_native(&self) -> NativeName {
-        NativeName(
-            LegacyUppercaseName::from_validated(FreeText { value: &self.0 }).title_case_segments(),
-        )
-    }
+            impl Deref for $name {
+                type Target = str;
 
-    /// MRZ transliteration source for this given-name slot.
-    #[must_use]
-    pub(crate) fn to_mrz_text(&self) -> NativeMrzText {
-        NativeMrzText(self.0.clone())
-    }
+                fn deref(&self) -> &str {
+                    &self.0
+                }
+            }
+
+            impl AsRef<str> for $name {
+                fn as_ref(&self) -> &str {
+                    &self.0
+                }
+            }
+
+            impl fmt::Display for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str(&self.0)
+                }
+            }
+        )+
+    };
 }
 
-impl Deref for FirstName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
+/// Inherent case-normalization and MRZ-source conversions shared by
+/// the decomposed given-name slot newtypes.
+macro_rules! impl_given_name_conversions {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl $name {
+                /// Render as case-normalized [`NativeName`]. See
+                /// [`Surname::to_native`] for the heuristic.
+                #[must_use]
+                pub fn to_native(&self) -> NativeName {
+                    NativeName(
+                        LegacyUppercaseName::from_validated(FreeText { value: &self.0 })
+                            .title_case_segments(),
+                    )
+                }
 
-impl AsRef<str> for FirstName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for FirstName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Second given name.
-///
-/// Distinct type from [`FirstName`] so the compiler refuses
-/// to greet someone with their second name where the first
-/// was intended.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SecondName(String);
-
-impl SecondName {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying second-name string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Render as case-normalized [`NativeName`]. See
-    /// [`Surname::to_native`] for the heuristic.
-    #[must_use]
-    pub fn to_native(&self) -> NativeName {
-        NativeName(
-            LegacyUppercaseName::from_validated(FreeText { value: &self.0 }).title_case_segments(),
-        )
-    }
-
-    /// MRZ transliteration source for this given-name slot.
-    #[must_use]
-    pub(crate) fn to_mrz_text(&self) -> NativeMrzText {
-        NativeMrzText(self.0.clone())
-    }
-}
-
-impl Deref for SecondName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for SecondName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for SecondName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Third-or-further given name.
-///
-/// Bag of additional given names beyond first and second. A
-/// person with names "Anna Maria Helena Sofia" yields
-/// `FirstName("Anna")`, `SecondName("Maria")`, and a vector
-/// `[AdditionalName("Helena"), AdditionalName("Sofia")]`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AdditionalName(String);
-
-impl AdditionalName {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying additional-name string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Render as case-normalized [`NativeName`]. See
-    /// [`Surname::to_native`] for the heuristic.
-    #[must_use]
-    pub fn to_native(&self) -> NativeName {
-        NativeName(
-            LegacyUppercaseName::from_validated(FreeText { value: &self.0 }).title_case_segments(),
-        )
-    }
-
-    /// MRZ transliteration source for this given-name slot.
-    #[must_use]
-    pub(crate) fn to_mrz_text(&self) -> NativeMrzText {
-        NativeMrzText(self.0.clone())
-    }
-}
-
-impl Deref for AdditionalName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for AdditionalName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for AdditionalName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+                /// MRZ transliteration source for this given-name slot.
+                #[must_use]
+                pub(crate) fn to_mrz_text(&self) -> NativeMrzText {
+                    NativeMrzText(self.0.clone())
+                }
+            }
+        )+
+    };
 }
 
 // =========================================================
-// DG11 free-text newtypes.
+// Decomposed given-name, DG11, and DG12 free-text newtypes.
 //
-// Each ICAO 9303-10 DG11 free-text field gets its own type so
-// no consumer can silently swap a title for a profession or
-// an address for a personal summary. All are UTF-8 verbatim;
-// diacritics preserved.
+// Each ICAO 9303-10 holder-identity free-text field has its
+// own type so consumers cannot swap given-name slots, titles,
+// professions, addresses, or document observations. All carry
+// validated UTF-8 verbatim with diacritics preserved.
 // =========================================================
 
-/// Personal honorific (DG11 tag `0x5F14`).
-///
-/// "Mr", "Mrs", "Prof.", "Dr", "Tri.". ICAO leaves this field
-/// as free-text with no enumerated vocabulary; Finnish DVV
-/// citizen cards seldom populate it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Title(String);
+free_text_newtype! {
+    /// First given name -- the "Hi, X!" slot.
+    ///
+    /// Conventionally the calling name (Finnish `kutsumanimi`).
+    /// Some Finnish citizens identify by their second given name
+    /// instead; refineid does not encode that preference here.
+    pub struct FirstName(pub new);
 
-impl Title {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
+    /// Second given name.
+    ///
+    /// Distinct type from [`FirstName`] so the compiler refuses
+    /// to greet someone with their second name where the first
+    /// was intended.
+    pub struct SecondName(pub(crate) new);
 
-    /// Borrow the underlying title string verbatim.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+    /// Third-or-further given name.
+    ///
+    /// Bag of additional given names beyond first and second. A
+    /// person with names "Anna Maria Helena Sofia" yields
+    /// `FirstName("Anna")`, `SecondName("Maria")`, and a vector
+    /// `[AdditionalName("Helena"), AdditionalName("Sofia")]`.
+    pub struct AdditionalName(pub(crate) new);
+
+    /// Personal honorific (DG11 tag `0x5F14`).
+    ///
+    /// Examples: `"Mr"`, `"Mrs"`, `"Prof."`, `"Dr"`, `"Tri."`.
+    /// ICAO leaves this field as free-text with no enumerated
+    /// vocabulary; Finnish DVV citizen cards seldom populate it.
+    pub struct Title(pub(crate) new);
+
+    /// Profession / occupation (DG11 tag `0x5F13`).
+    ///
+    /// Distinct from [`Title`] -- occupation vs personal
+    /// honorific. Stored as verbatim UTF-8 free-text.
+    pub struct Profession(pub(crate) new);
+
+    /// Personal summary (DG11 tag `0x5F15`).
+    ///
+    /// Free-form notes about the holder. Rarely populated.
+    pub struct PersonalSummary(pub(crate) new);
+
+    /// Place of birth (DG11 tag `0x5F11`).
+    ///
+    /// Sub-fields are separated by `<` per ICAO 9303-10; the
+    /// newtype carries the whole on-card value verbatim.
+    pub struct PlaceOfBirth(pub(crate) new);
+
+    /// Permanent address (DG11 tag `0x5F42`).
+    ///
+    /// Sub-fields are separated by `<` per ICAO 9303-10.
+    pub struct PermanentAddress(pub(crate) new);
+
+    /// Telephone number (DG11 tag `0x5F12`).
+    ///
+    /// Free-text on the card -- no E.164 normalisation enforced.
+    pub struct Telephone(pub(crate) new);
+
+    /// Custody information (DG11 tag `0x5F18`).
+    ///
+    /// Per ICAO 9303-10 Table 71, tag `0x5F18` carries custody
+    /// information, distinct from DG12 tag `0x5F1C` ([`TaxExit`]).
+    pub struct CustodyInformation(pub(crate) new);
+
+    /// One travel-document number from DG11 tag `0x5F17`.
+    ///
+    /// Cards may carry several; the on-card field separates them
+    /// with `<`. The TLV walker splits and emits
+    /// `Vec<OtherTdNumber>`.
+    pub struct OtherTdNumber(pub(crate) new);
+
+    /// One alternative / former name from DG11 tag `0x5F0F`.
+    ///
+    /// Nested under the `0xA0` content-specific wrapper with an
+    /// `0x02` instance-count byte; per ICAO 9303-10 the field may
+    /// repeat. The TLV walker emits `Vec<OtherName>`.
+    pub struct OtherName(pub(crate) new);
+
+    /// Holder's full name in the native form (DG11 tag `0x5F0E`).
+    ///
+    /// On-card encoding is variable -- ICAO 9303-10 sec. 4.7.11.4
+    /// leaves the field as a single free-text string. Issuers
+    /// typically write `Surname<<Given1<Given2<...` (MRZ-style
+    /// with filler `<` separators) with UTF-8 diacritics
+    /// preserved. [`Self::try_split_into_parts`] performs
+    /// best-effort decomposition into typed [`Surname`] and
+    /// [`SplitGivenNames`].
+    pub struct Dg11FullName(pub(crate) new);
+
+    /// Personal number from DG11 tag `0x5F10`.
+    ///
+    /// Distinct from [`Peuin`] (the cert subject DN `serialNumber`
+    /// attribute): DG11's personal number is the issuing-state
+    /// identifier in its natural format -- in Finland this is the
+    /// HETU (`DDMMYY+sign+NNN+check`). PEUIN derives from HETU
+    /// with a separate domain format.
+    pub struct PersonalNumber(pub(crate) new);
+
+    /// Issuing authority (DG12 tag `0x5F19`, ICAO 9303-10 Table 73).
+    pub struct IssuingAuthority(pub(crate) new);
+
+    /// Endorsements / observations (DG12 tag `0x5F1B`, ICAO 9303-10 Table 73).
+    pub struct Endorsements(pub(crate) new);
+
+    /// Tax / exit requirements (DG12 tag `0x5F1C`, ICAO 9303-10 Table 73).
+    ///
+    /// Distinct from [`CustodyInformation`] (DG11 `0x5F18`) --
+    /// different data group, tag, and semantics.
+    pub struct TaxExit(pub(crate) new);
+
+    /// Name of another person referenced on the document
+    /// (DG12 tag `0x5F1A`).
+    ///
+    /// Nested under `0xA0` with an `0x02` instance-count byte;
+    /// may repeat per ICAO 9303-10. Emitted as `Vec<OtherPerson>`.
+    pub struct OtherPerson(pub(crate) new);
+
+    /// Serial number of the personalisation system that wrote the
+    /// document (DG12 tag `0x5F56`).
+    pub struct PersonalisationDeviceSerial(pub(crate) new);
 }
 
-impl Deref for Title {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for Title {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Title {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Profession / occupation (DG11 tag `0x5F13`).
-///
-/// "Lääkäri", "Software Engineer". Distinct from [`Title`] --
-/// honorific vs job. Free-text.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Profession(String);
-
-impl Profession {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying profession string verbatim.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for Profession {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for Profession {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Profession {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Personal summary (DG11 tag `0x5F15`).
-///
-/// Free-form notes about the holder. Rarely populated.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PersonalSummary(String);
-
-impl PersonalSummary {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying personal-summary string verbatim.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for PersonalSummary {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for PersonalSummary {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for PersonalSummary {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Place of birth (DG11 tag `0x5F11`).
-///
-/// Sub-fields are separated by `<` per ICAO 9303-10; the
-/// newtype carries the whole on-card value verbatim.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PlaceOfBirth(String);
-
-impl PlaceOfBirth {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying place-of-birth string (sub-fields
-    /// separated by `<` per ICAO 9303-10).
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for PlaceOfBirth {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for PlaceOfBirth {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for PlaceOfBirth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Permanent address (DG11 tag `0x5F42`).
-///
-/// Sub-fields are separated by `<` per ICAO 9303-10.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PermanentAddress(String);
-
-impl PermanentAddress {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying permanent-address string (sub-fields
-    /// separated by `<` per ICAO 9303-10).
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for PermanentAddress {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for PermanentAddress {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for PermanentAddress {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Telephone number (DG11 tag `0x5F12`).
-///
-/// Free-text on the card -- no E.164 normalisation enforced.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Telephone(String);
-
-impl Telephone {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying telephone-number string verbatim
-    /// (no E.164 normalisation enforced).
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for Telephone {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for Telephone {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Telephone {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Custody information (DG11 tag `0x5F18`).
-///
-/// Per ICAO 9303-10 Table 71 the slot is reserved for custody
-/// information. Earlier refineid releases mislabelled this as
-/// "tax / exit requirements"; that label belongs to DG12
-/// `0x5F1C` ([`TaxExit`]).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CustodyInformation(String);
-
-impl CustodyInformation {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying custody-information string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for CustodyInformation {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for CustodyInformation {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for CustodyInformation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// One travel-document number from DG11 tag `0x5F17`.
-///
-/// Cards may carry several; the on-card field separates them
-/// with `<`. The TLV walker splits and emits `Vec<OtherTdNumber>`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct OtherTdNumber(String);
-
-impl OtherTdNumber {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying alternative TD-number string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for OtherTdNumber {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for OtherTdNumber {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for OtherTdNumber {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// One alternative / former name from DG11 tag `0x5F0F`.
-///
-/// Nested under the `0xA0` content-specific wrapper with an
-/// `0x02` instance-count byte; per ICAO 9303-10 the field may
-/// repeat. The TLV walker emits `Vec<OtherName>`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct OtherName(String);
-
-impl OtherName {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying alternative-name string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for OtherName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for OtherName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for OtherName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Holder's full name in the native form (DG11 tag `0x5F0E`).
-///
-/// On-card encoding is variable -- ICAO 9303-10 §4.7.11.4 leaves
-/// the field as a single free-text string. Implementations
-/// typically write `Surname<<Given1<Given2<...` (MRZ-style with
-/// filler `<` separators) but with diacritics preserved (UTF-8).
-/// We hold the bytes verbatim; [`try_split_into_parts`] attempts
-/// the best-effort decomposition into typed [`Surname`] +
-/// [`SplitGivenNames`].
-///
-/// [`try_split_into_parts`]: Dg11FullName::try_split_into_parts
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Dg11FullName(String);
+impl_given_name_conversions!(FirstName, SecondName, AdditionalName);
 
 impl Dg11FullName {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying full-name string verbatim (MRZ-style
-    /// `<<` separator between surname and given names not yet
-    /// expanded; use [`try_split_into_parts`](Self::try_split_into_parts)
-    /// to decompose).
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
     /// Best-effort decomposition into `(surname, given_names)`.
     ///
     /// Strategy, in order:
@@ -1705,6 +1334,8 @@ impl Dg11FullName {
     /// least one given name.
     #[must_use]
     pub fn try_split_into_parts(&self) -> Option<(Surname, SplitGivenNames)> {
+        const MIN_FALLBACK_NAME_TOKENS: usize = 2;
+
         let raw = self.0.as_str();
         let (surname_raw, given_raw): (String, String) = if let Some((s, g)) = raw.split_once("<<")
         {
@@ -1716,7 +1347,7 @@ impl Dg11FullName {
             // Fallback: last whitespace token = surname.
             let trimmed = raw.replace('<', " ");
             let mut tokens: Vec<String> = trimmed.split_whitespace().map(str::to_owned).collect();
-            if tokens.len() < 2 {
+            if tokens.len() < MIN_FALLBACK_NAME_TOKENS {
                 return None;
             }
             let surname = tokens.pop()?;
@@ -1725,280 +1356,9 @@ impl Dg11FullName {
         let surname = Surname::new(surname_raw).ok()?;
         let given = GivenNamesText::new(given_raw).ok()?.split();
         // Require at least a first given name; otherwise the
-        // parsed shape isn't useful for any caller. The discard
-        // via `let _` keeps the `unused_must_use` lint happy
-        // without re-binding the borrowed name.
+        // parsed shape isn't useful for any caller.
         let _: &FirstName = given.first.as_ref()?;
         Some((surname, given))
-    }
-}
-
-impl Deref for Dg11FullName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for Dg11FullName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Dg11FullName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Personal number from DG11 tag `0x5F10`.
-///
-/// Distinct from [`Peuin`] (the cert subject DN `serialNumber`
-/// attribute): DG11's personal number is the issuing-state
-/// identifier in its natural format -- in Finland this is the
-/// HETU (DDMMYY+sign+NNN+check). PEUIN derives from HETU but
-/// has a different shape. Different types, different domain
-/// values.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PersonalNumber(String);
-
-impl PersonalNumber {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying personal-number string (issuing-state
-    /// native format; HETU for Finland).
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for PersonalNumber {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for PersonalNumber {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for PersonalNumber {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-// =========================================================
-// DG12 free-text newtypes.
-//
-// Additional document data per ICAO 9303-10 §4.7.12 Table 73.
-// =========================================================
-
-/// Issuing authority (DG12 tag `0x5F19`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct IssuingAuthority(String);
-
-impl IssuingAuthority {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying issuing-authority string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for IssuingAuthority {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for IssuingAuthority {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for IssuingAuthority {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Endorsements / observations (DG12 tag `0x5F1B`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Endorsements(String);
-
-impl Endorsements {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying endorsements-and-observations string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for Endorsements {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for Endorsements {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Endorsements {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Tax / exit requirements (DG12 tag `0x5F1C`).
-///
-/// Distinct from [`CustodyInformation`] (DG11 `0x5F18`) --
-/// different DG, different slot, different semantics.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TaxExit(String);
-
-impl TaxExit {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying tax / exit-requirements string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for TaxExit {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for TaxExit {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for TaxExit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Name of another person referenced on the document
-/// (DG12 tag `0x5F1A`).
-///
-/// Nested under `0xA0` with an `0x02` instance-count byte;
-/// may repeat per ICAO 9303-10. Emitted as `Vec<OtherPerson>`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct OtherPerson(String);
-
-impl OtherPerson {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying other-person name string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for OtherPerson {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for OtherPerson {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for OtherPerson {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Serial number of the personalisation system that wrote the
-/// document (DG12 tag `0x5F56`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PersonalisationDeviceSerial(String);
-
-impl PersonalisationDeviceSerial {
-    /// # Errors
-    /// See [`FreeTextError`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying personalisation-device serial string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for PersonalisationDeviceSerial {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for PersonalisationDeviceSerial {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for PersonalisationDeviceSerial {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
     }
 }
 
