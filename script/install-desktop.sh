@@ -164,20 +164,51 @@ if [ -z "$DESTDIR" ]; then
     fi
 
     # Refresh running XFCE panels so in-memory menu caches pick up changes immediately.
-    for session_pid in $(pgrep -f '[x]fce4-session' 2>/dev/null || true); do
-        if [ -r "/proc/$session_pid/environ" ]; then
-            uid=$(stat -c '%u' "/proc/$session_pid" 2>/dev/null || continue)
-            user=$(id -nu "$uid" 2>/dev/null || continue)
-            display=$(tr '\0' '\n' < "/proc/$session_pid/environ" 2>/dev/null | grep '^DISPLAY=' | cut -d= -f2-)
-            bus="/run/user/$uid/bus"
-            if [ -n "$display" ] && [ -e "$bus" ]; then
-                cmd="pkill -u '$user' -x xfce4-panel 2>/dev/null || true; sleep 1; nohup xfce4-panel >/dev/null 2>&1 &"
-                if [ "$(id -u)" -eq 0 ] && [ "$uid" -ne 0 ]; then
-                    su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' $cmd" 2>/dev/null || true
-                elif [ "$uid" -eq "$(id -u)" ]; then
-                    DISPLAY="$display" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" sh -c "$cmd" 2>/dev/null || true
-                fi
+    seen_uids=""
+    for session_pid in $(pgrep -x xfce4-session 2>/dev/null || true); do
+        case "$session_pid" in ""|*[!0-9]*) continue ;; esac
+        [ -d "/proc/$session_pid" ] || continue
+        [ -r "/proc/$session_pid/environ" ] || continue
+
+        uid=$(stat -c '%u' "/proc/$session_pid" 2>/dev/null || stat -f '%u' "/proc/$session_pid" 2>/dev/null || true)
+        case "$uid" in ""|*[!0-9]*) continue ;; esac
+        [ "$uid" -ge 1000 ] || continue
+
+        case "$seen_uids" in *" $uid "*) continue ;; esac
+
+        user=$(id -nu "$uid" 2>/dev/null || true)
+        case "$user" in
+            *[!a-zA-Z0-9_.-]*) continue ;;
+            [a-zA-Z]*) ;;
+            *) continue ;;
+        esac
+
+        display=$(tr '\0' '\n' < "/proc/$session_pid/environ" 2>/dev/null | grep '^DISPLAY=' | head -n 1 | cut -d= -f2- || true)
+        [ -n "$display" ] || continue
+        [ "$(printf '%s\n' "$display" | wc -l)" -eq 1 ] || continue
+        case "$display" in *[!0-9.:]*) continue ;; esac
+        printf '%s\n' "$display" | grep -Eq '^:[0-9]+(\.[0-9]+)?$' || continue
+
+        bus="/run/user/$uid/bus"
+        [ -S "$bus" ] || [ -e "$bus" ] || continue
+
+        # Verify the PID was not recycled between stat and environ read
+        current_uid=$(stat -c '%u' "/proc/$session_pid" 2>/dev/null || stat -f '%u' "/proc/$session_pid" 2>/dev/null || true)
+        [ "$current_uid" = "$uid" ] || continue
+
+        seen_uids="$seen_uids $uid "
+
+        cmd='pkill -u "$1" -x xfce4-panel 2>/dev/null || true; sleep 1; nohup xfce4-panel >/dev/null 2>&1 &'
+        if [ "$(id -u)" -eq 0 ]; then
+            if command -v runuser >/dev/null 2>&1; then
+                runuser -u "$user" -- env DISPLAY="$display" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+                    sh -c "$cmd" _ "$user" 2>/dev/null || true
+            else
+                su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' pkill -u '$user' -x xfce4-panel 2>/dev/null || true; sleep 1; nohup xfce4-panel >/dev/null 2>&1 &" 2>/dev/null || true
             fi
+        elif [ "$uid" -eq "$(id -u)" ]; then
+            DISPLAY="$display" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+                sh -c "$cmd" _ "$user" 2>/dev/null || true
         fi
     done
 fi
