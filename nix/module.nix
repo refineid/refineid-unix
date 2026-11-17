@@ -118,15 +118,45 @@ in
 
       # Refresh running XFCE panels for active user sessions so in-memory menu caches
       # pick up the new or updated .desktop entries immediately.
-      for session_pid in $( ${pkgs.procps}/bin/pgrep -f '[x]fce4-session' 2>/dev/null || true ); do
-        if [ -r "/proc/$session_pid/environ" ]; then
-          uid=$(stat -c '%u' "/proc/$session_pid" 2>/dev/null || continue)
-          user=$(id -nu "$uid" 2>/dev/null || continue)
-          display=$(tr '\0' '\n' < "/proc/$session_pid/environ" 2>/dev/null | grep '^DISPLAY=' | cut -d= -f2-)
-          bus="/run/user/$uid/bus"
-          if [ -n "$display" ] && [ -e "$bus" ]; then
-            su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' ${pkgs.procps}/bin/pkill -u '$user' -x xfce4-panel 2>/dev/null || true; sleep 1; nohup xfce4-panel >/dev/null 2>&1 &" 2>/dev/null || true
-          fi
+      seen_uids=""
+      for session_pid in $( ${pkgs.procps}/bin/pgrep -x xfce4-session 2>/dev/null || true ); do
+        case "$session_pid" in ""|*[!0-9]*) continue ;; esac
+        [ -d "/proc/$session_pid" ] || continue
+        [ -r "/proc/$session_pid/environ" ] || continue
+
+        uid=$( ${pkgs.coreutils}/bin/stat -c '%u' "/proc/$session_pid" 2>/dev/null || true )
+        case "$uid" in ""|*[!0-9]*) continue ;; esac
+        [ "$uid" -ge 1000 ] || continue
+
+        case "$seen_uids" in *" $uid "*) continue ;; esac
+
+        user=$( ${pkgs.coreutils}/bin/id -nu "$uid" 2>/dev/null || true )
+        case "$user" in
+          *[!a-zA-Z0-9_.-]*) continue ;;
+          [a-zA-Z]*) ;;
+          *) continue ;;
+        esac
+
+        display=$( ${pkgs.coreutils}/bin/tr '\0' '\n' < "/proc/$session_pid/environ" 2>/dev/null | ${pkgs.gnugrep}/bin/grep '^DISPLAY=' | ${pkgs.coreutils}/bin/head -n 1 | ${pkgs.coreutils}/bin/cut -d= -f2- || true )
+        [ -n "$display" ] || continue
+        [ "$( ${pkgs.coreutils}/bin/printf '%s\n' "$display" | ${pkgs.coreutils}/bin/wc -l )" -eq 1 ] || continue
+        case "$display" in *[!0-9.:]*) continue ;; esac
+        ${pkgs.coreutils}/bin/printf '%s\n' "$display" | ${pkgs.gnugrep}/bin/grep -Eq '^:[0-9]+(\.[0-9]+)?$' || continue
+
+        bus="/run/user/$uid/bus"
+        [ -S "$bus" ] || [ -e "$bus" ] || continue
+
+        # Verify the PID was not recycled between stat and environ read
+        [ "$( ${pkgs.coreutils}/bin/stat -c '%u' "/proc/$session_pid" 2>/dev/null || true )" = "$uid" ] || continue
+
+        seen_uids="$seen_uids $uid "
+
+        if [ -x "${pkgs.util-linux}/bin/runuser" ]; then
+          ${pkgs.util-linux}/bin/runuser -u "$user" -- \
+            ${pkgs.coreutils}/bin/env DISPLAY="$display" DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+            /bin/sh -c '${pkgs.procps}/bin/pkill -u "$1" -x xfce4-panel 2>/dev/null || true; sleep 1; nohup xfce4-panel >/dev/null 2>&1 &' _ "$user" 2>/dev/null || true
+        else
+          su - "$user" -c "DISPLAY='$display' DBUS_SESSION_BUS_ADDRESS='unix:path=$bus' ${pkgs.procps}/bin/pkill -u '$user' -x xfce4-panel 2>/dev/null || true; sleep 1; nohup xfce4-panel >/dev/null 2>&1 &" 2>/dev/null || true
         fi
       done
     '';

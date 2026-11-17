@@ -16,6 +16,10 @@
 set -eu
 cd "$(git rev-parse --show-toplevel)"
 
+if [ "${CARGO_NET_OFFLINE:-}" = "true" ]; then
+    exit 0
+fi
+
 cargo update --quiet --package refineid-apdu
 
 # Prints name@lowest-version for each registry package locked more than
