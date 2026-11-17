@@ -828,6 +828,9 @@ pub struct RemoteReader {
     /// Opens the session a backlog appearance dials. Tests replace it to
     /// count dial attempts without a network.
     dial: fn(&[String], &str, Duration, &RoutingPreamble) -> Result<TcpFrameTransport, StreamError>,
+    /// Browses one round for stream announcements. Tests replace it to
+    /// observe lock lifetime without waiting on network discovery.
+    browse: fn(Duration, &[Ipv4Addr]) -> Vec<StreamService>,
 }
 
 /// One open session to a phone that reported a card it can serve; the
@@ -1028,6 +1031,7 @@ impl RemoteReader {
                 store,
             ),
             dial,
+            browse: browse_stream_services,
         }
     }
 
@@ -1448,7 +1452,7 @@ impl RemoteReader {
     /// addresses directly as well as the network.
     fn browse_for(&self, pair_id: PairId) -> Vec<StreamService> {
         let remembered = addresses::remembered(self.requester.store().directory(), pair_id);
-        browse_stream_services(BROWSE_ROUND, &remembered)
+        (self.browse)(BROWSE_ROUND, &remembered)
     }
 
     /// Remembers where the phone holding `pair_id` answered from, for the
@@ -2494,35 +2498,102 @@ mod tests {
 
     #[test]
     fn two_readers_on_one_store_contend_for_the_pairing() {
+        /// Upper bound on waiting for the searcher thread to enter browse, so
+        /// a broken search never hangs the test runner.
+        const PROBE_WAIT: Duration = Duration::from_secs(5);
+
+        #[derive(Default)]
+        struct ProbeState {
+            entered: bool,
+            released: bool,
+        }
+
+        #[derive(Default)]
+        struct ProbeGate {
+            state: std::sync::Mutex<ProbeState>,
+            changed: std::sync::Condvar,
+        }
+
+        struct ActiveProbeGuard(std::sync::Arc<ProbeGate>);
+
+        impl Drop for ActiveProbeGuard {
+            fn drop(&mut self) {
+                *ACTIVE_GATE.lock().unwrap() = None;
+                let mut state = self.0.state.lock().unwrap();
+                state.released = true;
+                self.0.changed.notify_all();
+            }
+        }
+
+        static ACTIVE_GATE: std::sync::Mutex<Option<std::sync::Arc<ProbeGate>>> =
+            std::sync::Mutex::new(None);
+
+        fn browse_holding_lock(_: Duration, _: &[std::net::Ipv4Addr]) -> Vec<StreamService> {
+            let Some(gate) = ACTIVE_GATE.lock().unwrap().clone() else {
+                return Vec::new();
+            };
+            let mut state = gate.state.lock().unwrap();
+            if state.entered {
+                return Vec::new();
+            }
+            state.entered = true;
+            gate.changed.notify_all();
+            let (_guard, _timeout) = gate
+                .changed
+                .wait_timeout_while(state, PROBE_WAIT, |current| !current.released)
+                .unwrap();
+            Vec::new()
+        }
+
+        fn browse_none(_: Duration, _: &[std::net::Ipv4Addr]) -> Vec<StreamService> {
+            Vec::new()
+        }
+
+        let gate = std::sync::Arc::new(ProbeGate::default());
+        *ACTIVE_GATE.lock().unwrap() = Some(std::sync::Arc::clone(&gate));
+        let _active_guard = ActiveProbeGuard(std::sync::Arc::clone(&gate));
+
         let directory = scratch();
         let mut first = reader_with_pairing(&directory);
+        first.browse = browse_holding_lock;
         let mut second =
             RemoteReader::with_store(desk(), "Linux", FilePairingStore::open(&directory).unwrap());
+        second.browse = browse_none;
         let pair_id = PairId::from_array(PAIR_ID);
-        // The first reader searches for a phone, finding none, and holds
-        // the pairing's lock for the whole search.
-        let (started, searching) = std::sync::mpsc::channel();
-        let searcher = std::thread::spawn(move || {
-            started.send(()).unwrap();
-            first.open_session(Some(pair_id), SEARCH)
-        });
-        searching.recv().unwrap();
-        // The second reader asks during the search and is told the phone is
-        // busy. Wait until the searcher has acquired the session lock before
-        // opening the contending session.
-        let lock_path = session_lock_path(&directory, pair_id);
-        while SessionLock::acquire(&lock_path).is_ok() {
-            std::thread::sleep(LOCK_STEP);
+        // The first reader acquires the pairing's lock before browsing and
+        // holds it across the round until the contending reader has checked.
+        let searcher =
+            std::thread::spawn(move || first.open_session(Some(pair_id), Duration::ZERO));
+        {
+            let state = gate.state.lock().unwrap();
+            let (_guard, wait_result) = gate
+                .changed
+                .wait_timeout_while(state, PROBE_WAIT, |current| !current.entered)
+                .unwrap();
+            assert!(
+                !wait_result.timed_out(),
+                "first reader did not enter browse within {PROBE_WAIT:?}"
+            );
         }
         assert_eq!(
             second.open_session(Some(pair_id), Duration::ZERO).err(),
             Some(RemoteError::Busy)
         );
+        {
+            let mut state = gate.state.lock().unwrap();
+            state.released = true;
+            gate.changed.notify_all();
+        }
         assert_eq!(searcher.join().unwrap().err(), Some(RemoteError::NotFound));
-        assert_eq!(
-            second.open_session(Some(pair_id), Duration::ZERO).err(),
-            Some(RemoteError::NotFound)
-        );
+        let mut released = Some(RemoteError::Busy);
+        for _ in 0..LOCK_LOOKS {
+            released = second.open_session(Some(pair_id), Duration::ZERO).err();
+            if released != Some(RemoteError::Busy) {
+                break;
+            }
+            std::thread::sleep(LOCK_STEP);
+        }
+        assert_eq!(released, Some(RemoteError::NotFound));
         let _ = std::fs::remove_dir_all(directory);
     }
 
