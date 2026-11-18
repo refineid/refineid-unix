@@ -1131,12 +1131,37 @@ fn https_post_to(
 }
 
 impl HttpHelpers {
-    /// Parse an HTTP/1.1 response (status line + headers +
-    /// body) from a `BufRead` source, capping the body at
-    /// `max_bytes`.
+    /// Read a line bounded by `max_bytes` into `buf`.
     ///
-    /// RFC 9112 §4 (status line), §5 (headers), §7 (body).
-    /// Body length is taken from `Content-Length` or
+    /// Reads at most `max_bytes + 1` bytes via `reader.by_ref().take(...)`.
+    /// If the line exceeds `max_bytes` or reaches EOF without a terminating `\n`,
+    /// an `InvalidData` error is returned to prevent unbounded memory allocation
+    /// on malformed or malicious streams. Returns `Ok(0)` on clean EOF at the start of a line.
+    fn read_bounded_line<R: BufRead>(
+        reader: &mut R,
+        buf: &mut String,
+        max_bytes: usize,
+    ) -> io::Result<usize> {
+        buf.clear();
+        let cap = (max_bytes.saturating_add(1)) as u64;
+        let n = reader.by_ref().take(cap).read_line(buf)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        if n > max_bytes || !buf.ends_with('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP line exceeds maximum allowed length or missing newline",
+            ));
+        }
+        Ok(n)
+    }
+
+    /// Read an HTTP response up to `max_bytes` of body. Responses
+    /// with an announced `Content-Length` larger than `max_bytes`
+    /// are rejected before reading the body.
+    ///
+    /// The response MUST provide either `Content-Length` or
     /// transfer-encoding `chunked`; absent both is rejected as
     /// [`HttpError::UnknownBodyLength`] so the caller never
     /// gets a partial response. 4xx/5xx and unknown status
@@ -1148,10 +1173,19 @@ impl HttpHelpers {
         /// Exclusive upper bound of HTTP success-class status
         /// codes (300 = first redirection-class code).
         const HTTP_SUCCESS_END: u16 = 300;
+        /// Maximum bytes permitted for the HTTP status line.
+        const MAX_STATUS_LINE_BYTES: usize = 8192;
+        /// Maximum bytes permitted for a single HTTP header line.
+        const MAX_HEADER_LINE_BYTES: usize = 8192;
+        /// Maximum total bytes permitted for all HTTP headers combined.
+        const MAX_HEADER_SECTION_BYTES: usize = 64 * 1024;
+        /// Maximum number of header fields permitted.
+        const MAX_HEADER_COUNT: usize = 128;
 
         // Status line.
         let mut status_line = String::new();
-        let _read_bytes: usize = reader.read_line(&mut status_line)?;
+        let _read_bytes: usize =
+            Self::read_bounded_line(reader, &mut status_line, MAX_STATUS_LINE_BYTES)?;
         let trimmed = status_line.trim_end_matches(['\r', '\n']);
         let mut parts = trimmed.splitn(3, ' ');
         let _version = parts
@@ -1172,15 +1206,31 @@ impl HttpHelpers {
         let mut content_length: Option<usize> = None;
         let mut chunked = false;
         let mut location: Option<String> = None;
+        let mut total_header_bytes = 0_usize;
+        let mut header_count = 0_usize;
+        let mut line = String::new();
         loop {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line)?;
+            let n = Self::read_bounded_line(reader, &mut line, MAX_HEADER_LINE_BYTES)?;
             if n == 0 {
                 break;
             }
             let trimmed = line.trim_end_matches(['\r', '\n']);
             if trimmed.is_empty() {
                 break;
+            }
+            header_count = header_count.saturating_add(1);
+            if header_count > MAX_HEADER_COUNT {
+                return Err(HttpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "too many HTTP headers",
+                )));
+            }
+            total_header_bytes = total_header_bytes.saturating_add(n);
+            if total_header_bytes > MAX_HEADER_SECTION_BYTES {
+                return Err(HttpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP header section exceeds maximum size",
+                )));
             }
             if let Some((name, value)) = trimmed.split_once(':') {
                 let name = name.trim().to_ascii_lowercase();
@@ -1243,10 +1293,24 @@ impl HttpHelpers {
         /// CRLF length (two bytes per RFC 9112 §7.1 chunk
         /// framing).
         const CRLF_LEN: usize = 2;
+        /// Maximum bytes permitted for a chunk-size line.
+        const MAX_CHUNK_SIZE_LINE_BYTES: usize = 8192;
+        /// Maximum bytes permitted for a single trailer line.
+        const MAX_TRAILER_LINE_BYTES: usize = 8192;
+        /// Maximum total bytes permitted for all chunk trailers combined.
+        const MAX_TRAILER_SECTION_BYTES: usize = 64 * 1024;
+        /// Maximum number of trailer fields permitted.
+        const MAX_TRAILER_COUNT: usize = 64;
+
         let mut out = Vec::new();
+        let mut size_line = String::new();
         loop {
-            let mut size_line = String::new();
-            let _read_bytes: usize = reader.read_line(&mut size_line)?;
+            let n = Self::read_bounded_line(reader, &mut size_line, MAX_CHUNK_SIZE_LINE_BYTES)?;
+            if n == 0 {
+                return Err(HttpError::BadChunkSize(
+                    "unexpected EOF reading chunk size".to_owned(),
+                ));
+            }
             let size_str = size_line
                 .trim_end_matches(['\r', '\n'])
                 .split(';')
@@ -1260,14 +1324,31 @@ impl HttpHelpers {
                 })?;
             if size == 0 {
                 // Trailer + final CRLF -- skip any trailer headers.
+                let mut total_trailer_bytes = 0_usize;
+                let mut trailer_count = 0_usize;
+                let mut trailer_line = String::new();
                 loop {
-                    let mut t = String::new();
-                    let n = reader.read_line(&mut t)?;
+                    let n =
+                        Self::read_bounded_line(reader, &mut trailer_line, MAX_TRAILER_LINE_BYTES)?;
                     if n == 0 {
                         break;
                     }
-                    if t.trim_end_matches(['\r', '\n']).is_empty() {
+                    if trailer_line.trim_end_matches(['\r', '\n']).is_empty() {
                         break;
+                    }
+                    trailer_count = trailer_count.saturating_add(1);
+                    if trailer_count > MAX_TRAILER_COUNT {
+                        return Err(HttpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "too many chunk trailers",
+                        )));
+                    }
+                    total_trailer_bytes = total_trailer_bytes.saturating_add(n);
+                    if total_trailer_bytes > MAX_TRAILER_SECTION_BYTES {
+                        return Err(HttpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "chunk trailers exceed maximum size",
+                        )));
                     }
                 }
                 break;
@@ -1294,6 +1375,11 @@ impl HttpHelpers {
             // Each chunk is followed by CRLF.
             let mut crlf = [0_u8; CRLF_LEN];
             reader.read_exact(&mut crlf)?;
+            if crlf != *b"\r\n" {
+                return Err(HttpError::BadChunkSize(
+                    "chunk did not terminate in CRLF".to_owned(),
+                ));
+            }
         }
         Ok(out)
     }
@@ -1424,6 +1510,59 @@ mod tests {
         let resp = synthetic_response("HTTP/1.1 200 OK\r\nCONTENT-LENGTH: 3", body);
         let parsed = HttpHelpers::read_response(&mut Cursor::new(resp), 1024_usize)?;
         check(parsed.as_slice(), body, "body")
+    }
+
+    #[test]
+    fn chunked_oversized_single_header_rejected_before_read() -> TestResult {
+        let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffff\r\n".to_vec();
+        let r = HttpHelpers::read_response(&mut Cursor::new(resp), 1024_usize);
+        check_true(
+            matches!(r, Err(HttpError::BodyTooLarge { .. })),
+            "BodyTooLarge for oversized chunk",
+        )
+    }
+
+    #[test]
+    fn newline_less_status_line_rejected() -> TestResult {
+        let resp = vec![b'A'; 16 * 1024];
+        let r = HttpHelpers::read_response(&mut Cursor::new(resp), 1024_usize);
+        check_true(
+            matches!(r, Err(HttpError::Io(_))),
+            "Io error for newline-less status line",
+        )
+    }
+
+    #[test]
+    fn newline_less_header_stream_rejected() -> TestResult {
+        let mut resp = b"HTTP/1.1 200 OK\r\n".to_vec();
+        resp.extend(vec![b'H'; 16 * 1024]);
+        let r = HttpHelpers::read_response(&mut Cursor::new(resp), 1024_usize);
+        check_true(
+            matches!(r, Err(HttpError::Io(_))),
+            "Io error for newline-less header",
+        )
+    }
+
+    #[test]
+    fn chunk_size_line_too_long_rejected() -> TestResult {
+        let mut resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        resp.extend(vec![b'0'; 16 * 1024]);
+        let r = HttpHelpers::read_response(&mut Cursor::new(resp), 1024_usize);
+        check_true(
+            matches!(r, Err(HttpError::Io(_))),
+            "Io error for oversized chunk-size line",
+        )
+    }
+
+    #[test]
+    fn chunked_oversized_trailers_rejected() -> TestResult {
+        let mut resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        resp.extend(vec![b'T'; 16 * 1024]);
+        let r = HttpHelpers::read_response(&mut Cursor::new(resp), 1024_usize);
+        check_true(
+            matches!(r, Err(HttpError::Io(_))),
+            "Io error for oversized trailers",
+        )
     }
 
     #[test]

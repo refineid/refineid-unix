@@ -29,6 +29,8 @@ const INITIAL_BUFFER_BYTES: usize = 8192;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Defensive ceiling on one chunk-size line.
 const MAX_CHUNK_SIZE_LINE_BYTES: usize = 16 * 1024;
+/// Defensive ceiling on total trailer section bytes.
+const MAX_TRAILER_BYTES: usize = 64 * 1024;
 /// Head/body separator (RFC 9112 §2.1).
 const HEAD_BODY_SEPARATOR: &[u8] = b"\r\n\r\n";
 /// Line separator.
@@ -194,12 +196,22 @@ impl Framing {
     ) -> Result<Vec<u8>, FramingError> {
         let mut buf = [0_u8; READ_CHUNK_BYTES];
         let mut decoded_body: Vec<u8> = Vec::new();
-        let mut cursor = head_end;
+        let mut leftover = raw.split_off(head_end);
+        let mut total_trailer_bytes = 0_usize;
+
         loop {
+            // Find the chunk-size line ending in CRLF.
             let size_line_end = loop {
-                let tail = raw.get(cursor..).unwrap_or_default();
-                if let Some(rel) = tail.windows(CRLF.len()).position(|window| window == CRLF) {
-                    break cursor.saturating_add(rel);
+                if let Some(rel) = leftover
+                    .windows(CRLF.len())
+                    .position(|window| window == CRLF)
+                {
+                    break rel;
+                }
+                if leftover.len() > MAX_CHUNK_SIZE_LINE_BYTES {
+                    return Err(FramingError::BadChunking(
+                        "chunk-size line too long".to_owned(),
+                    ));
                 }
                 let n = stream.read(&mut buf).map_err(FramingError::Io)?;
                 if n == 0 {
@@ -207,15 +219,16 @@ impl Framing {
                         "server closed before chunk-size CRLF".to_owned(),
                     ));
                 }
-                raw.extend_from_slice(buf.get(..n).unwrap_or_default());
-                if raw.len().saturating_sub(cursor) > MAX_CHUNK_SIZE_LINE_BYTES {
+                leftover.extend_from_slice(buf.get(..n).unwrap_or_default());
+                if leftover.len() > MAX_CHUNK_SIZE_LINE_BYTES {
                     return Err(FramingError::BadChunking(
                         "chunk-size line too long".to_owned(),
                     ));
                 }
             };
+
             let size_text =
-                String::from_utf8_lossy(raw.get(cursor..size_line_end).unwrap_or_default())
+                String::from_utf8_lossy(leftover.get(..size_line_end).unwrap_or_default())
                     .split(';')
                     .next()
                     .unwrap_or_default()
@@ -224,43 +237,84 @@ impl Framing {
             let chunk_len = usize::from_str_radix(&size_text, 16).map_err(|parse_error| {
                 FramingError::BadChunking(format!("bad chunk-size {size_text:?}: {parse_error}"))
             })?;
-            let data_start = size_line_end.saturating_add(CRLF.len());
-            let data_end = data_start.saturating_add(chunk_len);
-            let crlf_end = data_end.saturating_add(CRLF.len());
-            while raw.len() < crlf_end {
+
+            // Drain the chunk-size line and its CRLF.
+            leftover.drain(..size_line_end.saturating_add(CRLF.len()));
+
+            // Reject chunk if it would exceed max_bytes BEFORE allocating/reading chunk bytes.
+            let remaining = max_bytes.saturating_sub(decoded_body.len());
+            if chunk_len > remaining {
+                return Err(FramingError::BodyTooLarge(max_bytes));
+            }
+
+            if chunk_len == 0 {
+                // Drain optional trailers until a terminating empty line (CRLF).
+                loop {
+                    let line_end = loop {
+                        if let Some(rel) = leftover
+                            .windows(CRLF.len())
+                            .position(|window| window == CRLF)
+                        {
+                            break rel;
+                        }
+                        if leftover.len() > MAX_CHUNK_SIZE_LINE_BYTES
+                            || total_trailer_bytes.saturating_add(leftover.len())
+                                > MAX_TRAILER_BYTES
+                        {
+                            return Err(FramingError::BadChunking("trailers too long".to_owned()));
+                        }
+                        let n = stream.read(&mut buf).map_err(FramingError::Io)?;
+                        if n == 0 {
+                            break leftover.len();
+                        }
+                        leftover.extend_from_slice(buf.get(..n).unwrap_or_default());
+                    };
+
+                    if line_end == 0 {
+                        // Empty line (starts with CRLF) terminates trailers.
+                        break;
+                    }
+
+                    total_trailer_bytes =
+                        total_trailer_bytes.saturating_add(line_end.saturating_add(CRLF.len()));
+                    if total_trailer_bytes > MAX_TRAILER_BYTES {
+                        return Err(FramingError::BadChunking("trailers too long".to_owned()));
+                    }
+
+                    if line_end >= leftover.len() {
+                        // Peer closed before terminating CRLF.
+                        break;
+                    }
+
+                    leftover.drain(..line_end.saturating_add(CRLF.len()));
+                }
+                break;
+            }
+
+            let chunk_total = chunk_len.saturating_add(CRLF.len());
+            while leftover.len() < chunk_total {
                 let n = stream.read(&mut buf).map_err(FramingError::Io)?;
                 if n == 0 {
                     return Err(FramingError::BadChunking(
                         "server closed mid-chunk".to_owned(),
                     ));
                 }
-                raw.extend_from_slice(buf.get(..n).unwrap_or_default());
+                leftover.extend_from_slice(buf.get(..n).unwrap_or_default());
             }
-            if chunk_len == 0 {
-                // Drain optional trailers until a CRLF.
-                while !raw
-                    .get(data_start..)
-                    .unwrap_or_default()
-                    .windows(CRLF.len())
-                    .any(|window| window == CRLF)
-                {
-                    let n = stream.read(&mut buf).map_err(FramingError::Io)?;
-                    if n == 0 {
-                        break;
-                    }
-                    raw.extend_from_slice(buf.get(..n).unwrap_or_default());
-                }
-                break;
+
+            let trailing = leftover.get(chunk_len..chunk_total).unwrap_or_default();
+            if trailing != CRLF {
+                return Err(FramingError::BadChunking(
+                    "chunk did not terminate in CRLF".to_owned(),
+                ));
             }
-            decoded_body.extend_from_slice(raw.get(data_start..data_end).unwrap_or_default());
-            if decoded_body.len() > max_bytes {
-                return Err(FramingError::BodyTooLarge(max_bytes));
-            }
-            cursor = crlf_end;
+
+            decoded_body.extend_from_slice(leftover.get(..chunk_len).unwrap_or_default());
+            leftover.drain(..chunk_total);
         }
-        let mut result = raw.get(..head_end).unwrap_or_default().to_vec();
-        result.append(&mut decoded_body);
-        Ok(result)
+
+        raw.append(&mut decoded_body);
+        Ok(raw)
     }
 }
 
@@ -344,6 +398,54 @@ mod tests {
         assert!(matches!(
             Framing::read_response(&mut cursor, 5),
             Err(FramingError::BodyTooLarge(5))
+        ));
+    }
+
+    /// Single oversized chunk header (e.g. ffffffff\r\n) is rejected
+    /// before allocating or attempting to read mid-chunk.
+    #[test]
+    fn chunked_oversized_single_header_rejected_before_read() {
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffff\r\n".to_vec();
+        let mut cursor = std::io::Cursor::new(wire);
+        assert!(matches!(
+            Framing::read_response(&mut cursor, 1024),
+            Err(FramingError::BodyTooLarge(1024))
+        ));
+    }
+
+    /// An oversized chunk-size line is rejected as bad chunking.
+    #[test]
+    fn chunk_size_line_too_long_rejected() {
+        let mut wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        wire.extend(std::iter::repeat_n(b'a', 20 * 1024));
+        let mut cursor = std::io::Cursor::new(wire);
+        assert!(matches!(
+            Framing::read_response(&mut cursor, 1024),
+            Err(FramingError::BadChunking(_))
+        ));
+    }
+
+    /// Headers exceeding MAX_HEADER_BYTES without separator are rejected.
+    #[test]
+    fn header_section_too_large_rejected() {
+        let mut wire = b"HTTP/1.1 200 OK\r\nX-Padded: ".to_vec();
+        wire.extend(std::iter::repeat_n(b'A', 70 * 1024));
+        let mut cursor = std::io::Cursor::new(wire);
+        assert!(matches!(
+            Framing::read_response(&mut cursor, 1024),
+            Err(FramingError::HeadersTooLarge)
+        ));
+    }
+
+    /// Oversized trailers exceeding MAX_TRAILER_BYTES are rejected.
+    #[test]
+    fn chunked_oversized_trailers_rejected() {
+        let mut wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        wire.extend(std::iter::repeat_n(b'T', 70 * 1024));
+        let mut cursor = std::io::Cursor::new(wire);
+        assert!(matches!(
+            Framing::read_response(&mut cursor, 1024),
+            Err(FramingError::BadChunking(_))
         ));
     }
 }
