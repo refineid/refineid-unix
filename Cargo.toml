@@ -11,6 +11,7 @@ members = [
     "crates/refineid-lib-pcsc",
     "crates/refineid-lib-tls",
     "crates/refineid-pkcs11",
+    "crates/refineid-pkcs11-local",
     "crates/refineid-rapp-core",
 ]
 

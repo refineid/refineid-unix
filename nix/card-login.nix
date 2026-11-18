@@ -61,7 +61,11 @@ let
     pam_pkcs11 {
       use_pkcs11_module = refineid;
       pkcs11_module refineid {
-        module = ${cfg.package}/lib/librefineid_pkcs11.so;
+        # Card login uses the local-only module so PAM services (including
+        # unprivileged screen lockers running under the user's UID such as
+        # KDE Plasma 6's kscreenlocker_greet) never touch the RAPP pairing store
+        # or dial a paired phone.
+        module = ${cfg.package}/lib/librefineid_pkcs11_local.so;
         # The card's signature over a random challenge is checked against
         # the certificate; no chain, validity or revocation check.
         cert_policy = signature;
