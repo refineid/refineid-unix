@@ -37,6 +37,7 @@
 
 use core::fmt;
 use core::marker::PhantomData;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // =========================================================
 // Algorithm marker types.
@@ -259,8 +260,8 @@ impl<Alg> Plaintext<Alg> {
     /// Consume the container and return the owned plaintext bytes.
     #[inline]
     #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        core::mem::take(&mut self.bytes)
     }
 
     /// Length of the plaintext in bytes. Tier 0 `usize`;
@@ -277,6 +278,20 @@ impl<Alg> Plaintext<Alg> {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.bytes.is_empty()
+    }
+}
+
+impl<Alg> Zeroize for Plaintext<Alg> {
+    fn zeroize(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl<Alg> ZeroizeOnDrop for Plaintext<Alg> {}
+
+impl<Alg> Drop for Plaintext<Alg> {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
     }
 }
 
@@ -590,5 +605,20 @@ mod tests {
             assert!(!rendered.contains("de"), "got: {rendered}");
             assert!(!rendered.contains("222"), "got: {rendered}"); // 0xDE decimal
         }
+    }
+
+    #[test]
+    fn plaintext_zeroize_clears_heap_bytes() {
+        let mut plain: Plaintext<RsaPkcs1> = Plaintext::new(vec![0xAA; 32]);
+        assert_eq!(plain.len(), 32);
+        plain.zeroize();
+        assert_eq!(plain.len(), 0);
+        assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn plaintext_drop_zeroizes_internal_storage() {
+        let plain: Plaintext<RsaPkcs1> = Plaintext::new(vec![0xBB; 32]);
+        drop(plain);
     }
 }
