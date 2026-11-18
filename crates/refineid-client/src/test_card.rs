@@ -53,6 +53,28 @@ pub(crate) const TRIES_BELOW_FLOOR: u8 = 2;
 /// The certificate the card holds in every slot: the public DVV root,
 /// a real certificate standing in for the card's own.
 pub(crate) const CERTIFICATE: &[u8] = include_bytes!("../test-vectors/dvv-gov-root-ca-g3-rsa.der");
+/// An alternate certificate standing in for a second card.
+pub(crate) const ALT_CERTIFICATE: &[u8] =
+    include_bytes!("../test-vectors/dvv-gov-root-ca-g3-ecc.der");
+
+/// Synthetic EF.TokenInfo with serial "CARD-A":
+/// 30 0b 02 01 00 04 06 43 41 52 44 2d 41
+pub(crate) const TOKEN_INFO_A: &[u8] = &[
+    0x30, 0x0b, 0x02, 0x01, 0x00, 0x04, 0x06, b'C', b'A', b'R', b'D', b'-', b'A',
+];
+
+/// Synthetic EF.TokenInfo with serial "CARD-B":
+/// 30 0b 02 01 00 04 06 43 41 52 44 2d 42
+pub(crate) const TOKEN_INFO_B: &[u8] = &[
+    0x30, 0x0b, 0x02, 0x01, 0x00, 0x04, 0x06, b'C', b'A', b'R', b'D', b'-', b'B',
+];
+
+/// The currently selected file on the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectedFile {
+    Certificate,
+    TokenInfo,
+}
 
 /// The card state a flow test sets up.
 #[derive(Debug, Clone)]
@@ -61,6 +83,12 @@ pub(crate) struct SyntheticCard {
     pub(crate) pin_tries: PinRetries,
     /// The DER every certificate READ BINARY serves.
     pub(crate) certificate: &'static [u8],
+    /// The DER EF.TokenInfo READ BINARY serves.
+    pub(crate) token_info: Option<&'static [u8]>,
+    /// The currently selected file.
+    pub(crate) selected_file: SelectedFile,
+    /// Whether to reject PIN verification attempts.
+    pub(crate) reject_pin: bool,
 }
 
 impl SyntheticCard {
@@ -72,13 +100,41 @@ impl SyntheticCard {
         Ok(Self {
             pin_tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
             certificate: CERTIFICATE,
+            token_info: Some(TOKEN_INFO_A),
+            selected_file: SelectedFile::Certificate,
+            reject_pin: false,
         })
     }
 
-    fn answer(&self, apdu: &[u8]) -> ResponseApdu {
+    /// A card that rejects full PIN verification attempts with `tries` retries remaining.
+    pub(crate) fn with_wrong_pin(tries: u8) -> Result<Self, &'static str> {
+        Ok(Self {
+            pin_tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
+            certificate: CERTIFICATE,
+            token_info: Some(TOKEN_INFO_A),
+            selected_file: SelectedFile::Certificate,
+            reject_pin: true,
+        })
+    }
+
+    /// A second distinct card holding [`ALT_CERTIFICATE`] and serial "CARD-B".
+    ///
+    /// # Errors
+    /// `tries` is not a counter value.
+    pub(crate) fn card_b(tries: u8) -> Result<Self, &'static str> {
+        Ok(Self {
+            pin_tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
+            certificate: ALT_CERTIFICATE,
+            token_info: Some(TOKEN_INFO_B),
+            selected_file: SelectedFile::Certificate,
+            reject_pin: false,
+        })
+    }
+
+    fn answer(&mut self, apdu: &[u8]) -> ResponseApdu {
         let ins = apdu.get(INS_INDEX).copied();
         if ins == Some(Verify::INS) {
-            return if apdu.len() == PROBE_LEN {
+            return if apdu.len() == PROBE_LEN || self.reject_pin {
                 respond(
                     Vec::new(),
                     StatusWord::PinIncorrect {
@@ -95,7 +151,16 @@ impl SyntheticCard {
         if ins == Some(PsoComputeDigitalSignature::INS) {
             return respond(vec![ANSWER_FILL; RSA_3072_SIG_BYTES], StatusWord::Success);
         }
-        if ins == Some(SelectByAidNoFci::INS) || ins == Some(MseSet::INS) {
+        if ins == Some(SelectByAidNoFci::INS) {
+            // EF.TokenInfo FID is 0x5032
+            if apdu.get(5..7) == Some(&[0x50, 0x32]) {
+                self.selected_file = SelectedFile::TokenInfo;
+            } else {
+                self.selected_file = SelectedFile::Certificate;
+            }
+            return respond(Vec::new(), StatusWord::Success);
+        }
+        if ins == Some(MseSet::INS) {
             return respond(Vec::new(), StatusWord::Success);
         }
         respond(Vec::new(), StatusWord::FileNotFound)
@@ -107,14 +172,13 @@ impl SyntheticCard {
         else {
             return respond(Vec::new(), StatusWord::FileNotFound);
         };
+        let data = match self.selected_file {
+            SelectedFile::TokenInfo => self.token_info.unwrap_or(&[]),
+            SelectedFile::Certificate => self.certificate,
+        };
         let offset = usize::from(u16::from_be_bytes([high, low]));
-        let end = offset
-            .saturating_add(usize::from(le))
-            .min(self.certificate.len());
-        let body = self
-            .certificate
-            .get(offset..end)
-            .map_or_else(Vec::new, <[u8]>::to_vec);
+        let end = offset.saturating_add(usize::from(le)).min(data.len());
+        let body = data.get(offset..end).map_or_else(Vec::new, <[u8]>::to_vec);
         respond(body, StatusWord::Success)
     }
 }
@@ -177,5 +241,72 @@ impl ReaderBackend for SyntheticBackend {
         _access: ReaderAccessCap,
     ) -> Result<Self::Transport, Self::Error> {
         Ok(self.card.clone())
+    }
+}
+
+/// A thread-safe reader backend allowing card swap and card removal for testing.
+#[derive(Clone)]
+pub(crate) struct SwappableBackend {
+    pub(crate) readers: std::sync::Arc<std::sync::Mutex<Vec<ReaderInfo>>>,
+    pub(crate) card: std::sync::Arc<std::sync::Mutex<Option<SyntheticCard>>>,
+}
+
+impl SwappableBackend {
+    pub(crate) fn new(card: SyntheticCard) -> Self {
+        Self {
+            readers: std::sync::Arc::new(std::sync::Mutex::new(vec![ReaderInfo {
+                id: ReaderId::new(SYNTHETIC_READER.to_owned()),
+                card_present: true,
+            }])),
+            card: std::sync::Arc::new(std::sync::Mutex::new(Some(card))),
+        }
+    }
+
+    pub(crate) fn swap_card(&self, card: SyntheticCard) {
+        if let Ok(mut c) = self.card.lock() {
+            *c = Some(card);
+        }
+        if let Ok(mut r) = self.readers.lock()
+            && let Some(reader) = r.first_mut()
+        {
+            reader.card_present = true;
+        }
+    }
+
+    pub(crate) fn remove_card(&self) {
+        if let Ok(mut c) = self.card.lock() {
+            *c = None;
+        }
+        if let Ok(mut r) = self.readers.lock()
+            && let Some(reader) = r.first_mut()
+        {
+            reader.card_present = false;
+        }
+    }
+}
+
+impl ReaderBackend for SwappableBackend {
+    type Transport = SyntheticCard;
+    type Error = PcscError;
+
+    fn enumerate(&self) -> Result<Vec<ReaderInfo>, Self::Error> {
+        self.readers
+            .lock()
+            .map(|r| r.clone())
+            .map_err(|_| PcscError::Transport("readers lock poisoned".to_owned()))
+    }
+
+    fn open_session(
+        &self,
+        _reader: &ReaderId,
+        _access: ReaderAccessCap,
+    ) -> Result<Self::Transport, Self::Error> {
+        let guard = self
+            .card
+            .lock()
+            .map_err(|_| PcscError::Transport("card lock poisoned".to_owned()))?;
+        guard
+            .clone()
+            .ok_or_else(|| PcscError::Transport("no card in reader".to_owned()))
     }
 }

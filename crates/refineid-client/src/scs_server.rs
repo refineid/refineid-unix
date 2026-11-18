@@ -39,9 +39,15 @@ const LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 /// Bytes read per chunk from a connection.
 const READ_CHUNK_LENGTH: usize = 8_192;
 
-/// How long one connection may take between bytes before it is
-/// closed.
-const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum duration permitted for an individual chunk read or write.
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total deadline for reading and assembling the complete HTTP request.
+const TOTAL_REQUEST_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Maximum accepted request bytes (head + body).
+const MAX_REQUEST_BYTES: usize =
+    refineid_scs::values::HTTP_HEAD_MAXIMUM_LENGTH + refineid_scs::values::HTTP_BODY_MAXIMUM_LENGTH;
 
 /// Serve the SCS on the loopback address until the listener fails.
 ///
@@ -66,6 +72,12 @@ pub fn serve(verbose: bool) -> std::process::ExitCode {
             "scs: certificate fingerprint (SHA-256): {}",
             scs_identity::fingerprint_hex(&obtained.identity.cert_der)
         );
+        if let Some(root) = &obtained.identity.root_cert_der {
+            eprintln!(
+                "scs: root CA fingerprint (SHA-256): {}",
+                scs_identity::fingerprint_hex(root)
+            );
+        }
     }
     let config = match server_config(&obtained.identity) {
         Ok(config) => config,
@@ -95,6 +107,10 @@ pub fn serve(verbose: bool) -> std::process::ExitCode {
 
 /// Accept and serve connections until `limit` connections have been
 /// served, or forever when `None`.
+///
+/// Connections are served concurrently across threads so fast queries
+/// like `GET /version` remain responsive even while an operation or prompt
+/// is running on another connection.
 fn run_listener(
     listener: &TcpListener,
     config: &Arc<rustls::ServerConfig>,
@@ -104,23 +120,27 @@ fn run_listener(
     limit: Option<u64>,
 ) -> std::process::ExitCode {
     let mut served = 0_u64;
-    loop {
-        if limit.is_some_and(|allowed| served >= allowed) {
-            return ExitStatus::Ok.into();
-        }
-        let (stream, _) = match listener.accept() {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                eprintln!("scs: accept failed: {error}");
-                return ExitStatus::RuntimeFailure.into();
+    std::thread::scope(|scope| {
+        loop {
+            if limit.is_some_and(|allowed| served >= allowed) {
+                return ExitStatus::Ok.into();
             }
-        };
-        served += 1;
-        let outcome = serve_one(stream, config, backend, manager, verbose);
-        if verbose && let Err(error) = outcome {
-            eprintln!("scs: connection failed: {error}");
+            let (stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    eprintln!("scs: accept failed: {error}");
+                    return ExitStatus::RuntimeFailure.into();
+                }
+            };
+            served += 1;
+            scope.spawn(move || {
+                let outcome = serve_one(stream, config, backend, manager, verbose);
+                if verbose && let Err(error) = outcome {
+                    eprintln!("scs: connection failed: {error}");
+                }
+            });
         }
-    }
+    })
 }
 
 /// Serve one connection: the TLS handshake, one request, one answer,
@@ -133,12 +153,13 @@ fn serve_one(
     verbose: bool,
 ) -> std::io::Result<()> {
     let mut stream = stream;
-    stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
-    stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
+    stream.set_read_timeout(Some(CHUNK_TIMEOUT))?;
+    stream.set_write_timeout(Some(CHUNK_TIMEOUT))?;
     let mut connection = rustls::ServerConnection::new(config.clone())
         .map_err(|error| std::io::Error::other(format!("TLS accept: {error}")))?;
     let mut tls = rustls::Stream::new(&mut connection, &mut stream);
-    serve_exchange(&mut tls, backend, manager, verbose)
+    let start = std::time::Instant::now();
+    serve_exchange(&mut tls, backend, manager, verbose, start)
 }
 
 /// Read one request from the stream, dispatch it, and write the
@@ -148,10 +169,22 @@ fn serve_exchange(
     backend: &dyn SigningBackend,
     manager: &TransactionManager,
     verbose: bool,
+    start: std::time::Instant,
 ) -> std::io::Result<()> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; READ_CHUNK_LENGTH];
     loop {
+        if start.elapsed() >= TOTAL_REQUEST_DEADLINE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "total request-read deadline exceeded",
+            ));
+        }
+        let remaining = TOTAL_REQUEST_DEADLINE.saturating_sub(start.elapsed());
+        let _ = tls
+            .sock
+            .set_read_timeout(Some(remaining.min(CHUNK_TIMEOUT)));
+
         let read = tls.read(&mut chunk)?;
         if read == 0 {
             return Err(std::io::Error::other(
@@ -159,6 +192,11 @@ fn serve_exchange(
             ));
         }
         buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > MAX_REQUEST_BYTES {
+            return Err(std::io::Error::other(
+                "request body exceeds maximum allowed length",
+            ));
+        }
         match assemble(&buffer) {
             Assembly::Complete(exchange) => {
                 if verbose {
@@ -171,6 +209,7 @@ fn serve_exchange(
                     backend,
                     manager,
                 );
+                let _ = tls.sock.set_write_timeout(Some(CHUNK_TIMEOUT));
                 tls.write_all(&answer)?;
                 tls.conn.send_close_notify();
                 tls.flush()?;
@@ -198,11 +237,15 @@ fn server_config(
     // is the one live copy; it must stay for the server's lifetime
     // and rustls exposes no hook to scrub it at shutdown.
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(encoded.as_bytes().to_vec()));
+    let mut certs = vec![CertificateDer::from(identity.cert_der.clone())];
+    if let Some(root) = &identity.root_cert_der {
+        certs.push(CertificateDer::from(root.clone()));
+    }
     rustls::ServerConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()
         .map_err(|error| format!("configure TLS: {error}"))?
         .with_no_client_auth()
-        .with_single_cert(vec![CertificateDer::from(identity.cert_der.clone())], key)
+        .with_single_cert(certs, key)
         .map(Arc::new)
         .map_err(|error| format!("configure TLS: {error}"))
 }
@@ -379,5 +422,70 @@ mod tests {
             text.contains("\"signatureAlgorithm\":\"SHA256withRSA\""),
             "algorithm",
         )
+    }
+
+    /// A version request can be served while another connection is connected.
+    #[test]
+    fn concurrent_connections_stay_responsive() -> TestResult {
+        let directory = crate::test_util::TempDir::new("scs-server-concurrent")?;
+        let obtained = crate::scs_identity::obtain_in(directory.path())?;
+        let config = server_config(&obtained.identity)?;
+        let backend = ScriptedBackend {
+            signature: b"signature".to_vec(),
+        };
+        let manager = refineid_scs::TransactionManager::new();
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        std::thread::scope(|scope| -> Result<(), Box<dyn core::error::Error>> {
+            let server = scope
+                .spawn(|| run_listener(&listener, &config, &backend, &manager, false, Some(2)));
+            let provider = rustls::crypto::ring::default_provider();
+            let verifier = Arc::new(PinVerifier {
+                pinned: obtained.identity.cert_der.clone(),
+                verifying_key: *obtained.identity.key.verifying_key(),
+            });
+            let client_config = Arc::new(
+                rustls::ClientConfig::builder_with_provider(provider.into())
+                    .with_safe_default_protocol_versions()?
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+                    .with_no_client_auth(),
+            );
+            let name = rustls::pki_types::ServerName::try_from("localhost")?.to_owned();
+
+            // Client 1 connects and performs TLS handshake, then pauses before sending request.
+            let mut conn1 = rustls::ClientConnection::new(client_config.clone(), name.clone())?;
+            let mut sock1 = std::net::TcpStream::connect(address)?;
+            let mut tls1 = rustls::Stream::new(&mut conn1, &mut sock1);
+
+            // Client 2 connects concurrently and requests /version.
+            let mut conn2 = rustls::ClientConnection::new(client_config.clone(), name)?;
+            let mut sock2 = std::net::TcpStream::connect(address)?;
+            let mut tls2 = rustls::Stream::new(&mut conn2, &mut sock2);
+            tls2.write_all(b"GET /version HTTP/1.1\r\nContent-Length: 0\r\n\r\n")?;
+            tls2.flush()?;
+            let mut answer2 = Vec::new();
+            tls2.read_to_end(&mut answer2)?;
+            let text2 = core::str::from_utf8(&answer2)?;
+            check_true(
+                text2.starts_with("HTTP/1.1 200 OK\r\n"),
+                "concurrent status",
+            )?;
+
+            // Complete client 1's request.
+            tls1.write_all(b"GET /version HTTP/1.1\r\nContent-Length: 0\r\n\r\n")?;
+            tls1.flush()?;
+            let mut answer1 = Vec::new();
+            tls1.read_to_end(&mut answer1)?;
+            let text1 = core::str::from_utf8(&answer1)?;
+            check_true(text1.starts_with("HTTP/1.1 200 OK\r\n"), "client 1 status")?;
+
+            let status = server.join().map_err(|_| "server thread")?;
+            check_true(
+                status == crate::exit_status::ExitStatus::Ok.into(),
+                "server exits ok",
+            )
+        })?;
+        Ok(())
     }
 }
