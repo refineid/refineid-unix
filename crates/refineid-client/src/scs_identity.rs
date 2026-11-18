@@ -47,6 +47,8 @@ const STORE_DIRECTORY: &str = "scs-identity";
 const KEY_FILE: &str = "key.p8";
 /// The certificate file: DER.
 const CERT_FILE: &str = "cert.der";
+/// The root CA certificate file: DER.
+const ROOT_CERT_FILE: &str = "root.der";
 /// Suffix of a file being written.
 const TEMPORARY_SUFFIX: &str = ".tmp";
 /// Owner-only directory permissions.
@@ -55,8 +57,6 @@ const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 /// Length of a P-256 secret, in bytes.
 const SECRET_LENGTH: usize = 32;
-/// Length of the certificate serial number, in bytes.
-const SERIAL_LENGTH: usize = 8;
 /// Bytes per group in a printed fingerprint.
 const FINGERPRINT_GROUP_BYTES: usize = 4;
 
@@ -64,6 +64,8 @@ const FINGERPRINT_GROUP_BYTES: usize = 4;
 pub struct ScsIdentity {
     /// The DER certificate the server presents.
     pub cert_der: Vec<u8>,
+    /// The DER root CA certificate, if available.
+    pub root_cert_der: Option<Vec<u8>>,
     /// The P-256 signing key.
     pub key: p256::ecdsa::SigningKey,
 }
@@ -190,6 +192,9 @@ pub fn obtain_in(directory: &Path) -> Result<ObtainedIdentity, IdentityError> {
     };
     write_blob(directory, KEY_FILE, encoded_key.as_bytes())?;
     write_blob(directory, CERT_FILE, &identity.cert_der)?;
+    if let Some(root) = &identity.root_cert_der {
+        write_blob(directory, ROOT_CERT_FILE, root)?;
+    }
     Ok(ObtainedIdentity {
         identity,
         generated: true,
@@ -217,9 +222,22 @@ fn load(directory: &Path) -> Result<Option<ScsIdentity>, IdentityError> {
     if cert_der.is_empty() {
         return Err(IdentityError::KeyUnusable);
     }
+    let root_path = directory.join(ROOT_CERT_FILE);
+    let root_cert_der = if root_path.is_file() {
+        let der = fs::read(&root_path).map_err(|error| {
+            IdentityError::StoreUnusable(format!("read root certificate: {error}"))
+        })?;
+        if der.is_empty() { None } else { Some(der) }
+    } else {
+        None
+    };
     let key = p256::ecdsa::SigningKey::from_pkcs8_der(&key_der)
         .map_err(|_| IdentityError::KeyUnusable)?;
-    Ok(Some(ScsIdentity { cert_der, key }))
+    Ok(Some(ScsIdentity {
+        cert_der,
+        root_cert_der,
+        key,
+    }))
 }
 
 /// Generate a fresh identity.
@@ -231,22 +249,18 @@ fn generate() -> Result<ScsIdentity, IdentityError> {
             break key;
         }
     };
-    let mut serial = [0_u8; SERIAL_LENGTH];
-    getrandom::fill(&mut serial).map_err(|_| IdentityError::RandomUnusable)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| IdentityError::ClockUnusable)?;
     let not_before = i64::try_from(now.as_secs()).map_err(|_| IdentityError::ClockUnusable)?;
     let point = key.verifying_key().to_sec1_point(false);
-    let spki = refineid_scs::localhost::subject_public_key_info(point.as_bytes())
-        .map_err(|_| IdentityError::StoreUnusable("encode public key".to_owned()))?;
-    let cert_der = refineid_scs::localhost::make(&spki, &serial, not_before, |tbs| {
-        use p256::ecdsa::signature::Signer as _;
-        let signature: p256::ecdsa::Signature = key.sign(tbs);
-        Ok(signature.to_der().as_bytes().to_vec())
+    let chain = refineid_scs::localhost::make(point.as_bytes(), not_before)
+        .map_err(|_| IdentityError::StoreUnusable("build certificate".to_owned()))?;
+    Ok(ScsIdentity {
+        cert_der: chain.leaf_der,
+        root_cert_der: Some(chain.root_der),
+        key,
     })
-    .map_err(|_| IdentityError::StoreUnusable("build certificate".to_owned()))?;
-    Ok(ScsIdentity { cert_der, key })
 }
 
 /// Write `blob` as `file` in `directory`, atomically.
@@ -309,6 +323,11 @@ mod tests {
             &second.identity.cert_der,
             &first.identity.cert_der,
             "same certificate",
+        )?;
+        check(
+            &second.identity.root_cert_der,
+            &first.identity.root_cert_der,
+            "same root certificate",
         )?;
         check(
             &second.identity.key.to_bytes(),
