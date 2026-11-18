@@ -22,7 +22,10 @@
 //! exchange and S/MIME envelopes need.
 
 use alloc::fmt;
-use std::path::PathBuf;
+use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
 
 use refineid_lib_core::auth::{
     AuthError, PinOps as _, PinPolicyReason, PinSlot, RetryFloorRefusal, VerifyOutcome,
@@ -286,7 +289,7 @@ where
         })?;
     let plaintext_len = plaintext.len();
 
-    std::fs::write(&options.output, plaintext.as_bytes()).map_err(|source| {
+    write_plaintext_secure(&options.output, plaintext.as_bytes()).map_err(|source| {
         DecryptAuthError::PlaintextWrite {
             path: options.output.clone(),
             source,
@@ -317,6 +320,60 @@ impl fmt::Display for DecryptReport {
         )?;
         Ok(())
     }
+}
+
+/// File permissions for decrypted plaintext output: owner read/write only (0600).
+#[cfg(unix)]
+const FILE_MODE: u32 = 0o600;
+
+/// Atomically and securely writes decrypted plaintext to `path`.
+///
+/// Ensures owner-only permissions (0600 on Unix), refuses writing to symlinks,
+/// and uses a private temporary file with atomic rename to eliminate truncation
+/// races and prevent symlink traversal.
+fn write_plaintext_secure(path: &Path, plaintext: &[u8]) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to write to symlink: {}", path.display()),
+        ));
+    }
+
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid output file path",
+        ));
+    };
+
+    let nonce = getrandom::u64().unwrap_or(0);
+    let temporary =
+        path.with_file_name(format!(".{file_name}.tmp.{}.{nonce:x}", std::process::id()));
+
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(FILE_MODE);
+
+        let mut file = options.open(&temporary)?;
+        file.write_all(plaintext)?;
+        file.sync_all()?;
+
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to write to symlink: {}", path.display()),
+            ));
+        }
+
+        std::fs::rename(&temporary, path)
+    })();
+
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -556,6 +613,41 @@ mod tests {
                 Err(DecryptAuthError::PinEntry(e)) if e == ended
             ),
             "ended prompt",
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plaintext_write_creates_file_with_0600_mode() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new("decrypt-mode")?;
+        let out = dir.path().join("plaintext.bin");
+        write_plaintext_secure(&out, b"top-secret-plaintext")?;
+
+        let metadata = std::fs::metadata(&out)?;
+        let mode = metadata.permissions().mode() & 0o777;
+        check(&mode, &0o600, "file mode 0600")?;
+
+        let content = std::fs::read(&out)?;
+        check_true(content == b"top-secret-plaintext", "file content matches")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plaintext_write_refuses_symlink() -> TestResult {
+        let dir = TempDir::new("decrypt-symlink")?;
+        let target = dir.write("target.txt", b"original target content")?;
+        let symlink_path = dir.path().join("symlink_out.bin");
+        std::os::unix::fs::symlink(&target, &symlink_path)?;
+
+        let res = write_plaintext_secure(&symlink_path, b"unauthorized overwrite");
+        check_true(res.is_err(), "symlink write rejected")?;
+
+        let content = std::fs::read(&target)?;
+        check_true(
+            content == b"original target content",
+            "target content unaltered",
         )
     }
 }
