@@ -1,0 +1,23 @@
+[package]
+name = "refineid-unix-pkcs11-local"
+description = "Local-reader-only PKCS#11 v2.40 module for FINEID (no remote phone source or pairing store access)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+pin-change = ["refineid-pkcs11/pin-change"]
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+name = "refineid_pkcs11_local"
+
+[dependencies]
+refineid-pkcs11.workspace = true

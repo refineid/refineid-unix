@@ -132,14 +132,19 @@ craneLib.buildPackage (
     '';
 
     postInstall = ''
-      # The PKCS#11 cdylib (installed from the cargo build log; copy
-      # by hand if the crane hook missed it, and assert so a hook
-      # change cannot ship a package silently missing the module).
+      # The PKCS#11 cdylibs (installed from the cargo build log; copy
+      # by hand if the crane hook missed them, and assert so a hook
+      # change cannot ship a package silently missing a module).
       if [ ! -f $out/lib/librefineid_pkcs11.so ]; then
         mkdir -p $out/lib
         cp target/release/librefineid_pkcs11.so $out/lib/
       fi
       test -f $out/lib/librefineid_pkcs11.so
+      if [ ! -f $out/lib/librefineid_pkcs11_local.so ]; then
+        mkdir -p $out/lib
+        cp target/release/librefineid_pkcs11_local.so $out/lib/
+      fi
+      test -f $out/lib/librefineid_pkcs11_local.so
 
       # p11-kit module config: every p11-kit-aware consumer (Firefox
       # via p11-kit-proxy, OpenSSL via pkcs11-provider, GnuTLS,

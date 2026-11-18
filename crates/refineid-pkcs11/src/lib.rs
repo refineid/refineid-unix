@@ -36,10 +36,39 @@ use refineid_pkcs11::ck::{CkFunctionListPtrPtr, CkRv};
 pub unsafe extern "system" fn C_GetFunctionList(list: CkFunctionListPtrPtr) -> CkRv {
     // A second call finds the source installed already; that is the
     // same source, so the refusal carries nothing.
-    if let Some(source) = phone::PhoneSource::for_this_user() {
+    // The environment variable REFINEID_PKCS11_LOCAL_ONLY disables remote
+    // phone installation even when the caller loads librefineid_pkcs11.so.
+    if std::env::var_os("REFINEID_PKCS11_LOCAL_ONLY").is_none()
+        && let Some(source) = phone::PhoneSource::for_this_user()
+    {
         let _ = refineid_pkcs11::remote::install_remote_source(Box::new(source));
     }
     // SAFETY: `list` validity is the caller's PKCS#11 contract; the
     // core entry point null-checks it before writing.
     unsafe { refineid_pkcs11::get_function_list(list) }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code, reason = "FFI call to C_GetFunctionList")]
+mod tests {
+    use super::*;
+    use refineid_pkcs11::ck::CkFunctionListPtr;
+
+    #[test]
+    fn get_function_list_resolves_functions() {
+        let mut list: CkFunctionListPtr = core::ptr::null_mut();
+        let rv = unsafe { C_GetFunctionList(&raw mut list) };
+        assert_eq!(rv, 0);
+        assert!(!list.is_null());
+    }
+
+    #[test]
+    fn local_only_env_disables_remote_installation() {
+        unsafe { std::env::set_var("REFINEID_PKCS11_LOCAL_ONLY", "1") };
+        let mut list: CkFunctionListPtr = core::ptr::null_mut();
+        let rv = unsafe { C_GetFunctionList(&raw mut list) };
+        assert_eq!(rv, 0);
+        assert!(!list.is_null());
+        unsafe { std::env::remove_var("REFINEID_PKCS11_LOCAL_ONLY") };
+    }
 }
