@@ -17,7 +17,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -36,7 +36,23 @@ use rustls::sign::{CertifiedKey, Signer, SigningKey};
 use rustls::{SignatureAlgorithm, SignatureScheme};
 use rustls_platform_verifier::BuilderVerifierExt as _;
 
+use crate::framing::FramingError;
 use crate::simple_https::HttpsError;
+
+/// Defensive ceiling on response bytes read during client authentication (2 MiB).
+const MAX_RAPP_AUTH_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// Defensive timeout when dialing each resolved address for RAPP client authentication.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// I/O read and write timeout for the RAPP client authentication socket.
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn request_target(url: &Uri) -> String {
+    if url.query().is_empty() {
+        url.path().to_string()
+    } else {
+        format!("{}?{}", url.path(), url.query())
+    }
+}
 
 /// How long the signer browses for the paired phone.
 const REMOTE_DISCOVERY_TIMEOUT: Duration = refineid_rapp_core::remote::PHONE_DISCOVERY_TIMEOUT;
@@ -259,18 +275,42 @@ pub fn get_with_rapp_client_auth(url: &Uri, pair: PairId) -> Result<String, Http
         .map_err(|e| HttpsError::Tls(format!("client connection: {e}")))?;
 
     let addr = format!("{host}:{port}");
-    let mut sock = TcpStream::connect(&addr)
-        .map_err(|e| HttpsError::Connect(format!("connect({addr}): {e}")))?;
-    sock.set_read_timeout(Some(Duration::from_secs(30)))
+    let socket_addrs = addr
+        .to_socket_addrs()
+        .map_err(|e| HttpsError::Connect(format!("resolve {addr}: {e}")))?;
+
+    let mut last_err = None;
+    let mut sock = None;
+    for sa in socket_addrs {
+        match TcpStream::connect_timeout(&sa, CONNECT_TIMEOUT) {
+            Ok(s) => {
+                sock = Some(s);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+    let mut sock = sock.ok_or_else(|| {
+        HttpsError::Connect(format!(
+            "connect({addr}): {}",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no addresses resolved".to_owned())
+        ))
+    })?;
+
+    sock.set_read_timeout(Some(IO_TIMEOUT))
         .map_err(|e| HttpsError::Connect(e.to_string()))?;
-    sock.set_write_timeout(Some(Duration::from_secs(30)))
+    sock.set_write_timeout(Some(IO_TIMEOUT))
         .map_err(|e| HttpsError::Connect(e.to_string()))?;
 
     let mut tls_stream = rustls::Stream::new(&mut conn, &mut sock);
 
-    let path = url.path();
+    let target = request_target(url);
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: refineid-client/1.0\r\nConnection: close\r\nAccept: text/html, */*\r\n\r\n"
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: refineid-client/1.0\r\nConnection: close\r\nAccept: text/html, */*\r\n\r\n"
     );
     tls_stream
         .write_all(req.as_bytes())
@@ -280,7 +320,16 @@ pub fn get_with_rapp_client_auth(url: &Uri, pair: PairId) -> Result<String, Http
         .map_err(|e| HttpsError::Tls(format!("flush request: {e}")))?;
 
     let mut resp = Vec::new();
-    let _ = tls_stream.read_to_end(&mut resp);
+    (&mut tls_stream)
+        .take((MAX_RAPP_AUTH_RESPONSE_BYTES.saturating_add(1)) as u64)
+        .read_to_end(&mut resp)
+        .map_err(|e| HttpsError::Tls(format!("read response: {e}")))?;
+
+    if resp.len() > MAX_RAPP_AUTH_RESPONSE_BYTES {
+        return Err(HttpsError::Framing(FramingError::BodyTooLarge(
+            MAX_RAPP_AUTH_RESPONSE_BYTES,
+        )));
+    }
 
     // A server answer reached without the card is no login: the
     // handshake went on without an identity, and the reason is the
@@ -354,5 +403,24 @@ mod tests {
         };
         assert!(signer.sign(b"transcript").is_err());
         assert!(signer.offered.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn request_target_preserves_query_and_formats_path() {
+        use super::request_target;
+        use refineid_lib_core::text::Uri;
+
+        let url_no_query = Uri::parse("https://id.fineid.fi/login".to_owned()).unwrap();
+        assert_eq!(request_target(&url_no_query), "/login");
+
+        let url_with_query =
+            Uri::parse("https://id.fineid.fi/login?session=123&relay=ok".to_owned()).unwrap();
+        assert_eq!(
+            request_target(&url_with_query),
+            "/login?session=123&relay=ok"
+        );
+
+        let url_root_query = Uri::parse("https://id.fineid.fi/?auth=token".to_owned()).unwrap();
+        assert_eq!(request_target(&url_root_query), "/?auth=token");
     }
 }
