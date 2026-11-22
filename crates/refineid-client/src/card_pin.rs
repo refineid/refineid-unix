@@ -517,7 +517,7 @@ pub fn establish_card_session(
         .map_err(auth_to_card_pin)?;
     let model = match (classified, numbering) {
         (Ok(model), _) => Some(model),
-        (Err(_), PinReferenceScheme::Organizational) => None,
+        (Err(_), PinReferenceScheme::Organizational | PinReferenceScheme::Estonian) => None,
         (Err(e), PinReferenceScheme::Citizen) => {
             return Err(CardPinError::CardModelNotSupported(e));
         }
@@ -599,7 +599,7 @@ fn probe_slot<T: refineid_lib_core::transport::CardTransport>(
         status: transport.pin_status_with_scheme(slot, numbering).ok(),
         changed: match numbering {
             PinReferenceScheme::Citizen => transport.pin_changed_flag(slot).ok().flatten(),
-            PinReferenceScheme::Organizational => None,
+            PinReferenceScheme::Organizational | PinReferenceScheme::Estonian => None,
         },
     }
 }

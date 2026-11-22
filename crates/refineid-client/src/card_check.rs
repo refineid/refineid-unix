@@ -1518,6 +1518,7 @@ impl CardCheckReport {
             match self.pin_reference_scheme {
                 PinReferenceScheme::Citizen => "citizen (FINEID S1)",
                 PinReferenceScheme::Organizational => "organizational (FINEID S4-2)",
+                PinReferenceScheme::Estonian => "Estonian eID (EF.AOD)",
             }
         )?;
         writeln!(
