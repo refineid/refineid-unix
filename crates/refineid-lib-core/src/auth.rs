@@ -89,6 +89,16 @@ pub const PIN2_REFERENCE_ORGANIZATIONAL: u8 = 0x04;
 /// cannot be recovered once spent to zero.
 pub const PUK_REFERENCE_ORGANIZATIONAL: u8 = 0x12;
 
+/// Estonian eID PIN1 reference, from the card's EF.AOD (GED24035, the
+/// Estonian eID developer guide, EF.AOD).
+pub const PIN1_REFERENCE_ESTONIAN: u8 = 0x81;
+
+/// Estonian eID PIN2 reference, from the card's EF.AOD.
+pub const PIN2_REFERENCE_ESTONIAN: u8 = 0x82;
+
+/// Estonian eID unblock reference, from the card's EF.AOD.
+pub const PUK_REFERENCE_ESTONIAN: u8 = 0x83;
+
 /// FINEID stored-length for both PIN slots: 12 bytes. PIN1 / PIN2
 /// share the same encoding -- the difference is the slot reference,
 /// not the length.
@@ -168,6 +178,9 @@ impl PinSlot {
 /// Organization cards number them by their FINEID S4-2 v4.0 §4.2
 /// security-data-object identifiers instead: PIN AUTH `0x03`,
 /// PIN SIG `0x04`, PIN PUK `0x12`.
+/// Estonian eID cards number them by the references their EF.AOD
+/// publishes (GED24035): PIN1 `0x81`, PIN2 `0x82`, PUK `0x83`, over a
+/// twelve-byte block padded with zeroes and three attempts per PIN.
 ///
 /// The S4-2 v4.0 §5.2 EF.AOD *sample* prints references `0x11` /
 /// `0x0095`, contradicting the same document's §4.2 tables and
@@ -182,6 +195,10 @@ pub enum PinReferenceScheme {
     Citizen,
     /// FINEID S4-2 v4.0 §4.2 numbering -- the organization cards.
     Organizational,
+    /// Estonian eID numbering: the references EF.AOD carries
+    /// (GED24035), on the same twelve-byte padded block a citizen
+    /// card uses.
+    Estonian,
 }
 
 impl PinReferenceScheme {
@@ -194,6 +211,8 @@ impl PinReferenceScheme {
             (Self::Citizen, PinSlot::Pin2) => PIN2_REFERENCE_PKCS15,
             (Self::Organizational, PinSlot::Pin1) => PIN1_REFERENCE_ORGANIZATIONAL,
             (Self::Organizational, PinSlot::Pin2) => PIN2_REFERENCE_ORGANIZATIONAL,
+            (Self::Estonian, PinSlot::Pin1) => PIN1_REFERENCE_ESTONIAN,
+            (Self::Estonian, PinSlot::Pin2) => PIN2_REFERENCE_ESTONIAN,
         }
     }
 
@@ -210,6 +229,7 @@ impl PinReferenceScheme {
         match self {
             Self::Citizen => PUK_REFERENCE_PKCS15,
             Self::Organizational => PUK_REFERENCE_ORGANIZATIONAL,
+            Self::Estonian => PUK_REFERENCE_ESTONIAN,
         }
     }
 
@@ -235,6 +255,7 @@ impl From<PinReferenceScheme> for refineid_auth::PinReferenceScheme {
         match numbering {
             PinReferenceScheme::Citizen => Self::Citizen,
             PinReferenceScheme::Organizational => Self::Organizational,
+            PinReferenceScheme::Estonian => Self::Estonian,
         }
     }
 }
@@ -244,6 +265,7 @@ impl From<refineid_auth::PinReferenceScheme> for PinReferenceScheme {
         match numbering {
             refineid_auth::PinReferenceScheme::Citizen => Self::Citizen,
             refineid_auth::PinReferenceScheme::Organizational => Self::Organizational,
+            refineid_auth::PinReferenceScheme::Estonian => Self::Estonian,
         }
     }
 }
@@ -768,7 +790,7 @@ pub trait PinOps: CardTransport {
         let puk_accepted = accepted_lengths(lengths.puk())?;
         let target_accepted = accepted_lengths(lengths.slot(target.into()))?;
         match scheme {
-            PinReferenceScheme::Citizen => {
+            PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => {
                 let puk_ascii = puk.as_bytes();
                 let new_ascii = new_pin.as_bytes();
                 let target_stored = target.stored_length();
@@ -956,8 +978,9 @@ pub trait PinOps: CardTransport {
     /// The citizen numbering reads the PUK PIN-container (GET
     /// DATA); the organizational numbering probes its PIN PUK
     /// security data object with the counter-safe VERIFY status
-    /// form instead (S4-2 v4.0 §4.3.2), since the container does
-    /// not exist there.
+    /// form instead (S4-2 v4.0 §4.3.2), and the Estonian numbering
+    /// probes the PUK reference its EF.AOD publishes the same way,
+    /// since neither profile has the container.
     ///
     /// # Errors
     /// Transport failure.
@@ -970,7 +993,7 @@ pub trait PinOps: CardTransport {
     {
         match scheme {
             PinReferenceScheme::Citizen => self.puk_status(),
-            PinReferenceScheme::Organizational => {
+            PinReferenceScheme::Organizational | PinReferenceScheme::Estonian => {
                 let apdu = commands::VerifyPukProbe { scheme }.into_apdu();
                 let r = self
                     .transmit(apdu.as_bytes())
@@ -1323,8 +1346,8 @@ impl<T: CardTransport> refineid_apdu::CardTransport for CoreReads<'_, T> {
 /// One credential's wire block under `scheme`, for a typed length in
 /// `accepted` and at most `stored`.
 ///
-/// The citizen card compares a block padded to the stored length
-/// with [`PIN_PAD_BYTE`]; the organization card compares the typed
+/// The citizen and Estonian cards compare a block padded to the
+/// stored length with [`PIN_PAD_BYTE`]; the organization card compares the typed
 /// digits at their own length, because its EF.AOD publishes no
 /// padding and the S1 v3.0 §3.5.1.1 rule makes any other length a
 /// failed -- and counted -- comparison.
@@ -1339,7 +1362,7 @@ fn credential_block<TE>(
         return Err(AuthError::PinPolicy(PinPolicyReason::NoAcceptedLength));
     }
     match scheme {
-        PinReferenceScheme::Citizen => {
+        PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => {
             let mut padded = vec![PIN_PAD_BYTE; stored];
             #[expect(
                 clippy::indexing_slicing,
@@ -1507,6 +1530,23 @@ mod tests {
     const SW2_REFERENCE_NOT_FOUND: u8 = 0x88;
     /// SW2: incorrect P1-P2 (with SW1 `6A`).
     const SW2_INCORRECT_P1_P2: u8 = 0x86;
+
+    #[test]
+    fn estonian_numbering_uses_the_ef_aod_references() {
+        let estonian = PinReferenceScheme::Estonian;
+        assert_eq!(
+            estonian.p2_reference(PinSlot::Pin1),
+            PIN1_REFERENCE_ESTONIAN
+        );
+        assert_eq!(
+            estonian.p2_reference(PinSlot::Pin2),
+            PIN2_REFERENCE_ESTONIAN
+        );
+        assert_eq!(estonian.puk_reference(), PUK_REFERENCE_ESTONIAN);
+        assert!(!estonian.gates_esign_directory(PinSlot::Pin2));
+        let core: refineid_auth::PinReferenceScheme = estonian.into();
+        assert_eq!(PinReferenceScheme::from(core), estonian);
+    }
 
     fn citizen_pin1_probe() -> Vec<u8> {
         vec![

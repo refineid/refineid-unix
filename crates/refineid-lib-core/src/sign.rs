@@ -92,9 +92,9 @@ pub enum KeyRef {
     /// Authentication key, PIN1-gated. Wire byte `0x01`.
     Auth,
     /// Qualified-signature key, PIN2-gated, under the card's
-    /// numbering: [`KEY_REF_SIGN`] on citizen cards (FINEID S1 v4.2
-    /// §3.5), [`ORG_QUALIFIED_KEY_REF`] in DF.ESIGN on organization
-    /// cards.
+    /// numbering: [`KEY_REF_SIGN`] on citizen and Estonian eID cards
+    /// (FINEID S1 v4.2 §3.5), [`ORG_QUALIFIED_KEY_REF`] in DF.ESIGN
+    /// on organization cards.
     Sign(PinReferenceScheme),
 }
 
@@ -104,7 +104,7 @@ impl KeyRef {
     pub const fn as_u8(self) -> u8 {
         match self {
             Self::Auth => KEY_REF_AUTH,
-            Self::Sign(PinReferenceScheme::Citizen) => KEY_REF_SIGN,
+            Self::Sign(PinReferenceScheme::Citizen | PinReferenceScheme::Estonian) => KEY_REF_SIGN,
             Self::Sign(PinReferenceScheme::Organizational) => ORG_QUALIFIED_KEY_REF,
         }
     }

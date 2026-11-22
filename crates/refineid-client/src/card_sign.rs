@@ -510,7 +510,7 @@ fn sign_dispatch_by_alg<T: CardTransport>(
             // field there (organizational cards specification
             // §6.6.2.3).
             let signature = match scheme {
-                PinReferenceScheme::Citizen => transport
+                PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => transport
                     .sign_pre_hashed_sha256_rsa(slot.key_ref(scheme), input_sha256)
                     .map_err(sign_err_to_kind)?,
                 PinReferenceScheme::Organizational => transport
