@@ -50,6 +50,20 @@ CCID readers; the ACS driver is not needed for it.
 "already running?" after a crash, stop it, remove `/var/run/pcscd.pid`,
 and start it again.
 
+### A reader that does not appear
+
+`pcscd` serves the reader table, so a stopped daemon makes `pcsc_scan
+-r` print no readers even though the reader works. `service pcscd
+status` shows whether it runs.
+
+`usbconfig` needs root on FreeBSD; as a normal user it answers "No
+device match or lack of permissions" for every device, which says
+nothing about the reader. Run it as root, or skip it.
+
+There is no `/dev/ccid*` node. libccid drives the reader as a `ugen`
+device through libusb, so the absence of a CCID device node is expected
+and is not evidence that the reader is missing.
+
 ## 3. Name resolution and mDNS
 
 The phone's RAPP service is found over DNS-SD:
