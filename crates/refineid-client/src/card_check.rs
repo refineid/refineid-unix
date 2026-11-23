@@ -718,6 +718,18 @@ fn read_all_cert_slots<T: refineid_lib_core::transport::CardTransport>(
             }
         }
     }
+    if !secure_channel
+        && !slot_ders
+            .iter()
+            .any(|(slot, _)| *slot == CertSlot::Authentication)
+        && let Ok(profile) = transport.discover_estonian_authentication_profile()
+        && let Ok(der) = transport.read_certificate_at(profile.auth_cert_path())
+    {
+        transport
+            .select_core_application(profile.application_aid())
+            .map_err(|e| CardCheckError::CertRead(e.to_string()))?;
+        slot_ders.push((CertSlot::Authentication, der));
+    }
     Ok(slot_ders)
 }
 

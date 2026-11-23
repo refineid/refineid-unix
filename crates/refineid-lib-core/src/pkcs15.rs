@@ -72,9 +72,6 @@ const _: () = assert!(
 /// caller parses the cert DER to discover the real key alg.
 /// `EF.4331` authentication certificate file ID.
 pub const EF_AUTH_CERT_FID: [u8; 2] = [0x43, 0x31];
-/// `EF.3411` Estonian eID authentication certificate file ID, direct
-/// child of the PKCS#15 application DF.
-pub const EF_ESTONIAN_AUTH_CERT_FID: [u8; 2] = [0x34, 0x11];
 /// `EF.4332` qualified-signature certificate file ID.
 pub const EF_SIGN_CERT_FID: [u8; 2] = [0x43, 0x32];
 /// `EF.4333` second authentication slot (typically ECC on
@@ -124,15 +121,14 @@ enum SlotPath {
     UnderMf,
 }
 
+pub use refineid_pkcs15::{DiscoveredAuthenticationProfile, KeyReference, Pkcs15Path};
+
 /// One slot in the FINEID certificate directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertSlot {
     /// Authentication certificate (`EF.4331`) -- TLS client cert,
     /// S/MIME signing, suomi.fi-tunnistus. RSA on current cards.
     Authentication,
-    /// Estonian eID authentication certificate (`EF.3411`). Lives
-    /// directly under the PKCS#15 application DF.
-    EstonianAuthentication,
     /// Qualified-signature certificate (`EF.4332`) -- eIDAS
     /// qualified electronic signatures. RSA on current cards.
     Signature,
@@ -165,7 +161,6 @@ impl CertSlot {
     pub const fn fid(self) -> [u8; 2] {
         match self {
             Self::Authentication => EF_AUTH_CERT_FID,
-            Self::EstonianAuthentication => EF_ESTONIAN_AUTH_CERT_FID,
             Self::Signature => EF_SIGN_CERT_FID,
             Self::AuthenticationAlt => EF_AUTH_CERT_ALT_FID,
             Self::RootCa => EF_ROOT_CA_FID,
@@ -181,7 +176,6 @@ impl CertSlot {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Authentication => "authentication (EF.4331)",
-            Self::EstonianAuthentication => "Estonian authentication (EF.3411)",
             Self::Signature => "qualified signature (EF.4332)",
             Self::AuthenticationAlt => "authentication, alt slot (EF.4333)",
             Self::RootCa => "on-card issuing root CA (EF.4334)",
@@ -201,7 +195,7 @@ impl CertSlot {
     /// `CertSlot::find_in`.
     const fn path(self) -> SlotPath {
         match self {
-            Self::Authentication | Self::EstonianAuthentication => SlotPath::UnderPkcs15App,
+            Self::Authentication => SlotPath::UnderPkcs15App,
             Self::Signature | Self::AuthenticationAlt | Self::SignatureAlt => SlotPath::UnderDf5016,
             Self::RootCa | Self::IssuingCaEcc => SlotPath::UnderMf,
         }
@@ -219,26 +213,24 @@ impl CertSlot {
     /// Measured on a production card over an ACR1581 PICC slot,
     /// 2026-07-24.
     ///
-    /// Only [`CertSlot::Authentication`] and
-    /// [`CertSlot::EstonianAuthentication`] stay inside the
-    /// PKCS#15 application and are reachable under SM.
+    /// Only [`CertSlot::Authentication`] stays inside the
+    /// PKCS#15 application and is reachable under SM.
     #[must_use]
     #[inline]
     pub const fn requires_mf_traversal(self) -> bool {
         !matches!(self.path(), SlotPath::UnderPkcs15App)
     }
 
-    /// All cert slots a FINEID S4-2 or Estonian eID card *may*
-    /// publish, in directory order. Callers probe each; absent
-    /// slots return `SW=0x6A82` from the underlying SELECT,
-    /// which higher layers should treat as "not provisioned"
-    /// rather than an error.
+    /// All cert slots a FINEID S4-2 card *may* publish, in
+    /// directory order. Callers probe each; absent slots return
+    /// `SW=0x6A82` from the underlying SELECT, which higher
+    /// layers should treat as "not provisioned" rather than an
+    /// error.
     #[must_use]
     #[inline]
-    pub const fn all() -> [Self; 7] {
+    pub const fn all() -> [Self; 6] {
         [
             Self::Authentication,
-            Self::EstonianAuthentication,
             Self::Signature,
             Self::AuthenticationAlt,
             Self::RootCa,
@@ -527,14 +519,7 @@ pub trait Pkcs15Ops: CardTransport {
             let want_usize = remaining.min(usize::from(READ_CHUNK));
             let want = u8::try_from(want_usize).or(Err(Pkcs15Error::TooLarge))?;
             let offset_u16 = u16::try_from(offset).or(Err(Pkcs15Error::TooLarge))?;
-            let apdu = ReadBinaryByOffset {
-                offset: offset_u16,
-                le: want,
-            }
-            .into_apdu();
-            let r = self
-                .transmit(apdu.as_bytes())
-                .map_err(Pkcs15Error::Transport)?;
+            let r = read_binary_chunk_with_eof_retry(self, offset_u16, want)?;
             let eof = matches!(r.status_word(), StatusWord::EndOfFile);
             if !r.is_ok() && !eof {
                 return Err(Pkcs15Error::Sw(r.sw()));
@@ -590,10 +575,7 @@ pub trait Pkcs15Ops: CardTransport {
             let want_usize = remaining.min(usize::from(READ_CHUNK));
             let want = u8::try_from(want_usize).or(Err(Pkcs15Error::TooLarge))?;
             let offset = u16::try_from(collected.len()).or(Err(Pkcs15Error::TooLarge))?;
-            let apdu = ReadBinaryByOffset { offset, le: want }.into_apdu();
-            let response = self
-                .transmit(apdu.as_bytes())
-                .map_err(Pkcs15Error::Transport)?;
+            let response = read_binary_chunk_with_eof_retry(self, offset, want)?;
             let eof = matches!(response.status_word(), StatusWord::EndOfFile);
             if !response.is_ok() && !eof {
                 return Err(Pkcs15Error::Sw(response.sw()));
@@ -672,6 +654,125 @@ pub trait Pkcs15Ops: CardTransport {
         Ok(crate::cert_state::CertDer::new(bytes))
     }
 
+    /// Discover the Estonian eID authentication profile via `refineid-core`'s
+    /// ISO/IEC 7816-15 directory discovery (`EF.DIR` -> `EF.ODF` -> `EF.CDF` +
+    /// `EF.PrKDF` -> `EF.AOD`).
+    ///
+    /// Leaves the discovered application AID selected on success.
+    ///
+    /// # Errors
+    /// Transport failures, status errors (such as `6A82` when `EF.DIR` or
+    /// `"Estonian eID"` is absent), or malformed/ambiguous directory files.
+    #[inline]
+    fn discover_estonian_authentication_profile(
+        &mut self,
+    ) -> Result<DiscoveredAuthenticationProfile, Pkcs15Error<TxError<Self>>>
+    where
+        Self: Sized,
+    {
+        refineid_pkcs15::Pkcs15Ops::discover_estonian_authentication_profile(
+            &mut crate::auth::CoreReads(self),
+        )
+        .map_err(map_core_pkcs15_error)
+    }
+
+    /// Select the PKCS#15 application identified by a discovered `refineid-apdu`
+    /// AID (leaving it active for subsequent relative operations).
+    ///
+    /// # Errors
+    /// Transport or card status failure.
+    #[inline]
+    fn select_core_application(
+        &mut self,
+        aid: &refineid_apdu::Aid,
+    ) -> Result<(), Pkcs15Error<TxError<Self>>>
+    where
+        Self: Sized,
+    {
+        refineid_pkcs15::Pkcs15Ops::select_application(&mut crate::auth::CoreReads(self), aid)
+            .map_err(map_core_pkcs15_error)
+    }
+
+    /// Read and validate a complete DER certificate at an ISO/IEC 7816-15
+    /// `Pkcs15Path` via `refineid-core`.
+    ///
+    /// # Errors
+    /// Selection, read, or DER validation failure.
+    #[inline]
+    fn read_certificate_at(
+        &mut self,
+        path: &Pkcs15Path,
+    ) -> Result<crate::cert_state::CertDer, Pkcs15Error<TxError<Self>>>
+    where
+        Self: Sized,
+    {
+        let cert = refineid_pkcs15::Pkcs15Ops::read_certificate_at(
+            &mut crate::auth::CoreReads(self),
+            path,
+        )
+        .map_err(map_core_pkcs15_error)?;
+        Ok(crate::cert_state::CertDer::new(cert.into_bytes()))
+    }
+
+    /// Read the card's authentication certificate and, when resolved through
+    /// ISO/IEC 7816-15 directory discovery (Estonian eID), return the
+    /// discovered authentication profile as well.
+    ///
+    /// Tries FINEID `EF.4331` first, then ISO/IEC 7816-15 directory discovery
+    /// (`EF.DIR` -> `EF.ODF` -> `EF.CDF` + `EF.PrKDF` -> `EF.AOD`), then
+    /// FINEID `EF.4333` (`CertSlot::AuthenticationAlt`). On discovered cards,
+    /// re-selects the discovered application AID after reading the certificate.
+    ///
+    /// # Errors
+    /// Propagates transport errors immediately; returns the last card/format
+    /// error if no authentication certificate slot or discovered profile exists.
+    #[inline]
+    fn read_authentication_certificate_and_profile(
+        &mut self,
+    ) -> Result<
+        (
+            crate::cert_state::CertDer,
+            Option<DiscoveredAuthenticationProfile>,
+        ),
+        Pkcs15Error<TxError<Self>>,
+    >
+    where
+        Self: Sized,
+    {
+        match self.read_certificate(CertSlot::Authentication) {
+            Ok(cert) => return Ok((cert, None)),
+            Err(Pkcs15Error::Transport(err)) => return Err(Pkcs15Error::Transport(err)),
+            Err(_) => {}
+        }
+        match self.discover_estonian_authentication_profile() {
+            Ok(profile) => {
+                let cert = self.read_certificate_at(profile.auth_cert_path())?;
+                self.select_core_application(profile.application_aid())?;
+                return Ok((cert, Some(profile)));
+            }
+            Err(Pkcs15Error::Transport(err)) => return Err(Pkcs15Error::Transport(err)),
+            Err(_) => {}
+        }
+        self.read_certificate(CertSlot::AuthenticationAlt)
+            .map(|cert| (cert, None))
+    }
+
+    /// Read the card's authentication certificate across FINEID (`EF.4331` /
+    /// `EF.4333`) and ISO/IEC 7816-15 directory-discovered cards (Estonian eID).
+    ///
+    /// # Errors
+    /// As [`Self::read_authentication_certificate_and_profile`].
+    #[inline]
+    fn read_authentication_certificate(
+        &mut self,
+    ) -> Result<crate::cert_state::CertDer, Pkcs15Error<TxError<Self>>>
+    where
+        Self: Sized,
+    {
+        self.read_authentication_certificate_and_profile()
+            .map(|(cert, _profile)| cert)
+    }
+
     /// Read + parse `EF.TokenInfo` (`5032`).
     ///
     /// # Errors
@@ -694,6 +795,81 @@ pub trait Pkcs15Ops: CardTransport {
 }
 
 impl<T: CardTransport + ?Sized> Pkcs15Ops for T {}
+
+/// `Le = 0x00`: ISO 7816-4 short-form "up to 256 bytes / remaining bytes",
+/// used for the one-shot EOF retry when a fixed `READ_CHUNK` `Le` returns an
+/// empty-body `6282` (`EndOfFile`).
+const READ_LE_256: u8 = 0x00;
+
+/// Issue one `READ BINARY` at `offset` for `want` bytes, retrying once with
+/// `Le = 0x00` if a non-zero `Le` returns an empty-body `6282` (`EndOfFile`).
+fn read_binary_chunk_with_eof_retry<T: CardTransport>(
+    transport: &mut T,
+    offset: u16,
+    want: u8,
+) -> Result<crate::transport::ResponseApdu, Pkcs15Error<TxError<T>>> {
+    let apdu = ReadBinaryByOffset { offset, le: want }.into_apdu();
+    let response = transport
+        .transmit(apdu.as_bytes())
+        .map_err(Pkcs15Error::Transport)?;
+    if want != READ_LE_256
+        && response.body.is_empty()
+        && matches!(response.status_word(), StatusWord::EndOfFile)
+    {
+        let retry = ReadBinaryByOffset {
+            offset,
+            le: READ_LE_256,
+        }
+        .into_apdu();
+        return transport
+            .transmit(retry.as_bytes())
+            .map_err(Pkcs15Error::Transport);
+    }
+    Ok(response)
+}
+
+/// Lift a `refineid-core` [`refineid_pkcs15::Pkcs15Error`] through the
+/// `CoreReads` bridge into this crate's [`Pkcs15Error`].
+fn map_core_pkcs15_error<E>(
+    error: refineid_pkcs15::Pkcs15Error<crate::auth::CoreReadError<E>>,
+) -> Pkcs15Error<TransportDispatchError<E>> {
+    match error {
+        refineid_pkcs15::Pkcs15Error::Transport(crate::auth::CoreReadError::Transport(inner)) => {
+            Pkcs15Error::Transport(TransportDispatchError::Error(inner))
+        }
+        refineid_pkcs15::Pkcs15Error::Outcome(outcome) => {
+            #[expect(
+                clippy::wildcard_enum_match_arm,
+                reason = "refineid_apdu::TransportOutcome is #[non_exhaustive]; unmodeled future transitions map to ProtocolDesync"
+            )]
+            let local_outcome = match outcome {
+                refineid_apdu::TransportOutcome::NoCard => {
+                    crate::transport::TransportOutcome::NoCard
+                }
+                refineid_apdu::TransportOutcome::TimeoutUnknownState => {
+                    crate::transport::TransportOutcome::TimeoutUnknownState
+                }
+                refineid_apdu::TransportOutcome::CardReset => {
+                    crate::transport::TransportOutcome::CardReset
+                }
+                refineid_apdu::TransportOutcome::ReaderRemoved => {
+                    crate::transport::TransportOutcome::ReaderRemoved
+                }
+                _ => crate::transport::TransportOutcome::ProtocolDesync,
+            };
+            Pkcs15Error::Transport(TransportDispatchError::Outcome(local_outcome))
+        }
+        refineid_pkcs15::Pkcs15Error::Transport(crate::auth::CoreReadError::CredentialCommand) => {
+            Pkcs15Error::InvalidData("transport")
+        }
+        refineid_pkcs15::Pkcs15Error::Status(sw) => Pkcs15Error::Sw(sw.as_u16()),
+        refineid_pkcs15::Pkcs15Error::Aid(_) => Pkcs15Error::InvalidData("AID"),
+        refineid_pkcs15::Pkcs15Error::Command(_) => Pkcs15Error::InvalidData("command"),
+        refineid_pkcs15::Pkcs15Error::Empty => Pkcs15Error::Empty,
+        refineid_pkcs15::Pkcs15Error::TooLarge => Pkcs15Error::TooLarge,
+        refineid_pkcs15::Pkcs15Error::InvalidData(what) => Pkcs15Error::InvalidData(what),
+    }
+}
 
 /// SELECT FILE P1: any file by its identifier (ISO 7816-4 SELECT P1
 /// coding).
@@ -1202,9 +1378,7 @@ where
 
     // Cert read for human-readable identity. Best effort.
     let (common_name, surname, given_names, peuin, organization) = transport
-        .read_certificate(CertSlot::Authentication)
-        .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
-        .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt))
+        .read_authentication_certificate()
         .ok()
         .and_then(|der| {
             crate::x509::Certificate::from_der(der.as_bytes())
@@ -1757,35 +1931,156 @@ mod tests {
     }
 
     #[test]
-    fn read_estonian_authentication_certificate_selects_ef_3411_under_pkcs15() {
+    fn read_authentication_certificate_discovers_estonian_profile_via_iso7816_15() {
+        // Minimal valid DER certificate SEQUENCE (4 bytes).
         let cert = vec![0x30_u8, 0x02, 0x05, 0x00];
+        let estonian_aid: [u8; 12] = [
+            0xA0, 0x00, 0x00, 0x00, 0x63, 0x50, 0x4B, 0x43, 0x53, 0x2D, 0x31, 0x35,
+        ];
+        // EF.DIR: ApplicationTemplate (61) { AID (4F), label "Estonian eID" (50) }.
+        let mut ef_dir = vec![0x61, 28, 0x4F, 12];
+        ef_dir.extend_from_slice(&estonian_aid);
+        ef_dir.extend_from_slice(&[0x50, 12]);
+        ef_dir.extend_from_slice(b"Estonian eID");
+
+        // EF.ODF: PrivateKeys [A0] -> 5035, AuthObjects [A8] -> 5036, Certificates [A4] -> 5037.
+        let ef_odf = vec![
+            0xA0, 0x06, 0x30, 0x04, 0x04, 0x02, 0x50, 0x35, // PrKDF
+            0xA8, 0x06, 0x30, 0x04, 0x04, 0x02, 0x50, 0x36, // AODF
+            0xA4, 0x06, 0x30, 0x04, 0x04, 0x02, 0x50, 0x37, // CDF
+        ];
+
+        // EF.CDF: X.509 cert (30) { CommonObjectAttributes {}, CommonCertificateAttributes { iD=01 },
+        //   [A1] { X509CertificateAttributes { value = Path { 3F00 ADF1 3411 } } } }.
+        let ef_cdf = vec![
+            0x30, 0x15, // CertificateObject SEQUENCE
+            0x30, 0x00, // CommonObjectAttributes
+            0x30, 0x03, 0x04, 0x01, 0x01, // CommonCertificateAttributes { iD = 01 }
+            0xA1, 0x0C, // typeAttributes
+            0x30, 0x0A, // X509CertificateAttributes
+            0x30, 0x08, // Path SEQUENCE (ObjectValue::indirect)
+            0x04, 0x06, 0x3F, 0x00, 0xAD, 0xF1, 0x34, 0x11,
+        ];
+
+        // EF.PrKDF: PrivateECKey [A0] {
+        //   CommonObjectAttributes { authId = 01 },
+        //   CommonKeyAttributes { iD = 01, usage = digitalSignature (0x80), keyReference = 0x81 },
+        //   [A1] { PrivateECKeyAttributes { value = Path { empty } } }
+        // }.
+        let ef_prkdf = vec![
+            0xA0, 0x1A, // PrivateECKey
+            0x30, 0x03, 0x04, 0x01, 0x01, // CommonObjectAttributes { authId = 01 }
+            0x30, 0x0B, // CommonKeyAttributes
+            0x04, 0x01, 0x01, // iD = 01
+            0x03, 0x02, 0x05, 0x20, // usage = sign (bit 2, PKCS#15 KeyUsageFlags)
+            0x02, 0x02, 0x00, 0x81, // keyReference = 0x81 (positive DER INTEGER)
+            0xA1, 0x06, // typeAttributes
+            0x30, 0x04, // PrivateECKeyAttributes
+            0x30, 0x02, 0x04, 0x00, // Path { path = "" }
+        ];
+
+        // EF.AOD: AuthenticationObject (30) {
+        //   CommonObjectAttributes {},
+        //   CommonAuthenticationObjectAttributes { authId = 01 },
+        //   [A1] { PinAttributes { pinFlags = {}, pinType = ascii-numeric (1),
+        //          minLength = 4, storedLength = 12, maxLength = 12, pinReference [0] = 0x01 } }
+        // }.
+        let ef_aod = vec![
+            0x30, 0x1E, // AuthenticationObject
+            0x30, 0x00, // CommonObjectAttributes
+            0x30, 0x03, 0x04, 0x01,
+            0x01, // CommonAuthenticationObjectAttributes { authId = 01 }
+            0xA1, 0x15, // typeAttributes
+            0x30, 0x13, // PinAttributes
+            0x03, 0x02, 0x00, 0x00, // pinFlags
+            0x0A, 0x01, 0x01, // pinType = ascii-numeric
+            0x02, 0x01, 0x04, // minLength = 4
+            0x02, 0x01, 0x0C, // storedLength = 12
+            0x02, 0x01, 0x0C, // maxLength = 12
+            0x80, 0x01, 0x01, // pinReference = 0x01
+        ];
+
+        let mut select_aid = vec![0x00, 0xA4, 0x04, 0x0C, 0x0C];
+        select_aid.extend_from_slice(&estonian_aid);
+        let select_mf = vec![0x00, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00];
+        let eof_with = |body: &[u8]| ResponseApdu {
+            body: body.to_vec(),
+            sw1: 0x62,
+            sw2: 0x82,
+        };
+        let fnf = ResponseApdu {
+            body: Vec::new(),
+            sw1: 0x6A,
+            sw2: 0x82,
+        };
+
         let mut tx = ScriptedTransport::new(vec![
+            // 1. FINEID EF.4331 probe fails with FileNotFound (both P1=0x02 and P1=0x00 variants).
+            (select_aid.clone(), ok(&[])),
+            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x43, 0x31], fnf.clone()),
+            (vec![0x00, 0xA4, 0x00, 0x0C, 0x02, 0x43, 0x31], fnf),
+            // 2. ISO 7816-15 discovery: SELECT MF -> SELECT EF.DIR -> READ BINARY (eof confirmed).
+            (select_mf, ok(&[])),
+            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x2F, 0x00], ok(&[])),
+            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_dir)),
+            // 3. SELECT discovered AID -> EF.ODF (5031).
+            (select_aid.clone(), ok(&[])),
+            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x50, 0x31], ok(&[])),
+            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_odf)),
+            // 4. EF.CDF (single-step relative path 5037 -> select_ef P1=0x02).
+            (select_aid.clone(), ok(&[])),
+            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x50, 0x37], ok(&[])),
+            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_cdf)),
+            // 5. EF.PrKDF (single-step relative path 5035 -> select_ef P1=0x02).
+            (select_aid.clone(), ok(&[])),
+            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x50, 0x35], ok(&[])),
+            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_prkdf)),
+            // 6. EF.AOD (single-step relative path 5036 -> select_ef P1=0x02).
+            (select_aid.clone(), ok(&[])),
+            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x50, 0x36], ok(&[])),
+            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_aod)),
+            // 7. discover_authentication_profile re-selects AID.
+            (select_aid.clone(), ok(&[])),
+            // 8. read_certificate_at(3F00/ADF1/3411) via SELECT absolute path from MF (P1=0x08).
             (
-                vec![
-                    0x00, 0xA4, 0x04, 0x0C, 0x0C, 0xA0, 0x00, 0x00, 0x00, 0x63, 0x50, 0x4B, 0x43,
-                    0x53, 0x2D, 0x31, 0x35,
-                ],
+                vec![0x00, 0xA4, 0x08, 0x0C, 0x04, 0xAD, 0xF1, 0x34, 0x11],
                 ok(&[]),
             ),
-            (
-                vec![
-                    0x00,
-                    0xA4,
-                    0x02,
-                    0x0C,
-                    0x02,
-                    super::EF_ESTONIAN_AUTH_CERT_FID[0],
-                    super::EF_ESTONIAN_AUTH_CERT_FID[1],
-                ],
-                ok(&[]),
-            ),
-            (vec![0x00, 0xB0, 0x00, 0x00, 0x80], ok(&cert)),
+            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&cert)),
+            // 9. Re-select discovered AID at the end of read_authentication_certificate_and_profile.
+            (select_aid, ok(&[])),
         ]);
-        let der = tx
-            .read_certificate(CertSlot::EstonianAuthentication)
-            .expect("reads Estonian auth cert");
+
+        let (der, profile) = tx
+            .read_authentication_certificate_and_profile()
+            .expect("discovers and reads Estonian auth cert");
         assert_eq!(der.as_bytes(), cert.as_slice());
-        assert!(!CertSlot::EstonianAuthentication.requires_mf_traversal());
+        let profile = profile.expect("returns discovered profile");
+        assert_eq!(profile.auth_key_reference().as_u8(), 0x81);
+        assert_eq!(profile.pin1().reference(), 0x01);
+    }
+
+    #[test]
+    fn read_binary_retries_with_le_zero_on_empty_body_6282() {
+        let mut full = vec![0x30_u8, 0x81, 0x81];
+        full.resize(132, 0xAA);
+        let first_chunk = full[..128].to_vec();
+        let tail = full[128..].to_vec();
+
+        let eof_empty = ResponseApdu {
+            body: Vec::new(),
+            sw1: 0x62,
+            sw2: 0x82,
+        };
+        let mut tx = ScriptedTransport::new(vec![
+            (vec![0x00, 0xB0, 0x00, 0x00, 0x80], ok(&first_chunk)),
+            (vec![0x00, 0xB0, 0x00, 0x80, 0x80], eof_empty),
+            (vec![0x00, 0xB0, 0x00, 0x80, 0x00], ok(&tail)),
+        ]);
+        let read = tx
+            .read_binary_to_end(None)
+            .expect("empty-body 6282 retries with Le=00");
+        assert_eq!(read, full);
     }
 
     // ----- contactless (PACE-first) reader pick -----

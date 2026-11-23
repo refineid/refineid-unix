@@ -132,6 +132,9 @@ impl TryFrom<PinReferenceScheme> for QualifiedSignScheme {
 pub enum KeyRef {
     /// Authentication key, PIN1-gated. Wire byte `0x01`.
     Auth,
+    /// Authentication key whose wire reference byte was discovered from
+    /// an ISO/IEC 7816-15 `EF.PrKDF` entry (e.g. Estonian eID).
+    DiscoveredAuth(u8),
     /// Qualified-signature key, PIN2-gated, under a supported
     /// qualified-signing family: [`KEY_REF_SIGN`] on citizen cards
     /// (FINEID S1 v4.2 §3.5), [`ORG_QUALIFIED_KEY_REF`] in DF.ESIGN
@@ -140,11 +143,19 @@ pub enum KeyRef {
 }
 
 impl KeyRef {
+    /// Build a [`KeyRef::DiscoveredAuth`] from a typed `EF.PrKDF` key
+    /// reference resolved by ISO/IEC 7816-15 directory discovery.
+    #[must_use]
+    pub const fn discovered_auth(reference: refineid_pkcs15::KeyReference) -> Self {
+        Self::DiscoveredAuth(reference.as_u8())
+    }
+
     /// The card-side reference byte for MSE:Set DST/CT.
     #[must_use]
     pub const fn as_u8(self) -> u8 {
         match self {
             Self::Auth => KEY_REF_AUTH,
+            Self::DiscoveredAuth(reference) => reference,
             Self::Sign(QualifiedSignScheme::Citizen) => KEY_REF_SIGN,
             Self::Sign(QualifiedSignScheme::Organizational) => ORG_QUALIFIED_KEY_REF,
         }
@@ -452,7 +463,9 @@ pub trait SignOps: CardTransport {
         Self: Sized,
     {
         match key_ref {
-            KeyRef::Auth => self.mse_set_at(commands::SignatureAlgRef::RSA_PKCS1_RAW, key_ref)?,
+            KeyRef::Auth | KeyRef::DiscoveredAuth(_) => {
+                self.mse_set_at(commands::SignatureAlgRef::RSA_PKCS1_RAW, key_ref)?;
+            }
             KeyRef::Sign(_) => {
                 self.mse_set_dst(commands::SignatureAlgRef::RSA_PKCS1_RAW, key_ref)?;
             }
