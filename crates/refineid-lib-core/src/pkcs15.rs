@@ -1932,122 +1932,233 @@ mod tests {
 
     #[test]
     fn read_authentication_certificate_discovers_estonian_profile_via_iso7816_15() {
-        // Minimal valid DER certificate SEQUENCE (4 bytes).
-        let cert = vec![0x30_u8, 0x02, 0x05, 0x00];
-        let estonian_aid: [u8; 12] = [
-            0xA0, 0x00, 0x00, 0x00, 0x63, 0x50, 0x4B, 0x43, 0x53, 0x2D, 0x31, 0x35,
-        ];
-        // EF.DIR: ApplicationTemplate (61) { AID (4F), label "Estonian eID" (50) }.
-        let mut ef_dir = vec![0x61, 28, 0x4F, 12];
-        ef_dir.extend_from_slice(&estonian_aid);
-        ef_dir.extend_from_slice(&[0x50, 12]);
-        ef_dir.extend_from_slice(b"Estonian eID");
-
-        // EF.ODF: PrivateKeys [A0] -> 5035, AuthObjects [A8] -> 5036, Certificates [A4] -> 5037.
-        let ef_odf = vec![
-            0xA0, 0x06, 0x30, 0x04, 0x04, 0x02, 0x50, 0x35, // PrKDF
-            0xA8, 0x06, 0x30, 0x04, 0x04, 0x02, 0x50, 0x36, // AODF
-            0xA4, 0x06, 0x30, 0x04, 0x04, 0x02, 0x50, 0x37, // CDF
-        ];
-
-        // EF.CDF: X.509 cert (30) { CommonObjectAttributes {}, CommonCertificateAttributes { iD=01 },
-        //   [A1] { X509CertificateAttributes { value = Path { 3F00 ADF1 3411 } } } }.
-        let ef_cdf = vec![
-            0x30, 0x15, // CertificateObject SEQUENCE
-            0x30, 0x00, // CommonObjectAttributes
-            0x30, 0x03, 0x04, 0x01, 0x01, // CommonCertificateAttributes { iD = 01 }
-            0xA1, 0x0C, // typeAttributes
-            0x30, 0x0A, // X509CertificateAttributes
-            0x30, 0x08, // Path SEQUENCE (ObjectValue::indirect)
-            0x04, 0x06, 0x3F, 0x00, 0xAD, 0xF1, 0x34, 0x11,
-        ];
-
-        // EF.PrKDF: PrivateECKey [A0] {
-        //   CommonObjectAttributes { authId = 01 },
-        //   CommonKeyAttributes { iD = 01, usage = digitalSignature (0x80), keyReference = 0x81 },
-        //   [A1] { PrivateECKeyAttributes { value = Path { empty } } }
-        // }.
-        let ef_prkdf = vec![
-            0xA0, 0x1A, // PrivateECKey
-            0x30, 0x03, 0x04, 0x01, 0x01, // CommonObjectAttributes { authId = 01 }
-            0x30, 0x0B, // CommonKeyAttributes
-            0x04, 0x01, 0x01, // iD = 01
-            0x03, 0x02, 0x05, 0x20, // usage = sign (bit 2, PKCS#15 KeyUsageFlags)
-            0x02, 0x02, 0x00, 0x81, // keyReference = 0x81 (positive DER INTEGER)
-            0xA1, 0x06, // typeAttributes
-            0x30, 0x04, // PrivateECKeyAttributes
-            0x30, 0x02, 0x04, 0x00, // Path { path = "" }
-        ];
-
-        // EF.AOD: AuthenticationObject (30) {
-        //   CommonObjectAttributes {},
-        //   CommonAuthenticationObjectAttributes { authId = 01 },
-        //   [A1] { PinAttributes { pinFlags = {}, pinType = ascii-numeric (1),
-        //          minLength = 4, storedLength = 12, maxLength = 12, pinReference [0] = 0x01 } }
-        // }.
-        let ef_aod = vec![
-            0x30, 0x1E, // AuthenticationObject
-            0x30, 0x00, // CommonObjectAttributes
-            0x30, 0x03, 0x04, 0x01,
-            0x01, // CommonAuthenticationObjectAttributes { authId = 01 }
-            0xA1, 0x15, // typeAttributes
-            0x30, 0x13, // PinAttributes
-            0x03, 0x02, 0x00, 0x00, // pinFlags
-            0x0A, 0x01, 0x01, // pinType = ascii-numeric
-            0x02, 0x01, 0x04, // minLength = 4
-            0x02, 0x01, 0x0C, // storedLength = 12
-            0x02, 0x01, 0x0C, // maxLength = 12
-            0x80, 0x01, 0x01, // pinReference = 0x01
-        ];
-
-        let mut select_aid = vec![0x00, 0xA4, 0x04, 0x0C, 0x0C];
-        select_aid.extend_from_slice(&estonian_aid);
-        let select_mf = vec![0x00, 0xA4, 0x00, 0x0C, 0x02, 0x3F, 0x00];
-        let eof_with = |body: &[u8]| ResponseApdu {
-            body: body.to_vec(),
-            sw1: 0x62,
-            sw2: 0x82,
+        use super::{
+            Aid, ApduClass, FileId, ReadBinaryByOffset, SelectByAidNoFci, SelectEfNoFci,
+            SelectFile, SelectFileResponseMode, SelectFileTarget, StatusWord,
         };
-        let fnf = ResponseApdu {
-            body: Vec::new(),
-            sw1: 0x6A,
-            sw2: 0x82,
+        use crate::apdu::iso7816::AbsolutePath;
+
+        const TAG_ASN1_INTEGER: u8 = 0x02;
+        const TAG_ASN1_BIT_STRING: u8 = 0x03;
+        const TAG_ASN1_OCTET_STRING: u8 = 0x04;
+        const TAG_ASN1_NULL: u8 = 0x05;
+        const TAG_ASN1_ENUMERATED: u8 = 0x0A;
+        const TAG_ASN1_SEQUENCE: u8 = 0x30;
+        const TAG_APP_AID: u8 = 0x4F;
+        const TAG_APP_LABEL: u8 = 0x50;
+        const TAG_APP_TEMPLATE: u8 = 0x61;
+        const TAG_CONTEXT_PRIMITIVE_0: u8 = 0x80;
+        const TAG_CONTEXT_CONSTRUCTED_0: u8 = 0xA0;
+        const TAG_CONTEXT_CONSTRUCTED_1: u8 = 0xA1;
+        const TAG_ODF_CERTIFICATES: u8 = 0xA4;
+        const TAG_ODF_AUTH_OBJECTS: u8 = 0xA8;
+
+        const TEST_PRKDF_FID: [u8; 2] = [0x50, 0x35];
+        const TEST_AOD_FID: [u8; 2] = [0x50, 0x36];
+        const TEST_CDF_FID: [u8; 2] = [0x50, 0x37];
+        const TEST_ADF1_FID: [u8; 2] = [0xAD, 0xF1];
+        const TEST_AUTH_CERT_FID: [u8; 2] = [0x34, 0x11];
+        const TEST_OBJECT_ID: [u8; 1] = [0x01];
+        const TEST_DISCOVERED_KEY_REF: u8 = 0x81;
+        const TEST_PIN1_REF: u8 = 0x01;
+        const DER_POSITIVE_INT_PAD: u8 = 0x00;
+        const KEY_USAGE_SIGN_UNUSED_BITS: u8 = 5;
+        const KEY_USAGE_SIGN_BYTE: u8 = 0x20;
+        const PIN_FLAGS_NONE_UNUSED_BITS: u8 = 0;
+        const PIN_FLAGS_NONE_BYTE: u8 = 0x00;
+        const PIN_TYPE_ASCII_NUMERIC: u8 = 1;
+        const PIN_MIN_LENGTH: u8 = 4;
+        const PIN_STORED_LENGTH: u8 = 12;
+        const PIN_MAX_LENGTH: u8 = 12;
+        // `refineid-pkcs15` issues 223-byte reads so responses fit short-form SM.
+        const CORE_READ_CHUNK: u8 = 223;
+        const READ_OFFSET_START: u16 = 0;
+
+        fn ber_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(value.len().saturating_add(2));
+            out.push(tag);
+            out.push(u8::try_from(value.len()).expect("short DER length"));
+            out.extend_from_slice(value);
+            out
+        }
+
+        fn response_with_sw(body: &[u8], status: StatusWord) -> ResponseApdu {
+            let [sw1, sw2] = status.as_u16().to_be_bytes();
+            ResponseApdu {
+                body: body.to_vec(),
+                sw1,
+                sw2,
+            }
+        }
+
+        fn select_ef_wire(fid: [u8; 2]) -> Vec<u8> {
+            SelectEfNoFci { fid }.into_apdu().as_bytes().to_vec()
+        }
+
+        fn select_any_wire(fid: FileId) -> Vec<u8> {
+            SelectFile {
+                class: ApduClass::Plain,
+                target: SelectFileTarget::AnyByFileId(Some(fid)),
+                response_mode: SelectFileResponseMode::None,
+            }
+            .into_apdu()
+            .as_bytes()
+            .to_vec()
+        }
+
+        fn read_core_chunk_wire() -> Vec<u8> {
+            ReadBinaryByOffset {
+                offset: READ_OFFSET_START,
+                le: CORE_READ_CHUNK,
+            }
+            .into_apdu()
+            .as_bytes()
+            .to_vec()
+        }
+
+        let cert = ber_tlv(TAG_ASN1_SEQUENCE, &ber_tlv(TAG_ASN1_NULL, &[]));
+        let aid = Aid::from_slice(PKCS15_AID).expect("standard PKCS#15 AID");
+        let select_aid = SelectByAidNoFci { aid }.into_apdu().as_bytes().to_vec();
+        let select_mf = select_any_wire(FileId::MF);
+        let select_auth_cert_path = SelectFile {
+            class: ApduClass::Plain,
+            target: SelectFileTarget::AbsolutePath(
+                AbsolutePath::new(vec![
+                    FileId::new(TEST_ADF1_FID),
+                    FileId::new(TEST_AUTH_CERT_FID),
+                ])
+                .expect("valid absolute path under MF"),
+            ),
+            response_mode: SelectFileResponseMode::None,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+
+        // EF.DIR: ApplicationTemplate { AID, label "Estonian eID" }.
+        let mut dir_entry = ber_tlv(TAG_APP_AID, PKCS15_AID);
+        dir_entry.extend_from_slice(&ber_tlv(
+            TAG_APP_LABEL,
+            refineid_pkcs15::ESTONIAN_EID_APPLICATION_LABEL.as_bytes(),
+        ));
+        let ef_dir = ber_tlv(TAG_APP_TEMPLATE, &dir_entry);
+
+        // EF.ODF: PrivateKeys -> TEST_PRKDF_FID, AuthObjects -> TEST_AOD_FID, Certificates -> TEST_CDF_FID.
+        let odf_entry = |tag: u8, fid: [u8; 2]| {
+            ber_tlv(
+                tag,
+                &ber_tlv(TAG_ASN1_SEQUENCE, &ber_tlv(TAG_ASN1_OCTET_STRING, &fid)),
+            )
         };
+        let mut ef_odf = odf_entry(TAG_CONTEXT_CONSTRUCTED_0, TEST_PRKDF_FID);
+        ef_odf.extend_from_slice(&odf_entry(TAG_ODF_AUTH_OBJECTS, TEST_AOD_FID));
+        ef_odf.extend_from_slice(&odf_entry(TAG_ODF_CERTIFICATES, TEST_CDF_FID));
+
+        // EF.CDF: X.509 cert entry pointing to MF / TEST_ADF1_FID / TEST_AUTH_CERT_FID.
+        let mut full_cert_path_bytes = Vec::new();
+        full_cert_path_bytes.extend_from_slice(FileId::MF.as_bytes());
+        full_cert_path_bytes.extend_from_slice(&TEST_ADF1_FID);
+        full_cert_path_bytes.extend_from_slice(&TEST_AUTH_CERT_FID);
+        let mut cdf_body = ber_tlv(TAG_ASN1_SEQUENCE, &[]);
+        cdf_body.extend_from_slice(&ber_tlv(
+            TAG_ASN1_SEQUENCE,
+            &ber_tlv(TAG_ASN1_OCTET_STRING, &TEST_OBJECT_ID),
+        ));
+        cdf_body.extend_from_slice(&ber_tlv(
+            TAG_CONTEXT_CONSTRUCTED_1,
+            &ber_tlv(
+                TAG_ASN1_SEQUENCE,
+                &ber_tlv(
+                    TAG_ASN1_SEQUENCE,
+                    &ber_tlv(TAG_ASN1_OCTET_STRING, &full_cert_path_bytes),
+                ),
+            ),
+        ));
+        let ef_cdf = ber_tlv(TAG_ASN1_SEQUENCE, &cdf_body);
+
+        // EF.PrKDF: PrivateECKey with authId, usage=sign, and non-default keyReference.
+        let mut key_attrs = ber_tlv(TAG_ASN1_OCTET_STRING, &TEST_OBJECT_ID);
+        key_attrs.extend_from_slice(&ber_tlv(
+            TAG_ASN1_BIT_STRING,
+            &[KEY_USAGE_SIGN_UNUSED_BITS, KEY_USAGE_SIGN_BYTE],
+        ));
+        key_attrs.extend_from_slice(&ber_tlv(
+            TAG_ASN1_INTEGER,
+            &[DER_POSITIVE_INT_PAD, TEST_DISCOVERED_KEY_REF],
+        ));
+        let mut prkdf_body = ber_tlv(
+            TAG_ASN1_SEQUENCE,
+            &ber_tlv(TAG_ASN1_OCTET_STRING, &TEST_OBJECT_ID),
+        );
+        prkdf_body.extend_from_slice(&ber_tlv(TAG_ASN1_SEQUENCE, &key_attrs));
+        prkdf_body.extend_from_slice(&ber_tlv(
+            TAG_CONTEXT_CONSTRUCTED_1,
+            &ber_tlv(
+                TAG_ASN1_SEQUENCE,
+                &ber_tlv(TAG_ASN1_SEQUENCE, &ber_tlv(TAG_ASN1_OCTET_STRING, &[])),
+            ),
+        ));
+        let ef_prkdf = ber_tlv(TAG_CONTEXT_CONSTRUCTED_0, &prkdf_body);
+
+        // EF.AOD: PIN1 authentication object linked by TEST_OBJECT_ID.
+        let mut pin_attrs = ber_tlv(
+            TAG_ASN1_BIT_STRING,
+            &[PIN_FLAGS_NONE_UNUSED_BITS, PIN_FLAGS_NONE_BYTE],
+        );
+        pin_attrs.extend_from_slice(&ber_tlv(TAG_ASN1_ENUMERATED, &[PIN_TYPE_ASCII_NUMERIC]));
+        pin_attrs.extend_from_slice(&ber_tlv(TAG_ASN1_INTEGER, &[PIN_MIN_LENGTH]));
+        pin_attrs.extend_from_slice(&ber_tlv(TAG_ASN1_INTEGER, &[PIN_STORED_LENGTH]));
+        pin_attrs.extend_from_slice(&ber_tlv(TAG_ASN1_INTEGER, &[PIN_MAX_LENGTH]));
+        pin_attrs.extend_from_slice(&ber_tlv(TAG_CONTEXT_PRIMITIVE_0, &[TEST_PIN1_REF]));
+        let mut aod_body = ber_tlv(TAG_ASN1_SEQUENCE, &[]);
+        aod_body.extend_from_slice(&ber_tlv(
+            TAG_ASN1_SEQUENCE,
+            &ber_tlv(TAG_ASN1_OCTET_STRING, &TEST_OBJECT_ID),
+        ));
+        aod_body.extend_from_slice(&ber_tlv(
+            TAG_CONTEXT_CONSTRUCTED_1,
+            &ber_tlv(TAG_ASN1_SEQUENCE, &pin_attrs),
+        ));
+        let ef_aod = ber_tlv(TAG_ASN1_SEQUENCE, &aod_body);
+
+        let fnf = response_with_sw(&[], StatusWord::FileNotFound);
+        let eof_with = |body: &[u8]| response_with_sw(body, StatusWord::EndOfFile);
+        let read_chunk = read_core_chunk_wire();
 
         let mut tx = ScriptedTransport::new(vec![
-            // 1. FINEID EF.4331 probe fails with FileNotFound (both P1=0x02 and P1=0x00 variants).
+            // 1. FINEID EF.4331 probe fails with FileNotFound (both EF and any-by-FID variants).
             (select_aid.clone(), ok(&[])),
-            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x43, 0x31], fnf.clone()),
-            (vec![0x00, 0xA4, 0x00, 0x0C, 0x02, 0x43, 0x31], fnf),
+            (select_ef_wire(EF_AUTH_CERT_FID), fnf.clone()),
+            (select_any_wire(FileId::new(EF_AUTH_CERT_FID)), fnf),
             // 2. ISO 7816-15 discovery: SELECT MF -> SELECT EF.DIR -> READ BINARY (eof confirmed).
             (select_mf, ok(&[])),
-            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x2F, 0x00], ok(&[])),
-            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_dir)),
-            // 3. SELECT discovered AID -> EF.ODF (5031).
-            (select_aid.clone(), ok(&[])),
-            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x50, 0x31], ok(&[])),
-            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_odf)),
-            // 4. EF.CDF (single-step relative path 5037 -> select_ef P1=0x02).
-            (select_aid.clone(), ok(&[])),
-            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x50, 0x37], ok(&[])),
-            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_cdf)),
-            // 5. EF.PrKDF (single-step relative path 5035 -> select_ef P1=0x02).
-            (select_aid.clone(), ok(&[])),
-            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x50, 0x35], ok(&[])),
-            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_prkdf)),
-            // 6. EF.AOD (single-step relative path 5036 -> select_ef P1=0x02).
-            (select_aid.clone(), ok(&[])),
-            (vec![0x00, 0xA4, 0x02, 0x0C, 0x02, 0x50, 0x36], ok(&[])),
-            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&ef_aod)),
-            // 7. discover_authentication_profile re-selects AID.
-            (select_aid.clone(), ok(&[])),
-            // 8. read_certificate_at(3F00/ADF1/3411) via SELECT absolute path from MF (P1=0x08).
             (
-                vec![0x00, 0xA4, 0x08, 0x0C, 0x04, 0xAD, 0xF1, 0x34, 0x11],
+                select_ef_wire(*refineid_pkcs15::EF_DIR_FID.as_bytes()),
                 ok(&[]),
             ),
-            (vec![0x00, 0xB0, 0x00, 0x00, 0xDF], eof_with(&cert)),
-            // 9. Re-select discovered AID at the end of read_authentication_certificate_and_profile.
+            (read_chunk.clone(), eof_with(&ef_dir)),
+            // 3. SELECT discovered AID -> EF.ODF.
+            (select_aid.clone(), ok(&[])),
+            (
+                select_ef_wire(*refineid_pkcs15::EF_ODF_FID.as_bytes()),
+                ok(&[]),
+            ),
+            (read_chunk.clone(), eof_with(&ef_odf)),
+            // 4. EF.CDF -> EF.PrKDF -> EF.AOD.
+            (select_aid.clone(), ok(&[])),
+            (select_ef_wire(TEST_CDF_FID), ok(&[])),
+            (read_chunk.clone(), eof_with(&ef_cdf)),
+            (select_aid.clone(), ok(&[])),
+            (select_ef_wire(TEST_PRKDF_FID), ok(&[])),
+            (read_chunk.clone(), eof_with(&ef_prkdf)),
+            (select_aid.clone(), ok(&[])),
+            (select_ef_wire(TEST_AOD_FID), ok(&[])),
+            (read_chunk.clone(), eof_with(&ef_aod)),
+            // 5. discover_authentication_profile re-selects AID, then reads discovered cert path.
+            (select_aid.clone(), ok(&[])),
+            (select_auth_cert_path, ok(&[])),
+            (read_chunk, eof_with(&cert)),
+            // 6. Re-select discovered AID after reading the certificate.
             (select_aid, ok(&[])),
         ]);
 
@@ -2056,26 +2167,60 @@ mod tests {
             .expect("discovers and reads Estonian auth cert");
         assert_eq!(der.as_bytes(), cert.as_slice());
         let profile = profile.expect("returns discovered profile");
-        assert_eq!(profile.auth_key_reference().as_u8(), 0x81);
-        assert_eq!(profile.pin1().reference(), 0x01);
+        assert_eq!(
+            profile.auth_key_reference().as_u8(),
+            TEST_DISCOVERED_KEY_REF
+        );
+        assert_eq!(profile.pin1().reference(), TEST_PIN1_REF);
     }
 
     #[test]
     fn read_binary_retries_with_le_zero_on_empty_body_6282() {
-        let mut full = vec![0x30_u8, 0x81, 0x81];
-        full.resize(132, 0xAA);
-        let first_chunk = full[..128].to_vec();
-        let tail = full[128..].to_vec();
+        use super::{READ_CHUNK, READ_LE_256, ReadBinaryByOffset, StatusWord};
 
+        const FIRST_CHUNK_LEN: usize = READ_CHUNK as usize;
+        const TAIL_LEN: usize = 4;
+        const TOTAL_LEN: usize = FIRST_CHUNK_LEN + TAIL_LEN;
+        const FILL_BYTE: u8 = 0xAA;
+        const OFFSET_ZERO: u16 = 0;
+        const OFFSET_SECOND_CHUNK: u16 = READ_CHUNK as u16;
+
+        let full = vec![FILL_BYTE; TOTAL_LEN];
+        let first_chunk = full[..FIRST_CHUNK_LEN].to_vec();
+        let tail = full[FIRST_CHUNK_LEN..].to_vec();
+
+        let [eof_sw1, eof_sw2] = StatusWord::EndOfFile.as_u16().to_be_bytes();
         let eof_empty = ResponseApdu {
             body: Vec::new(),
-            sw1: 0x62,
-            sw2: 0x82,
+            sw1: eof_sw1,
+            sw2: eof_sw2,
         };
+        let read_first = ReadBinaryByOffset {
+            offset: OFFSET_ZERO,
+            le: READ_CHUNK,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+        let read_second_fixed = ReadBinaryByOffset {
+            offset: OFFSET_SECOND_CHUNK,
+            le: READ_CHUNK,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+        let read_second_retry = ReadBinaryByOffset {
+            offset: OFFSET_SECOND_CHUNK,
+            le: READ_LE_256,
+        }
+        .into_apdu()
+        .as_bytes()
+        .to_vec();
+
         let mut tx = ScriptedTransport::new(vec![
-            (vec![0x00, 0xB0, 0x00, 0x00, 0x80], ok(&first_chunk)),
-            (vec![0x00, 0xB0, 0x00, 0x80, 0x80], eof_empty),
-            (vec![0x00, 0xB0, 0x00, 0x80, 0x00], ok(&tail)),
+            (read_first, ok(&first_chunk)),
+            (read_second_fixed, eof_empty),
+            (read_second_retry, ok(&tail)),
         ]);
         let read = tx
             .read_binary_to_end(None)
