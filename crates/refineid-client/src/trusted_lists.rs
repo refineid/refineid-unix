@@ -48,11 +48,26 @@ const APPLICATION_DIRECTORY: &str = "refineid";
 const LISTS_DIRECTORY: &str = "trusted-lists";
 
 /// The per-user cache: `$XDG_CACHE_HOME/refineid/trusted-lists`,
-/// or `$HOME/.cache/refineid/trusted-lists`. A variable that is
-/// unset, empty or relative does not count; `None` when none
-/// counts.
+/// or `$HOME/.cache/refineid/trusted-lists`. Returns `None` for a
+/// privileged process (root or setuid/setgid) so inherited caller
+/// environment variables cannot steer writes into a caller-chosen
+/// directory, or when no variable names an absolute directory.
 fn user_cache() -> Option<ListCache> {
-    directory_from(|name| std::env::var_os(name)).map(ListCache::at)
+    user_cache_for(crate::ca_certificates::process_is_privileged(), |name| {
+        std::env::var_os(name).filter(|value| !value.is_empty())
+    })
+}
+
+/// [`user_cache`] parameterised on privilege status and environment lookup
+/// for unit tests.
+fn user_cache_for(
+    privileged: bool,
+    variable: impl Fn(&str) -> Option<OsString>,
+) -> Option<ListCache> {
+    if privileged {
+        return None;
+    }
+    directory_from(variable).map(ListCache::at)
 }
 
 /// [`user_cache`] over the environment `variable` reads.

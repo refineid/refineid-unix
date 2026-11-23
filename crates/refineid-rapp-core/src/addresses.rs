@@ -9,10 +9,8 @@
 //! answered from before. The addresses are a cache: losing them costs a
 //! slower discovery, never a pairing.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::fs;
 use std::net::Ipv4Addr;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::ids::PairId;
@@ -45,25 +43,11 @@ pub fn remember(directory: &Path, pair_id: PairId, address: Ipv4Addr) {
     addresses.insert(0, address);
     addresses.truncate(REMEMBERED_ADDRESSES);
     let path = path_for(directory, pair_id);
-    let temporary = path.with_extension("tmp");
     let text: String = addresses
         .iter()
         .map(|address| format!("{address}\n"))
         .collect();
-    let written = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(FILE_MODE)
-            .open(&temporary)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&temporary, &path)
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
+    let _ = crate::file_store::write_atomically(&path, text.as_bytes(), FILE_MODE);
 }
 
 /// Drops what is remembered for `pair_id`.
@@ -131,6 +115,34 @@ mod tests {
             Ipv4Addr::new(192, 0, 2, 1),
         );
         assert!(remembered(&directory, PairId::from_array([2; 16])).is_empty());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn remember_does_not_follow_or_truncate_a_planted_tmp_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = scratch();
+        let pair_id = PairId::from_array([9; 16]);
+        let victim = directory.join("victim.txt");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let planted = super::path_for(&directory, pair_id).with_extension("tmp");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        remember(&directory, pair_id, Ipv4Addr::new(192, 0, 2, 42));
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(&planted).is_ok());
+        assert_eq!(
+            remembered(&directory, pair_id),
+            vec![Ipv4Addr::new(192, 0, 2, 42)]
+        );
+        let mode = std::fs::metadata(super::path_for(&directory, pair_id))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }

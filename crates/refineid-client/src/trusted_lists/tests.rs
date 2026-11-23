@@ -51,6 +51,27 @@ fn the_cache_is_under_the_xdg_cache_home_else_home() -> TestResult {
     check(&resolved(&[]), &None, "none")
 }
 
+#[test]
+fn privileged_process_gets_no_user_cache() -> TestResult {
+    let env = |name: &str| match name {
+        XDG_CACHE_HOME => Some(OsString::from("/synthetic/cache")),
+        HOME => Some(OsString::from("/synthetic/home")),
+        _ => None,
+    };
+    check(
+        &user_cache_for(true, env),
+        &None,
+        "privileged process refuses per-user cache",
+    )?;
+    check(
+        &user_cache_for(false, env),
+        &Some(ListCache::at(PathBuf::from(
+            "/synthetic/cache/refineid/trusted-lists",
+        ))),
+        "unprivileged process resolves per-user cache",
+    )
+}
+
 /// The live lists, over the network, into a scratch cache. Run by hand:
 /// `cargo test -p refineid-client live_lists -- --ignored --nocapture`.
 #[test]

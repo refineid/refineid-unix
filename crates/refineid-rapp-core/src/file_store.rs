@@ -221,6 +221,94 @@ fn write_record(directory: &Path, record: &PairingRecord) -> Result<(), StoreErr
     write_blob(directory, record.pair_id(), &blob)
 }
 
+/// Maximum exclusive-create attempts when picking a unique temporary sibling path.
+const MAX_TEMP_ATTEMPTS: usize = 8;
+
+/// Atomically write `bytes` to `path` with owner-only `mode` using an
+/// exclusive (`O_CREAT | O_EXCL | O_NOFOLLOW`), uniquely named sibling
+/// temporary file and `rename(2)`.
+///
+/// Pre-existing files or symlinks at predicted temporary paths are never
+/// followed, truncated, or unlinked.
+///
+/// # Errors
+/// Returns any underlying I/O error from creating, writing, syncing, or
+/// renaming the temporary file.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    write_atomically_with_suffix(path, bytes, mode, |_| {
+        let mut nonce = [0_u8; 8];
+        getrandom::fill(&mut nonce)
+            .map_err(|_| std::io::Error::other("random temporary suffix unavailable"))?;
+        let mut suffix = String::with_capacity(nonce.len().saturating_mul(2));
+        for byte in nonce {
+            use core::fmt::Write as _;
+            let _ = write!(suffix, "{byte:02x}");
+        }
+        Ok(suffix)
+    })
+}
+
+fn write_atomically_with_suffix(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    mut next_suffix: impl FnMut(usize) -> std::io::Result<String>,
+) -> std::io::Result<()> {
+    let Some(base_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target path has no UTF-8 file name",
+        ));
+    };
+    let nofollow_flag = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+        .map_err(|_| std::io::Error::other("O_NOFOLLOW flag exceeds i32"))?;
+    let pid = std::process::id();
+
+    let mut opened: Option<(PathBuf, File)> = None;
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let suffix = next_suffix(attempt)?;
+        let candidate =
+            path.with_file_name(format!(".{base_name}.{TEMPORARY_EXTENSION}.{pid}.{suffix}"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(nofollow_flag)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    || error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let Some((temporary, mut file)) = opened else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "exhausted temporary file creation attempts",
+        ));
+    };
+
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Writes `blob`, the stored form of `pair_id`'s record, as its file,
 /// atomically.
 ///
@@ -228,23 +316,7 @@ fn write_record(directory: &Path, record: &PairingRecord) -> Result<(), StoreErr
 /// [`StoreError::WriteRefused`] when the file cannot be written.
 fn write_blob(directory: &Path, pair_id: PairId, blob: &[u8]) -> Result<(), StoreError> {
     let path = path_for(directory, pair_id);
-    let temporary = path.with_extension(TEMPORARY_EXTENSION);
-    let written = (|| {
-        let mut file: File = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(FILE_MODE)
-            .open(&temporary)?;
-        file.write_all(blob)?;
-        file.sync_all()?;
-        fs::rename(&temporary, &path)
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
-        return Err(StoreError::WriteRefused);
-    }
-    Ok(())
+    write_atomically(&path, blob, FILE_MODE).map_err(|_| StoreError::WriteRefused)
 }
 
 /// Rewrites `record`'s file at this build's revision, which holds no
@@ -681,12 +753,13 @@ mod tests {
 
     #[test]
     fn an_idle_sweep_the_disk_refused_is_repeated_by_the_next() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
         let mut store = FilePairingStore::open(&directory).unwrap();
         store.insert(record(pair_id)).unwrap();
-        let blocked = path_for(&directory, pair_id).with_extension(TEMPORARY_EXTENSION);
-        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
         // A sweep that changes nothing writes nothing.
         assert_eq!(
             store.sweep(pair_id, CREATED_AT_MS, false),
@@ -705,7 +778,7 @@ mod tests {
             disk.get(pair_id).unwrap().state(),
             PairingState::PairedDisconnected
         );
-        std::fs::remove_dir(&blocked).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
             store.sweep(pair_id, IDLE_LIMIT_AT_MS, false),
             Ok(SweepOutcome::Expired)
@@ -835,20 +908,69 @@ mod tests {
 
     #[test]
     fn a_refused_rewrite_keeps_no_certificate_in_memory_and_the_next_load_makes_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
         write_certificate_revision(&directory, pair_id);
-        let blocked = path_for(&directory, pair_id).with_extension(TEMPORARY_EXTENSION);
-        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
         let store = FilePairingStore::open_without_sweep(&directory).unwrap();
         assert_eq!(revision_of(&directory, pair_id), CERTIFICATE_REVISION);
         assert_eq!(
             store.get(pair_id).unwrap().state(),
             PairingState::PairedDisconnected
         );
-        std::fs::remove_dir(&blocked).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         drop(FilePairingStore::open_without_sweep(&directory).unwrap());
         assert!(!any_file_holds(&directory, CERTIFICATE));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn write_blob_does_not_follow_or_truncate_a_planted_tmp_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = scratch();
+        std::fs::create_dir_all(&directory).unwrap();
+        let pair_id = PairId::from_array(FIRST);
+        let victim = directory.join("victim.txt");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let planted = path_for(&directory, pair_id).with_extension(TEMPORARY_EXTENSION);
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let mut store = FilePairingStore::open(&directory).unwrap();
+        store.insert(record(pair_id)).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(&planted).is_ok());
+        let mode = std::fs::metadata(path_for(&directory, pair_id))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn write_atomically_refuses_exact_candidate_symlink_and_retries() {
+        let directory = scratch();
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("record.json");
+        let victim = directory.join("victim.txt");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let pid = std::process::id();
+        let exact_candidate = directory.join(format!(".record.json.{TEMPORARY_EXTENSION}.{pid}.0"));
+        std::os::unix::fs::symlink(&victim, &exact_candidate).unwrap();
+
+        super::write_atomically_with_suffix(&target, b"fresh", FILE_MODE, |attempt| {
+            Ok(attempt.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(&exact_candidate).is_ok());
+        assert_eq!(std::fs::read(&target).unwrap(), b"fresh");
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -895,12 +1017,13 @@ mod tests {
 
     #[test]
     fn a_refused_write_leaves_what_the_disk_holds() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let directory = scratch();
         let pair_id = PairId::from_array(FIRST);
         let mut store = FilePairingStore::open(&directory).unwrap();
         store.insert(record(pair_id)).unwrap();
-        let blocked = path_for(&directory, pair_id).with_extension(TEMPORARY_EXTENSION);
-        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
         assert_eq!(
             store.update(pair_id, &mut |entry| Some(entry.forgotten(FORGOTTEN_AT_MS))),
             Err(StoreError::WriteRefused)
@@ -909,6 +1032,7 @@ mod tests {
             store.get(pair_id).unwrap().state(),
             PairingState::PairedDisconnected
         );
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }
