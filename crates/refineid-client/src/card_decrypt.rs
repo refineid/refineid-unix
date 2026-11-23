@@ -196,6 +196,9 @@ fn auth_to_decrypt<E: fmt::Display>(e: AuthError<E>) -> DecryptAuthError {
     match e {
         AuthError::Transport(t) => DecryptAuthError::Transport(format!("{t}")),
         AuthError::PinPolicy(r) => DecryptAuthError::PinPolicy(r),
+        AuthError::UnsupportedSlot { scheme, slot } => {
+            DecryptAuthError::Transport(format!("{slot:?} is not supported under {scheme:?}"))
+        }
     }
 }
 
@@ -218,7 +221,12 @@ fn pin1_gate<T: CardTransport>(transport: &mut T) -> Result<(), DecryptAuthError
     let status = transport
         .pin_status(PinSlot::Pin1)
         .map_err(auth_to_decrypt)?;
-    check_retry_floor(PinSlot::Pin1, status).map_err(DecryptAuthError::RetryFloor)
+    check_retry_floor(
+        PinSlot::Pin1,
+        status,
+        refineid_lib_core::auth::PinReferenceScheme::Citizen,
+    )
+    .map_err(DecryptAuthError::RetryFloor)
 }
 
 /// Decrypt `options.input` against the first reader with a card.

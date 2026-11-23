@@ -78,12 +78,53 @@ pub const KEY_REF_SIGN: u8 = 0x02;
 /// answers `6A88`.
 pub const ORG_QUALIFIED_KEY_REF: u8 = 0x82;
 
+/// Credential numbering families that support qualified signing in
+/// `refineid-lib-core`.
+///
+/// Estonian eID qualified signing lives in the separate QSCD
+/// application with a card-specific EF.PrKDF key reference and a
+/// first-use PIN2 guard, so [`PinReferenceScheme::Estonian`] cannot be
+/// converted into this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QualifiedSignScheme {
+    /// FINEID S1 citizen card (`KEY_REF_SIGN`).
+    Citizen,
+    /// FINEID S4 organizational card (`ORG_QUALIFIED_KEY_REF` in DF.ESIGN).
+    Organizational,
+}
+
+/// Refusal when a card family has no supported qualified signing path
+/// in `refineid-lib-core`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedQualifiedScheme(pub PinReferenceScheme);
+
+impl core::fmt::Display for UnsupportedQualifiedScheme {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "qualified signing is not supported under {:?}", self.0)
+    }
+}
+
+impl core::error::Error for UnsupportedQualifiedScheme {}
+
+impl TryFrom<PinReferenceScheme> for QualifiedSignScheme {
+    type Error = UnsupportedQualifiedScheme;
+
+    fn try_from(scheme: PinReferenceScheme) -> Result<Self, Self::Error> {
+        match scheme {
+            PinReferenceScheme::Citizen => Ok(Self::Citizen),
+            PinReferenceScheme::Organizational => Ok(Self::Organizational),
+            PinReferenceScheme::Estonian => Err(UnsupportedQualifiedScheme(scheme)),
+        }
+    }
+}
+
 /// Private-key reference, typed at the sign-API boundary.
 ///
 /// The card publishes two private keys: authentication and qualified
 /// signature. `KeyRef` captures the dispatch at the type level so the
-/// sign / decrypt chain refuses arbitrary `u8` values. The qualified
-/// key carries the card's credential numbering, which decides both
+/// sign / decrypt chain refuses arbitrary `u8` values and refuses
+/// unsupported qualified-signing families at compile time. The
+/// qualified key carries a [`QualifiedSignScheme`], which decides both
 /// its reference byte and the shape of its signing chain; the runtime
 /// byte is emitted at the MSE:Set DST/CT APDU build site via
 /// [`KeyRef::as_u8`].
@@ -91,11 +132,11 @@ pub const ORG_QUALIFIED_KEY_REF: u8 = 0x82;
 pub enum KeyRef {
     /// Authentication key, PIN1-gated. Wire byte `0x01`.
     Auth,
-    /// Qualified-signature key, PIN2-gated, under the card's
-    /// numbering: [`KEY_REF_SIGN`] on citizen and Estonian eID cards
+    /// Qualified-signature key, PIN2-gated, under a supported
+    /// qualified-signing family: [`KEY_REF_SIGN`] on citizen cards
     /// (FINEID S1 v4.2 §3.5), [`ORG_QUALIFIED_KEY_REF`] in DF.ESIGN
     /// on organization cards.
-    Sign(PinReferenceScheme),
+    Sign(QualifiedSignScheme),
 }
 
 impl KeyRef {
@@ -104,8 +145,8 @@ impl KeyRef {
     pub const fn as_u8(self) -> u8 {
         match self {
             Self::Auth => KEY_REF_AUTH,
-            Self::Sign(PinReferenceScheme::Citizen | PinReferenceScheme::Estonian) => KEY_REF_SIGN,
-            Self::Sign(PinReferenceScheme::Organizational) => ORG_QUALIFIED_KEY_REF,
+            Self::Sign(QualifiedSignScheme::Citizen) => KEY_REF_SIGN,
+            Self::Sign(QualifiedSignScheme::Organizational) => ORG_QUALIFIED_KEY_REF,
         }
     }
 
@@ -114,7 +155,7 @@ impl KeyRef {
     /// qualified key (organizational cards specification §6.6.2.3).
     #[must_use]
     pub const fn signs_digest_inline(self) -> bool {
-        matches!(self, Self::Sign(PinReferenceScheme::Organizational))
+        matches!(self, Self::Sign(QualifiedSignScheme::Organizational))
     }
 }
 
@@ -862,16 +903,16 @@ pub trait SignOps: CardTransport {
     }
 
     /// Qualified-signature-slot convenience wrapper for
-    /// [`SignOps::sign_pre_hashed_sha256_rsa`] under the card's
-    /// numbering. **Caller must have verified PIN2** in this
-    /// session, and nothing may SELECT between that VERIFY and this
+    /// [`SignOps::sign_pre_hashed_sha256_rsa`] under a supported
+    /// qualified-signing family. **Caller must have verified PIN2** in
+    /// this session, and nothing may SELECT between that VERIFY and this
     /// call.
     ///
     /// # Errors
     /// See [`SignOps::sign_pre_hashed_sha256_rsa`].
     fn sign_pre_hashed_sha256_rsa_qualified(
         &mut self,
-        scheme: PinReferenceScheme,
+        scheme: QualifiedSignScheme,
         hash: Sha256,
     ) -> Result<Signature<RsaPkcs1Sha256>, SignError<TxError<Self>>>
     where
@@ -1476,7 +1517,7 @@ mod tests {
             (
                 expected_mse_set_ct(
                     commands::DecipherAlgRef::RsassaPkcs1V1_5,
-                    KeyRef::Sign(PinReferenceScheme::Citizen),
+                    KeyRef::Sign(QualifiedSignScheme::Citizen),
                 ),
                 ok(&[]),
             ),
@@ -1487,7 +1528,7 @@ mod tests {
             ),
         ]);
         let out = tx
-            .decrypt_rsa_pkcs1(KeyRef::Sign(PinReferenceScheme::Citizen), ct)
+            .decrypt_rsa_pkcs1(KeyRef::Sign(QualifiedSignScheme::Citizen), ct)
             .expect("ok");
         assert_eq!(out.as_bytes(), plaintext.as_slice());
     }
@@ -1500,7 +1541,7 @@ mod tests {
             (
                 expected_mse_set_dst(
                     SignatureAlgRef::SHA256_RSA_PKCS1_V1_5,
-                    KeyRef::Sign(PinReferenceScheme::Citizen),
+                    KeyRef::Sign(QualifiedSignScheme::Citizen),
                 ),
                 ok(&[]),
             ),
@@ -1514,7 +1555,7 @@ mod tests {
             ),
         ]);
         let out = tx
-            .sign_pre_hashed_sha256_rsa_qualified(PinReferenceScheme::Citizen, hash)
+            .sign_pre_hashed_sha256_rsa_qualified(QualifiedSignScheme::Citizen, hash)
             .expect("ok");
         assert_eq!(out.as_bytes(), sig.as_slice());
     }
@@ -1552,13 +1593,23 @@ mod tests {
         hash: Sha256,
     ) -> Signature<RsaPkcs1Sha256> {
         use crate::auth::PinOps as _;
+        let qualified =
+            QualifiedSignScheme::try_from(scheme).expect("supported qualified signing scheme");
         let pin = crate::pin::PinBytes::try_from(*TEST_PIN2).expect("valid test PIN");
         let outcome = tx
             .verify_pin_with_scheme(crate::auth::PinSlot::Pin2, scheme, pin)
             .expect("VERIFY PIN2");
         assert_eq!(outcome, crate::auth::VerifyOutcome::Ok);
-        tx.sign_pre_hashed_sha256_rsa(KeyRef::Sign(scheme), hash)
+        tx.sign_pre_hashed_sha256_rsa(KeyRef::Sign(qualified), hash)
             .expect("qualified signature")
+    }
+
+    #[test]
+    fn estonian_scheme_cannot_become_a_qualified_signing_key() {
+        assert_eq!(
+            QualifiedSignScheme::try_from(PinReferenceScheme::Estonian),
+            Err(UnsupportedQualifiedScheme(PinReferenceScheme::Estonian))
+        );
     }
 
     #[test]
@@ -1568,6 +1619,7 @@ mod tests {
         // one PSO:CDS carrying the digest.
         use crate::pkcs15::esign_wire;
         let scheme = PinReferenceScheme::Organizational;
+        let qualified = QualifiedSignScheme::Organizational;
         let hash = placeholder_sha256_digest();
         let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
         let mut tx = Scripted::new(vec![
@@ -1575,7 +1627,10 @@ mod tests {
             (esign_wire::select_esign_by_name().into_bytes(), ok(&[])),
             (expected_verify_pin2(scheme).into_bytes(), ok(&[])),
             (
-                expected_mse_set_dst(SignatureAlgRef::SHA256_RSA_PKCS1_V1_5, KeyRef::Sign(scheme)),
+                expected_mse_set_dst(
+                    SignatureAlgRef::SHA256_RSA_PKCS1_V1_5,
+                    KeyRef::Sign(qualified),
+                ),
                 ok(&[]),
             ),
             (
@@ -1590,7 +1645,7 @@ mod tests {
         let out = verify_and_sign_qualified(&mut tx, scheme, hash);
         assert_eq!(out.as_bytes(), sig.as_slice());
         assert!(tx.steps.is_empty(), "every scripted APDU was sent");
-        assert_eq!(KeyRef::Sign(scheme).as_u8(), ORG_QUALIFIED_KEY_REF);
+        assert_eq!(KeyRef::Sign(qualified).as_u8(), ORG_QUALIFIED_KEY_REF);
     }
 
     #[test]
@@ -1598,12 +1653,16 @@ mod tests {
         // VERIFY PIN2 (S1 numbering) -> MSE:Set DST key 02 ->
         // PSO:HASH -> empty PSO:CDS; no SELECT.
         let scheme = PinReferenceScheme::Citizen;
+        let qualified = QualifiedSignScheme::Citizen;
         let hash = placeholder_sha256_digest();
         let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
         let mut tx = Scripted::new(vec![
             (expected_verify_pin2(scheme).into_bytes(), ok(&[])),
             (
-                expected_mse_set_dst(SignatureAlgRef::SHA256_RSA_PKCS1_V1_5, KeyRef::Sign(scheme)),
+                expected_mse_set_dst(
+                    SignatureAlgRef::SHA256_RSA_PKCS1_V1_5,
+                    KeyRef::Sign(qualified),
+                ),
                 ok(&[]),
             ),
             (
@@ -1618,17 +1677,17 @@ mod tests {
         let out = verify_and_sign_qualified(&mut tx, scheme, hash);
         assert_eq!(out.as_bytes(), sig.as_slice());
         assert!(tx.steps.is_empty(), "every scripted APDU was sent");
-        assert_eq!(KeyRef::Sign(scheme).as_u8(), KEY_REF_SIGN);
+        assert_eq!(KeyRef::Sign(qualified).as_u8(), KEY_REF_SIGN);
     }
 
     #[test]
     fn organizational_qualified_ecdsa_carries_the_digest_inline() {
-        let scheme = PinReferenceScheme::Organizational;
+        let qualified = QualifiedSignScheme::Organizational;
         let hash = placeholder_sha384_digest();
         let sig = placeholder_sig_bytes(ECDSA_P384_SIG_BYTES);
         let mut tx = Scripted::new(vec![
             (
-                expected_mse_set_dst(SignatureAlgRef::SHA384_ECDSA, KeyRef::Sign(scheme)),
+                expected_mse_set_dst(SignatureAlgRef::SHA384_ECDSA, KeyRef::Sign(qualified)),
                 ok(&[]),
             ),
             (
@@ -1641,7 +1700,7 @@ mod tests {
             ),
         ]);
         let out = tx
-            .sign_pre_hashed_sha384_ecdsa_p384(KeyRef::Sign(scheme), hash)
+            .sign_pre_hashed_sha384_ecdsa_p384(KeyRef::Sign(qualified), hash)
             .expect("ok");
         assert_eq!(out.as_bytes(), sig.as_slice());
     }

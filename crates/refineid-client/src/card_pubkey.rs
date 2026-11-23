@@ -389,12 +389,19 @@ fn pubkey_one(
         .select_pkcs15_application()
         .map_err(|e| PubkeyError::Pkcs15Select(format!("{e}")))?;
 
-    let cert_der = transport
-        .read_certificate(options.slot.cert_slot())
-        .map_err(|e| PubkeyError::CertUnavailable {
-            slot: options.slot,
-            detail: format!("read: {e}"),
-        })?;
+    let cert_der = match options.slot {
+        PubkeySlot::Auth => transport
+            .read_certificate(CertSlot::Authentication)
+            .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
+            .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt)),
+        PubkeySlot::Qualified => transport
+            .read_certificate(CertSlot::Signature)
+            .or_else(|_| transport.read_certificate(CertSlot::SignatureAlt)),
+    }
+    .map_err(|e| PubkeyError::CertUnavailable {
+        slot: options.slot,
+        detail: format!("read: {e}"),
+    })?;
     let cert_owned =
         OwnedCert::from_der(cert_der.as_bytes()).map_err(|e| PubkeyError::CertUnavailable {
             slot: options.slot,

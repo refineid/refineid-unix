@@ -50,7 +50,7 @@ use refineid_lib_core::pace;
 use refineid_lib_core::pkcs15::Pkcs15Ops as _;
 use refineid_lib_core::pkcs15::{CertSlot, Pkcs15Error};
 use refineid_lib_core::secure_messaging::SmTransport;
-use refineid_lib_core::sign::{KeyRef, SignError, SignOps as _};
+use refineid_lib_core::sign::{KeyRef, QualifiedSignScheme, SignError, SignOps as _};
 use refineid_lib_core::transport::CardTransport;
 use refineid_lib_core::x509::{
     Certificate, EcCurve, OwnedCert, PublicKeyAlgorithm, extract_rsa_public_key,
@@ -76,17 +76,14 @@ pub enum SignSlot {
 
 impl SignSlot {
     /// PKCS#15 key reference for this signing slot under the
-    /// card's numbering.
-    ///
-    /// FINEID S1 v4.2 §3.5 -- auth key uses `KeyRef::Auth`
-    /// (ref `0x01`), qualified-signature key uses
-    /// `KeyRef::Sign` (ref `0x02`, or the DF.ESIGN-local
-    /// reference on an organization card). Used as the
-    /// `MSE:SET DST` data byte.
-    const fn key_ref(self, scheme: PinReferenceScheme) -> KeyRef {
+    /// card's numbering, failing closed when `scheme` has no
+    /// supported qualified-signing path here.
+    fn key_ref(self, scheme: PinReferenceScheme) -> Result<KeyRef, SignErrorKind> {
         match self {
-            Self::Auth => KeyRef::Auth,
-            Self::Qualified => KeyRef::Sign(scheme),
+            Self::Auth => Ok(KeyRef::Auth),
+            Self::Qualified => QualifiedSignScheme::try_from(scheme)
+                .map(KeyRef::Sign)
+                .map_err(|error| SignErrorKind::Transport(format!("{error}"))),
         }
     }
     /// PIN slot that gates use of this signing key.
@@ -496,12 +493,12 @@ fn sign_dispatch_by_alg<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
     scheme: PinReferenceScheme,
+    key_ref: KeyRef,
     cert: &Certificate<'_>,
-    cert_algorithm: PublicKeyAlgorithm,
     input_bytes: &[u8],
     input_sha256: Sha256,
 ) -> Result<(Vec<u8>, LocalVerifyOutcome), SignErrorKind> {
-    match cert_algorithm {
+    match cert.spki.algorithm() {
         PublicKeyAlgorithm::Rsa { .. } => {
             let pubkey = extract_rsa_public_key(cert.spki.as_der())
                 .ok_or(SignErrorKind::UnsupportedKeyType(slot))?;
@@ -511,10 +508,10 @@ fn sign_dispatch_by_alg<T: CardTransport>(
             // §6.6.2.3).
             let signature = match scheme {
                 PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => transport
-                    .sign_pre_hashed_sha256_rsa(slot.key_ref(scheme), input_sha256)
+                    .sign_pre_hashed_sha256_rsa(key_ref, input_sha256)
                     .map_err(sign_err_to_kind)?,
                 PinReferenceScheme::Organizational => transport
-                    .sign_pre_hashed_sha256_rsa_hash_in_command(slot.key_ref(scheme), input_sha256)
+                    .sign_pre_hashed_sha256_rsa_hash_in_command(key_ref, input_sha256)
                     .map_err(sign_err_to_kind)?,
             };
             let verify = match pubkey.verify_pkcs1v15_sha256(input_bytes, &signature) {
@@ -528,7 +525,7 @@ fn sign_dispatch_by_alg<T: CardTransport>(
         PublicKeyAlgorithm::Ec(EcCurve::Secp384r1) => {
             let hash_sha384 = Sha384::of(input_bytes);
             let signature = transport
-                .sign_pre_hashed_sha384_ecdsa_p384(slot.key_ref(scheme), hash_sha384)
+                .sign_pre_hashed_sha384_ecdsa_p384(key_ref, hash_sha384)
                 .map_err(sign_err_to_kind)?;
             let pubkey =
                 cert.spki
@@ -727,6 +724,16 @@ struct SignChainOutput {
 /// dispatch with its local verify. Generic over
 /// [`CardTransport`] so the same code runs on the plain contact
 /// channel and inside the PACE [`SmTransport`] on contactless.
+fn auth_err_to_sign_kind<TE: fmt::Display>(slot: SignSlot, error: AuthError<TE>) -> SignErrorKind {
+    match error {
+        AuthError::Transport(t) => SignErrorKind::Transport(format!("{t}")),
+        AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
+        AuthError::UnsupportedSlot { scheme, slot: pin } => {
+            SignErrorKind::Transport(format!("{pin:?} is not supported under {scheme:?}"))
+        }
+    }
+}
+
 fn sign_chain<T: CardTransport>(
     transport: &mut T,
     slot: SignSlot,
@@ -734,20 +741,20 @@ fn sign_chain<T: CardTransport>(
     input_bytes: &[u8],
     input_sha256: Sha256,
 ) -> Result<SignChainOutput, SignErrorKind> {
-    let cert_der = transport
-        .read_certificate(slot.cert_slot())
-        .or_else(|_| {
-            let alt = match slot.cert_slot() {
-                CertSlot::Authentication => CertSlot::AuthenticationAlt,
-                CertSlot::Signature => CertSlot::SignatureAlt,
-                other => other,
-            };
-            transport.read_certificate(alt)
-        })
-        .map_err(|e| SignErrorKind::CertUnavailable {
-            slot,
-            detail: format!("read: {e}"),
-        })?;
+    let cert_der = match slot.cert_slot() {
+        CertSlot::Authentication => transport
+            .read_certificate(CertSlot::Authentication)
+            .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
+            .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt)),
+        CertSlot::Signature => transport
+            .read_certificate(CertSlot::Signature)
+            .or_else(|_| transport.read_certificate(CertSlot::SignatureAlt)),
+        other => transport.read_certificate(other),
+    }
+    .map_err(|e| SignErrorKind::CertUnavailable {
+        slot,
+        detail: format!("read: {e}"),
+    })?;
     let cert_owned =
         OwnedCert::from_der(cert_der.as_bytes()).map_err(|e| SignErrorKind::CertUnavailable {
             slot,
@@ -756,24 +763,18 @@ fn sign_chain<T: CardTransport>(
     // Bind the view once: `view()` re-parses the DER on each call.
     let cert = cert_owned.view();
     let cert_subject_cn = cert.subject.common_name();
-    let cert_algorithm = cert.spki.algorithm();
 
     // The reference numbering is the card's to declare (citizen
-    // S1 v4.2 vs organizational S4-2 v4.0), resolved by
+    // S1 v4.2, organizational S4-2 v4.0, or Estonian eID), resolved by
     // counter-safe probes before the typed PIN is spent.
     let scheme = transport
         .resolve_pin_reference_scheme()
-        .map_err(|e| match e {
-            AuthError::Transport(t) => SignErrorKind::Transport(format!("{t}")),
-            AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
-        })?;
+        .map_err(|e| auth_err_to_sign_kind(slot, e))?;
+    let key_ref = slot.key_ref(scheme)?;
     let status = transport
         .pin_status_with_scheme(slot.pin_slot(), scheme)
-        .map_err(|e| match e {
-            AuthError::Transport(t) => SignErrorKind::Transport(format!("{t}")),
-            AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
-        })?;
-    check_retry_floor(slot.pin_slot(), status).map_err(SignErrorKind::RetryFloor)?;
+        .map_err(|e| auth_err_to_sign_kind(slot, e))?;
+    check_retry_floor(slot.pin_slot(), status, scheme).map_err(SignErrorKind::RetryFloor)?;
     // The prompt is the one moment the card is out of the flow's hands,
     // so the card that answers VERIFY must be the card that was checked.
     let bound = live_token_serial(transport)?;
@@ -785,10 +786,7 @@ fn sign_chain<T: CardTransport>(
     }
     let outcome = transport
         .verify_pin_with_scheme(slot.pin_slot(), scheme, pin)
-        .map_err(|e| match e {
-            AuthError::Transport(t) => SignErrorKind::Transport(format!("{t}")),
-            AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
-        })?;
+        .map_err(|e| auth_err_to_sign_kind(slot, e))?;
     let pin_retries_after = match outcome {
         VerifyOutcome::Ok => None,
         rejected @ (VerifyOutcome::WrongPin { .. }
@@ -810,8 +808,8 @@ fn sign_chain<T: CardTransport>(
         transport,
         slot,
         scheme,
+        key_ref,
         &cert,
-        cert_algorithm,
         input_bytes,
         input_sha256,
     )?;
@@ -819,7 +817,7 @@ fn sign_chain<T: CardTransport>(
     Ok(SignChainOutput {
         cert_der,
         cert_subject_cn,
-        key_ref: slot.key_ref(scheme),
+        key_ref,
         pin_retries_after,
         signature_bytes,
         local_verify,
@@ -951,8 +949,9 @@ mod tests {
         for scheme in [
             PinReferenceScheme::Citizen,
             PinReferenceScheme::Organizational,
+            PinReferenceScheme::Estonian,
         ] {
-            check(&s.key_ref(scheme).as_u8(), &KEY_REF_AUTH, "auth key ref")?;
+            check(&s.key_ref(scheme)?.as_u8(), &KEY_REF_AUTH, "auth key ref")?;
         }
         check_true(matches!(s.pin_slot(), PinSlot::Pin1), "auth pin slot")?;
         check_true(
@@ -967,14 +966,21 @@ mod tests {
     fn qualified_slot_maps_to_pin2_keyref02_ef4332() -> TestResult {
         let s = SignSlot::Qualified;
         check(
-            &s.key_ref(PinReferenceScheme::Citizen).as_u8(),
+            &s.key_ref(PinReferenceScheme::Citizen)?.as_u8(),
             &KEY_REF_SIGN,
             "citizen qualified key ref",
         )?;
         check(
-            &s.key_ref(PinReferenceScheme::Organizational).as_u8(),
+            &s.key_ref(PinReferenceScheme::Organizational)?.as_u8(),
             &ORG_QUALIFIED_KEY_REF,
             "organizational qualified key ref",
+        )?;
+        check_true(
+            matches!(
+                s.key_ref(PinReferenceScheme::Estonian),
+                Err(SignErrorKind::Transport(_))
+            ),
+            "Estonian qualified key fails closed",
         )?;
         check_true(matches!(s.pin_slot(), PinSlot::Pin2), "qualified pin slot")?;
         check_true(
@@ -1319,5 +1325,33 @@ mod tests {
             "flow passed VERIFY",
         )?;
         check(&asked, &1, "prompts")
+    }
+
+    #[test]
+    fn estonian_qualified_signing_fails_closed_before_prompting() -> TestResult {
+        let card = SyntheticCard::estonian(PinReferenceScheme::Estonian.pin_retry_limit())?;
+        let backend = SyntheticBackend::one_reader(true, card.clone());
+        let dir = TempDir::new("estonian-sign-qualified")?;
+        let input = dir.write("message.txt", MESSAGE)?;
+        let (pin, asked) = counting_source();
+        let options = SignOptions {
+            input,
+            output: dir.path().join("signature.bin"),
+            pin,
+            save_cert: None,
+            reader_filter: None,
+            can: None,
+        };
+        let result = sign_with_slot(backend, SignSlot::Qualified, options);
+        check_true(
+            matches!(result, Err(SignErrorKind::Transport(_))),
+            "Estonian qualified signing fails closed",
+        )?;
+        check(&prompts(&asked), &0, "never prompts for PIN2")?;
+        check(
+            &card.credential_or_sign_apdu_count(),
+            &0,
+            "zero credential or signing APDUs sent",
+        )
     }
 }

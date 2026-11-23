@@ -640,9 +640,13 @@ fn read_pkcs15_section<T: refineid_lib_core::transport::CardTransport>(
     let pin1 = transport
         .pin_status_with_scheme(PinSlot::Pin1, pin_reference_scheme)
         .ok();
-    let pin2 = transport
-        .pin_status_with_scheme(PinSlot::Pin2, pin_reference_scheme)
-        .ok();
+    let pin2 = (pin_reference_scheme != PinReferenceScheme::Estonian)
+        .then(|| {
+            transport
+                .pin_status_with_scheme(PinSlot::Pin2, pin_reference_scheme)
+                .ok()
+        })
+        .flatten();
     let puk = (!secure_channel)
         .then(|| transport.puk_status_with_scheme(pin_reference_scheme).ok())
         .flatten();

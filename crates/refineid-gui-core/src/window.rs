@@ -29,17 +29,30 @@ use refineid_lib_core::pin::{ActivationPinEight, ActivationPinSeven};
 
 use crate::model::{CanRequest, CardSource, ReaderPresence, UiState};
 
+/// The credential numbering of the selected card, falling back to the
+/// `organization_card` flag when no card record is attached to `state`.
+fn active_scheme(state: &UiState) -> PinReferenceScheme {
+    state
+        .selected_card
+        .and_then(|index| state.cards.get(index))
+        .map_or_else(
+            || {
+                if state.organization_card {
+                    PinReferenceScheme::Organizational
+                } else {
+                    PinReferenceScheme::Citizen
+                }
+            },
+            |card| card.report.pin_reference_scheme,
+        )
+}
+
 /// The PIN and PUK lengths of the card in use where PINs are set: what
 /// its activation session read, or the FINEID bounds.
 fn card_lengths(state: &UiState) -> CardPinLengths {
-    state.pin_lengths.unwrap_or_else(|| {
-        let numbering = if state.organization_card {
-            PinReferenceScheme::Organizational
-        } else {
-            PinReferenceScheme::Citizen
-        };
-        CardPinLengths::not_listed(numbering.into())
-    })
+    state
+        .pin_lengths
+        .unwrap_or_else(|| CardPinLengths::not_listed(active_scheme(state).into()))
 }
 
 /// The digit counts a credential with `lengths` accepts; `None` when
@@ -438,17 +451,17 @@ fn puk_tries(status: Option<PukStatus>) -> Option<u8> {
 /// Whether a PIN needs a reset: its counter is on the last two tries
 /// or at none. The floor sends a PIN at no tries left to the card, which
 /// refuses it for itself, so only the PUK brings that PIN back.
-fn pin_below_floor(slot: PinSlot, status: Option<PinStatus>) -> bool {
+fn pin_below_floor(slot: PinSlot, status: Option<PinStatus>, scheme: PinReferenceScheme) -> bool {
     pin_tries(status) == Some(NO_TRIES)
         || (pin_tries(status).is_some()
-            && status.is_some_and(|s| check_retry_floor(slot, s).is_err()))
+            && status.is_some_and(|s| check_retry_floor(slot, s, scheme).is_err()))
 }
 
 /// Whether the floor refuses the PUK on a counter it reports: its last
 /// two tries. A PUK at no tries left or blocked is not refused: the
 /// reset goes to the card, which answers for itself.
-fn puk_refused(status: Option<PukStatus>) -> bool {
-    puk_tries(status).is_some() && status.is_some_and(|s| check_puk_retry_floor(s).is_err())
+fn puk_refused(status: Option<PukStatus>, scheme: PinReferenceScheme) -> bool {
+    puk_tries(status).is_some() && status.is_some_and(|s| check_puk_retry_floor(s, scheme).is_err())
 }
 
 /// What a card below the retry floor needs (the Apple app's
@@ -476,13 +489,16 @@ impl Recovery {
         if !state.selected_card_is_local || state.activation_available {
             return None;
         }
+        let scheme = active_scheme(state);
         // A counter that reports no tries (verified, or not reported) is
         // no concern for that credential.
-        if puk_refused(state.puk_status) {
+        if puk_refused(state.puk_status, scheme) {
             Some(Self::UseOtherSoftware)
-        } else if pin_below_floor(PinSlot::Pin1, state.pin1_status) {
+        } else if pin_below_floor(PinSlot::Pin1, state.pin1_status, scheme) {
             Some(Self::ResetPin1)
-        } else if pin_below_floor(PinSlot::Pin2, state.pin2_status) {
+        } else if scheme != PinReferenceScheme::Estonian
+            && pin_below_floor(PinSlot::Pin2, state.pin2_status, scheme)
+        {
             Some(Self::ResetPin2)
         } else {
             None
@@ -643,12 +659,19 @@ impl PinTask {
         if state.busy || !state.selected_card_is_local {
             return false;
         }
+        let scheme = active_scheme(state);
         match self {
             Self::ChangePin1 => state.pin1_change_available,
             Self::ChangePin2 => state.pin2_change_available,
-            Self::ResetPin1 | Self::ResetPin2 => state
+            Self::ResetPin1 => state
                 .puk_status
-                .is_some_and(|status| check_puk_retry_floor(status).is_ok()),
+                .is_some_and(|status| check_puk_retry_floor(status, scheme).is_ok()),
+            Self::ResetPin2 => {
+                scheme != PinReferenceScheme::Estonian
+                    && state
+                        .puk_status
+                        .is_some_and(|status| check_puk_retry_floor(status, scheme).is_ok())
+            }
         }
     }
 
@@ -678,7 +701,8 @@ pub struct AttemptsEntry {
 /// row is not shown while this is empty.
 #[must_use]
 pub fn attempts_below_full(state: &UiState) -> Vec<AttemptsEntry> {
-    let limit = refineid_lib_core::auth::PIN_TRY_LIMIT;
+    let scheme = active_scheme(state);
+    let limit = scheme.pin_retry_limit();
     let pin = |name: &str, slot: PinSlot, status: Option<PinStatus>| {
         let value = match status? {
             PinStatus::Verified => return None,
@@ -690,7 +714,7 @@ pub fn attempts_below_full(state: &UiState) -> Vec<AttemptsEntry> {
         };
         Some(AttemptsEntry {
             text: format!("{name} {value}"),
-            below_floor: pin_below_floor(slot, status),
+            below_floor: pin_below_floor(slot, status, scheme),
         })
     };
     let puk = |status: Option<PukStatus>| {
@@ -704,7 +728,7 @@ pub fn attempts_below_full(state: &UiState) -> Vec<AttemptsEntry> {
         };
         Some(AttemptsEntry {
             text: format!("{PUK} {value}"),
-            below_floor: puk_refused(status)
+            below_floor: puk_refused(status, scheme)
                 || puk_tries(status) == Some(NO_TRIES)
                 || matches!(status, Some(PukStatus::Invalidated)),
         })
@@ -714,7 +738,9 @@ pub fn attempts_below_full(state: &UiState) -> Vec<AttemptsEntry> {
     }
     [
         pin("Basic PIN 1", PinSlot::Pin1, state.pin1_status),
-        pin("Signature PIN 2", PinSlot::Pin2, state.pin2_status),
+        (scheme != PinReferenceScheme::Estonian)
+            .then(|| pin("Signature PIN 2", PinSlot::Pin2, state.pin2_status))
+            .flatten(),
         puk(state.puk_status),
     ]
     .into_iter()
@@ -1118,5 +1144,40 @@ mod tests {
         state.pin2_status = Some(PinStatus::Remaining(retries(5)));
         assert_eq!(Recovery::derive(&state), None);
         assert!(attempts_below_full(&state).is_empty());
+    }
+
+    #[test]
+    fn estonian_card_uses_three_try_limit_and_disables_pin2_tasks() {
+        let mut estonian = card(CardSource::Local);
+        estonian.report.pin_reference_scheme = PinReferenceScheme::Estonian;
+        let limit = PinReferenceScheme::Estonian.pin_retry_limit();
+        let mut state = UiState {
+            cards: vec![estonian],
+            selected_card: Some(0),
+            selected_card_is_local: true,
+            pin1_status: Some(PinStatus::Remaining(retries(limit))),
+            pin2_status: Some(PinStatus::Remaining(retries(1))),
+            puk_status: Some(PukStatus::Remaining(retries(limit))),
+            pin1_change_available: true,
+            pin2_change_available: false,
+            ..UiState::default()
+        };
+        assert!(
+            attempts_below_full(&state).is_empty(),
+            "pristine Estonian 3-try counters are full"
+        );
+        assert!(PinTask::ResetPin1.available(&state));
+        assert!(!PinTask::ResetPin2.available(&state));
+        assert_eq!(Recovery::derive(&state), None);
+
+        state.pin1_status = Some(PinStatus::Remaining(retries(limit - 1)));
+        assert_eq!(Recovery::derive(&state), Some(Recovery::ResetPin1));
+        assert_eq!(
+            attempts_below_full(&state),
+            vec![AttemptsEntry {
+                text: format!("Basic PIN 1 {}/{limit}", limit - 1),
+                below_floor: true,
+            }]
+        );
     }
 }

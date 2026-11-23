@@ -33,7 +33,7 @@ use refineid_lib_core::crypto::digest::{Sha256, Sha384, Sha512};
 use refineid_lib_core::identity::{TokenSerial, render_token_serial};
 use refineid_lib_core::pin::PinBytes;
 use refineid_lib_core::pkcs15::{CertSlot, Pkcs15Ops as _};
-use refineid_lib_core::sign::{KeyRef, SignError, SignOps as _};
+use refineid_lib_core::sign::{KeyRef, QualifiedSignScheme, SignError, SignOps as _};
 use refineid_lib_core::transport::CardTransport;
 use refineid_lib_core::x509::{Certificate, EcCurve, OwnedCert, PublicKeyAlgorithm};
 use refineid_scs::{
@@ -327,22 +327,17 @@ fn read_card_leaf<T: CardTransport>(
     transport: &mut T,
     purpose: SignPurpose,
 ) -> Result<Vec<u8>, BackendFailure> {
-    let slot = match purpose {
-        SignPurpose::Authentication => CertSlot::Authentication,
-        SignPurpose::Qualified => CertSlot::Signature,
-    };
-    transport
-        .read_certificate(slot)
-        .or_else(|_| {
-            let alt = match slot {
-                CertSlot::Authentication => CertSlot::AuthenticationAlt,
-                CertSlot::Signature => CertSlot::SignatureAlt,
-                other => other,
-            };
-            transport.read_certificate(alt)
-        })
-        .map(|cert| cert.as_bytes().to_vec())
-        .map_err(|_| BackendFailure::SigningUnavailable("card certificate unavailable".to_owned()))
+    match purpose {
+        SignPurpose::Authentication => transport
+            .read_certificate(CertSlot::Authentication)
+            .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
+            .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt)),
+        SignPurpose::Qualified => transport
+            .read_certificate(CertSlot::Signature)
+            .or_else(|_| transport.read_certificate(CertSlot::SignatureAlt)),
+    }
+    .map(|cert| cert.as_bytes().to_vec())
+    .map_err(|_| BackendFailure::SigningUnavailable("card certificate unavailable".to_owned()))
 }
 
 impl<B> SigningBackend for ScsBackend<B>
@@ -405,6 +400,16 @@ where
         let scheme = transport
             .resolve_pin_reference_scheme()
             .map_err(|_| BackendFailure::SigningUnavailable("sign chain failed".to_owned()))?;
+        let key_ref = match request.purpose {
+            SignPurpose::Authentication => KeyRef::Auth,
+            SignPurpose::Qualified => QualifiedSignScheme::try_from(scheme)
+                .map(KeyRef::Sign)
+                .map_err(|_| {
+                    BackendFailure::SigningUnavailable(
+                        "qualified signing is not supported for this card".to_owned(),
+                    )
+                })?,
+        };
         if request.purpose == SignPurpose::Qualified
             && scheme == PinReferenceScheme::Organizational
             && !transport
@@ -422,7 +427,7 @@ where
         let status = transport
             .pin_status_with_scheme(slot, scheme)
             .map_err(|_| BackendFailure::SigningUnavailable("sign chain failed".to_owned()))?;
-        if check_retry_floor(slot, status).is_err() {
+        if check_retry_floor(slot, status, scheme).is_err() {
             return Err(BackendFailure::CredentialRefused(
                 "credential retry state refuses the sign".to_owned(),
             ));
@@ -467,7 +472,7 @@ where
             BackendFailure::SigningUnavailable("card certificate unavailable".to_owned())
         })?;
         let cert = owned.view();
-        sign_with_cert(&mut transport, request, &cert, scheme, &planned)
+        sign_with_cert(&mut transport, request, key_ref, &cert, scheme, &planned)
     }
 }
 
@@ -578,14 +583,11 @@ fn live_token_serial<T: CardTransport>(
 fn sign_with_cert<T: CardTransport>(
     transport: &mut T,
     request: SignRequest,
+    key_ref: KeyRef,
     cert: &Certificate<'_>,
     scheme: PinReferenceScheme,
     planned: &PlannedHash,
 ) -> Result<Vec<u8>, BackendFailure> {
-    let key_ref = match request.purpose {
-        SignPurpose::Authentication => KeyRef::Auth,
-        SignPurpose::Qualified => KeyRef::Sign(scheme),
-    };
     match cert.spki.algorithm() {
         PublicKeyAlgorithm::Rsa { .. } => {
             sign_rsa(transport, request, key_ref, scheme, planned, cert)
@@ -1177,5 +1179,28 @@ mod tests {
             "constant PIN rejected string",
         )?;
         check(&prompts(&calls), &1, "prompts once")
+    }
+
+    #[test]
+    fn estonian_qualified_sign_fails_closed_before_prompting() -> TestResult {
+        let (prompt, calls) = answering_prompt();
+        let card = SyntheticCard::estonian(
+            refineid_lib_core::auth::PinReferenceScheme::Estonian.pin_retry_limit(),
+        )?;
+        let backend =
+            ScsBackend::with_prompt(SyntheticBackend::one_reader(true, card.clone()), prompt);
+        let mut req = request();
+        req.purpose = SignPurpose::Qualified;
+        let outcome = SigningBackend::sign(&backend, req);
+        check_true(
+            matches!(outcome, Err(BackendFailure::SigningUnavailable(_))),
+            "Estonian qualified sign refused",
+        )?;
+        check(&prompts(&calls), &0, "never prompts for PIN2")?;
+        check(
+            &card.credential_or_sign_apdu_count(),
+            &0,
+            "zero credential or signing APDUs sent",
+        )
     }
 }

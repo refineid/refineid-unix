@@ -503,10 +503,13 @@ impl RefineIdController {
                 .as_ref()
                 .filter(|_| is_local)
                 .map(|ctx| ctx.lengths);
-            // A card here signs whatever its activation scheme; the
-            // phone's card signs when the pairing grants it.
+            // A FINEID card here signs whatever its activation scheme;
+            // Estonian eID qualified signing lives in QSCD and is
+            // refused until QSCD support lands. The phone's card signs
+            // when the pairing grants it.
             state.signature_supported = if is_local {
-                true
+                card.report.pin_reference_scheme
+                    != refineid_lib_core::auth::PinReferenceScheme::Estonian
             } else {
                 state
                     .phone
