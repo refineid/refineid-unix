@@ -12,7 +12,7 @@ publish = false
 workspace = true
 
 [dependencies]
-refineid-gui-core = { path = "../refineid-gui-core", version = "26" }
+refineid-gui-core.workspace = true
 refineid-lib-core.workspace = true
 refineid-rapp-core.workspace = true
 
