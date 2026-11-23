@@ -13,6 +13,7 @@ members = [
     "crates/refineid-pkcs11",
     "crates/refineid-pkcs11-local",
     "crates/refineid-rapp-core",
+    "tools/xtask",
 ]
 
 [workspace.package]
@@ -41,6 +42,7 @@ refineid-dev-errors = { path = "crates/refineid-dev-errors", version = "26" }
 
 refineid-apdu = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-auth = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
+refineid-build-number = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pkcs15 = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-rapp = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pcsc = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
@@ -126,6 +128,13 @@ p256 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa
 # PKCS#8 key encoding for the SCS identity: the traits behind the
 # P-256 key's storage form.
 pkcs8 = { version = "0.11", features = ["alloc"] }
+
+# Policy checks (tools/xtask).
+proc-macro2 = { version = "1", features = ["span-locations"] }
+rustc_lexer = "0.1"
+serde_json = "1"
+syn = { version = "2", features = ["full", "visit"] }
+walkdir = "2"
 
 [workspace.lints.cargo]
 unused_dependencies = "deny"

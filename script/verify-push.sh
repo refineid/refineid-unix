@@ -15,6 +15,15 @@ fi
 echo "== verify-push: format check =="
 cargo fmt --all --check
 
+echo "== verify-push: magic-number policy =="
+if [ -n "${REFINEID_MAGIC_DIFF_BASE:-}" ]; then
+    cargo run -q -p xtask -- check-magic-numbers --diff-base "$REFINEID_MAGIC_DIFF_BASE"
+elif git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+    cargo run -q -p xtask -- check-magic-numbers --diff-base origin/main
+else
+    cargo run -q -p xtask -- check-magic-numbers
+fi
+
 RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-D warnings"
 RUSTDOCFLAGS="${RUSTDOCFLAGS:+${RUSTDOCFLAGS} }-D warnings"
 export RUSTFLAGS RUSTDOCFLAGS

@@ -36,6 +36,9 @@ refineid-apdu.workspace = true
 refineid-auth.workspace = true
 refineid-pkcs15.workspace = true
 
+[build-dependencies]
+refineid-build-number.workspace = true
+
 [dev-dependencies]
 hex.workspace = true
 proptest.workspace = true

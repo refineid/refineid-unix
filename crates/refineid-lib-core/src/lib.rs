@@ -109,6 +109,3 @@ pub use error::IoError;
 /// and the build number `B`, the UTC time of day of the build as
 /// hour * 100 + minute, as build.rs assembles them.
 pub const VERSION: &str = env!("REFINEID_VERSION");
-
-#[cfg(test)]
-mod build_number;

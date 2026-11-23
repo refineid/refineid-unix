@@ -21,7 +21,7 @@ use std::env;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-include!("src/build_number.rs");
+use refineid_build_number::{build_number, is_build_number};
 
 const BUILD_NUMBER_ENV: &str = "REFINEID_BUILD_NUMBER";
 const BUILD_MARK_ENV: &str = "REFINEID_BUILD_MARK";
@@ -31,6 +31,20 @@ const VERSION_ENV: &str = "REFINEID_VERSION";
 /// build while a `rerun-if-changed` path is missing, so the build
 /// number is the time of the latest build.
 const ALWAYS_RERUN: &str = "refineid-build-number-always-rerun";
+
+/// Whether `text` is a build mark: one or more lowercase ASCII letters a-z.
+fn is_build_mark(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_lowercase())
+}
+
+/// Assemble the project version from the workspace version `day`, an optional
+/// build mark `mark`, and the build number `number`.
+fn project_version(day: &str, mark: Option<&str>, number: &str) -> String {
+    match mark {
+        Some(mark) => format!("{day}~{mark}{number}"),
+        None => format!("{day}.{number}"),
+    }
+}
 
 fn main() -> ExitCode {
     println!("cargo:rerun-if-changed={ALWAYS_RERUN}");
