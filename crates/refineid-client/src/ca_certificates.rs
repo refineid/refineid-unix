@@ -224,7 +224,7 @@ fn directory_from(variable: impl Fn(&str) -> Option<std::ffi::OsString>) -> Opti
 
 /// Whether this process runs as root or with an effective user or
 /// group other than its real one.
-fn process_is_privileged() -> bool {
+pub(crate) fn process_is_privileged() -> bool {
     use rustix::process::{getegid, geteuid, getgid, getuid};
     geteuid().is_root() || geteuid() != getuid() || getegid() != getgid()
 }
