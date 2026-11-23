@@ -13,5 +13,8 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 cargo fmt --all --check
+RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-D warnings"
+export RUSTFLAGS
 cargo check --workspace --all-targets
+cargo run -q -p xtask -- check-magic-numbers --staged
 echo "pre-commit quality gates passed."

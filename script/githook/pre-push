@@ -34,19 +34,29 @@ if [ ! -s "$updates" ]; then
     exit $?
 fi
 
-while read -r _local_ref local_sha _remote_ref _remote_sha; do
+while read -r _local_ref local_sha _remote_ref remote_sha; do
     if [ "$local_sha" = "$zero" ]; then
         continue
     fi
+    diff_base=""
+    if [ "$remote_sha" != "$zero" ] && git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+        diff_base="$remote_sha"
+    elif git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+        diff_base="origin/main"
+    fi
     if [ "$local_sha" = "$head" ] && git diff --quiet && git diff --cached --quiet; then
-        "$root/script/verify-push.sh"
+        REFINEID_MAGIC_DIFF_BASE="$diff_base" "$root/script/verify-push.sh"
         continue
     fi
     tmp=$(mktemp -d "$worktrees/refineid-unix-push.XXXXXX")
     git worktree add --detach --quiet "$tmp" "$local_sha"
     trap 'git worktree remove --force "$tmp"; rm -f "$updates"' EXIT INT TERM
     echo "pre-push: verifying $(git rev-parse --short "$local_sha") in a clean worktree"
-    (cd "$tmp" && CARGO_TARGET_DIR="$root/target/pushed-commit" "$tmp/script/verify-push.sh")
+    (
+        cd "$tmp"
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+        REFINEID_MAGIC_DIFF_BASE="$diff_base" CARGO_TARGET_DIR="$root/target/pushed-commit" "$tmp/script/verify-push.sh"
+    )
     git worktree remove --force "$tmp"
     trap 'rm -f "$updates"' EXIT INT TERM
 done < "$updates"

@@ -98,10 +98,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "fltk")]
         "fltk" => run_fltk(pair),
         other => {
+            const USAGE_EXIT_CODE: i32 = 2;
             eprintln!(
                 "Unknown or unsupported presentation driver: '{other}' (available: {available_str})"
             );
-            std::process::exit(2);
+            std::process::exit(USAGE_EXIT_CODE);
         }
     };
     refineid_dev_errors::flush!();

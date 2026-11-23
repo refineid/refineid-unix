@@ -45,6 +45,9 @@ mod tests {
     use super::*;
     use refineid_pkcs11::ck::CkFunctionListPtr;
 
+    /// Cryptoki major version required by OASIS PKCS#11 v2.40.
+    const PKCS11_V2_MAJOR: u8 = 2;
+
     #[test]
     fn function_list_resolves_and_has_entry_points() {
         let mut list: CkFunctionListPtr = core::ptr::null_mut();
@@ -52,6 +55,6 @@ mod tests {
         assert_eq!(rv, 0);
         assert!(!list.is_null());
         let functions = unsafe { *list };
-        assert_eq!(functions.version.major, 2);
+        assert_eq!(functions.version.major, PKCS11_V2_MAJOR);
     }
 }

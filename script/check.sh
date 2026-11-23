@@ -33,5 +33,6 @@ run cargo test --workspace
 run cargo test --workspace --examples
 run cargo clippy --workspace --all-targets -- -D warnings
 run cargo fmt --all --check
+run cargo run -q -p xtask -- check-magic-numbers
 
 printf '\nall gates green.\n' >&2
