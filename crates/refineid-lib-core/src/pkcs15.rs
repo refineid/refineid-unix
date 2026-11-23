@@ -72,6 +72,9 @@ const _: () = assert!(
 /// caller parses the cert DER to discover the real key alg.
 /// `EF.4331` authentication certificate file ID.
 pub const EF_AUTH_CERT_FID: [u8; 2] = [0x43, 0x31];
+/// `EF.3411` Estonian eID authentication certificate file ID, direct
+/// child of the PKCS#15 application DF.
+pub const EF_ESTONIAN_AUTH_CERT_FID: [u8; 2] = [0x34, 0x11];
 /// `EF.4332` qualified-signature certificate file ID.
 pub const EF_SIGN_CERT_FID: [u8; 2] = [0x43, 0x32];
 /// `EF.4333` second authentication slot (typically ECC on
@@ -127,6 +130,9 @@ pub enum CertSlot {
     /// Authentication certificate (`EF.4331`) -- TLS client cert,
     /// S/MIME signing, suomi.fi-tunnistus. RSA on current cards.
     Authentication,
+    /// Estonian eID authentication certificate (`EF.3411`). Lives
+    /// directly under the PKCS#15 application DF.
+    EstonianAuthentication,
     /// Qualified-signature certificate (`EF.4332`) -- eIDAS
     /// qualified electronic signatures. RSA on current cards.
     Signature,
@@ -159,6 +165,7 @@ impl CertSlot {
     pub const fn fid(self) -> [u8; 2] {
         match self {
             Self::Authentication => EF_AUTH_CERT_FID,
+            Self::EstonianAuthentication => EF_ESTONIAN_AUTH_CERT_FID,
             Self::Signature => EF_SIGN_CERT_FID,
             Self::AuthenticationAlt => EF_AUTH_CERT_ALT_FID,
             Self::RootCa => EF_ROOT_CA_FID,
@@ -174,6 +181,7 @@ impl CertSlot {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Authentication => "authentication (EF.4331)",
+            Self::EstonianAuthentication => "Estonian authentication (EF.3411)",
             Self::Signature => "qualified signature (EF.4332)",
             Self::AuthenticationAlt => "authentication, alt slot (EF.4333)",
             Self::RootCa => "on-card issuing root CA (EF.4334)",
@@ -193,7 +201,7 @@ impl CertSlot {
     /// `CertSlot::find_in`.
     const fn path(self) -> SlotPath {
         match self {
-            Self::Authentication => SlotPath::UnderPkcs15App,
+            Self::Authentication | Self::EstonianAuthentication => SlotPath::UnderPkcs15App,
             Self::Signature | Self::AuthenticationAlt | Self::SignatureAlt => SlotPath::UnderDf5016,
             Self::RootCa | Self::IssuingCaEcc => SlotPath::UnderMf,
         }
@@ -211,24 +219,26 @@ impl CertSlot {
     /// Measured on a production card over an ACR1581 PICC slot,
     /// 2026-07-24.
     ///
-    /// Only [`CertSlot::Authentication`] stays inside the
-    /// PKCS#15 application and is reachable under SM.
+    /// Only [`CertSlot::Authentication`] and
+    /// [`CertSlot::EstonianAuthentication`] stay inside the
+    /// PKCS#15 application and are reachable under SM.
     #[must_use]
     #[inline]
     pub const fn requires_mf_traversal(self) -> bool {
         !matches!(self.path(), SlotPath::UnderPkcs15App)
     }
 
-    /// All cert slots a FINEID S4-2 card *may* publish, in
-    /// directory order. Callers probe each; absent slots return
-    /// `SW=0x6A82` from the underlying SELECT, which higher
-    /// layers should treat as "not provisioned" rather than an
-    /// error.
+    /// All cert slots a FINEID S4-2 or Estonian eID card *may*
+    /// publish, in directory order. Callers probe each; absent
+    /// slots return `SW=0x6A82` from the underlying SELECT,
+    /// which higher layers should treat as "not provisioned"
+    /// rather than an error.
     #[must_use]
     #[inline]
-    pub const fn all() -> [Self; 6] {
+    pub const fn all() -> [Self; 7] {
         [
             Self::Authentication,
+            Self::EstonianAuthentication,
             Self::Signature,
             Self::AuthenticationAlt,
             Self::RootCa,
@@ -1193,6 +1203,7 @@ where
     // Cert read for human-readable identity. Best effort.
     let (common_name, surname, given_names, peuin, organization) = transport
         .read_certificate(CertSlot::Authentication)
+        .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
         .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt))
         .ok()
         .and_then(|der| {
@@ -1743,6 +1754,38 @@ mod tests {
             .read_certificate(CertSlot::Authentication)
             .expect("reads cert");
         assert_eq!(der.as_bytes(), cert.as_slice());
+    }
+
+    #[test]
+    fn read_estonian_authentication_certificate_selects_ef_3411_under_pkcs15() {
+        let cert = vec![0x30_u8, 0x02, 0x05, 0x00];
+        let mut tx = ScriptedTransport::new(vec![
+            (
+                vec![
+                    0x00, 0xA4, 0x04, 0x0C, 0x0C, 0xA0, 0x00, 0x00, 0x00, 0x63, 0x50, 0x4B, 0x43,
+                    0x53, 0x2D, 0x31, 0x35,
+                ],
+                ok(&[]),
+            ),
+            (
+                vec![
+                    0x00,
+                    0xA4,
+                    0x02,
+                    0x0C,
+                    0x02,
+                    super::EF_ESTONIAN_AUTH_CERT_FID[0],
+                    super::EF_ESTONIAN_AUTH_CERT_FID[1],
+                ],
+                ok(&[]),
+            ),
+            (vec![0x00, 0xB0, 0x00, 0x00, 0x80], ok(&cert)),
+        ]);
+        let der = tx
+            .read_certificate(CertSlot::EstonianAuthentication)
+            .expect("reads Estonian auth cert");
+        assert_eq!(der.as_bytes(), cert.as_slice());
+        assert!(!CertSlot::EstonianAuthentication.requires_mf_traversal());
     }
 
     // ----- contactless (PACE-first) reader pick -----

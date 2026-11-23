@@ -91,9 +91,18 @@ impl ManagedCard {
     }
 
     /// Whether a change with the current PIN passes the retry floor for
-    /// `slot`: five, four or three tries left, or already verified.
+    /// `slot`: within the card profile's safe retry counts, or already
+    /// verified. PIN2 on Estonian eID cards lives in the separate QSCD
+    /// application and is refused here.
     pub fn pin_change_available(&self, slot: PinSlot, status: Option<&PinStatus>) -> bool {
-        status.is_some_and(|&status| check_retry_floor(slot, status).is_ok())
+        let scheme = self.report.pin_reference_scheme;
+        if matches!(
+            (scheme, slot),
+            (PinReferenceScheme::Estonian, PinSlot::Pin2)
+        ) {
+            return false;
+        }
+        status.is_some_and(|&status| check_retry_floor(slot, status, scheme).is_ok())
     }
 
     /// Each PIN's readiness ([`PinReadiness::judge`]), PIN 1 then

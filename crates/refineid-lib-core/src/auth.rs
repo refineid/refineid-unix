@@ -233,6 +233,32 @@ impl PinReferenceScheme {
         }
     }
 
+    /// The pad octet this numbering uses to fill a padded credential
+    /// block, delegated to `refineid-auth`.
+    #[must_use]
+    pub const fn pad_byte(self) -> u8 {
+        match self {
+            Self::Citizen => refineid_auth::PinReferenceScheme::Citizen.pad().octet(),
+            Self::Organizational => refineid_auth::PinReferenceScheme::Organizational
+                .pad()
+                .octet(),
+            Self::Estonian => refineid_auth::PinReferenceScheme::Estonian.pad().octet(),
+        }
+    }
+
+    /// The number of attempts a pristine PIN has under this numbering,
+    /// delegated to `refineid-auth`.
+    #[must_use]
+    pub const fn pin_retry_limit(self) -> u8 {
+        match self {
+            Self::Citizen => refineid_auth::PinReferenceScheme::Citizen.pin_retry_limit(),
+            Self::Organizational => {
+                refineid_auth::PinReferenceScheme::Organizational.pin_retry_limit()
+            }
+            Self::Estonian => refineid_auth::PinReferenceScheme::Estonian.pin_retry_limit(),
+        }
+    }
+
     /// The activation procedure (FINEID S4-1 v4.2 §4.6) a card with
     /// this numbering follows, as refineid-core decides it.
     ///
@@ -386,27 +412,38 @@ impl From<PinSlot> for FlooredCredential {
 }
 
 /// The retry floor from `refineid-auth`, applied to a status this crate
-/// probed: a command that can spend a `slot` attempt is sent only at
-/// five, four or three tries left, or when the PIN is already verified.
-/// A PUK-driven reset is gated by [`check_puk_retry_floor`] instead.
+/// probed under `scheme`: a command that can spend a `slot` attempt is
+/// sent only within the card profile's safe retry counts, or when the
+/// PIN is already verified. A PUK-driven reset is gated by
+/// [`check_puk_retry_floor`] instead.
 ///
 /// # Errors
 /// [`RetryFloorRefusal`] naming the PIN and the state that refused it.
-pub fn check_retry_floor(slot: PinSlot, status: PinStatus) -> Result<(), RetryFloorRefusal> {
-    refineid_auth::check_retry_floor(slot.into(), status.into())
+pub fn check_retry_floor(
+    slot: PinSlot,
+    status: PinStatus,
+    scheme: PinReferenceScheme,
+) -> Result<(), RetryFloorRefusal> {
+    refineid_auth::check_retry_floor_with_scheme(slot.into(), status.into(), scheme.into())
 }
 
-/// The same retry floor applied to the PUK's own counter: anything that
-/// presents the PUK -- RESET RETRY COUNTER, or the activation PIN on a
-/// card that ships with blocked PINs -- is refused at two or one PUK
-/// tries left and at a counter the card did not report. At five, four or
-/// three tries left, at no tries left, blocked or invalidated it goes to
-/// the card, which answers for itself.
+/// The same retry floor applied to the PUK's own counter under
+/// `scheme`: anything that presents the PUK -- RESET RETRY COUNTER, or
+/// the activation PIN on a card that ships with blocked PINs -- is
+/// refused at two or one PUK tries left and at a counter the card did
+/// not report.
 ///
 /// # Errors
 /// [`RetryFloorRefusal`] naming the PUK and the state that refused it.
-pub fn check_puk_retry_floor(status: PukStatus) -> Result<(), RetryFloorRefusal> {
-    refineid_auth::check_retry_floor(FlooredCredential::Puk, status.into())
+pub fn check_puk_retry_floor(
+    status: PukStatus,
+    scheme: PinReferenceScheme,
+) -> Result<(), RetryFloorRefusal> {
+    refineid_auth::check_retry_floor_with_scheme(
+        FlooredCredential::Puk,
+        status.into(),
+        scheme.into(),
+    )
 }
 
 /// Outcome of the counter-safe PUK retry probe through the FINEID
@@ -542,6 +579,14 @@ pub enum AuthError<TE> {
     Transport(TE),
     /// Locally-rejected PIN; no APDU was sent.
     PinPolicy(PinPolicyReason),
+    /// The requested PIN slot is not supported in this application
+    /// context under `scheme`; no APDU was sent.
+    UnsupportedSlot {
+        /// Credential numbering resolved for the card.
+        scheme: PinReferenceScheme,
+        /// The PIN slot that cannot be addressed in this context.
+        slot: PinSlot,
+    },
 }
 
 impl<TE: core::fmt::Display> core::fmt::Display for AuthError<TE> {
@@ -549,6 +594,9 @@ impl<TE: core::fmt::Display> core::fmt::Display for AuthError<TE> {
         match self {
             Self::Transport(e) => write!(f, "auth transport: {e}"),
             Self::PinPolicy(reason) => write!(f, "auth pin policy: {reason}"),
+            Self::UnsupportedSlot { scheme, slot } => {
+                write!(f, "auth: {slot:?} is not supported under {scheme:?}")
+            }
         }
     }
 }
@@ -660,6 +708,7 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
+        ensure_slot_supported(scheme, slot)?;
         if scheme.gates_esign_directory(slot) {
             let entered = self
                 .select_esign_directory()
@@ -742,6 +791,7 @@ pub trait PinOps: CardTransport {
         Self: Sized,
     {
         let scheme = PinReferenceScheme::from(lengths.numbering());
+        ensure_slot_supported(scheme, slot)?;
         let stored = slot.stored_length();
         let accepted = accepted_lengths(lengths.slot(slot.into()))?;
         let mut current_block =
@@ -787,6 +837,7 @@ pub trait PinOps: CardTransport {
         Self: Sized,
     {
         let scheme = PinReferenceScheme::from(lengths.numbering());
+        ensure_slot_supported(scheme, target)?;
         let puk_accepted = accepted_lengths(lengths.puk())?;
         let target_accepted = accepted_lengths(lengths.slot(target.into()))?;
         match scheme {
@@ -801,7 +852,7 @@ pub trait PinOps: CardTransport {
                 }
 
                 let mut padded =
-                    vec![PIN_PAD_BYTE; PUK_STORED_LENGTH.saturating_add(target_stored)];
+                    vec![scheme.pad_byte(); PUK_STORED_LENGTH.saturating_add(target_stored)];
                 #[expect(
                     clippy::indexing_slicing,
                     clippy::arithmetic_side_effects,
@@ -916,16 +967,15 @@ pub trait PinOps: CardTransport {
         Ok(classify_pin_status_sw(r.status_word()))
     }
 
-    /// Ask the card which reference numbering it uses, spending two
-    /// counter-safe probes at most and no retries.
+    /// Ask the card which reference numbering it uses, spending at
+    /// most three counter-safe probes and no retries.
     ///
-    /// The citizen PIN1 reference is probed first: any recognised
-    /// PIN state means the citizen numbering ([`PinReferenceScheme`])
-    /// is live. `SW=6A88` -- reference not found -- is the
-    /// organization card's signature, confirmed by probing the
-    /// S4-2 numbering the same way. A card that answers neither
-    /// probe recognisably resolves to citizen, which preserves the
-    /// behaviour every existing caller had before this seam existed.
+    /// Probes Citizen, then Organizational, then Estonian eID. Any
+    /// recognised PIN status settles the numbering immediately. A
+    /// security-channel refusal (`SecurityNotSatisfied` or
+    /// `SmDataObjectsIncorrect`, e.g. a contactless card before PACE)
+    /// stops probing immediately rather than sending further probes.
+    /// When all three miss, falls back to Citizen.
     ///
     /// # Errors
     /// Transport failure.
@@ -935,18 +985,32 @@ pub trait PinOps: CardTransport {
     where
         Self: Sized,
     {
+        const fn stops_scheme_probe(sw: StatusWord) -> bool {
+            matches!(
+                sw,
+                StatusWord::SecurityNotSatisfied | StatusWord::SmDataObjectsIncorrect
+            )
+        }
+
         let citizen = reference_probe_sw(self, PinReferenceScheme::Citizen)?;
-        if !matches!(citizen, StatusWord::ReferenceDataNotFound) {
+        if !matches!(classify_pin_status_sw(citizen), PinStatus::Other(_))
+            || stops_scheme_probe(citizen)
+        {
             return Ok(PinReferenceScheme::Citizen);
         }
-        let organizational = reference_probe_sw(self, PinReferenceScheme::Organizational)?;
-        Ok(match classify_pin_status_sw(organizational) {
-            PinStatus::Verified
-            | PinStatus::Remaining(_)
-            | PinStatus::Locked
-            | PinStatus::NoInfo => PinReferenceScheme::Organizational,
-            PinStatus::Other(_) => PinReferenceScheme::Citizen,
-        })
+        for scheme in [
+            PinReferenceScheme::Organizational,
+            PinReferenceScheme::Estonian,
+        ] {
+            let sw = reference_probe_sw(self, scheme)?;
+            if !matches!(classify_pin_status_sw(sw), PinStatus::Other(_)) {
+                return Ok(scheme);
+            }
+            if stops_scheme_probe(sw) {
+                return Ok(PinReferenceScheme::Citizen);
+            }
+        }
+        Ok(PinReferenceScheme::Citizen)
     }
 
     /// Read the shared PUK retry counter without presenting a PUK.
@@ -1343,14 +1407,32 @@ impl<T: CardTransport> refineid_apdu::CardTransport for CoreReads<'_, T> {
     }
 }
 
+/// Fail closed when `slot` cannot be addressed in the current
+/// application context under `scheme`.
+///
+/// On Estonian eID cards, PIN2 lives in the separate QSCD application
+/// rather than the eID application.
+const fn ensure_slot_supported<TE>(
+    scheme: PinReferenceScheme,
+    slot: PinSlot,
+) -> Result<(), AuthError<TE>> {
+    if matches!(
+        (scheme, slot),
+        (PinReferenceScheme::Estonian, PinSlot::Pin2)
+    ) {
+        return Err(AuthError::UnsupportedSlot { scheme, slot });
+    }
+    Ok(())
+}
+
 /// One credential's wire block under `scheme`, for a typed length in
 /// `accepted` and at most `stored`.
 ///
 /// The citizen and Estonian cards compare a block padded to the
-/// stored length with [`PIN_PAD_BYTE`]; the organization card compares the typed
-/// digits at their own length, because its EF.AOD publishes no
-/// padding and the S1 v3.0 §3.5.1.1 rule makes any other length a
-/// failed -- and counted -- comparison.
+/// stored length with the profile's pad byte; the organization card
+/// compares the typed digits at their own length, because its EF.AOD
+/// publishes no padding and the S1 v3.0 section 3.5.1.1 rule makes any other
+/// length a failed -- and counted -- comparison.
 fn credential_block<TE>(
     scheme: PinReferenceScheme,
     accepted: &RangeInclusive<usize>,
@@ -1363,7 +1445,7 @@ fn credential_block<TE>(
     }
     match scheme {
         PinReferenceScheme::Citizen | PinReferenceScheme::Estonian => {
-            let mut padded = vec![PIN_PAD_BYTE; stored];
+            let mut padded = vec![scheme.pad_byte(); stored];
             #[expect(
                 clippy::indexing_slicing,
                 reason = "the check above proves ascii.len() <= stored; padded was allocated at length stored, so padded[..ascii.len()] is in-bounds."
@@ -1568,6 +1650,16 @@ mod tests {
         ]
     }
 
+    fn estonian_pin1_probe() -> Vec<u8> {
+        vec![
+            PLAIN_CLASS,
+            VERIFY_INSTRUCTION,
+            VERIFY_MODE,
+            PIN1_REFERENCE_ESTONIAN,
+            PROBE_LC,
+        ]
+    }
+
     #[test]
     fn resolve_scheme_stops_at_citizen_when_reference_answers() {
         // Citizen PIN1 probe answers a retry count: citizen
@@ -1722,7 +1814,78 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scheme_defaults_to_citizen_when_neither_answers() {
+    fn resolve_scheme_finds_estonian_numbering() {
+        const SW1_SUCCESS: u8 = 0x90;
+        const SW2_SUCCESS: u8 = 0x00;
+        const SW1_SECURITY: u8 = 0x69;
+        const SW2_LOCKED: u8 = 0x83;
+        const SW2_NO_INFO: u8 = 0x00;
+
+        for response in [
+            sw(SW1_RETRY_COUNTER, SW2_THREE_RETRIES),
+            sw(SW1_SUCCESS, SW2_SUCCESS),
+            sw(SW1_SECURITY, SW2_LOCKED),
+            sw(SW1_RETRY_COUNTER, SW2_NO_INFO),
+        ] {
+            let mut tx = SteppedTx {
+                script: vec![
+                    (
+                        citizen_pin1_probe(),
+                        sw(SW1_WRONG_PARAMETERS, SW2_REFERENCE_NOT_FOUND),
+                    ),
+                    (
+                        organizational_pin1_probe(),
+                        sw(SW1_WRONG_PARAMETERS, SW2_REFERENCE_NOT_FOUND),
+                    ),
+                    (estonian_pin1_probe(), response),
+                ],
+                cursor: 0,
+            };
+            let scheme = tx
+                .resolve_pin_reference_scheme()
+                .expect("Estonian resolution succeeds");
+            assert_eq!(scheme, PinReferenceScheme::Estonian);
+            assert_eq!(tx.cursor, tx.script.len());
+        }
+    }
+
+    #[test]
+    fn resolve_scheme_stops_immediately_on_security_status() {
+        const SW1_SECURITY: u8 = 0x69;
+        const SW2_SECURITY_NOT_SATISFIED: u8 = 0x82;
+        const SW2_SM_INCORRECT: u8 = 0x88;
+
+        for sw2 in [SW2_SECURITY_NOT_SATISFIED, SW2_SM_INCORRECT] {
+            let mut tx = SteppedTx {
+                script: vec![(citizen_pin1_probe(), sw(SW1_SECURITY, sw2))],
+                cursor: 0,
+            };
+            let scheme = tx
+                .resolve_pin_reference_scheme()
+                .expect("pre-PACE refusal stops probing");
+            assert_eq!(scheme, PinReferenceScheme::Citizen);
+            assert_eq!(tx.cursor, tx.script.len());
+
+            let mut org_tx = SteppedTx {
+                script: vec![
+                    (
+                        citizen_pin1_probe(),
+                        sw(SW1_WRONG_PARAMETERS, SW2_REFERENCE_NOT_FOUND),
+                    ),
+                    (organizational_pin1_probe(), sw(SW1_SECURITY, sw2)),
+                ],
+                cursor: 0,
+            };
+            let org_scheme = org_tx
+                .resolve_pin_reference_scheme()
+                .expect("security refusal on organizational probe stops before Estonian");
+            assert_eq!(org_scheme, PinReferenceScheme::Citizen);
+            assert_eq!(org_tx.cursor, org_tx.script.len());
+        }
+    }
+
+    #[test]
+    fn resolve_scheme_defaults_to_citizen_when_all_three_miss() {
         let mut tx = SteppedTx {
             script: vec![
                 (
@@ -1733,6 +1896,10 @@ mod tests {
                     organizational_pin1_probe(),
                     sw(SW1_WRONG_PARAMETERS, SW2_INCORRECT_P1_P2),
                 ),
+                (
+                    estonian_pin1_probe(),
+                    sw(SW1_WRONG_PARAMETERS, SW2_REFERENCE_NOT_FOUND),
+                ),
             ],
             cursor: 0,
         };
@@ -1741,6 +1908,53 @@ mod tests {
             .expect("resolution succeeds");
         assert_eq!(scheme, PinReferenceScheme::Citizen);
         assert_eq!(tx.cursor, tx.script.len());
+    }
+
+    #[test]
+    fn estonian_pin2_operations_fail_closed_without_transmitting() {
+        let lengths = CardPinLengths::not_listed(PinReferenceScheme::Estonian.into());
+        let mut tx = SteppedTx {
+            script: vec![],
+            cursor: 0,
+        };
+        let pin = PinBytes::try_from(*b"123456").expect("valid PIN fixture");
+        let puk = PinBytes::try_from(*b"12345678").expect("valid PUK fixture");
+
+        assert!(matches!(
+            tx.verify_pin_with_scheme(PinSlot::Pin2, PinReferenceScheme::Estonian, pin.clone()),
+            Err(AuthError::UnsupportedSlot {
+                scheme: PinReferenceScheme::Estonian,
+                slot: PinSlot::Pin2,
+            })
+        ));
+        assert!(matches!(
+            tx.change_pin(&lengths, PinSlot::Pin2, pin.clone(), pin.clone()),
+            Err(AuthError::UnsupportedSlot {
+                scheme: PinReferenceScheme::Estonian,
+                slot: PinSlot::Pin2,
+            })
+        ));
+        assert!(matches!(
+            tx.reset_retry_counter(&lengths, PinSlot::Pin2, puk, pin),
+            Err(AuthError::UnsupportedSlot {
+                scheme: PinReferenceScheme::Estonian,
+                slot: PinSlot::Pin2,
+            })
+        ));
+        assert_eq!(tx.cursor, 0, "zero APDUs transmitted");
+    }
+
+    #[test]
+    fn profile_pad_and_retry_limit_delegate_to_core() {
+        for scheme in [
+            PinReferenceScheme::Citizen,
+            PinReferenceScheme::Organizational,
+            PinReferenceScheme::Estonian,
+        ] {
+            let core: refineid_auth::PinReferenceScheme = scheme.into();
+            assert_eq!(scheme.pad_byte(), core.pad().octet());
+            assert_eq!(scheme.pin_retry_limit(), core.pin_retry_limit());
+        }
     }
 
     #[test]

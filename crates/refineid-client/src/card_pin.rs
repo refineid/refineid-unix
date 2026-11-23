@@ -326,7 +326,35 @@ fn auth_to_card_pin(e: AuthError<impl fmt::Display>) -> CardPinError {
     match e {
         AuthError::Transport(t) => CardPinError::Transport(format!("{t}")),
         AuthError::PinPolicy(r) => CardPinError::PinPolicy(r),
+        AuthError::UnsupportedSlot { scheme, slot } => {
+            CardPinError::Transport(format!("{slot:?} is not supported under {scheme:?}"))
+        }
     }
+}
+
+/// Fail closed when `slot` cannot be managed in the current eID
+/// application context under `numbering`.
+fn ensure_manage_slot_supported(
+    numbering: PinReferenceScheme,
+    slot: PinManageSlot,
+) -> Result<(), CardPinError> {
+    if numbering == PinReferenceScheme::Estonian && slot == PinManageSlot::Pin2 {
+        return Err(CardPinError::Transport(
+            "Signature PIN 2 is not supported on Estonian eID cards yet".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fail closed on card families that do not follow FINEID S4-1
+/// section 4.6 factory activation.
+fn ensure_activation_supported(numbering: PinReferenceScheme) -> Result<(), CardPinError> {
+    if numbering == PinReferenceScheme::Estonian {
+        return Err(CardPinError::Transport(
+            "factory activation is not supported on Estonian eID cards".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Card session bound to one physical card.
@@ -539,6 +567,8 @@ pub fn establish_card_session(
 
     let validity_start = transport
         .read_certificate(CertSlot::Authentication)
+        .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
+        .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt))
         .ok()
         .and_then(|der| OwnedCert::from_der(der.as_bytes()).ok())
         .map(|cert| cert.view().not_before);
@@ -567,12 +597,18 @@ fn change_gate(
     slot: PinManageSlot,
     readiness: PinReadiness,
     probe: Option<PinStatus>,
+    numbering: PinReferenceScheme,
 ) -> Result<(), CardPinError> {
+    ensure_manage_slot_supported(numbering, slot)?;
     if readiness == PinReadiness::AwaitsActivation {
         return Err(CardPinError::CardLooksUnactivated { slot, probe });
     }
-    check_retry_floor(slot.as_pin_slot(), probe.unwrap_or(PinStatus::NoInfo))
-        .map_err(CardPinError::RetryFloor)
+    check_retry_floor(
+        slot.as_pin_slot(),
+        probe.unwrap_or(PinStatus::NoInfo),
+        numbering,
+    )
+    .map_err(CardPinError::RetryFloor)
 }
 
 /// Gate for a PUK-driven reset: the reset presents the PUK, so the
@@ -582,8 +618,13 @@ fn change_gate(
 /// five, four or three tries left. Where the PIN changed flag is not
 /// readable a blocked PIN and a never-set PIN read the same, and the
 /// PUK resets either, so the card answers for the PIN itself.
-fn unblock_gate(puk: Option<PukStatus>) -> Result<(), CardPinError> {
-    puk_gate(puk)
+fn unblock_gate(
+    slot: PinManageSlot,
+    puk: Option<PukStatus>,
+    numbering: PinReferenceScheme,
+) -> Result<(), CardPinError> {
+    ensure_manage_slot_supported(numbering, slot)?;
+    puk_gate(puk, numbering)
 }
 
 /// One PIN's activation probes under `numbering`: its counter-safe
@@ -606,8 +647,9 @@ fn probe_slot<T: refineid_lib_core::transport::CardTransport>(
 
 /// The retry floor for the PUK's counter; a probe that returned no
 /// status is an unreadable counter.
-fn puk_gate(puk: Option<PukStatus>) -> Result<(), CardPinError> {
-    check_puk_retry_floor(puk.unwrap_or(PukStatus::NoInfo)).map_err(CardPinError::RetryFloor)
+fn puk_gate(puk: Option<PukStatus>, numbering: PinReferenceScheme) -> Result<(), CardPinError> {
+    check_puk_retry_floor(puk.unwrap_or(PukStatus::NoInfo), numbering)
+        .map_err(CardPinError::RetryFloor)
 }
 
 /// Rotate the PIN in `options.slot`. The card's own outcome
@@ -639,13 +681,19 @@ pub(crate) fn probe_change_gate_for_cli(
     ctx: &PinManagementCardContext,
     slot: PinManageSlot,
 ) -> Result<(), CardPinError> {
+    ensure_manage_slot_supported(ctx.numbering(), slot)?;
     let mut transport = backend.open_session(ctx.reader_id(), ReaderAccessCap::Read)?;
     transport
         .select_pkcs15_application()
         .map_err(|error| CardPinError::Pkcs15Select(format!("{error}")))?;
     re_verify_session(&mut transport, ctx.bound_serial())?;
     let probe = probe_slot(&mut transport, ctx.numbering(), slot.as_pin_slot());
-    change_gate(slot, probe.readiness(ctx.activation_scheme()), probe.status)
+    change_gate(
+        slot,
+        probe.readiness(ctx.activation_scheme()),
+        probe.status,
+        ctx.numbering(),
+    )
 }
 
 /// Run the unblock gate (PUK counter at or above the retry floor) in a
@@ -662,12 +710,17 @@ pub(crate) fn probe_unblock_gate_for_cli(
     ctx: &PinManagementCardContext,
     slot: PinManageSlot,
 ) -> Result<Option<PinStatus>, CardPinError> {
+    ensure_manage_slot_supported(ctx.numbering(), slot)?;
     let mut transport = backend.open_session(ctx.reader_id(), ReaderAccessCap::Read)?;
     transport
         .select_pkcs15_application()
         .map_err(|error| CardPinError::Pkcs15Select(format!("{error}")))?;
     re_verify_session(&mut transport, ctx.bound_serial())?;
-    unblock_gate(transport.puk_status_with_scheme(ctx.numbering()).ok())?;
+    unblock_gate(
+        slot,
+        transport.puk_status_with_scheme(ctx.numbering()).ok(),
+        ctx.numbering(),
+    )?;
     Ok(transport
         .pin_status_with_scheme(slot.as_pin_slot(), ctx.numbering())
         .ok())
@@ -680,6 +733,7 @@ pub(crate) fn change_pin_first_for_cli(
     ctx: PinManagementCardContext,
     options: ChangePinOptions,
 ) -> Result<ChangePinReport, CardPinError> {
+    ensure_manage_slot_supported(ctx.numbering(), options.slot)?;
     // The typestate parameter `ctx` proves the caller is on a
     // PIN-management command path (operator intent: card is
     // activated). The compiler refuses to let
@@ -714,6 +768,7 @@ pub(crate) fn change_pin_first_for_cli(
         options.slot,
         probe.readiness(ctx.activation_scheme()),
         probe.status,
+        numbering,
     )?;
 
     re_verify_session(&mut transport, ctx.bound_serial())?;
@@ -762,6 +817,7 @@ pub fn unblock_pin_first(
     ctx: PinManagementCardContext,
     options: UnblockPinOptions,
 ) -> Result<UnblockPinReport, CardPinError> {
+    ensure_manage_slot_supported(ctx.numbering(), options.slot)?;
     let person = ctx.identity().person_string();
     let card_serial = ctx.identity().best_serial().unwrap_or("").to_owned();
     crate::events::CardTarget {
@@ -782,7 +838,11 @@ pub fn unblock_pin_first(
 
     let slot = options.slot.as_pin_slot();
     let numbering = ctx.numbering();
-    unblock_gate(transport.puk_status_with_scheme(numbering).ok())?;
+    unblock_gate(
+        options.slot,
+        transport.puk_status_with_scheme(numbering).ok(),
+        numbering,
+    )?;
 
     re_verify_session(&mut transport, ctx.bound_serial())?;
 
@@ -1225,6 +1285,7 @@ fn activate_slot_setup<T: refineid_lib_core::transport::CardTransport>(
     activation_pin_bytes: PinBytes,
     new_pin: PinBytes,
 ) -> Result<UnblockOutcome, CardPinError> {
+    ensure_activation_supported(ctx.numbering)?;
     match ctx.scheme {
         ActivationScheme::PresetActivationPin => transport
             .change_pin(&ctx.lengths, slot, activation_pin_bytes, new_pin)
@@ -1233,7 +1294,10 @@ fn activate_slot_setup<T: refineid_lib_core::transport::CardTransport>(
         ActivationScheme::ActivationCodeIsPuk => {
             // The activation PIN is presented as the PUK, under the
             // PUK's counter.
-            puk_gate(transport.puk_status_with_scheme(ctx.numbering).ok())?;
+            puk_gate(
+                transport.puk_status_with_scheme(ctx.numbering).ok(),
+                ctx.numbering,
+            )?;
             transport
                 .reset_retry_counter(&ctx.lengths, slot, activation_pin_bytes, new_pin)
                 .map_err(auth_to_card_pin)
@@ -1275,6 +1339,7 @@ fn activation_gate<T: refineid_lib_core::transport::CardTransport>(
     allow_reactivate: bool,
     emit_probe: bool,
 ) -> Result<ActivationGate, CardPinError> {
+    ensure_activation_supported(ctx.numbering)?;
     let reader_label = ctx.reader_id.as_str().to_owned();
     let pin1 = probe_slot(transport, ctx.numbering, PinSlot::Pin1);
     let pin2 = probe_slot(transport, ctx.numbering, PinSlot::Pin2);
@@ -1321,14 +1386,21 @@ fn activation_gate<T: refineid_lib_core::transport::CardTransport>(
                     ActivationTarget::One(one) => one.as_pin_slot() == slot,
                 };
                 if targeted {
-                    check_retry_floor(slot, probe.status.unwrap_or(PinStatus::NoInfo))
-                        .map_err(CardPinError::RetryFloor)?;
+                    check_retry_floor(
+                        slot,
+                        probe.status.unwrap_or(PinStatus::NoInfo),
+                        ctx.numbering,
+                    )
+                    .map_err(CardPinError::RetryFloor)?;
                 }
             }
         }
         // The activation PIN is presented as the PUK.
         ActivationScheme::ActivationCodeIsPuk => {
-            puk_gate(transport.puk_status_with_scheme(ctx.numbering).ok())?;
+            puk_gate(
+                transport.puk_status_with_scheme(ctx.numbering).ok(),
+                ctx.numbering,
+            )?;
         }
     }
     Ok(ActivationGate::Proceed {
@@ -1350,6 +1422,7 @@ pub(crate) fn probe_activation_gate_for_cli(
     target: ActivationTarget,
     allow_reactivate: bool,
 ) -> Result<Option<ActivateReport>, CardPinError> {
+    ensure_activation_supported(ctx.numbering)?;
     let mut transport = backend.open_session(&ctx.reader_id, ReaderAccessCap::Read)?;
     transport
         .select_pkcs15_application()
@@ -1471,6 +1544,7 @@ fn run_activation(
     allow_reactivate: bool,
     pins: ActivationPins,
 ) -> Result<ActivateReport, CardPinError> {
+    ensure_activation_supported(ctx.numbering)?;
     let person = ctx.identity.person_string();
     crate::events::CardTarget {
         device: ctx.reader_id.as_str(),
@@ -1789,7 +1863,7 @@ impl CardPinHelpers {
 #[cfg(test)]
 mod gate_tests {
     use refineid_lib_core::apdu::status_word::PinRetries;
-    use refineid_lib_core::auth::{ActivationScheme, PIN_TRY_LIMIT};
+    use refineid_lib_core::auth::{ActivationScheme, PIN_TRY_LIMIT, PinReferenceScheme};
 
     use super::{
         CardPinError, PinManageSlot, PinReadiness, PinStatus, PukStatus, change_gate, unblock_gate,
@@ -1821,12 +1895,24 @@ mod gate_tests {
             for &readiness in NOT_AWAITING {
                 for &count in SERVED {
                     check_true(
-                        change_gate(slot, readiness, Some(remaining(count)?)).is_ok(),
+                        change_gate(
+                            slot,
+                            readiness,
+                            Some(remaining(count)?),
+                            PinReferenceScheme::Citizen,
+                        )
+                        .is_ok(),
                         "served",
                     )?;
                 }
                 check_true(
-                    change_gate(slot, readiness, Some(PinStatus::Verified)).is_ok(),
+                    change_gate(
+                        slot,
+                        readiness,
+                        Some(PinStatus::Verified),
+                        PinReferenceScheme::Citizen,
+                    )
+                    .is_ok(),
                     "verified",
                 )?;
             }
@@ -1842,7 +1928,12 @@ mod gate_tests {
                 PinManageSlot::Pin2 => "PIN 2",
             };
             for &count in BELOW_FLOOR {
-                let refused = change_gate(slot, PinReadiness::Activated, Some(remaining(count)?));
+                let refused = change_gate(
+                    slot,
+                    PinReadiness::Activated,
+                    Some(remaining(count)?),
+                    PinReferenceScheme::Citizen,
+                );
                 check_true(
                     matches!(refused, Err(CardPinError::RetryFloor(_))),
                     "below the floor",
@@ -1860,11 +1951,23 @@ mod gate_tests {
     fn a_change_goes_to_the_card_at_no_tries_left_and_blocked() -> TestResult {
         for &slot in SLOTS {
             check_true(
-                change_gate(slot, PinReadiness::Activated, Some(remaining(NO_TRIES)?)).is_ok(),
+                change_gate(
+                    slot,
+                    PinReadiness::Activated,
+                    Some(remaining(NO_TRIES)?),
+                    PinReferenceScheme::Citizen,
+                )
+                .is_ok(),
                 "no tries left",
             )?;
             check_true(
-                change_gate(slot, PinReadiness::Activated, Some(PinStatus::Locked)).is_ok(),
+                change_gate(
+                    slot,
+                    PinReadiness::Activated,
+                    Some(PinStatus::Locked),
+                    PinReferenceScheme::Citizen,
+                )
+                .is_ok(),
                 "blocked",
             )?;
         }
@@ -1882,7 +1985,15 @@ mod gate_tests {
     #[test]
     fn a_puk_reset_is_allowed_while_the_puk_is_served() -> TestResult {
         for &puk in SERVED {
-            check_true(unblock_gate(Some(puk_remaining(puk)?)).is_ok(), "PUK reset")?;
+            check_true(
+                unblock_gate(
+                    PinManageSlot::Pin1,
+                    Some(puk_remaining(puk)?),
+                    PinReferenceScheme::Citizen,
+                )
+                .is_ok(),
+                "PUK reset",
+            )?;
         }
         Ok(())
     }
@@ -1893,7 +2004,11 @@ mod gate_tests {
     #[test]
     fn a_puk_reset_is_refused_at_two_or_one_puk_tries() -> TestResult {
         for &puk in PUK_LAST_TRIES {
-            let refused = unblock_gate(Some(puk_remaining(puk)?));
+            let refused = unblock_gate(
+                PinManageSlot::Pin1,
+                Some(puk_remaining(puk)?),
+                PinReferenceScheme::Citizen,
+            );
             check_true(
                 matches!(refused, Err(CardPinError::RetryFloor(_))),
                 "below the floor",
@@ -1914,7 +2029,10 @@ mod gate_tests {
             Some(PukStatus::Other(UNMODELED_SW)),
         ] {
             check_true(
-                matches!(unblock_gate(puk), Err(CardPinError::RetryFloor(_))),
+                matches!(
+                    unblock_gate(PinManageSlot::Pin1, puk, PinReferenceScheme::Citizen),
+                    Err(CardPinError::RetryFloor(_))
+                ),
                 "refused",
             )?;
         }
@@ -1931,7 +2049,10 @@ mod gate_tests {
             Some(PukStatus::Locked),
             Some(PukStatus::Invalidated),
         ] {
-            check_true(unblock_gate(puk).is_ok(), "served")?;
+            check_true(
+                unblock_gate(PinManageSlot::Pin1, puk, PinReferenceScheme::Citizen).is_ok(),
+                "served",
+            )?;
         }
         Ok(())
     }
@@ -1952,13 +2073,22 @@ mod gate_tests {
             "reads as awaiting activation",
         )?;
         check_true(
-            unblock_gate(Some(puk_remaining(PIN_TRY_LIMIT)?)).is_ok(),
+            unblock_gate(
+                PinManageSlot::Pin1,
+                Some(puk_remaining(PIN_TRY_LIMIT)?),
+                PinReferenceScheme::Organizational,
+            )
+            .is_ok(),
             "PUK at the limit passes",
         )?;
         for &puk in PUK_LAST_TRIES {
             check_true(
                 matches!(
-                    unblock_gate(Some(puk_remaining(puk)?)),
+                    unblock_gate(
+                        PinManageSlot::Pin1,
+                        Some(puk_remaining(puk)?),
+                        PinReferenceScheme::Organizational,
+                    ),
                     Err(CardPinError::RetryFloor(_))
                 ),
                 "PUK on its last tries is refused",
@@ -1973,7 +2103,12 @@ mod gate_tests {
             for probe in [None, Some(PinStatus::NoInfo)] {
                 check_true(
                     matches!(
-                        change_gate(slot, PinReadiness::Activated, probe),
+                        change_gate(
+                            slot,
+                            PinReadiness::Activated,
+                            probe,
+                            PinReferenceScheme::Citizen,
+                        ),
                         Err(CardPinError::RetryFloor(_))
                     ),
                     "unreadable counter",
@@ -1995,7 +2130,7 @@ mod gate_tests {
             Some(fresh),
         );
         for &slot in SLOTS {
-            let refused = change_gate(slot, readiness, Some(fresh));
+            let refused = change_gate(slot, readiness, Some(fresh), PinReferenceScheme::Citizen);
             check_true(
                 matches!(refused, Err(CardPinError::CardLooksUnactivated { .. })),
                 "change refused",
@@ -2005,6 +2140,102 @@ mod gate_tests {
             check_true(text.contains("blocked or never set"), "names the states")?;
             check_true(text.contains("pin unblock"), "points to the unblock")?;
             check_true(text.contains("pin activate"), "points to activation")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn estonian_pin2_management_gates_fail_closed_and_pin1_uses_three_try_scale() -> TestResult {
+        let estonian_limit = PinReferenceScheme::Estonian.pin_retry_limit();
+        check_true(
+            change_gate(
+                PinManageSlot::Pin1,
+                PinReadiness::Activated,
+                Some(remaining(estonian_limit)?),
+                PinReferenceScheme::Estonian,
+            )
+            .is_ok(),
+            "Estonian PIN1 at 3 tries is served",
+        )?;
+        check_true(
+            matches!(
+                change_gate(
+                    PinManageSlot::Pin1,
+                    PinReadiness::Activated,
+                    Some(remaining(estonian_limit + 1)?),
+                    PinReferenceScheme::Estonian,
+                ),
+                Err(CardPinError::RetryFloor(_))
+            ),
+            "Estonian PIN1 above 3-try limit is refused as unreadable",
+        )?;
+        check_true(
+            matches!(
+                change_gate(
+                    PinManageSlot::Pin2,
+                    PinReadiness::Activated,
+                    Some(remaining(estonian_limit)?),
+                    PinReferenceScheme::Estonian,
+                ),
+                Err(CardPinError::Transport(_))
+            ),
+            "Estonian PIN2 change fails closed",
+        )?;
+        check_true(
+            matches!(
+                unblock_gate(
+                    PinManageSlot::Pin2,
+                    Some(puk_remaining(estonian_limit)?),
+                    PinReferenceScheme::Estonian,
+                ),
+                Err(CardPinError::Transport(_))
+            ),
+            "Estonian PIN2 unblock fails closed",
+        )?;
+
+        struct NeverTransmitting;
+        impl refineid_lib_core::transport::CardTransport for NeverTransmitting {
+            type Error = &'static str;
+
+            fn transmit_outcome(
+                &mut self,
+                _apdu: &refineid_lib_core::transport::CommandApdu,
+            ) -> Result<refineid_lib_core::transport::TransportOutcome, Self::Error> {
+                Err("unexpected APDU")
+            }
+
+            fn atr(&self) -> Result<refineid_lib_core::atr::Atr, refineid_lib_core::atr::AtrError> {
+                refineid_lib_core::atr::Atr::new(refineid_lib_core::atr::MINIMAL_DIRECT_ATR)
+            }
+        }
+
+        let mut card = NeverTransmitting;
+        let ctx = super::ActivationCardContext {
+            reader_id: refineid_lib_core::backend::ReaderId::new(
+                crate::test_card::SYNTHETIC_READER.to_owned(),
+            ),
+            identity: refineid_lib_core::identity::CredentialIdentity::new(),
+            validity_start: None,
+            scheme: ActivationScheme::ActivationCodeIsPuk,
+            numbering: PinReferenceScheme::Estonian,
+            bound_serial: refineid_lib_core::identity::TokenSerial::new("CARD-A".to_owned()),
+            model: None,
+            lengths: refineid_lib_core::auth::CardPinLengths::not_listed(
+                PinReferenceScheme::Estonian.into(),
+            ),
+        };
+        for target in [
+            super::ActivationTarget::Both,
+            super::ActivationTarget::One(PinManageSlot::Pin1),
+            super::ActivationTarget::One(PinManageSlot::Pin2),
+        ] {
+            check_true(
+                matches!(
+                    super::activation_gate(&mut card, &ctx, target, false, false),
+                    Err(CardPinError::Transport(_))
+                ),
+                "Estonian activation_gate fails closed without transmitting any APDU",
+            )?;
         }
         Ok(())
     }

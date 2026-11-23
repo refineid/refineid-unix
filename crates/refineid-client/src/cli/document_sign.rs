@@ -518,6 +518,13 @@ const fn slot_label(slot: SignSlot) -> &'static str {
     }
 }
 
+const fn slot_key_ref_byte(slot: SignSlot) -> u8 {
+    match slot {
+        SignSlot::Authentication => refineid_lib_core::sign::KEY_REF_AUTH,
+        SignSlot::Qualified => refineid_lib_core::sign::KEY_REF_SIGN,
+    }
+}
+
 impl core::fmt::Display for DocumentReport<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let sign = self.sign;
@@ -528,7 +535,7 @@ impl core::fmt::Display for DocumentReport<'_> {
                 f,
                 "slot: {} (key ref {:#04X})",
                 slot_label(sign.slot),
-                sign.slot.key_ref().as_byte()
+                slot_key_ref_byte(sign.slot)
             )?,
             SigningDevice::PairedPhone => writeln!(f, "slot: {}", slot_label(sign.slot))?,
         }

@@ -22,6 +22,7 @@ use refineid_lib_core::apdu::iso7816::{ReadBinaryByOffset, SelectByAidNoFci};
 use refineid_lib_core::apdu::status_word::{PinRetries, StatusWord};
 use refineid_lib_core::atr::{Atr, AtrError, MINIMAL_DIRECT_ATR};
 use refineid_lib_core::auth::commands::Verify;
+use refineid_lib_core::auth::{PinReferenceScheme, PinSlot};
 use refineid_lib_core::backend::{ReaderAccessCap, ReaderBackend, ReaderId, ReaderInfo};
 use refineid_lib_core::sign::RSA_3072_SIG_BYTES;
 use refineid_lib_core::sign::commands::{MseSet, PsoComputeDigitalSignature};
@@ -81,6 +82,8 @@ pub(crate) enum SelectedFile {
 pub(crate) struct SyntheticCard {
     /// What a counter-only VERIFY reports.
     pub(crate) pin_tries: PinRetries,
+    /// Credential reference numbering the synthetic card answers to.
+    pub(crate) scheme: PinReferenceScheme,
     /// The DER every certificate READ BINARY serves.
     pub(crate) certificate: &'static [u8],
     /// The DER EF.TokenInfo READ BINARY serves.
@@ -89,6 +92,8 @@ pub(crate) struct SyntheticCard {
     pub(crate) selected_file: SelectedFile,
     /// Whether to reject PIN verification attempts.
     pub(crate) reject_pin: bool,
+    /// Count of credential VERIFY (non-probe) and MSE/PSO APDUs observed.
+    pub(crate) credential_or_sign_apdus: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SyntheticCard {
@@ -99,10 +104,28 @@ impl SyntheticCard {
     pub(crate) fn with_tries(tries: u8) -> Result<Self, &'static str> {
         Ok(Self {
             pin_tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
+            scheme: PinReferenceScheme::Citizen,
             certificate: CERTIFICATE,
             token_info: Some(TOKEN_INFO_A),
             selected_file: SelectedFile::Certificate,
             reject_pin: false,
+            credential_or_sign_apdus: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    /// An Estonian eID synthetic card answering only Estonian PIN1 probes.
+    ///
+    /// # Errors
+    /// `tries` is not a counter value.
+    pub(crate) fn estonian(tries: u8) -> Result<Self, &'static str> {
+        Ok(Self {
+            pin_tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
+            scheme: PinReferenceScheme::Estonian,
+            certificate: CERTIFICATE,
+            token_info: Some(TOKEN_INFO_A),
+            selected_file: SelectedFile::Certificate,
+            reject_pin: false,
+            credential_or_sign_apdus: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -110,10 +133,12 @@ impl SyntheticCard {
     pub(crate) fn with_wrong_pin(tries: u8) -> Result<Self, &'static str> {
         Ok(Self {
             pin_tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
+            scheme: PinReferenceScheme::Citizen,
             certificate: CERTIFICATE,
             token_info: Some(TOKEN_INFO_A),
             selected_file: SelectedFile::Certificate,
             reject_pin: true,
+            credential_or_sign_apdus: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -124,17 +149,38 @@ impl SyntheticCard {
     pub(crate) fn card_b(tries: u8) -> Result<Self, &'static str> {
         Ok(Self {
             pin_tries: PinRetries::from_nibble(tries).ok_or("not a counter value")?,
+            scheme: PinReferenceScheme::Citizen,
             certificate: ALT_CERTIFICATE,
             token_info: Some(TOKEN_INFO_B),
             selected_file: SelectedFile::Certificate,
             reject_pin: false,
+            credential_or_sign_apdus: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Number of credential VERIFY or signing (MSE/PSO) APDUs received.
+    pub(crate) fn credential_or_sign_apdu_count(&self) -> usize {
+        self.credential_or_sign_apdus
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn answer(&mut self, apdu: &[u8]) -> ResponseApdu {
         let ins = apdu.get(INS_INDEX).copied();
         if ins == Some(Verify::INS) {
-            return if apdu.len() == PROBE_LEN || self.reject_pin {
+            let is_probe = apdu.len() == PROBE_LEN;
+            if !is_probe {
+                self.credential_or_sign_apdus
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self.scheme == PinReferenceScheme::Estonian {
+                let p2 = apdu.get(P2_INDEX).copied();
+                let allowed = p2 == Some(PinReferenceScheme::Estonian.p2_reference(PinSlot::Pin1))
+                    || p2 == Some(PinReferenceScheme::Estonian.puk_reference());
+                if !allowed {
+                    return respond(Vec::new(), StatusWord::ReferenceDataNotFound);
+                }
+            }
+            return if is_probe || self.reject_pin {
                 respond(
                     Vec::new(),
                     StatusWord::PinIncorrect {
@@ -149,6 +195,8 @@ impl SyntheticCard {
             return self.read_binary(apdu);
         }
         if ins == Some(PsoComputeDigitalSignature::INS) {
+            self.credential_or_sign_apdus
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return respond(vec![ANSWER_FILL; RSA_3072_SIG_BYTES], StatusWord::Success);
         }
         if ins == Some(SelectByAidNoFci::INS) {
@@ -161,6 +209,8 @@ impl SyntheticCard {
             return respond(Vec::new(), StatusWord::Success);
         }
         if ins == Some(MseSet::INS) {
+            self.credential_or_sign_apdus
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return respond(Vec::new(), StatusWord::Success);
         }
         respond(Vec::new(), StatusWord::FileNotFound)
