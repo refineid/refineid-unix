@@ -328,10 +328,7 @@ fn read_card_leaf<T: CardTransport>(
     purpose: SignPurpose,
 ) -> Result<Vec<u8>, BackendFailure> {
     match purpose {
-        SignPurpose::Authentication => transport
-            .read_certificate(CertSlot::Authentication)
-            .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
-            .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt)),
+        SignPurpose::Authentication => transport.read_authentication_certificate(),
         SignPurpose::Qualified => transport
             .read_certificate(CertSlot::Signature)
             .or_else(|_| transport.read_certificate(CertSlot::SignatureAlt)),
@@ -400,15 +397,31 @@ where
         let scheme = transport
             .resolve_pin_reference_scheme()
             .map_err(|_| BackendFailure::SigningUnavailable("sign chain failed".to_owned()))?;
-        let key_ref = match request.purpose {
-            SignPurpose::Authentication => KeyRef::Auth,
-            SignPurpose::Qualified => QualifiedSignScheme::try_from(scheme)
-                .map(KeyRef::Sign)
-                .map_err(|_| {
-                    BackendFailure::SigningUnavailable(
-                        "qualified signing is not supported for this card".to_owned(),
-                    )
-                })?,
+        let (key_ref, discovered_aid) = match request.purpose {
+            SignPurpose::Authentication if scheme == PinReferenceScheme::Estonian => {
+                let profile = transport
+                    .discover_estonian_authentication_profile()
+                    .map_err(|_| {
+                        BackendFailure::SigningUnavailable(
+                            "authentication profile unavailable".to_owned(),
+                        )
+                    })?;
+                (
+                    KeyRef::discovered_auth(profile.auth_key_reference()),
+                    Some(profile.application_aid().clone()),
+                )
+            }
+            SignPurpose::Authentication => (KeyRef::Auth, None),
+            SignPurpose::Qualified => (
+                QualifiedSignScheme::try_from(scheme)
+                    .map(KeyRef::Sign)
+                    .map_err(|_| {
+                        BackendFailure::SigningUnavailable(
+                            "qualified signing is not supported for this card".to_owned(),
+                        )
+                    })?,
+                None,
+            ),
         };
         if request.purpose == SignPurpose::Qualified
             && scheme == PinReferenceScheme::Organizational
@@ -446,6 +459,13 @@ where
         if live_token_serial(&mut transport)? != bound {
             return Err(BackendFailure::SigningUnavailable(
                 crate::card_sign::CARD_CHANGED_DURING_PROMPT.to_owned(),
+            ));
+        }
+        if let Some(aid) = discovered_aid.as_ref()
+            && transport.select_core_application(aid).is_err()
+        {
+            return Err(BackendFailure::SigningUnavailable(
+                "select application".to_owned(),
             ));
         }
         match transport

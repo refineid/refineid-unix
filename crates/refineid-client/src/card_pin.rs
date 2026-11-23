@@ -41,7 +41,7 @@ use refineid_lib_core::backend::{
 };
 use refineid_lib_core::fineid_card::{CardClassificationError, FineidCardModel};
 use refineid_lib_core::pin::{ActivationCode, PinBytes, Puk};
-use refineid_lib_core::pkcs15::{CertSlot, FineidReaderPick};
+use refineid_lib_core::pkcs15::FineidReaderPick;
 use refineid_lib_core::pkcs15::{FineidReaderPicker as _, Pkcs15Ops as _};
 use refineid_lib_core::x509::{DateTime, OwnedCert};
 use refineid_lib_pcsc::{PcscBackend, PcscError};
@@ -566,9 +566,7 @@ pub fn establish_card_session(
         .ok_or(CardPinError::TokenSerialUnavailable)?;
 
     let validity_start = transport
-        .read_certificate(CertSlot::Authentication)
-        .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
-        .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt))
+        .read_authentication_certificate()
         .ok()
         .and_then(|der| OwnedCert::from_der(der.as_bytes()).ok())
         .map(|cert| cert.view().not_before);

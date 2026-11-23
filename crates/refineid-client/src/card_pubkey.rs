@@ -390,10 +390,7 @@ fn pubkey_one(
         .map_err(|e| PubkeyError::Pkcs15Select(format!("{e}")))?;
 
     let cert_der = match options.slot {
-        PubkeySlot::Auth => transport
-            .read_certificate(CertSlot::Authentication)
-            .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
-            .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt)),
+        PubkeySlot::Auth => transport.read_authentication_certificate(),
         PubkeySlot::Qualified => transport
             .read_certificate(CertSlot::Signature)
             .or_else(|_| transport.read_certificate(CertSlot::SignatureAlt)),

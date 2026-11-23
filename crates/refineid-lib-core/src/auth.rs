@@ -1303,7 +1303,7 @@ fn accepted_lengths<TE>(
 /// refineid-core's card transport over this crate's, for the reads
 /// refineid-core performs itself. It sends plain commands only; no
 /// credential command crosses it.
-struct CoreReads<'t, T>(&'t mut T);
+pub(crate) struct CoreReads<'t, T>(pub(crate) &'t mut T);
 
 /// Why a read refineid-core performs over this crate's card transport
 /// failed.

@@ -741,15 +741,13 @@ fn sign_chain<T: CardTransport>(
     input_bytes: &[u8],
     input_sha256: Sha256,
 ) -> Result<SignChainOutput, SignErrorKind> {
-    let cert_der = match slot.cert_slot() {
-        CertSlot::Authentication => transport
-            .read_certificate(CertSlot::Authentication)
-            .or_else(|_| transport.read_certificate(CertSlot::EstonianAuthentication))
-            .or_else(|_| transport.read_certificate(CertSlot::AuthenticationAlt)),
+    let (cert_der, discovered_profile) = match slot.cert_slot() {
+        CertSlot::Authentication => transport.read_authentication_certificate_and_profile(),
         CertSlot::Signature => transport
             .read_certificate(CertSlot::Signature)
-            .or_else(|_| transport.read_certificate(CertSlot::SignatureAlt)),
-        other => transport.read_certificate(other),
+            .or_else(|_| transport.read_certificate(CertSlot::SignatureAlt))
+            .map(|der| (der, None)),
+        other => transport.read_certificate(other).map(|der| (der, None)),
     }
     .map_err(|e| SignErrorKind::CertUnavailable {
         slot,
@@ -770,7 +768,10 @@ fn sign_chain<T: CardTransport>(
     let scheme = transport
         .resolve_pin_reference_scheme()
         .map_err(|e| auth_err_to_sign_kind(slot, e))?;
-    let key_ref = slot.key_ref(scheme)?;
+    let key_ref = match (slot, discovered_profile.as_ref()) {
+        (SignSlot::Auth, Some(profile)) => KeyRef::discovered_auth(profile.auth_key_reference()),
+        _ => slot.key_ref(scheme)?,
+    };
     let status = transport
         .pin_status_with_scheme(slot.pin_slot(), scheme)
         .map_err(|e| auth_err_to_sign_kind(slot, e))?;
@@ -783,6 +784,11 @@ fn sign_chain<T: CardTransport>(
         return Err(SignErrorKind::DisplayedCard(
             CARD_CHANGED_DURING_PROMPT.to_owned(),
         ));
+    }
+    if let Some(profile) = discovered_profile.as_ref() {
+        transport
+            .select_core_application(profile.application_aid())
+            .map_err(|e| SignErrorKind::Transport(format!("select discovered application: {e}")))?;
     }
     let outcome = transport
         .verify_pin_with_scheme(slot.pin_slot(), scheme, pin)
