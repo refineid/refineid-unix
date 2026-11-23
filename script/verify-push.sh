@@ -15,6 +15,10 @@ fi
 echo "== verify-push: format check =="
 cargo fmt --all --check
 
+RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-D warnings"
+RUSTDOCFLAGS="${RUSTDOCFLAGS:+${RUSTDOCFLAGS} }-D warnings"
+export RUSTFLAGS RUSTDOCFLAGS
+
 echo "== verify-push: workspace build =="
 cargo build --workspace --all-targets
 
