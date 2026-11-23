@@ -208,8 +208,13 @@ pub struct CardCheckReport {
 pub struct CertReport {
     /// Which certificate slot this report covers. Rendered via
     /// [`CertSlot::label`] at display time ("Authentication",
-    /// "Signature", "Root CA", ...).
+    /// "Signature", "Root CA", ...) unless [`Self::discovered_fid`]
+    /// records an ISO/IEC 7816-15 discovered file identifier.
     pub slot: CertSlot,
+    /// Leaf EF file identifier discovered via ISO/IEC 7816-15
+    /// (`EF.DIR -> EF.ODF -> EF.CDF`) when the certificate was not
+    /// read from a fixed FINEID slot file identifier.
+    pub discovered_fid: Option<[u8; 2]>,
     /// Common Name attribute from the cert's subject DN per
     /// RFC 5280 §4.1.2.6. `None` if absent / unparseable.
     pub subject_cn: Option<refineid_lib_core::identity::CommonName>,
@@ -526,11 +531,23 @@ impl<'a> SodDer<'a> {
 /// over contactless it only becomes true inside a PACE secure
 /// channel, and this struct is what
 /// [`read_pkcs15_section`] returns from either.
+/// One certificate DER read from a card slot, preserving an ISO/IEC
+/// 7816-15 discovered leaf FID when the certificate did not come from a
+/// fixed FINEID file identifier.
+struct SlotDer {
+    /// Logical certificate slot.
+    slot: CertSlot,
+    /// Leaf EF file identifier discovered via ISO/IEC 7816-15, if any.
+    discovered_fid: Option<[u8; 2]>,
+    /// Raw certificate DER bytes.
+    der: CertDer,
+}
+
 struct Pkcs15Section {
     /// EF.TokenInfo contents; defaulted when unreadable.
     token_info: TokenInfo,
     /// Every provisioned cert slot's DER.
-    slot_ders: Vec<(CertSlot, CertDer)>,
+    slot_ders: Vec<SlotDer>,
     /// Which credential reference numbering the card answered to
     /// (citizen S1 v4.2 vs organizational S4-2 v4.0).
     pin_reference_scheme: PinReferenceScheme,
@@ -650,20 +667,25 @@ fn read_pkcs15_section<T: refineid_lib_core::transport::CardTransport>(
     let puk = (!secure_channel)
         .then(|| transport.puk_status_with_scheme(pin_reference_scheme).ok())
         .flatten();
-    let pin1_policy = transport.pin_policy_counters(PinSlot::Pin1).ok().flatten();
-    let pin2_policy = (!secure_channel)
+    let supports_fineid_pin_container = pin_reference_scheme == PinReferenceScheme::Citizen;
+    let pin1_policy = supports_fineid_pin_container
+        .then(|| transport.pin_policy_counters(PinSlot::Pin1).ok().flatten())
+        .flatten();
+    let pin2_policy = (!secure_channel && supports_fineid_pin_container)
         .then(|| transport.pin_policy_counters(PinSlot::Pin2).ok().flatten())
         .flatten();
-    let puk_policy = (!secure_channel)
+    let puk_policy = (!secure_channel && supports_fineid_pin_container)
         .then(|| transport.puk_policy_counters().ok().flatten())
         .flatten();
-    // PIN-changed flag probes (S1 v4.2 §3.15.2; counter-safe GET
-    // DATA on the PIN container). Best-effort like pin_status: a
-    // card that does not return the flag surfaces as `None`.
-    // `Ok(None)` vs `Err(_)` both collapse to
-    // `None` -- we treat the call site as flag-indeterminate.
-    let pin1_changed = transport.pin_changed_flag(PinSlot::Pin1).ok().flatten();
-    let pin2_changed = (!secure_channel)
+    // PIN-changed flag probes (FINEID S1 v4.2 §3.15.2; counter-safe GET
+    // DATA on the citizen PIN container). Only citizen FINEID cards
+    // expose this container; organizational and Estonian eID cards do
+    // not, so querying them under citizen references yields unrelated
+    // or error responses.
+    let pin1_changed = supports_fineid_pin_container
+        .then(|| transport.pin_changed_flag(PinSlot::Pin1).ok().flatten())
+        .flatten();
+    let pin2_changed = (!secure_channel && supports_fineid_pin_container)
         .then(|| transport.pin_changed_flag(PinSlot::Pin2).ok().flatten())
         .flatten();
     if secure_channel {
@@ -690,8 +712,8 @@ fn read_pkcs15_section<T: refineid_lib_core::transport::CardTransport>(
 fn read_all_cert_slots<T: refineid_lib_core::transport::CardTransport>(
     transport: &mut T,
     secure_channel: bool,
-) -> Result<Vec<(CertSlot, CertDer)>, CardCheckError> {
-    let mut slot_ders: Vec<(CertSlot, CertDer)> = Vec::new();
+) -> Result<Vec<SlotDer>, CardCheckError> {
+    let mut slot_ders: Vec<SlotDer> = Vec::new();
     for slot in CertSlot::all() {
         // Over a PACE channel, reaching a slot via the MF tears
         // the channel down and takes the rest of the readout --
@@ -706,7 +728,11 @@ fn read_all_cert_slots<T: refineid_lib_core::transport::CardTransport>(
             continue;
         }
         match transport.read_certificate(slot) {
-            Ok(der) => slot_ders.push((slot, der)),
+            Ok(der) => slot_ders.push(SlotDer {
+                slot,
+                discovered_fid: None,
+                der,
+            }),
             // Absent slot: the SELECT returns FileNotFound (SW 0x6A82),
             // which means "not provisioned" rather than a real failure.
             Err(Pkcs15Error::Sw(sw)) if StatusWord::from_u16(sw) == StatusWord::FileNotFound => {}
@@ -721,31 +747,33 @@ fn read_all_cert_slots<T: refineid_lib_core::transport::CardTransport>(
     if !secure_channel
         && !slot_ders
             .iter()
-            .any(|(slot, _)| *slot == CertSlot::Authentication)
+            .any(|entry| entry.slot == CertSlot::Authentication)
         && let Ok(profile) = transport.discover_estonian_authentication_profile()
         && let Ok(der) = transport.read_certificate_at(profile.auth_cert_path())
     {
         transport
             .select_core_application(profile.application_aid())
             .map_err(|e| CardCheckError::CertRead(e.to_string()))?;
-        slot_ders.push((CertSlot::Authentication, der));
+        let discovered_fid = Some(*profile.auth_cert_path().file().as_bytes());
+        slot_ders.push(SlotDer {
+            slot: CertSlot::Authentication,
+            discovered_fid,
+            der,
+        });
     }
     Ok(slot_ders)
 }
 
-/// Save each `(slot, der)` pair to `dir/EF.<fid>.der`.
-fn save_slot_ders(
-    dir: &std::path::Path,
-    slot_ders: &[(CertSlot, CertDer)],
-) -> Result<(), CardCheckError> {
+/// Save each slot's certificate DER to `dir/EF.<fid>.der`.
+fn save_slot_ders(dir: &std::path::Path, slot_ders: &[SlotDer]) -> Result<(), CardCheckError> {
     std::fs::create_dir_all(dir).map_err(|source| CardCheckError::CrlRead {
         path: dir.to_path_buf(),
         source,
     })?;
-    for (slot, der) in slot_ders {
-        let fid = slot.fid();
+    for entry in slot_ders {
+        let fid = entry.discovered_fid.unwrap_or_else(|| entry.slot.fid());
         let path = dir.join(format!("EF.{:02x}{:02x}.der", fid[0], fid[1]));
-        std::fs::write(&path, der.as_bytes())
+        std::fs::write(&path, entry.der.as_bytes())
             .map_err(|source| CardCheckError::CrlRead { path, source })?;
     }
     Ok(())
@@ -846,8 +874,8 @@ pub(crate) fn check_for_reader(
     let slot_der = |slot: CertSlot| -> Option<&CertDer> {
         slot_ders
             .iter()
-            .find(|(s, _)| *s == slot)
-            .map(|(_, der)| der)
+            .find(|entry| entry.slot == slot)
+            .map(|entry| &entry.der)
     };
     let root_der = slot_der(CertSlot::RootCa);
     let issuing_ca_der = slot_der(CertSlot::IssuingCaEcc);
@@ -880,8 +908,13 @@ pub(crate) fn check_for_reader(
         anchors,
     };
     let mut certs = Vec::new();
-    for (slot, der) in &slot_ders {
-        certs.push(build_cert_report(*slot, der, &ctx)?);
+    for entry in &slot_ders {
+        certs.push(build_cert_report(
+            entry.slot,
+            entry.discovered_fid,
+            &entry.der,
+            &ctx,
+        )?);
     }
 
     // Optional eMRTD section. Separate transport session because
@@ -996,6 +1029,7 @@ use refineid_lib_core::crypto::digest::Sha256 as CertSha256;
 /// same reference clock.
 fn build_cert_report(
     slot: CertSlot,
+    discovered_fid: Option<[u8; 2]>,
     der: &CertDer,
     ctx: &VerifyContext<'_>,
 ) -> Result<CertReport, CardCheckError> {
@@ -1068,6 +1102,7 @@ fn build_cert_report(
 
     Ok(CertReport {
         slot,
+        discovered_fid,
         subject_cn,
         issuer_cn,
         serial,
@@ -1513,14 +1548,19 @@ impl CardCheckReport {
             if i > 0 {
                 writeln!(f)?;
             }
-            writeln!(f, "[cert {}: {}]", i.saturating_add(1), c.slot.label())?;
+            writeln!(
+                f,
+                "[cert {}: {}]",
+                i.saturating_add(1),
+                c.slot_header_label()
+            )?;
             write!(f, "{c}")?;
         }
         writeln!(f)
     }
 
     /// Write the retry-counter section for PIN1, PIN2, and the
-    /// shared PUK, plus the PIN-changed flags.
+    /// shared PUK, plus the PIN-changed flags on citizen FINEID cards.
     ///
     /// The retry-counter probe uses the counter-safe empty-Lc
     /// VERIFY form per FINEID S1 v4.2 §3.5.4, so this
@@ -1537,28 +1577,66 @@ impl CardCheckReport {
                 PinReferenceScheme::Estonian => "Estonian eID (EF.AOD)",
             }
         )?;
-        writeln!(
-            f,
-            "Basic PIN 1:             {} (changed since manufacture: {}; usage: {}; unblocks: {})",
-            CardCheckHelpers::render_pin_status(self.pin1.as_ref()),
-            CardCheckHelpers::render_pin_changed(self.pin1_changed),
-            CardCheckHelpers::render_usage_counter(self.pin1_policy.as_ref()),
-            CardCheckHelpers::render_unblocking_counter(self.pin1_policy.as_ref()),
-        )?;
-        writeln!(
-            f,
-            "Signature PIN 2:         {} (changed since manufacture: {}; usage: {}; unblocks: {})",
-            CardCheckHelpers::render_pin_status(self.pin2.as_ref()),
-            CardCheckHelpers::render_pin_changed(self.pin2_changed),
-            CardCheckHelpers::render_usage_counter(self.pin2_policy.as_ref()),
-            CardCheckHelpers::render_unblocking_counter(self.pin2_policy.as_ref()),
-        )?;
-        writeln!(
-            f,
-            "PUK (shared recovery):    {} (usage: {})",
-            CardCheckHelpers::render_puk_status(self.puk.as_ref()),
-            CardCheckHelpers::render_usage_counter(self.puk_policy.as_ref()),
-        )
+        match self.pin_reference_scheme {
+            PinReferenceScheme::Citizen => {
+                writeln!(
+                    f,
+                    "Basic PIN 1:             {} (changed since manufacture: {}; usage: {}; unblocks: {})",
+                    CardCheckHelpers::render_pin_status(self.pin1.as_ref()),
+                    CardCheckHelpers::render_pin_changed(self.pin1_changed),
+                    CardCheckHelpers::render_usage_counter(self.pin1_policy.as_ref()),
+                    CardCheckHelpers::render_unblocking_counter(self.pin1_policy.as_ref()),
+                )?;
+                writeln!(
+                    f,
+                    "Signature PIN 2:         {} (changed since manufacture: {}; usage: {}; unblocks: {})",
+                    CardCheckHelpers::render_pin_status(self.pin2.as_ref()),
+                    CardCheckHelpers::render_pin_changed(self.pin2_changed),
+                    CardCheckHelpers::render_usage_counter(self.pin2_policy.as_ref()),
+                    CardCheckHelpers::render_unblocking_counter(self.pin2_policy.as_ref()),
+                )?;
+                writeln!(
+                    f,
+                    "PUK (shared recovery):    {} (usage: {})",
+                    CardCheckHelpers::render_puk_status(self.puk.as_ref()),
+                    CardCheckHelpers::render_usage_counter(self.puk_policy.as_ref()),
+                )
+            }
+            PinReferenceScheme::Organizational => {
+                writeln!(
+                    f,
+                    "Basic PIN 1:             {}",
+                    CardCheckHelpers::render_pin_status(self.pin1.as_ref()),
+                )?;
+                writeln!(
+                    f,
+                    "Signature PIN 2:         {}",
+                    CardCheckHelpers::render_pin_status(self.pin2.as_ref()),
+                )?;
+                writeln!(
+                    f,
+                    "PUK (shared recovery):    {}",
+                    CardCheckHelpers::render_puk_status(self.puk.as_ref()),
+                )
+            }
+            PinReferenceScheme::Estonian => {
+                writeln!(
+                    f,
+                    "Basic PIN 1:             {}",
+                    CardCheckHelpers::render_pin_status(self.pin1.as_ref()),
+                )?;
+                let pin2_line = self.pin2.as_ref().map_or_else(
+                    || "not probed (separate QSCD application)".to_owned(),
+                    |status| CardCheckHelpers::render_pin_status(Some(status)),
+                );
+                writeln!(f, "Signature PIN 2:         {pin2_line}")?;
+                writeln!(
+                    f,
+                    "PUK (shared recovery):    {}",
+                    CardCheckHelpers::render_puk_status(self.puk.as_ref()),
+                )
+            }
+        }
     }
 
     /// Write the optional eMRTD section (MRZ, DG11/12 fields,
@@ -1727,6 +1805,21 @@ impl CardCheckHelpers {
         Self::write_emrtd_mrz(f, emrtd)?;
         Self::write_emrtd_images(f, emrtd)?;
         Self::write_emrtd_security(f, emrtd)
+    }
+}
+
+impl CertReport {
+    /// Label printed in the `[cert N: ...]` header. Uses the discovered
+    /// ISO/IEC 7816-15 file identifier when present instead of assuming
+    /// a fixed FINEID file identifier.
+    #[must_use]
+    fn slot_header_label(&self) -> std::borrow::Cow<'_, str> {
+        match self.discovered_fid {
+            Some([hi, lo]) if self.slot == CertSlot::Authentication => {
+                std::borrow::Cow::Owned(format!("authentication (ISO 7816-15 EF.{hi:02X}{lo:02X})"))
+            }
+            _ => std::borrow::Cow::Borrowed(self.slot.label()),
+        }
     }
 }
 
@@ -2185,10 +2278,10 @@ mod tests {
 
     use super::AnchorCert;
     use super::{
-        AiaIssuerCert, AiaIssuerCertStatus, CardCheckError, CardCheckHelpers, CheckOutcome,
-        CheckOutcomeSection, FINNISH_LIST_UNAVAILABLE, NO_INTERMEDIATE, NOT_ANCHORED,
-        NOT_ANCHORED_NO_LISTS, SignatureCheck, VerifyContext, days_between, fmt_check_outcome,
-        now_date_time, run_chain_check, verify_crl,
+        AiaIssuerCert, AiaIssuerCertStatus, CardCheckError, CardCheckHelpers, CardCheckReport,
+        CertDer, CheckOutcome, CheckOutcomeSection, FINNISH_LIST_UNAVAILABLE, NO_INTERMEDIATE,
+        NOT_ANCHORED, NOT_ANCHORED_NO_LISTS, SignatureCheck, VerifyContext, build_cert_report,
+        days_between, fmt_check_outcome, now_date_time, run_chain_check, verify_crl,
     };
     use crate::test_util::{TestResult, check, check_true};
     use crate::trusted_lists::{AnchorSource, FinnishListGap, RunAnchors};
@@ -2198,12 +2291,15 @@ mod tests {
     use refineid_lib_core::aa::AaOutcome;
     use refineid_lib_core::apdu::status_word::PinRetries;
     use refineid_lib_core::auth::{
-        CredentialPolicyCounters, PinStatus, PukStatus, UnblockingCounter, UsageCounter,
+        CredentialPolicyCounters, PinReferenceScheme, PinStatus, PukStatus, UnblockingCounter,
+        UsageCounter,
     };
     use refineid_lib_core::ca::CaOutcome;
+    use refineid_lib_core::card_access::CardAccess;
     use refineid_lib_core::crl::OwnedCrl;
     use refineid_lib_core::crypto::rsa::HashAlg;
-    use refineid_lib_core::identity::MrzDate;
+    use refineid_lib_core::identity::{CredentialIdentity, MrzDate};
+    use refineid_lib_core::pkcs15::{CertSlot, TokenInfo};
     use refineid_lib_core::revocation::{InapplicableReason, RevocationStatus};
     use refineid_lib_core::x509::{DateTime, OwnedCert};
 
@@ -3054,6 +3150,81 @@ mod tests {
         check_true(
             format!("{err}").contains("OS RNG unavailable"),
             "Rng display",
+        )
+    }
+
+    #[test]
+    fn estonian_pin_counters_skip_fineid_pin_container_metadata() -> TestResult {
+        const ESTONIAN_PRISTINE_RETRIES: u8 = 3;
+        let pristine = PinRetries::from_nibble(ESTONIAN_PRISTINE_RETRIES)
+            .ok_or("3 is a valid retry nibble")?;
+        let report = CardCheckReport {
+            reader: "Test Reader".to_owned(),
+            identity: CredentialIdentity::new(),
+            atr_hex: String::new(),
+            token_info: TokenInfo::default(),
+            card_access: CardAccess::default(),
+            certs: Vec::new(),
+            pin_reference_scheme: PinReferenceScheme::Estonian,
+            pin1: Some(PinStatus::Remaining(pristine)),
+            pin2: None,
+            puk: Some(PukStatus::Remaining(pristine)),
+            pin1_policy: None,
+            pin2_policy: None,
+            puk_policy: None,
+            pin1_changed: None,
+            pin2_changed: None,
+            emrtd: None,
+            emrtd_error: None,
+        };
+        let rendered = format!("{report}");
+        check_true(
+            rendered.contains("Estonian eID (EF.AOD)"),
+            "names Estonian scheme",
+        )?;
+        check_true(
+            rendered.contains("Basic PIN 1:             3 retries left\n"),
+            "PIN1 shows retries without FINEID DF2F metadata",
+        )?;
+        check_true(
+            rendered.contains("Signature PIN 2:         not probed (separate QSCD application)\n"),
+            "PIN2 states separate QSCD application",
+        )?;
+        check_true(
+            !rendered.contains("still factory value") && !rendered.contains("DF2F"),
+            "no misleading FINEID container flags",
+        )?;
+        check_true(
+            rendered.contains("PUK (shared recovery):    3 retries left\n"),
+            "PUK shows retries without FINEID usage metadata",
+        )
+    }
+
+    #[test]
+    fn discovered_iso7816_15_auth_cert_label_does_not_claim_fineid_fid() -> TestResult {
+        const ESTONIAN_AUTH_FID: [u8; 2] = [0x34, 0x01];
+        let anchors = listed(&[DVV_ROOT_RSA_DER])?;
+        let ctx = ctx(None, None, &anchors)?;
+        let der = CertDer::new(DVV_ROOT_RSA_DER.to_vec());
+
+        let discovered = build_cert_report(
+            CertSlot::Authentication,
+            Some(ESTONIAN_AUTH_FID),
+            &der,
+            &ctx,
+        )?;
+        let discovered_label = discovered.slot_header_label();
+        check(
+            discovered_label.as_ref(),
+            "authentication (ISO 7816-15 EF.3401)",
+            "discovered auth cert header label",
+        )?;
+
+        let fineid = build_cert_report(CertSlot::Authentication, None, &der, &ctx)?;
+        check(
+            fineid.slot_header_label().as_ref(),
+            CertSlot::Authentication.label(),
+            "FINEID auth cert header label",
         )
     }
 }
