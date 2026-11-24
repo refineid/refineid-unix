@@ -11,6 +11,7 @@
   craneLib,
   pkg-config,
   cmake,
+  git,
   # GTK apps abort without the GSettings machinery in their
   # environment (the file chooser reads org.gtk.Settings.FileChooser).
   wrapGAppsHook4,
@@ -107,6 +108,10 @@ craneLib.buildPackage (
   commonArgs
   // {
     inherit cargoArtifacts;
+
+    # The xtask touched-line test drives git on a scratch repository.
+    # Check-only, so the dependency build environment stays identical.
+    nativeCheckInputs = [ git ];
 
     # The GUI dlopens its windowing stack at runtime.
     runtimeLibs = lib.makeLibraryPath [
