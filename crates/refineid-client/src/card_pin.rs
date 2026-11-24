@@ -34,7 +34,7 @@ use alloc::fmt;
 use refineid_lib_core::auth::{
     ActivationScheme, AuthError, CardPinLengths, ChangePinOutcome, PinOps as _, PinPolicyReason,
     PinReadiness, PinReferenceScheme, PinSlot, PinStatus, PukStatus, RetryFloorRefusal,
-    UnblockOutcome, check_puk_retry_floor, check_retry_floor,
+    UnblockOutcome, activation_scheme_for_card, check_puk_retry_floor, check_retry_floor,
 };
 use refineid_lib_core::backend::{
     ReaderAccessCap, ReaderBackend as _, ReaderFilter, ReaderPickError,
@@ -326,9 +326,11 @@ fn auth_to_card_pin(e: AuthError<impl fmt::Display>) -> CardPinError {
     match e {
         AuthError::Transport(t) => CardPinError::Transport(format!("{t}")),
         AuthError::PinPolicy(r) => CardPinError::PinPolicy(r),
+        AuthError::RetryFloor(refusal) => CardPinError::RetryFloor(refusal),
         AuthError::UnsupportedSlot { scheme, slot } => {
             CardPinError::Transport(format!("{slot:?} is not supported under {scheme:?}"))
         }
+        AuthError::Command(detail) => CardPinError::Transport(format!("auth command: {detail}")),
     }
 }
 
@@ -394,7 +396,7 @@ pub struct CardSession {
     /// when the certificate could not be read or parsed.
     pub validity_start: Option<DateTime>,
     /// The card's activation scheme
-    /// ([`PinReferenceScheme::activation_scheme`]); `None` gives no
+    /// ([`activation_scheme_for_card`]); `None` gives no
     /// activation decision.
     pub activation_scheme: Option<ActivationScheme>,
     /// The PIN 1, PIN 2 and PUK lengths the card accepts, read under
@@ -570,7 +572,7 @@ pub fn establish_card_session(
         .ok()
         .and_then(|der| OwnedCert::from_der(der.as_bytes()).ok())
         .map(|cert| cert.view().not_before);
-    let activation_scheme = numbering.activation_scheme(validity_start);
+    let activation_scheme = activation_scheme_for_card(numbering, validity_start);
     let lengths = transport
         .read_card_pin_lengths(numbering)
         .map_err(|e| CardPinError::Transport(format!("PIN lengths read: {e}")))?;
@@ -958,7 +960,7 @@ pub struct ActivationCardContext {
     /// a scheme).
     pub validity_start: Option<DateTime>,
     /// The card's activation scheme
-    /// ([`PinReferenceScheme::activation_scheme`]).
+    /// ([`activation_scheme_for_card`]).
     pub scheme: ActivationScheme,
     /// The credential reference numbering the card answers to.
     pub numbering: PinReferenceScheme,
@@ -2219,7 +2221,7 @@ mod gate_tests {
             bound_serial: refineid_lib_core::identity::TokenSerial::new("CARD-A".to_owned()),
             model: None,
             lengths: refineid_lib_core::auth::CardPinLengths::not_listed(
-                PinReferenceScheme::Estonian.into(),
+                PinReferenceScheme::Estonian,
             ),
         };
         for target in [
@@ -2440,8 +2442,7 @@ mod activate_tests {
     /// flag await activation.
     #[test]
     fn organization_card_activates_by_the_puk_scheme() -> TestResult {
-        let scheme = PinReferenceScheme::Organizational
-            .activation_scheme(None)
+        let scheme = super::activation_scheme_for_card(PinReferenceScheme::Organizational, None)
             .ok_or("organization numbering has a scheme")?;
         check_true(
             scheme == ActivationScheme::ActivationCodeIsPuk,

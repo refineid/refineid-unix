@@ -21,8 +21,7 @@
 use refineid_lib_core::apdu::iso7816::{ReadBinary, SelectByAidNoFci};
 use refineid_lib_core::apdu::status_word::{PinRetries, StatusWord};
 use refineid_lib_core::atr::{Atr, AtrError, MINIMAL_DIRECT_ATR};
-use refineid_lib_core::auth::commands::Verify;
-use refineid_lib_core::auth::{PinReferenceScheme, PinSlot};
+use refineid_lib_core::auth::{PinReferenceScheme, PinSlot, VERIFY_INS};
 use refineid_lib_core::backend::{ReaderAccessCap, ReaderBackend, ReaderId, ReaderInfo};
 use refineid_lib_core::sign::RSA_3072_SIG_BYTES;
 use refineid_lib_core::sign::commands::{MseSet, PsoComputeDigitalSignature};
@@ -166,15 +165,17 @@ impl SyntheticCard {
 
     fn answer(&mut self, apdu: &[u8]) -> ResponseApdu {
         let ins = apdu.get(INS_INDEX).copied();
-        if ins == Some(Verify::INS) {
-            let is_probe = apdu.len() == PROBE_LEN;
+        if ins == Some(VERIFY_INS) {
+            const EMPTY_LC: u8 = 0x00;
+            let is_probe = apdu.len() == HEADER_LEN
+                || (apdu.len() == PROBE_LEN && apdu.get(HEADER_LEN) == Some(&EMPTY_LC));
             if !is_probe {
                 self.credential_or_sign_apdus
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             if self.scheme == PinReferenceScheme::Estonian {
                 let p2 = apdu.get(P2_INDEX).copied();
-                let allowed = p2 == Some(PinReferenceScheme::Estonian.p2_reference(PinSlot::Pin1))
+                let allowed = p2 == Some(PinReferenceScheme::Estonian.reference(PinSlot::Pin1))
                     || p2 == Some(PinReferenceScheme::Estonian.puk_reference());
                 if !allowed {
                     return respond(Vec::new(), StatusWord::ReferenceDataNotFound);

@@ -2026,7 +2026,7 @@ impl CardCheckHelpers {
             Some(PinStatus::Remaining(n)) => format!("{n} retries left"),
             Some(PinStatus::NoInfo) => "no retry information (probably exhausted)".to_owned(),
             Some(PinStatus::Locked) => "BLOCKED -- needs PUK unblock".to_owned(),
-            Some(PinStatus::Other(sw)) => format!("unexpected SW={sw:#06X}"),
+            Some(PinStatus::Other(sw)) => format!("unexpected SW={:#06X}", sw.as_u16()),
             None => "(probe failed)".to_owned(),
         }
     }

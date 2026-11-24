@@ -470,8 +470,19 @@ where
         }
         match transport
             .verify_pin_with_scheme(slot, scheme, pin)
-            .map_err(|_| BackendFailure::SigningUnavailable("sign chain failed".to_owned()))?
-        {
+            .map_err(|err| match err {
+                refineid_lib_core::auth::AuthError::RetryFloor(_) => {
+                    BackendFailure::CredentialRefused(
+                        "credential retry state refuses the sign".to_owned(),
+                    )
+                }
+                refineid_lib_core::auth::AuthError::Transport(_)
+                | refineid_lib_core::auth::AuthError::PinPolicy(_)
+                | refineid_lib_core::auth::AuthError::UnsupportedSlot { .. }
+                | refineid_lib_core::auth::AuthError::Command(_) => {
+                    BackendFailure::SigningUnavailable("sign chain failed".to_owned())
+                }
+            })? {
             VerifyOutcome::Ok => {}
             VerifyOutcome::WrongPin { retries_left } => {
                 eprintln!("scs: PIN rejected; {retries_left} attempts left");
