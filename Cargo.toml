@@ -41,9 +41,11 @@ refineid-rapp-core = { path = "crates/refineid-rapp-core", version = "26" }
 refineid-dev-errors = { path = "crates/refineid-dev-errors", version = "26" }
 
 refineid-apdu = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
+refineid-atr = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-auth = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-ber = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-build-number = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
+refineid-digest = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pkcs15 = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-rapp = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pcsc = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }

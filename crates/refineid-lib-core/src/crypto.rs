@@ -28,7 +28,7 @@
 
 pub mod brainpool_p384;
 pub mod container;
-pub mod digest;
+pub use refineid_digest as digest;
 pub mod ecdsa;
 pub mod rsa;
 pub mod symmetric;

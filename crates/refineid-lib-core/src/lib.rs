@@ -63,7 +63,7 @@
 
 pub mod aa;
 pub mod apdu;
-pub mod atr;
+pub use refineid_atr as atr;
 pub mod auth;
 pub mod backend;
 pub mod base64;
@@ -79,7 +79,17 @@ pub mod crypto;
 pub mod emrtd;
 pub mod error;
 pub mod events;
-pub mod fineid_card;
+
+/// FINEID card identity and ATR/ATS classification, re-exported from
+/// [`refineid_atr::fineid`] alongside the core ATR types.
+pub mod fineid_card {
+    #![expect(
+        clippy::pub_use,
+        reason = "library-facade pattern: collects FINEID model classification and core ATR types under fineid_card::*"
+    )]
+    pub use refineid_atr::fineid::*;
+    pub use refineid_atr::{ATR_MAX_LEN, ATR_MIN_LEN, Atr, AtrError};
+}
 pub mod hex;
 pub mod identity;
 pub mod iso8601;
