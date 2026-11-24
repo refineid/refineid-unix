@@ -76,7 +76,7 @@ const fn cmd(slot: Option<PinManageSlot>) -> &'static str {
 /// The length hint of a new PIN's first prompt: the lengths the card
 /// accepts for it; none when the card accepts no length.
 fn digit_hint(slot: PinManageSlot, lengths: &CardPinLengths) -> Option<String> {
-    let range = lengths.slot(slot.as_pin_slot().into()).accepted()?;
+    let range = lengths.slot(slot.as_pin_slot()).accepted()?;
     Some(if range.min() == range.max() {
         format!("{} digits", range.min())
     } else {
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn a_card_listing_no_lengths_hints_the_fineid_bounds() -> TestResult {
         let lengths =
-            CardPinLengths::not_listed(refineid_lib_core::auth::PinReferenceScheme::Citizen.into());
+            CardPinLengths::not_listed(refineid_lib_core::auth::PinReferenceScheme::Citizen);
         check(
             &digit_hint(PinManageSlot::Pin1, &lengths).as_deref(),
             &Some("4-12 digits"),

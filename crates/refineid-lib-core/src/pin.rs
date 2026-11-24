@@ -91,6 +91,15 @@ impl PinBytes {
     pub const fn digit_count(&self) -> usize {
         self.length as usize
     }
+
+    /// Move the validated digits into a `refineid-auth` `UnvalidatedSecret`.
+    ///
+    /// Both `PinBytes` and `UnvalidatedSecret` derive `ZeroizeOnDrop`, so the
+    /// source storage is wiped automatically on every exit path.
+    pub(crate) fn into_unvalidated_secret(self) -> refineid_auth::UnvalidatedSecret {
+        let digits = self.bytes[..self.digit_count()].to_vec();
+        refineid_auth::UnvalidatedSecret::from_owned_bytes(digits)
+    }
 }
 
 impl TryFrom<Vec<u8>> for PinBytes {
@@ -375,7 +384,7 @@ impl core::fmt::Debug for ActivationPinEight {
 /// API sum-type for "either activation entry".
 ///
 /// The variant follows the activation scheme read from the card
-/// (`PinReferenceScheme::activation_scheme`): [`Self::Seven`] for
+/// (`crate::auth::activation_scheme_for_card`): [`Self::Seven`] for
 /// §4.6.2, [`Self::Eight`] for §4.6.1. Consumers like
 /// `card_pin::activate_first` refuse a variant that does not match
 /// the card's scheme before any command is sent.

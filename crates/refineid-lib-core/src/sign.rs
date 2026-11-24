@@ -1587,20 +1587,33 @@ mod tests {
 
     /// A synthetic PIN 2 the scripted card accepts.
     const TEST_PIN2: &[u8; 6] = b"123456";
+    /// VERIFY P1 byte: verify mode.
+    const VERIFY_P1_MODE: u8 = 0x00;
+
+    fn expected_verify_pin2_probe(scheme: PinReferenceScheme) -> Vec<u8> {
+        vec![
+            ApduClass::Plain.as_byte(),
+            crate::auth::VERIFY_INS,
+            VERIFY_P1_MODE,
+            scheme.reference(crate::auth::PinSlot::Pin2),
+        ]
+    }
 
     fn expected_verify_pin2(scheme: PinReferenceScheme) -> CommandApdu {
         let mut block = TEST_PIN2.to_vec();
         if scheme == PinReferenceScheme::Citizen {
             block.resize(crate::auth::PIN2_STORED_LENGTH, crate::auth::PIN_PAD_BYTE);
         }
-        crate::auth::commands::Verify {
-            class: ApduClass::Plain,
-            mode: crate::auth::commands::VerifyMode::Verify,
-            slot: crate::auth::PinSlot::Pin2,
-            scheme,
-            data: crate::auth::commands::VerifyData::PinBlock(block),
-        }
-        .into_apdu()
+        let lc = u8::try_from(block.len()).expect("short-form Lc");
+        let mut apdu = vec![
+            ApduClass::Plain.as_byte(),
+            crate::auth::VERIFY_INS,
+            VERIFY_P1_MODE,
+            scheme.reference(crate::auth::PinSlot::Pin2),
+            lc,
+        ];
+        apdu.extend_from_slice(&block);
+        CommandApdu::new(apdu)
     }
 
     fn expected_pso_cds_over_digest(digest: &[u8], le: u8) -> CommandApdu {
@@ -1650,6 +1663,7 @@ mod tests {
         let mut tx = Scripted::new(vec![
             (esign_wire::select_mf().into_bytes(), ok(&[])),
             (esign_wire::select_esign_by_name().into_bytes(), ok(&[])),
+            (expected_verify_pin2_probe(scheme), ok(&[])),
             (expected_verify_pin2(scheme).into_bytes(), ok(&[])),
             (
                 expected_mse_set_dst(
@@ -1682,6 +1696,7 @@ mod tests {
         let hash = placeholder_sha256_digest();
         let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
         let mut tx = Scripted::new(vec![
+            (expected_verify_pin2_probe(scheme), ok(&[])),
             (expected_verify_pin2(scheme).into_bytes(), ok(&[])),
             (
                 expected_mse_set_dst(

@@ -160,7 +160,7 @@ impl fmt::Display for DecryptAuthError {
                 write!(f, "Basic PIN 1 is blocked -- card needs a PUK unblock")
             }
             Self::PinRejected(VerifyOutcome::Other(sw)) => {
-                write!(f, "Basic PIN 1 verify: unexpected SW={sw:#06X}")
+                write!(f, "Basic PIN 1 verify: unexpected SW={:#06X}", sw.as_u16())
             }
             Self::PinRejected(VerifyOutcome::Ok) => {
                 write!(f, "internal: PinRejected(Ok) is not an error state")
@@ -196,8 +196,12 @@ fn auth_to_decrypt<E: fmt::Display>(e: AuthError<E>) -> DecryptAuthError {
     match e {
         AuthError::Transport(t) => DecryptAuthError::Transport(format!("{t}")),
         AuthError::PinPolicy(r) => DecryptAuthError::PinPolicy(r),
+        AuthError::RetryFloor(refusal) => DecryptAuthError::RetryFloor(refusal),
         AuthError::UnsupportedSlot { scheme, slot } => {
             DecryptAuthError::Transport(format!("{slot:?} is not supported under {scheme:?}"))
+        }
+        AuthError::Command(detail) => {
+            DecryptAuthError::Transport(format!("auth command: {detail}"))
         }
     }
 }
@@ -410,10 +414,14 @@ mod tests {
                 .contains("Basic PIN 1 is blocked"),
             "locked",
         )?;
+        const UNEXPECTED_SW: u16 = 0x6F00;
+        let expected_other_sw = format!("unexpected SW={UNEXPECTED_SW:#06X}");
         check_true(
-            DecryptAuthError::PinRejected(VerifyOutcome::Other(0x6F00))
-                .to_string()
-                .contains("unexpected SW=0x6F00"),
+            DecryptAuthError::PinRejected(VerifyOutcome::Other(
+                refineid_lib_core::apdu::status_word::StatusWord::from_u16(UNEXPECTED_SW),
+            ))
+            .to_string()
+            .contains(&expected_other_sw),
             "other sw",
         )?;
         check_true(

@@ -91,6 +91,11 @@ impl CommandApdu {
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
+
+    /// Overwrite the buffered APDU bytes with zeroes.
+    pub(crate) fn zeroize_bytes(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.bytes);
+    }
 }
 
 impl From<refineid_apdu::CommandApdu> for CommandApdu {

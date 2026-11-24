@@ -52,7 +52,7 @@ fn active_scheme(state: &UiState) -> PinReferenceScheme {
 fn card_lengths(state: &UiState) -> CardPinLengths {
     state
         .pin_lengths
-        .unwrap_or_else(|| CardPinLengths::not_listed(active_scheme(state).into()))
+        .unwrap_or_else(|| CardPinLengths::not_listed(active_scheme(state)))
 }
 
 /// The digit counts a credential with `lengths` accepts; `None` when
@@ -65,7 +65,7 @@ fn accepted(lengths: CredentialLengths) -> Option<RangeInclusive<usize>> {
 /// use; `None` when the card accepts no length.
 #[must_use]
 pub fn pin_digits(state: &UiState, slot: PinSlot) -> Option<RangeInclusive<usize>> {
-    accepted(card_lengths(state).slot(slot.into()))
+    accepted(card_lengths(state).slot(slot))
 }
 
 /// How many digits the PUK may have on the card in use; `None` when the

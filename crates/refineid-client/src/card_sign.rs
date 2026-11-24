@@ -396,7 +396,12 @@ impl fmt::Display for SignErrorKind {
                 slot,
                 outcome: VerifyOutcome::Other(sw),
             } => {
-                write!(f, "{} verify: unexpected SW={sw:#06X}", slot.pin_label())
+                write!(
+                    f,
+                    "{} verify: unexpected SW={:#06X}",
+                    slot.pin_label(),
+                    sw.as_u16()
+                )
             }
             Self::PinRejected {
                 outcome: VerifyOutcome::Ok,
@@ -726,9 +731,11 @@ fn auth_err_to_sign_kind<TE: fmt::Display>(slot: SignSlot, error: AuthError<TE>)
     match error {
         AuthError::Transport(t) => SignErrorKind::Transport(format!("{t}")),
         AuthError::PinPolicy(reason) => SignErrorKind::PinPolicy { slot, reason },
+        AuthError::RetryFloor(refusal) => SignErrorKind::RetryFloor(refusal),
         AuthError::UnsupportedSlot { scheme, slot: pin } => {
             SignErrorKind::Transport(format!("{pin:?} is not supported under {scheme:?}"))
         }
+        AuthError::Command(detail) => SignErrorKind::Transport(format!("auth command: {detail}")),
     }
 }
 
@@ -1055,7 +1062,7 @@ mod tests {
 
         let other = SignErrorKind::PinRejected {
             slot: SignSlot::Auth,
-            outcome: VerifyOutcome::Other(0x6A88),
+            outcome: VerifyOutcome::Other(StatusWord::ReferenceDataNotFound),
         }
         .to_string();
         check_true(other.contains("0x6A88"), "other sw rendered")?;
