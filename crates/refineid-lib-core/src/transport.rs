@@ -20,8 +20,9 @@
 //! in their own crates so the protocol layer stays unaware of
 //! where the bytes are going.
 
-use crate::apdu::status_word::StatusWord;
 use crate::atr::{Atr, AtrError};
+
+pub use refineid_apdu::{ResponseApdu, TransportErrorExt, TransportErrorKind, TransportOutcome};
 
 /// One outgoing smart-card command APDU.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +93,18 @@ impl CommandApdu {
     }
 }
 
+impl From<refineid_apdu::CommandApdu> for CommandApdu {
+    fn from(command: refineid_apdu::CommandApdu) -> Self {
+        let allows_wrong_le = command.corrected_wrong_le(0).is_some();
+        let converted = Self::new(command.as_bytes().to_vec());
+        if allows_wrong_le {
+            converted.allow_wrong_le_retry()
+        } else {
+            converted
+        }
+    }
+}
+
 impl From<Vec<u8>> for CommandApdu {
     fn from(bytes: Vec<u8>) -> Self {
         Self::new(bytes)
@@ -115,176 +128,6 @@ impl AsRef<[u8]> for CommandApdu {
         self.as_bytes()
     }
 }
-
-/// One smartcard APDU response: body plus the two status bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResponseApdu {
-    /// Response data body (excluding SW1/SW2). Empty for
-    /// status-only responses. Tier 0 `Vec<u8>` -- the typed
-    /// shape depends on the command (cert DER, PIN status, ...).
-    pub body: Vec<u8>,
-    /// First status byte per ISO 7816-4 §5.1.3. Tier 0 `u8`;
-    /// the typed projection is
-    /// `StatusWord` via
-    /// [`status_word`](Self::status_word).
-    pub sw1: u8,
-    /// Second status byte per ISO 7816-4 §5.1.3. Tier 0 `u8`.
-    pub sw2: u8,
-}
-
-impl ResponseApdu {
-    /// `SW1 << 8 | SW2` as a raw `u16`. Prefer
-    /// [`status_word`] for typed matching; the raw value is
-    /// kept available for diagnostics and JSON-Lines event
-    /// fields where the typed enum would lose the exact byte
-    /// shape.
-    ///
-    /// [`status_word`]: ResponseApdu::status_word
-    #[must_use]
-    pub const fn sw(&self) -> u16 {
-        // `u16::from(u8)` is not yet const-callable (the
-        // `From` trait is not const-stable). The widening
-        // `as u16` cast is exact for u8 -> u16; the per-site
-        // allow is the minimal escape hatch in a const fn.
-        #[expect(
-            clippy::as_conversions,
-            reason = "u8 -> u16 widening in a const fn; u16::from is not const-callable (From trait not yet const-stable). The widening is exact; cast_lossless is no longer suppressed because clippy doesn't flag widening casts on this path today."
-        )]
-        let combined = ((self.sw1 as u16) << 8_u32) | (self.sw2 as u16);
-        combined
-    }
-
-    /// Decoded ISO 7816-4 status word, per
-    /// [`StatusWord`]. This is the
-    /// canonical accessor -- consumers should match on the
-    /// typed enum rather than compare against raw `sw1` /
-    /// `sw2` / [`sw`] values.
-    ///
-    /// [`sw`]: ResponseApdu::sw
-    #[must_use]
-    pub const fn status_word(&self) -> StatusWord {
-        StatusWord::from_bytes(self.sw1, self.sw2)
-    }
-
-    /// `true` iff the status word is exactly `0x9000`. Thin
-    /// shorthand over [`status_word`] for the common case where
-    /// the caller doesn't care which non-success status arrived.
-    ///
-    /// [`status_word`]: ResponseApdu::status_word
-    #[must_use]
-    pub const fn is_ok(&self) -> bool {
-        matches!(self.status_word(), StatusWord::Success)
-    }
-}
-
-/// Transport-level state transitions and faults that matter above
-/// the pure byte-moving layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TransportOutcome {
-    /// A real APDU response (body + SW1/SW2). Pipeline can match
-    /// on `response.status_word()` and continue.
-    Response(ResponseApdu),
-    /// Card slot was sensed empty during the exchange.
-    NoCard,
-    /// Transport timed out with the card in an unknown state
-    /// (the response may have landed before the timeout fired).
-    TimeoutUnknownState,
-    /// Card reset itself (warm or cold) during the exchange.
-    CardReset,
-    /// T=1 block-numbering / window state lost; subsequent
-    /// frames cannot be interpreted.
-    ProtocolDesync,
-    /// Reader was unplugged or its session terminated.
-    ReaderRemoved,
-}
-
-impl TransportOutcome {
-    /// Drop the outcome wrapper if it carries a real APDU
-    /// response; otherwise hand the outcome back as an error.
-    ///
-    /// # Errors
-    /// Any non-response transport state (no card, reader removed,
-    /// card reset, etc.).
-    pub fn into_response(self) -> Result<ResponseApdu, Self> {
-        #[expect(
-            clippy::wildcard_enum_match_arm,
-            reason = "TransportOutcome is #[non_exhaustive]; the non-Response variants (NoCard, CardReset, ReaderRemoved, ...) and any future variant are uniformly surfaced as Err(outcome) for the caller's typed dispatch."
-        )]
-        match self {
-            Self::Response(response) => Ok(response),
-            other => Err(other),
-        }
-    }
-
-    /// Project a non-response outcome to its
-    /// [`TransportErrorKind`]; `None` for the `Response` variant.
-    #[must_use]
-    pub const fn kind(&self) -> Option<TransportErrorKind> {
-        match self {
-            Self::Response(_) => None,
-            Self::NoCard => Some(TransportErrorKind::NoCard),
-            Self::TimeoutUnknownState => Some(TransportErrorKind::TimeoutUnknownState),
-            Self::CardReset => Some(TransportErrorKind::CardReset),
-            Self::ProtocolDesync => Some(TransportErrorKind::ProtocolDesync),
-            Self::ReaderRemoved => Some(TransportErrorKind::ReaderRemoved),
-        }
-    }
-}
-
-impl core::fmt::Display for TransportOutcome {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Response(response) => write!(
-                f,
-                "response SW={:#06X} body={}B",
-                response.sw(),
-                response.body.len()
-            ),
-            Self::NoCard => write!(f, "no card present"),
-            Self::TimeoutUnknownState => write!(f, "transport timeout; card state unknown"),
-            Self::CardReset => write!(f, "card reset during transport"),
-            Self::ProtocolDesync => write!(f, "transport protocol desynchronised"),
-            Self::ReaderRemoved => write!(f, "reader or card removed"),
-        }
-    }
-}
-
-/// Coarse classification for transport errors that are not
-/// already represented as a [`TransportOutcome`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TransportErrorKind {
-    /// Backend-specific error (PC/SC error, USB CCID glitch,
-    /// ...). The adapter's `Display` carries the detail.
-    Backend,
-    /// Card slot was sensed empty.
-    NoCard,
-    /// Transport timed out; card state unknown.
-    TimeoutUnknownState,
-    /// Card reset mid-exchange.
-    CardReset,
-    /// T=1 protocol desync (window / block numbering corrupted).
-    ProtocolDesync,
-    /// Reader unplugged / session terminated.
-    ReaderRemoved,
-}
-
-/// Adapter-specific transport errors classify themselves into a
-/// small stable fault vocabulary so the use-case layer can match
-/// on a typed kind rather than a substring of `Display`.
-pub trait TransportErrorExt {
-    /// Classify this error into the [`TransportErrorKind`]
-    /// vocabulary. Default impl returns `Backend`; adapters that
-    /// have richer information (PC/SC's
-    /// `SCARD_W_REMOVED_CARD`, etc.) override.
-    fn kind(&self) -> TransportErrorKind {
-        TransportErrorKind::Backend
-    }
-}
-
-impl TransportErrorExt for String {}
-impl TransportErrorExt for &'static str {}
 
 /// "I expected a real APDU response, but the transport had a
 /// higher-level state transition or backend failure instead."
@@ -355,17 +198,10 @@ pub trait CardTransport {
         Self: Sized,
     {
         let command = CommandApdu::from(apdu);
-        #[expect(
-            clippy::wildcard_enum_match_arm,
-            reason = "TransportOutcome is #[non_exhaustive]; non-Response state transitions (NoCard, CardReset, ReaderRemoved, ...) and any future variant are lifted into TransportDispatchError::Outcome so the caller can branch on TransportErrorKind."
-        )]
-        match self
-            .transmit_outcome(&command)
+        self.transmit_outcome(&command)
             .map_err(TransportDispatchError::Error)?
-        {
-            TransportOutcome::Response(response) => Ok(response),
-            outcome => Err(TransportDispatchError::Outcome(outcome)),
-        }
+            .into_response()
+            .map_err(TransportDispatchError::Outcome)
     }
 
     /// Card's ATR, parsed into the typed [`Atr`]. Upper layers read
@@ -434,13 +270,16 @@ mod tests {
 
     #[test]
     fn apdu_response_status_helpers() {
+        const SW_SUCCESS: u16 = 0x9000;
+        const SW_PIN_THREE_RETRIES: u16 = 0x63C3;
+
         let ok = ResponseApdu {
             body: vec![],
             sw1: 0x90,
             sw2: 0x00,
         };
         assert!(ok.is_ok());
-        assert_eq!(ok.sw(), 0x9000);
+        assert_eq!(ok.status_word().as_u16(), SW_SUCCESS);
 
         let pin_wrong = ResponseApdu {
             body: vec![],
@@ -448,7 +287,7 @@ mod tests {
             sw2: 0xC3,
         };
         assert!(!pin_wrong.is_ok());
-        assert_eq!(pin_wrong.sw(), 0x63C3);
+        assert_eq!(pin_wrong.status_word().as_u16(), SW_PIN_THREE_RETRIES);
     }
 
     #[test]
@@ -488,6 +327,89 @@ mod tests {
         assert_eq!(
             tx.atr().expect("mock exposes its ATR").to_wire_bytes(),
             MINIMAL_DIRECT_ATR
+        );
+    }
+
+    #[test]
+    fn from_core_command_apdu_preserves_wrong_le_retry_policy() {
+        use crate::apdu::iso7816::{
+            ApduClass, DirectOffset15, FileId, GetResponse, ReadBinary, ReadBinaryOffset,
+            SelectEfNoFci,
+        };
+
+        const LE_ANY: u8 = 0x00;
+        const CORRECTED_GET_RESPONSE_LE: u8 = 0x20;
+        const SECOND_RETRY_LE: u8 = 0x10;
+        const INITIAL_READ_LE: u8 = 0x80;
+        const CORRECTED_READ_LE: u8 = 0x40;
+        const SAMPLE_EF_FID: FileId = FileId::from_u16(0x4331);
+
+        let get_response: CommandApdu = GetResponse {
+            class: ApduClass::Plain,
+            le: LE_ANY,
+        }
+        .into_apdu()
+        .into();
+        let retried = get_response
+            .corrected_wrong_le(CORRECTED_GET_RESPONSE_LE)
+            .expect("GetResponse keeps one wrong-Le retry across From conversion");
+        assert_eq!(
+            retried.as_bytes(),
+            &[
+                ApduClass::Plain.as_byte(),
+                GetResponse::INS,
+                GetResponse::P1,
+                GetResponse::P2,
+                CORRECTED_GET_RESPONSE_LE,
+            ]
+        );
+        assert!(
+            retried.corrected_wrong_le(SECOND_RETRY_LE).is_none(),
+            "corrected command cannot be retried a second time"
+        );
+
+        let foreign_already_retried: CommandApdu = GetResponse {
+            class: ApduClass::Plain,
+            le: LE_ANY,
+        }
+        .into_apdu()
+        .corrected_wrong_le(CORRECTED_GET_RESPONSE_LE)
+        .expect("fresh core GetResponse permits one wrong-Le correction")
+        .into();
+        assert!(
+            foreign_already_retried
+                .corrected_wrong_le(SECOND_RETRY_LE)
+                .is_none(),
+            "already-corrected core command must stay terminal across From conversion"
+        );
+
+        let read_binary: CommandApdu = ReadBinary {
+            class: ApduClass::Plain,
+            offset: ReadBinaryOffset::Direct(
+                DirectOffset15::try_new(0).expect("offset zero fits in DirectOffset15"),
+            ),
+            le: INITIAL_READ_LE,
+        }
+        .into_apdu()
+        .into();
+        let retried_read = read_binary
+            .corrected_wrong_le(CORRECTED_READ_LE)
+            .expect("ReadBinary keeps one wrong-Le retry across From conversion");
+        assert_eq!(
+            retried_read.as_bytes(),
+            &[
+                ApduClass::Plain.as_byte(),
+                ReadBinary::INS,
+                0,
+                0,
+                CORRECTED_READ_LE,
+            ]
+        );
+
+        let select_ef: CommandApdu = SelectEfNoFci { fid: SAMPLE_EF_FID }.into_apdu().into();
+        assert!(
+            select_ef.corrected_wrong_le(SECOND_RETRY_LE).is_none(),
+            "non-case-2 SelectEfNoFci must not gain wrong-Le retry across From conversion"
         );
     }
 }

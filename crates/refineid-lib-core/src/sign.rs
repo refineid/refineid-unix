@@ -274,7 +274,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("MSE:Set DST", r.sw()));
+            return Err(SignError::Sw("MSE:Set DST", r.status_word().as_u16()));
         }
         Ok(())
     }
@@ -302,7 +302,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("MSE:Set CT", r.sw()));
+            return Err(SignError::Sw("MSE:Set CT", r.status_word().as_u16()));
         }
         Ok(())
     }
@@ -331,7 +331,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("MSE:Set AT", r.sw()));
+            return Err(SignError::Sw("MSE:Set AT", r.status_word().as_u16()));
         }
         Ok(())
     }
@@ -377,7 +377,7 @@ pub trait SignOps: CardTransport {
             apdu.push(0x00);
             let r = self.transmit(&apdu).map_err(SignError::Transport)?;
             if !r.is_ok() {
-                return Err(SignError::Sw("PSO:CDS data", r.sw()));
+                return Err(SignError::Sw("PSO:CDS data", r.status_word().as_u16()));
             }
             return Ok(Signature::new(r.body));
         }
@@ -398,7 +398,7 @@ pub trait SignOps: CardTransport {
             if r.is_ok() {
                 return Ok(Signature::new(r.body));
             }
-            r.sw()
+            r.status_word().as_u16()
         } else {
             0
         };
@@ -422,7 +422,10 @@ pub trait SignOps: CardTransport {
             if ext_sw != 0 {
                 return Err(SignError::Sw("PSO:CDS extended", ext_sw));
             }
-            return Err(SignError::Sw("PSO:CDS chunk 1/2", r1.sw()));
+            return Err(SignError::Sw(
+                "PSO:CDS chunk 1/2",
+                r1.status_word().as_u16(),
+            ));
         }
 
         let mut apdu2 = Vec::with_capacity(5 + second.len() + 1);
@@ -432,7 +435,10 @@ pub trait SignOps: CardTransport {
         apdu2.push(0x00);
         let r2 = self.transmit(&apdu2).map_err(SignError::Transport)?;
         if !r2.is_ok() {
-            return Err(SignError::Sw("PSO:CDS chunk 2/2", r2.sw()));
+            return Err(SignError::Sw(
+                "PSO:CDS chunk 2/2",
+                r2.status_word().as_u16(),
+            ));
         }
         Ok(Signature::new(r2.body))
     }
@@ -495,7 +501,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.sw()));
+            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
         }
         Ok(())
     }
@@ -522,7 +528,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.sw()));
+            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
         }
         Ok(())
     }
@@ -549,7 +555,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.sw()));
+            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
         }
         Ok(())
     }
@@ -576,7 +582,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.sw()));
+            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
         }
         Ok(())
     }
@@ -604,7 +610,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.sw()));
+            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
         }
         Ok(())
     }
@@ -635,7 +641,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("PSO:CDS", r.sw()));
+            return Err(SignError::Sw("PSO:CDS", r.status_word().as_u16()));
         }
         Ok(Signature::new(r.body))
     }
@@ -662,7 +668,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("PSO:CDS", r.sw()));
+            return Err(SignError::Sw("PSO:CDS", r.status_word().as_u16()));
         }
         Ok(Signature::new(r.body))
     }
@@ -962,7 +968,7 @@ pub trait SignOps: CardTransport {
                 .transmit(apdu.as_bytes())
                 .map_err(SignError::Transport)?;
             if !r.is_ok() {
-                return Err(SignError::Sw("PSO:DECIPHER", r.sw()));
+                return Err(SignError::Sw("PSO:DECIPHER", r.status_word().as_u16()));
             }
             return Ok(Plaintext::new(r.body));
         }
@@ -983,7 +989,10 @@ pub trait SignOps: CardTransport {
             .transmit(apdu1.as_bytes())
             .map_err(SignError::Transport)?;
         if !r1.is_ok() {
-            return Err(SignError::Sw("PSO:DECIPHER chunk 1/2", r1.sw()));
+            return Err(SignError::Sw(
+                "PSO:DECIPHER chunk 1/2",
+                r1.status_word().as_u16(),
+            ));
         }
 
         let apdu2 = commands::PsoDecipher {
@@ -995,7 +1004,10 @@ pub trait SignOps: CardTransport {
             .transmit(apdu2.as_bytes())
             .map_err(SignError::Transport)?;
         if !r2.is_ok() {
-            return Err(SignError::Sw("PSO:DECIPHER chunk 2/2", r2.sw()));
+            return Err(SignError::Sw(
+                "PSO:DECIPHER chunk 2/2",
+                r2.status_word().as_u16(),
+            ));
         }
         Ok(Plaintext::new(r2.body))
     }
@@ -1053,7 +1065,7 @@ pub trait SignOps: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(SignError::Transport)?;
         if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.sw()));
+            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
         }
         Ok(())
     }

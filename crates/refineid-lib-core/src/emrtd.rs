@@ -43,7 +43,9 @@
 //!   the embedded image rather than parsing the biometric
 //!   header proper.
 
-use crate::apdu::iso7816::{ReadBinaryByOffset, ReadBinaryBySfi, SelectByAidNoFci};
+use crate::apdu::iso7816::{
+    ApduClass, DirectOffset15, ReadBinary, ReadBinaryOffset, SelectByAidNoFci,
+};
 use crate::apdu::primitives::Aid;
 use crate::apdu::status_word::StatusWord;
 use crate::ber::{BerError, BerTag, BerTlv, BerTlvIter, Integer, Oid, Sequence, Set};
@@ -205,36 +207,50 @@ const _: () = assert!(
 // `crate::apdu::primitives::Sfi`.
 use crate::apdu::primitives::Sfi;
 
+/// Const-context wrapper over [`Sfi::new`] for compile-time-known
+/// ICAO data-group short file identifiers. Panics at compile time if
+/// out of range.
+#[expect(
+    clippy::panic,
+    reason = "Const-eval boundary: builds compile-time ICAO SFI constants; out-of-range fails compilation rather than panicking at runtime."
+)]
+const fn sfi_const(value: u8) -> Sfi {
+    match Sfi::new(value) {
+        Ok(sfi) => sfi,
+        Err(_) => panic!("SFI out of ISO 7816-4 range"),
+    }
+}
+
 /// SFI for EF.COM (Common Data Element list) per ICAO Doc 9303-10 §3.6.
-pub const SFI_EF_COM: Sfi = Sfi::from_const(0x1E);
+pub const SFI_EF_COM: Sfi = sfi_const(0x1E);
 /// SFI for DG1 (MRZ) per ICAO Doc 9303-10 §4.7.1.
-pub const SFI_EF_DG1: Sfi = Sfi::from_const(0x01);
+pub const SFI_EF_DG1: Sfi = sfi_const(0x01);
 /// SFI for DG2 (encoded face) per ICAO Doc 9303-10 §4.7.2.
-pub const SFI_EF_DG2: Sfi = Sfi::from_const(0x02);
+pub const SFI_EF_DG2: Sfi = sfi_const(0x02);
 /// SFI for DG3 (encoded fingerprints; EAC-protected) per ICAO
 /// Doc 9303-10 §4.7.3.
-pub const SFI_EF_DG3: Sfi = Sfi::from_const(0x03);
+pub const SFI_EF_DG3: Sfi = sfi_const(0x03);
 /// SFI for DG7 (displayed signature or usual mark) per ICAO
 /// Doc 9303-10 §4.7.7.
-pub const SFI_EF_DG7: Sfi = Sfi::from_const(0x07);
+pub const SFI_EF_DG7: Sfi = sfi_const(0x07);
 /// SFI for DG11 (additional personal details) per ICAO
 /// Doc 9303-10 §4.7.11.
-pub const SFI_EF_DG11: Sfi = Sfi::from_const(0x0B);
+pub const SFI_EF_DG11: Sfi = sfi_const(0x0B);
 /// SFI for DG12 (additional document details) per ICAO
 /// Doc 9303-10 §4.7.12.
-pub const SFI_EF_DG12: Sfi = Sfi::from_const(0x0C);
+pub const SFI_EF_DG12: Sfi = sfi_const(0x0C);
 /// SFI for DG13 (issuing-state optional details) per ICAO
 /// Doc 9303-10 §4.7.13.
-pub const SFI_EF_DG13: Sfi = Sfi::from_const(0x0D);
+pub const SFI_EF_DG13: Sfi = sfi_const(0x0D);
 /// SFI for DG14 (chip-auth security infos) per ICAO Doc 9303-11
 /// §9.2.
-pub const SFI_EF_DG14: Sfi = Sfi::from_const(0x0E);
+pub const SFI_EF_DG14: Sfi = sfi_const(0x0E);
 /// SFI for DG15 (active-authentication public key) per ICAO
 /// Doc 9303-11 §9.1.
-pub const SFI_EF_DG15: Sfi = Sfi::from_const(0x0F);
+pub const SFI_EF_DG15: Sfi = sfi_const(0x0F);
 /// SFI for EF.SOD (Document Security Object, CMS `SignedData` per
 /// RFC 5652) per ICAO Doc 9303-10 §4.6.2.
-pub const SFI_EF_SOD: Sfi = Sfi::from_const(0x1D);
+pub const SFI_EF_SOD: Sfi = sfi_const(0x1D);
 
 /// Max read chunk per ISO 7816-4 single-byte Le, leaving room for SM
 /// overhead (eMRTD SM wraps every command into DO87 + DO8E adding
@@ -295,7 +311,12 @@ pub(crate) fn read_file<T: CardTransport>(
     transport: &mut T,
     sfi: Sfi,
 ) -> Result<Vec<u8>, EmrtdError<T::Error>> {
-    let header = read_chunk(transport, AddressMode::Sfi(sfi), 0, 4)?;
+    const HEADER_PROBE_LEN: u8 = 4;
+    let header = read_chunk(
+        transport,
+        ReadBinaryOffset::BySfi { sfi, offset: 0 },
+        HEADER_PROBE_LEN,
+    )?;
     if header.len() < 2 {
         return Ok(header);
     }
@@ -310,38 +331,24 @@ pub(crate) fn read_file<T: CardTransport>(
         // underflow.
         let remaining = total.saturating_sub(collected.len());
         let want = u8::try_from(core::cmp::min(MAX_CHUNK, remaining)).unwrap_or(u8::MAX);
-        // EF.DG1/DG2 sizes on a FINEID card sit well below 64 KiB, and
-        // ICAO 9303 caps EFs at 65535 bytes anyway (BER long-form Le=0x82).
-        // Past 0xFFFF we stop -- the card can't address higher
-        // anyway under the short-form READ BINARY shape.
-        let Ok(offset) = u16::try_from(collected.len()) else {
-            break;
+        // Short-form READ BINARY carries a 15-bit direct offset
+        // (`DirectOffset15::MAX`). Fail closed rather than silently
+        // truncating or wrapping the offset if an EF declares a larger body.
+        let Some(offset) = u16::try_from(collected.len())
+            .ok()
+            .and_then(|raw| DirectOffset15::try_new(raw).ok())
+        else {
+            return Err(EmrtdError::ParseFailure(
+                "READ BINARY direct offset exceeds 15-bit short-form limit",
+            ));
         };
-        let chunk = read_chunk(transport, AddressMode::Offset, offset, want)?;
+        let chunk = read_chunk(transport, ReadBinaryOffset::Direct(offset), want)?;
         if chunk.is_empty() {
             break;
         }
         collected.extend_from_slice(&chunk);
     }
     Ok(collected)
-}
-
-/// Which addressing form a chunked READ BINARY uses against an
-/// eMRTD application.
-///
-/// ISO 7816-4 §7.2.3 defines two `READ BINARY` shapes: short-EF
-/// implicit (SFI in P1) and offset-only (current EF, offset in
-/// P1||P2). The eMRTD select chain typically selects DG1..DG16
-/// once via SFI to pick up the SOD-promised file, then continues
-/// with offset-form reads to walk through it.
-#[derive(Debug, Clone, Copy)]
-enum AddressMode {
-    /// Short EF identifier addressing -- ISO 7816-4 §7.2.3 (P1
-    /// has the SFI marker, P2 has the byte offset 0..127).
-    Sfi(Sfi),
-    /// Current-EF offset addressing -- ISO 7816-4 §7.2.3 (P1||P2
-    /// is the 15-bit offset against the previously-selected EF).
-    Offset,
 }
 
 /// Issue one READ BINARY APDU and return the response body.
@@ -353,29 +360,15 @@ enum AddressMode {
 /// callers detect EOF by the short response, not by an error.
 fn read_chunk<T: CardTransport>(
     transport: &mut T,
-    mode: AddressMode,
-    offset: u16,
+    offset: ReadBinaryOffset,
     length: u8,
 ) -> Result<Vec<u8>, EmrtdError<T::Error>> {
-    let apdu = match mode {
-        AddressMode::Sfi(sfi) => ReadBinaryBySfi {
-            sfi,
-            // SFI-form READ BINARY P2 carries the offset; for
-            // the eMRTD first-chunk discovery refineid always
-            // passes 0 here (full read starts at byte 0).  The
-            // low byte of the offset is the on-wire P2 byte; the
-            // high byte travels in P1 alongside the SFI marker
-            // for the alternate-form variant we don't use here.
-            // `to_be_bytes()[1]` reads as "low byte of the
-            // big-endian repr" and silences
-            // clippy::little_endian_bytes (which prefers be_bytes
-            // workspace-wide).
-            offset: offset.to_be_bytes()[1],
-            le: length,
-        }
-        .into_apdu(),
-        AddressMode::Offset => ReadBinaryByOffset { offset, le: length }.into_apdu(),
-    };
+    let apdu = ReadBinary {
+        class: ApduClass::Plain,
+        offset,
+        le: length,
+    }
+    .into_apdu();
     let r = transport
         .transmit(apdu.as_bytes())
         .map_err(EmrtdError::Transport)?;
@@ -387,7 +380,7 @@ fn read_chunk<T: CardTransport>(
     } else {
         Err(EmrtdError::Sw {
             op: "READ BINARY",
-            sw: r.sw(),
+            sw: r.status_word().as_u16(),
         })
     }
 }

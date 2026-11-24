@@ -36,9 +36,50 @@
 //! refuses the INTERNAL AUTHENTICATE APDU outside Secure
 //! Messaging. Callers pass an already-SM-wrapped transport.
 
-use crate::apdu::iso7816::InternalAuthenticate;
+use crate::apdu::iso7816::APDU_HEADER_LEN;
 use crate::crypto::rsa::{HashAlg, RsaPublicKey, RsaVerifyError, verify_iso9796_2_ds1};
-use crate::transport::{CardTransport, TransportDispatchError};
+use crate::transport::{CardTransport, CommandApdu, TransportDispatchError};
+
+/// Length of the Active Authentication host challenge in bytes (ICAO 9303-11).
+const AA_CHALLENGE_LEN: usize = 8;
+
+/// ISO 7816-4 `INTERNAL AUTHENTICATE` command with an eight-byte host challenge.
+///
+/// Used by Active Authentication (ICAO 9303-11) until the eMRTD driver moves to
+/// `refineid-emrtd`.
+#[derive(Debug, Clone, Copy)]
+struct InternalAuthenticate {
+    /// Eight-byte host-supplied challenge.
+    challenge: [u8; AA_CHALLENGE_LEN],
+}
+
+impl InternalAuthenticate {
+    /// ISO 7816-4 plain class byte.
+    const CLA: u8 = 0x00;
+    /// ISO 7816-4 `INTERNAL AUTHENTICATE` instruction byte.
+    const INS: u8 = 0x88;
+    /// P1: reserved.
+    const P1: u8 = 0x00;
+    /// P2: reserved.
+    const P2: u8 = 0x00;
+    /// Lc: byte length of the host challenge.
+    const LC: u8 = 0x08;
+    /// Le: request all available signature bytes.
+    const LE_ANY: u8 = 0x00;
+    /// Wire length: header, Lc, challenge, and Le.
+    const WIRE_LEN: usize = APDU_HEADER_LEN + 1 + AA_CHALLENGE_LEN + 1;
+
+    /// Serialise into the wire command APDU.
+    #[inline]
+    #[must_use]
+    fn into_apdu(self) -> CommandApdu {
+        let mut out = Vec::with_capacity(Self::WIRE_LEN);
+        out.extend_from_slice(&[Self::CLA, Self::INS, Self::P1, Self::P2, Self::LC]);
+        out.extend_from_slice(&self.challenge);
+        out.push(Self::LE_ANY);
+        CommandApdu::new(out)
+    }
+}
 
 /// Outcome of an AA round-trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +179,9 @@ pub(crate) fn run_active_authentication<T: CardTransport>(
         .transmit(apdu.as_bytes())
         .map_err(AaError::Transport)?;
     if !response.is_ok() {
-        return Ok(AaOutcome::CardRejected { sw: response.sw() });
+        return Ok(AaOutcome::CardRejected {
+            sw: response.status_word().as_u16(),
+        });
     }
     let signature = response.body;
     match verify_iso9796_2_ds1(dg15_pubkey, &rnd_ifd, &signature) {
@@ -523,5 +566,34 @@ b3dbd3288fcb53327ee5a5ebd487e96e8f4e8a41c998494dcf1288a39a9b91";
 
         let random: AaError<String> = AaError::Random(crate::rng::Failure::UNSUPPORTED);
         assert!(format!("{random}").starts_with("AA random"), "{random}");
+    }
+
+    #[test]
+    fn internal_authenticate_wire_layout_and_no_wrong_le_retry() {
+        use super::{AA_CHALLENGE_LEN, InternalAuthenticate};
+
+        const CHALLENGE: [u8; AA_CHALLENGE_LEN] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        const RETRY_LE: u8 = 0x10;
+
+        let apdu = InternalAuthenticate {
+            challenge: CHALLENGE,
+        }
+        .into_apdu();
+        let mut expected = vec![
+            InternalAuthenticate::CLA,
+            InternalAuthenticate::INS,
+            InternalAuthenticate::P1,
+            InternalAuthenticate::P2,
+            InternalAuthenticate::LC,
+        ];
+        expected.extend_from_slice(&CHALLENGE);
+        expected.push(InternalAuthenticate::LE_ANY);
+
+        assert_eq!(apdu.as_bytes().len(), InternalAuthenticate::WIRE_LEN);
+        assert_eq!(apdu.as_bytes(), expected.as_slice());
+        assert!(
+            apdu.corrected_wrong_le(RETRY_LE).is_none(),
+            "INTERNAL AUTHENTICATE must not opt into wrong-Le retry"
+        );
     }
 }

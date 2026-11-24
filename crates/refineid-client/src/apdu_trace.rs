@@ -136,7 +136,7 @@ impl<T: CardTransport> ApduTraceTransport<T> {
     /// Status word is rendered upper-case hex (`6300`, `9000`,
     /// ...) for readability against ISO 7816-4 tables.
     fn emit_response(step: &str, response: &ResponseApdu) {
-        let sw_str = format!("{:04X}", response.sw());
+        let sw_str = format!("{:04X}", response.status_word().as_u16());
         crate::events::CardActivateApduRx {
             step,
             response_len: response.body.len(),
@@ -162,7 +162,6 @@ impl<T: CardTransport> ApduTraceTransport<T> {
             TransportOutcome::CardReset => "CardReset",
             TransportOutcome::ProtocolDesync => "ProtocolDesync",
             TransportOutcome::ReaderRemoved => "ReaderRemoved",
-            _ => "UnknownTransportOutcome",
         };
         crate::events::CardActivateApduRx {
             step,

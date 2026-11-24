@@ -59,7 +59,7 @@ use core::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use crypto_bigint::U384;
 use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::apdu::iso7816::ReadBinaryBySfi;
+use crate::apdu::iso7816::{ApduClass, ReadBinary, ReadBinaryOffset};
 use crate::ber;
 use crate::crypto::brainpool_p384::{AffinePoint, n as brainpool_n};
 use crate::crypto::symmetric::{KdfParam, kdf_aes256};
@@ -234,7 +234,9 @@ pub(crate) fn run_chip_authentication<T: CardTransport>(
     mse_apdu.extend_from_slice(&mse_data);
     let mse_resp = transport.transmit(&mse_apdu).map_err(CaError::Transport)?;
     if !mse_resp.is_ok() {
-        return Ok(CaOutcome::MseRejected { sw: mse_resp.sw() });
+        return Ok(CaOutcome::MseRejected {
+            sw: mse_resp.status_word().as_u16(),
+        });
     }
 
     // Step 4: generate ephemeral keypair on the same curve, send
@@ -267,7 +269,9 @@ pub(crate) fn run_chip_authentication<T: CardTransport>(
         .transmit(ga_apdu.as_bytes())
         .map_err(CaError::Transport)?;
     if !ga_resp.is_ok() {
-        return Ok(CaOutcome::GaRejected { sw: ga_resp.sw() });
+        return Ok(CaOutcome::GaRejected {
+            sw: ga_resp.status_word().as_u16(),
+        });
     }
 
     // Step 5: compute shared secret K = d_PCD * Q_PICC, take x.
@@ -305,10 +309,14 @@ pub(crate) fn run_chip_authentication<T: CardTransport>(
     // hold the matching CA private key) the SM-MAC on its
     // response will fail and the transport surfaces an
     // SmError::MacMismatch.
-    let probe = ReadBinaryBySfi {
-        sfi: SFI_EF_DG1,
-        offset: 0,
-        le: 4,
+    const CA_PROBE_LEN: u8 = 4;
+    let probe = ReadBinary {
+        class: ApduClass::Plain,
+        offset: ReadBinaryOffset::BySfi {
+            sfi: SFI_EF_DG1,
+            offset: 0,
+        },
+        le: CA_PROBE_LEN,
     }
     .into_apdu();
     match transport.transmit(probe.as_bytes()) {
@@ -316,7 +324,7 @@ pub(crate) fn run_chip_authentication<T: CardTransport>(
             protocol_label: proto_label,
         }),
         Ok(probe_resp) => Ok(CaOutcome::VerificationFailed {
-            detail: format!("probe SW={:#06X}", probe_resp.sw()),
+            detail: format!("probe SW={:#06X}", probe_resp.status_word().as_u16()),
         }),
         Err(err) => Ok(CaOutcome::VerificationFailed {
             detail: format!("{err}"),
@@ -421,7 +429,7 @@ mod tests {
         CA_MSE_SET_AT_P1, CaError, CaHelpers, CaOutcome, random_scalar_in_range_n,
         run_chip_authentication,
     };
-    use crate::apdu::iso7816::ReadBinaryBySfi;
+    use crate::apdu::iso7816::ReadBinary;
     use crate::apdu::status_word::StatusWord;
     use crate::atr::{Atr, AtrError, MINIMAL_DIRECT_ATR};
     use crate::ber::{self, BerTlvIter};
@@ -719,7 +727,7 @@ mod tests {
             }
 
             // Validation probe: READ BINARY of short-EF DG1 (00 B0 81 00 04).
-            if ins == ReadBinaryBySfi::INS && p1 == SFI_EF_DG1.as_p1_short_form() {
+            if ins == ReadBinary::INS && p1 == SFI_EF_DG1.as_p1_short_form() {
                 return Ok(TransportOutcome::Response(
                     self.sm_response(&[0x61, 0x5B, 0x5F, 0x1F], 0x9000),
                 ));

@@ -33,6 +33,12 @@
 //! boundary; every byte sequence has a protocol role and a
 //! typed container).
 
-pub mod iso7816;
-pub mod primitives;
-pub mod status_word;
+pub use refineid_apdu::primitives;
+pub use refineid_apdu::status_word;
+
+/// Typed ISO 7816-4 command builders and primitives from `refineid-apdu`.
+pub mod iso7816 {
+    pub use refineid_apdu::command::{APDU_HEADER_LEN, ApduClass};
+    pub use refineid_apdu::iso7816::*;
+    pub use refineid_apdu::primitives::FileId;
+}
