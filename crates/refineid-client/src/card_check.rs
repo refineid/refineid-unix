@@ -1038,9 +1038,9 @@ fn build_cert_report(
     let cert = cert_owned.view();
     let subject_cn = cert.subject.common_name();
     let issuer_cn = cert.issuer.common_name();
-    let serial = cert.serial();
+    let serial = refineid_lib_core::x509::cert_serial(&cert);
     let sha256 = CertSha256::of(der.as_bytes());
-    let signature_alg = SignatureAlgorithm::from_oid(cert.signature_alg_oid.as_bytes());
+    let signature_alg = SignatureAlgorithm::from_oid(cert.signature_alg_oid);
 
     let key_alg = parse_subject_public_key_info(cert.spki.as_der());
     let (crl_urls, ocsp_urls, ca_issuers_urls, san_emails, key_usage, eku) =
@@ -1318,7 +1318,7 @@ fn run_ocsp_check(
     // `issuer_cert.spki` was validated when the issuer cert parsed).
     let key_hash = ocsp::IssuerKeyHash::from_subject_public_key(&issuer_cert.spki);
     let name_hash = CardCheckHelpers::issuer_name_hash(&cert.issuer);
-    let serial = cert.serial();
+    let serial = refineid_lib_core::x509::cert_serial(cert);
     // A dead OS RNG means nothing on this host can be trusted: abort the
     // whole check rather than send a replayable, nonce-less request. Same
     // fail-closed posture as the PACE / AA / CA draws in lib-core.
@@ -1788,7 +1788,7 @@ impl CardCheckHelpers {
             writeln!(f, "DG15 (AA pubkey):    {} bytes", dg15.len())?;
             if let Ok(dg15_typed) = refineid_lib_core::emrtd::Dg15Bytes::try_from(dg15.as_slice())
                 && let Some(alg) = parse_subject_public_key_info(
-                    refineid_lib_core::emrtd::parse_dg15_spki(dg15_typed),
+                    &refineid_lib_core::emrtd::parse_dg15_spki(dg15_typed),
                 )
             {
                 writeln!(f, "                     {}", alg.label())?;
@@ -2134,7 +2134,7 @@ fn render_country_cross_check(
     let dsc_der = signed.certificates_der.first()?;
     let dsc_owned = OwnedCert::from_der(dsc_der).ok()?;
     let dsc = dsc_owned.view();
-    let dsc_country = dsc.issuer.country()?;
+    let dsc_country = refineid_lib_core::x509::name_country(dsc.issuer)?;
     let expected_iso = dg1_icao.to_iso_alpha2();
     match expected_iso {
         Some(iso) if iso == dsc_country => Some(format!(
@@ -2239,7 +2239,7 @@ impl CardCheckHelpers {
     /// AUTHENTICATE rejected, sig verify failed, AA disabled).
     fn render_aa_outcome(o: &refineid_lib_core::aa::AaOutcome) -> String {
         use refineid_lib_core::aa::AaOutcome;
-        use refineid_lib_core::crypto::rsa::HashAlg;
+        use refineid_lib_core::crypto::digest::HashAlg;
         let hash_label = |h: HashAlg| match h {
             HashAlg::Sha1 => "SHA-1",
             HashAlg::Sha256 => "SHA-256",
@@ -2305,7 +2305,7 @@ mod tests {
     use refineid_lib_core::ca::CaOutcome;
     use refineid_lib_core::card_access::CardAccess;
     use refineid_lib_core::crl::OwnedCrl;
-    use refineid_lib_core::crypto::rsa::HashAlg;
+    use refineid_lib_core::crypto::digest::HashAlg;
     use refineid_lib_core::identity::{CredentialIdentity, MrzDate};
     use refineid_lib_core::pkcs15::{CertSlot, TokenInfo};
     use refineid_lib_core::revocation::{InapplicableReason, RevocationStatus};

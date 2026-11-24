@@ -1356,10 +1356,10 @@ fn deduplicate_cards(
     // with an inserted card overrides RAPP.
     if cards.is_empty()
         && let Some((phone_name, der)) = phone
-        && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(der)
+        && let Ok(owned_cert) = refineid_lib_core::x509::OwnedCert::from_der(&der)
     {
         let view = owned_cert.view();
-        let serial = TokenSerial::new(owned_cert.serial().to_string());
+        let serial = TokenSerial::new(refineid_lib_core::x509::cert_serial(&view).to_string());
         let mut identity = CredentialIdentity::new();
         if let Some(cn) = view.subject.common_name() {
             identity = identity.with_common_name(cn.clone());

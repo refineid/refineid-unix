@@ -1451,7 +1451,7 @@ pub fn read_personal_data<T: CardTransport>(
     let aa_result = dg15_der.as_deref().and_then(|dg15| {
         let dg15_typed = Dg15Bytes::try_from(dg15).ok()?;
         let spki = parse_dg15_spki(dg15_typed);
-        let pubkey = crate::x509::extract_rsa_public_key(spki)?;
+        let pubkey = crate::x509::extract_rsa_public_key(&spki)?;
         crate::aa::run_active_authentication(&mut sm, &pubkey).ok()
     });
 

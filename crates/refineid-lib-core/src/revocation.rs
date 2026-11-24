@@ -121,7 +121,7 @@ pub fn check_against_crl(
     {
         return RevocationStatus::Stale;
     }
-    crl.find_serial(&cert.serial())
+    crl.find_serial(&crate::x509::cert_serial(&cert))
         .map_or(RevocationStatus::Good, |entry| RevocationStatus::Revoked {
             at: entry.revocation_date,
             reason: entry.reason,
@@ -321,7 +321,7 @@ impl CachedCertId {
         let issuer = x509_cert::name::Name::from_der(cert.issuer.as_der()).ok()?;
         Some(Self {
             issuer,
-            serial: cert.serial(),
+            serial: crate::x509::cert_serial(&cert),
         })
     }
 }

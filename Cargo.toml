@@ -45,6 +45,7 @@ refineid-atr = { git = "https://github.com/refineid/refineid-core.git", branch =
 refineid-auth = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-ber = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-build-number = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
+refineid-cms = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-digest = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pkcs15 = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-rapp = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }

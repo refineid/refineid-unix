@@ -593,10 +593,6 @@ impl CardPubkeyHelpers {
                 slot,
                 detail: "unrecognised EC named curve".to_owned(),
             }),
-            PublicKeyAlgorithm::EcExplicit { .. } => Err(PubkeyError::SshUnsupportedKey {
-                slot,
-                detail: "EC with explicit parameters -- OpenSSH only wires named curves".to_owned(),
-            }),
             PublicKeyAlgorithm::Rsa { .. } | PublicKeyAlgorithm::Other => {
                 // RSA case was caught above by extract_rsa_public_key
                 // returning Some; Other shouldn't have come this far
@@ -919,11 +915,11 @@ mod tests {
 
     #[test]
     fn ssh_rsa_line_shape() -> TestResult {
-        // Smallest valid RsaModulus (512-bit floor, odd low byte,
+        // Smallest valid RsaModulus (2048-bit floor, odd low byte,
         // canonical PKCS#1 form) + the standard e=65537.
-        const TEST_MODULUS_BYTE_LEN: usize = 64;
+        const TEST_MODULUS_BYTE_LEN: usize = 256;
         const TEST_MODULUS_FILL: u8 = 0xC1;
-        let modulus = RsaModulus::try_from_pkcs1(vec![TEST_MODULUS_FILL; TEST_MODULUS_BYTE_LEN])
+        let modulus = RsaModulus::try_from_pkcs1(&[TEST_MODULUS_FILL; TEST_MODULUS_BYTE_LEN])
             .map_err(|e| format!("test fixture modulus: {e}"))?;
         let key = RsaPublicKey {
             modulus,

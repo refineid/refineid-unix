@@ -198,10 +198,10 @@ pub struct Crl<'a> {
     revoked_seq_value: Option<&'a [u8]>,
     /// Signature algorithm OID body (the value of the `06 LL`
     /// TLV inside the outer `signatureAlgorithm`).
-    pub signature_alg_oid: &'a [u8],
+    pub signature_alg_oid: crate::oid::Oid<'a>,
     /// Outer signature BIT STRING value with the unused-bits
     /// leading byte stripped.
-    pub signature_bits: &'a [u8],
+    pub signature_bits: crate::x509::SignatureOctets<'a>,
 }
 
 impl Crl<'_> {
@@ -215,12 +215,13 @@ impl Crl<'_> {
         &self,
         issuer_spki_der: B,
     ) -> Result<(), crate::x509::VerifyError> {
-        let issuer_spki_der = issuer_spki_der.as_ref();
+        let issuer_spki = crate::x509::SpkiDer::try_from(issuer_spki_der.as_ref())
+            .map_err(|_| crate::x509::VerifyError::BadIssuerKey)?;
         crate::x509::verify_tbs_signature(crate::x509::TbsSignature {
             tbs_der: self.tbs_der,
             signature_alg_oid: self.signature_alg_oid,
             signature_bits: self.signature_bits,
-            issuer_spki_der,
+            issuer_spki,
         })
     }
 }
@@ -546,7 +547,8 @@ impl<'a> Crl<'a> {
         if alg_oid.tag() != Tag::ObjectIdentifier {
             return Err(X509Error::UnexpectedStructure("CRL signatureAlgorithm OID"));
         }
-        let signature_alg_oid = alg_oid.value();
+        let signature_alg_oid = crate::oid::Oid::new(alg_oid.value())
+            .map_err(|_| X509Error::UnexpectedStructure("CRL signatureAlgorithm OID"))?;
         if !alg_reader.is_finished() {
             alg_reader.tlv_bytes().map_err(|_ignored| {
                 X509Error::UnexpectedStructure("CRL signatureAlgorithm parameters")
@@ -570,16 +572,8 @@ impl<'a> Crl<'a> {
                 "CRL signature not BIT STRING",
             ));
         }
-        let Some((&unused_bits, signature_bits)) = sig_bits.value().split_first() else {
-            return Err(X509Error::UnexpectedStructure(
-                "CRL signature BIT STRING empty",
-            ));
-        };
-        if unused_bits != 0 {
-            return Err(X509Error::UnexpectedStructure(
-                "CRL signature has unused bits",
-            ));
-        }
+        let signature_bits =
+            crate::x509::SignatureOctets::parse(sig_bits.value(), "CRL signature")?;
         if !reader.is_finished() {
             return Err(X509Error::UnexpectedStructure(
                 "CRL trailing CertificateList fields",
@@ -606,8 +600,8 @@ fn parse_tbs_cert_list<'a>(
     tbs_der: &'a [u8],
     raw: &'a [u8],
     outer_signature_algorithm_der: &'a [u8],
-    signature_alg_oid: &'a [u8],
-    signature_bits: &'a [u8],
+    signature_alg_oid: crate::oid::Oid<'a>,
+    signature_bits: crate::x509::SignatureOctets<'a>,
 ) -> Result<Crl<'a>, X509Error> {
     // TBSCertList ::= SEQUENCE {
     //     version                 INTEGER OPTIONAL,
@@ -711,7 +705,7 @@ fn parse_tbs_cert_list<'a>(
     Ok(Crl {
         raw_der: raw,
         tbs_der,
-        issuer: crate::x509::Name::from_validated(issuer_dn_der),
+        issuer: crate::x509::Name::try_from(issuer_dn_der)?,
         this_update,
         next_update,
         revoked_seq_value,
