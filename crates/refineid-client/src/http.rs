@@ -1423,7 +1423,7 @@ mod tests {
         let url = Uri::parse("http://127.0.0.1:9/tsa".to_owned()).expect("test URL");
         let auth_header = format!(
             "Basic {}",
-            refineid_lib_core::base64::encode(b"test-user:test-pass")
+            refineid_doc_sign::base64::encode(b"test-user:test-pass")
         );
         let error = post_authority(
             &url,

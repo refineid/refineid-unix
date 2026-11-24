@@ -455,13 +455,13 @@ mod tests {
     fn basic_authorization_and_header_values_reject_header_injection() {
         let valid_auth = format!(
             "Basic {}",
-            refineid_lib_core::base64::encode(b"test-user:test-pass")
+            refineid_doc_sign::base64::encode(b"test-user:test-pass")
         );
         assert!(super::validate_basic_authorization(&valid_auth).is_ok());
         assert!(super::validate_basic_authorization("Bearer token").is_err());
         let injection = format!(
             "Basic {}\r\nX-Evil: yes",
-            refineid_lib_core::base64::encode(b"user")
+            refineid_doc_sign::base64::encode(b"user")
         );
         assert!(super::validate_basic_authorization(&injection).is_err());
         assert!(super::validate_basic_authorization("Basic abc=def=").is_err());
@@ -512,7 +512,7 @@ mod tests {
         };
         let auth_header = format!(
             "Basic {}",
-            refineid_lib_core::base64::encode(b"test-user:test-pass")
+            refineid_doc_sign::base64::encode(b"test-user:test-pass")
         );
         super::send_request(
             &mut io,
