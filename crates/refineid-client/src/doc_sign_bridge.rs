@@ -36,8 +36,8 @@ pub fn can(can: &refineid_lib_core::can::Can) -> Option<Can> {
 /// The same card serial as core's type, rendered as core renders a
 /// serial read off the card, so it compares equal to the live one.
 #[must_use]
-pub fn token_serial(serial: &refineid_lib_core::identity::TokenSerial) -> TokenSerial {
-    render_token_serial(TokenSerial::new(serial.as_str().to_owned()))
+pub fn token_serial(serial: &TokenSerial) -> TokenSerial {
+    render_token_serial(serial.clone())
 }
 
 /// The same PIN as core's type.

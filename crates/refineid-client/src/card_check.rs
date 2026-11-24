@@ -714,7 +714,7 @@ fn read_all_cert_slots<T: refineid_lib_core::transport::CardTransport>(
     secure_channel: bool,
 ) -> Result<Vec<SlotDer>, CardCheckError> {
     let mut slot_ders: Vec<SlotDer> = Vec::new();
-    for slot in CertSlot::all() {
+    for slot in refineid_lib_core::pkcs15::ALL_CERT_SLOTS {
         // Over a PACE channel, reaching a slot via the MF tears
         // the channel down and takes the rest of the readout --
         // including the PIN counters -- with it. Skip those
@@ -771,8 +771,10 @@ fn save_slot_ders(dir: &std::path::Path, slot_ders: &[SlotDer]) -> Result<(), Ca
         source,
     })?;
     for entry in slot_ders {
-        let fid = entry.discovered_fid.unwrap_or_else(|| entry.slot.fid());
-        let path = dir.join(format!("EF.{:02x}{:02x}.der", fid[0], fid[1]));
+        let [fid_hi, fid_lo] = entry
+            .discovered_fid
+            .unwrap_or_else(|| *entry.slot.fid().as_bytes());
+        let path = dir.join(format!("EF.{fid_hi:02x}{fid_lo:02x}.der"));
         std::fs::write(&path, entry.der.as_bytes())
             .map_err(|source| CardCheckError::CrlRead { path, source })?;
     }

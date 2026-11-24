@@ -14,35 +14,10 @@
 
 //! The single OS-CSPRNG seam for this crate.
 //!
-//! Every random draw in `lib-core` goes through here so the fail-closed
-//! policy lives in exactly one place: a failed OS RNG is always a hard
-//! [`Failure`], propagated by the caller, never silently swallowed into a
-//! weakened mode (a dropped nonce, a predictable IV). A dead OS RNG means
-//! no cryptographic operation on this host can be trusted, so the only
-//! correct response is to abort.
-//!
-//! Domain nonce / key types ([`crate::ocsp::OcspNonce`], the PACE / AA / CA
-//! ephemeral draws) build on [`fill`] / [`array()`] rather than calling
-//! `getrandom` directly. `getrandom` is banned outside this module by
-//! policy, so a new call site cannot
-//! reintroduce a "draw, swallow the error, continue" path -- the mistake
-//! this seam exists to make unrepresentable.
+//! Re-exports [`Failure`] and [`fill`] from [`refineid_pace::rng`] and adds
+//! [`array()`] for fixed-width random draws.
 
-/// The OS CSPRNG was unavailable.
-///
-/// Re-exported from `getrandom` so callers keep storing the concrete cause;
-/// this alias is the crate's one RNG error type.
-pub type Failure = getrandom::Error;
-
-/// Fill `buf` with OS CSPRNG bytes, or fail.
-///
-/// # Errors
-/// Returns [`Failure`] if the OS RNG is unavailable. Propagate it; never
-/// proceed with a partially-filled or zero buffer.
-#[inline]
-pub fn fill(buf: &mut [u8]) -> Result<(), Failure> {
-    getrandom::fill(buf)
-}
+pub use refineid_pace::rng::{Failure, fill};
 
 /// Draw a fresh `N`-byte array from the OS CSPRNG, or fail.
 ///
@@ -51,6 +26,6 @@ pub fn fill(buf: &mut [u8]) -> Result<(), Failure> {
 #[inline]
 pub fn array<const N: usize>() -> Result<[u8; N], Failure> {
     let mut bytes = [0_u8; N];
-    getrandom::fill(&mut bytes)?;
+    fill(&mut bytes)?;
     Ok(bytes)
 }
