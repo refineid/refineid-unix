@@ -38,7 +38,7 @@ use refineid_lib_core::backend::{
     ReaderAccessCap, ReaderBackend as _, ReaderBackendOps as _, ReaderPickError,
 };
 use refineid_lib_core::card_access::EF_CARD_ACCESS_FID;
-use refineid_lib_core::pkcs15::{CertSlot, EF_TOKEN_INFO_FID, Pkcs15Error, Pkcs15Ops as _};
+use refineid_lib_core::pkcs15::{ALL_CERT_SLOTS, EF_TOKEN_INFO_FID, Pkcs15Error, Pkcs15Ops as _};
 use refineid_lib_core::transport::CardTransport;
 use refineid_lib_pcsc::{PcscBackend, PcscError};
 
@@ -214,7 +214,7 @@ pub(crate) fn export_all_first(
         // and there's nothing meaningful left to dump.
         return Err(ExportError::Transport(format!("SELECT PKCS#15 app: {e}")));
     }
-    match read_raw_ef_under_current_df(&mut transport, EF_TOKEN_INFO_FID) {
+    match read_raw_ef_under_current_df(&mut transport, *EF_TOKEN_INFO_FID.as_bytes()) {
         Ok(bytes) => write_file(
             &options.directory,
             "EF.5032.der",
@@ -229,11 +229,11 @@ pub(crate) fn export_all_first(
     // Cert slots -- read_certificate handles its own SELECT chain
     // per slot (UnderPkcs15App / UnderDf5016 / UnderMf), so we
     // don't need to babysit DF state here.
-    for slot in CertSlot::all() {
+    for slot in ALL_CERT_SLOTS {
         match transport.read_certificate(slot) {
             Ok(der) => {
-                let fid = slot.fid();
-                let name = format!("EF.{:02x}{:02x}.der", fid[0], fid[1]);
+                let [fid_hi, fid_lo] = *slot.fid().as_bytes();
+                let name = format!("EF.{fid_hi:02x}{fid_lo:02x}.der");
                 write_file(
                     &options.directory,
                     &name,
@@ -245,12 +245,8 @@ pub(crate) fn export_all_first(
             // Absent slot: SELECT returns FileNotFound (SW 0x6A82) ->
             // "not provisioned", recorded as skipped, not an error.
             Err(Pkcs15Error::Sw(sw)) if StatusWord::from_u16(sw) == StatusWord::FileNotFound => {
-                skipped.push(format!(
-                    "EF.{:02x}{:02x} ({})",
-                    slot.fid()[0],
-                    slot.fid()[1],
-                    slot.label()
-                ));
+                let [fid_hi, fid_lo] = *slot.fid().as_bytes();
+                skipped.push(format!("EF.{fid_hi:02x}{fid_lo:02x} ({})", slot.label()));
             }
             Err(e) => return Err(ExportError::Transport(format!("{e}"))),
         }
