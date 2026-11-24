@@ -535,7 +535,7 @@ pub fn establish_card_session(
     let atr = transport
         .atr()
         .map_err(|e| CardPinError::Transport(format!("ATR length: {e}")))?;
-    let classified = atr.classify();
+    let classified = FineidCardModel::from_atr(&atr);
 
     transport
         .select_pkcs15_application()
