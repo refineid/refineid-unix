@@ -50,8 +50,6 @@
   "crates/refineid-lib-core/src/pin.rs": 5,
   "crates/refineid-lib-core/src/revocation.rs": 210,
   "crates/refineid-lib-core/src/secure_messaging.rs": 119,
-  "crates/refineid-lib-core/src/sign.rs": 62,
-  "crates/refineid-lib-core/src/sign/commands.rs": 117,
   "crates/refineid-lib-core/src/text.rs": 15,
   "crates/refineid-lib-core/src/transport.rs": 22,
   "crates/refineid-lib-core/tests/digest_signature_vectors.rs": 1,

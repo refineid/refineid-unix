@@ -38,6 +38,7 @@ refineid-cms.workspace = true
 refineid-digest.workspace = true
 refineid-pace.workspace = true
 refineid-pkcs15.workspace = true
+refineid-sign.workspace = true
 
 [build-dependencies]
 refineid-build-number.workspace = true

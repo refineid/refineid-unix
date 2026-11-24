@@ -24,7 +24,7 @@ use refineid_lib_core::atr::{Atr, AtrError, MINIMAL_DIRECT_ATR};
 use refineid_lib_core::auth::{PinReferenceScheme, PinSlot, VERIFY_INS};
 use refineid_lib_core::backend::{ReaderAccessCap, ReaderBackend, ReaderId, ReaderInfo};
 use refineid_lib_core::sign::RSA_3072_SIG_BYTES;
-use refineid_lib_core::sign::commands::{MseSet, PsoComputeDigitalSignature};
+use refineid_lib_core::sign::commands::{MSE_INS, PSO_INS};
 use refineid_lib_core::transport::{CardTransport, CommandApdu, ResponseApdu, TransportOutcome};
 use refineid_lib_pcsc::PcscError;
 
@@ -195,7 +195,7 @@ impl SyntheticCard {
         if ins == Some(ReadBinary::INS) {
             return self.read_binary(apdu);
         }
-        if ins == Some(PsoComputeDigitalSignature::INS) {
+        if ins == Some(PSO_INS) {
             self.credential_or_sign_apdus
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return respond(vec![ANSWER_FILL; RSA_3072_SIG_BYTES], StatusWord::Success);
@@ -209,7 +209,7 @@ impl SyntheticCard {
             }
             return respond(Vec::new(), StatusWord::Success);
         }
-        if ins == Some(MseSet::INS) {
+        if ins == Some(MSE_INS) {
             self.credential_or_sign_apdus
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return respond(Vec::new(), StatusWord::Success);

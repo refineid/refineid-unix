@@ -55,6 +55,7 @@ refineid-remote = { git = "https://github.com/refineid/refineid-core.git", branc
 refineid-doc-sign = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-pace = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-scs = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
+refineid-sign = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 fltk = "1.5.23"
 gtk4 = "0.11"
 
