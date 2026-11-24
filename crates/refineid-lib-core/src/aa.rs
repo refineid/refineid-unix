@@ -37,7 +37,8 @@
 //! Messaging. Callers pass an already-SM-wrapped transport.
 
 use crate::apdu::iso7816::APDU_HEADER_LEN;
-use crate::crypto::rsa::{HashAlg, RsaPublicKey, RsaVerifyError, verify_iso9796_2_ds1};
+use crate::crypto::digest::HashAlg;
+use crate::crypto::rsa::{RsaPublicKey, RsaVerifyError};
 use crate::transport::{CardTransport, CommandApdu, TransportDispatchError};
 
 /// Length of the Active Authentication host challenge in bytes (ICAO 9303-11).
@@ -184,7 +185,7 @@ pub(crate) fn run_active_authentication<T: CardTransport>(
         });
     }
     let signature = response.body;
-    match verify_iso9796_2_ds1(dg15_pubkey, &rnd_ifd, &signature) {
+    match dg15_pubkey.verify_iso9796_2_ds1(&rnd_ifd, &signature) {
         Ok(recovered) => Ok(AaOutcome::Verified {
             hash: recovered.hash,
             m1_len: recovered.m1.len(),
@@ -211,162 +212,69 @@ mod tests {
 
     use super::{AaError, AaOutcome, run_active_authentication};
     use crate::atr::{Atr, AtrError, MINIMAL_DIRECT_ATR};
-    use crate::crypto::rsa::{
-        HashAlg, RsaModulus, RsaPublicExponent, RsaPublicKey, RsaVerifyError,
-    };
+    use crate::crypto::digest::HashAlg;
+    use crate::crypto::rsa::{RsaPublicKey, RsaVerifyError};
     use crate::transport::{
         CardTransport, CommandApdu, ResponseApdu, TransportDispatchError, TransportOutcome,
     };
-    use crypto_bigint::{
-        BoxedUint, Odd,
-        modular::{BoxedMontyForm, BoxedMontyParams},
-    };
-    use sha1::Sha1;
-    use sha2::{Digest as _, Sha256, Sha384, Sha512};
-
-    // An RSA-1024 keypair built offline with OpenSSL -- lib-core is
-    // verify-only and never generates or holds private keys, so the
-    // chip-mock signer below needs a committed private exponent to
-    // play the PICC half of the ISO 9796-2 DS1 round-trip. Generated
-    // with:
-    //
-    // ```sh
-    // openssl genrsa 1024 > aa_test.pem
-    // openssl rsa -in aa_test.pem -text -noout
-    // ```
-    //
-    // then the modulus / private-exponent blocks were hex-joined with
-    // the ASN.1 sign byte stripped. e = 65537 (the OpenSSL default and
-    // the value FINEID issues). 1024-bit clears the 512-bit
-    // `RsaModulus::MIN_BITS` floor while keeping the in-test modexp fast.
-
-    /// DG15 RSA modulus `n` (128 bytes, canonical PKCS#1, no sign byte).
-    const N_HEX: &str = "dc6b0cc4238ded3c8d7053307b1f321be3b0500ec973e64ea47596cbfacf91d9\
-4126d5b059fe1ca835c1a4b6868e0d82ceab655e9556b4ffb58d159b06b587ce5\
-504badce3a2e2d043e06387e5cb3c2ff4d97c365add868e47ba31964c23a96533\
-ea5b5fbbdd1fe129b69e2923b9620db65592a4a94e4be1be731488849ed193";
-    /// Matching private exponent `d` (held only by the chip mock).
-    const D_HEX: &str = "b57624226daaf07e836acff1ffcae4f3f4f538539422289ee1e234ed6564f18b\
-cc896e2f2b477acc38c55d172f9b4f203b88fb816cacdf820d334370478bb76ae\
-d7ceb4ad6b8b5baf2a6bbd26bc34d8e3f5393c38af42ec4a6c0ed2fa056a5ad26\
-b3dbd3288fcb53327ee5a5ebd487e96e8f4e8a41c998494dcf1288a39a9b91";
+    use crate::x509::extract_rsa_public_key;
+    use refineid_cms::testkit::TestKey;
 
     /// `INTERNAL AUTHENTICATE` instruction byte (ISO 7816-4).
     const INS_INTERNAL_AUTHENTICATE: u8 = 0x88;
-    /// Leading byte of an ISO 9796-2 DS1 recoverable message.
-    const ISO9796_DS1_LEADING_BYTE: u8 = 0x6A;
-    /// Implicit trailer (SHA-1).
-    const TRAILER_SHA1: &[u8] = &[0xBC];
-    /// Explicit trailer for SHA-256 (`HFI=0x34 || 0xCC`).
-    const TRAILER_SHA256: &[u8] = &[0x34, 0xCC];
-    /// Explicit trailer for SHA-384 (`HFI=0x36 || 0xCC`, ISO/IEC 10118-3).
-    const TRAILER_SHA384: &[u8] = &[0x36, 0xCC];
-    /// Explicit trailer for SHA-512 (`HFI=0x35 || 0xCC`, ISO/IEC 10118-3).
-    const TRAILER_SHA512: &[u8] = &[0x35, 0xCC];
+    /// Expected length in bytes of the ISO 7816-4 AA APDU:
+    /// header + Lc + 8-byte challenge + Le.
+    const AA_APDU_LEN: usize = 14;
+    /// Byte offset of `INS` within the APDU header.
+    const APDU_INS_INDEX: usize = 1;
+    /// Byte offset of `Lc` within the APDU header.
+    const APDU_LC_INDEX: usize = 4;
+    /// Expected `Lc` byte for the 8-byte host challenge.
+    const AA_CHALLENGE_LC: u8 = 0x08;
+    /// Byte range of the challenge data within the APDU.
+    const CHALLENGE_START: usize = 5;
+    const CHALLENGE_END: usize = 13;
+    /// ISO/IEC 9796-2 DS1 leading byte width.
+    const DS1_LEADING_LEN: usize = 1;
+    /// Implicit SHA-1 trailer width.
+    const DS1_IMPLICIT_TRAILER_LEN: usize = 1;
+    /// Explicit two-byte trailer width (`HFI || CC`).
+    const DS1_EXPLICIT_TRAILER_LEN: usize = 2;
+    /// ISO 7816-4 normal-processing status word high byte.
+    const SW_OK_1: u8 = 0x90;
+    /// ISO 7816-4 normal-processing status word low byte.
+    const SW_OK_2: u8 = 0x00;
+    /// Single-bit XOR mask used to mutate the challenge in negative tests.
+    const BIT_FLIP_MASK: u8 = 0x01;
 
     // MARK: - Fixture builders
 
-    fn modulus_bytes() -> Vec<u8> {
-        hex::decode(N_HEX).expect("N_HEX is valid hex")
-    }
-
-    fn private_exponent_bytes() -> Vec<u8> {
-        hex::decode(D_HEX).expect("D_HEX is valid hex")
+    /// The RFC 9500 2048-bit RSA test key playing the PICC half of AA.
+    fn chip_key() -> TestKey {
+        TestKey::rsa_2048()
     }
 
     /// The DG15 public key the driver verifies against.
     fn dg15_pubkey() -> RsaPublicKey {
-        RsaPublicKey {
-            modulus: RsaModulus::try_from_pkcs1(modulus_bytes())
-                .expect("committed 1024-bit modulus is canonical PKCS#1"),
-            exponent: RsaPublicExponent::e_65537(),
-        }
+        extract_rsa_public_key(&chip_key().spki()).expect("RFC 9500 RSA SPKI parses")
     }
 
-    /// Per-hash digest length and trailer bytes (ICAO 9303-11 §6.1 /
-    /// ISO 9796-2 §9).
-    fn hash_params(hash: HashAlg) -> (usize, &'static [u8]) {
-        match hash {
-            HashAlg::Sha1 => (20, TRAILER_SHA1),
-            HashAlg::Sha256 => (32, TRAILER_SHA256),
-            HashAlg::Sha384 => (48, TRAILER_SHA384),
-            HashAlg::Sha512 => (64, TRAILER_SHA512),
-        }
-    }
-
-    /// `H(m1 || m2)` for the trailer's hash function.
-    fn digest_concat(hash: HashAlg, m1: &[u8], m2: &[u8]) -> Vec<u8> {
-        match hash {
-            HashAlg::Sha1 => {
-                let mut h = Sha1::new();
-                h.update(m1);
-                h.update(m2);
-                h.finalize().to_vec()
-            }
-            HashAlg::Sha256 => {
-                let mut h = Sha256::new();
-                h.update(m1);
-                h.update(m2);
-                h.finalize().to_vec()
-            }
-            HashAlg::Sha384 => {
-                let mut h = Sha384::new();
-                h.update(m1);
-                h.update(m2);
-                h.finalize().to_vec()
-            }
-            HashAlg::Sha512 => {
-                let mut h = Sha512::new();
-                h.update(m1);
-                h.update(m2);
-                h.finalize().to_vec()
-            }
-        }
-    }
-
-    /// RSA raw exponentiation `base^exp mod n`, returned as exactly `k`
-    /// big-endian bytes -- the chip's private-key operation, the inverse
-    /// of the verifier's `raw_recover`. Mirrors the crypto-bigint modexp
-    /// the production verifier uses so the two halves agree bit-for-bit.
-    fn raw_rsa_exp(n: &[u8], exp: &[u8], base: &[u8]) -> Vec<u8> {
-        let k = n.len();
-        let bits =
-            (u32::try_from(k).expect("modulus byte length fits u32") * 8).next_multiple_of(64);
-        let modulus = BoxedUint::from_be_slice(n, bits).expect("modulus decodes");
-        let exponent = BoxedUint::from_be_slice_vartime(exp);
-        let base_uint = BoxedUint::from_be_slice(base, bits).expect("base decodes");
-        let odd: Odd<BoxedUint> = Option::from(Odd::new(modulus)).expect("modulus is odd");
-        let params = BoxedMontyParams::new(odd);
-        let form = BoxedMontyForm::new(base_uint, &params);
-        let result = form.pow(&exponent).retrieve().to_be_bytes();
-        // Right-align into a k-byte buffer (the modexp result never
-        // exceeds the modulus, so it fits in k bytes).
-        let src = result.as_ref();
-        let mut out = vec![0_u8; k];
-        let copy = src.len().min(k);
-        out[k - copy..].copy_from_slice(&src[src.len() - copy..]);
-        out
+    /// Expected recovered-`M1` length for the RFC 9500 2048-bit key under `hash`.
+    fn expected_m1_len(hash: HashAlg) -> usize {
+        let k = dg15_pubkey().modulus.byte_len();
+        let trailer_len = match hash {
+            HashAlg::Sha1 => DS1_IMPLICIT_TRAILER_LEN,
+            HashAlg::Sha256 | HashAlg::Sha384 | HashAlg::Sha512 => DS1_EXPLICIT_TRAILER_LEN,
+        };
+        k - DS1_LEADING_LEN - hash.digest_len() - trailer_len
     }
 
     /// Build a valid ISO 9796-2 DS1 signature over `challenge` using the
-    /// committed private key: `s = (6A || M1 || H(M1 || challenge) || T)^d
-    /// mod n`. `M1` is sized so the recoverable message fills the whole
-    /// modulus.
+    /// RFC 9500 test RSA key.
     fn ds1_signature(hash: HashAlg, challenge: &[u8]) -> Vec<u8> {
-        let n = modulus_bytes();
-        let d = private_exponent_bytes();
-        let k = n.len();
-        let (digest_len, trailer) = hash_params(hash);
-        let m1_len = k - 1 - digest_len - trailer.len();
-        let m1 = vec![0xA5_u8; m1_len];
-        let digest = digest_concat(hash, &m1, challenge);
-        let mut f = Vec::with_capacity(k);
-        f.push(ISO9796_DS1_LEADING_BYTE);
-        f.extend_from_slice(&m1);
-        f.extend_from_slice(&digest);
-        f.extend_from_slice(trailer);
-        assert_eq!(f.len(), k, "recoverable message must be exactly k bytes");
-        raw_rsa_exp(&n, &d, &f)
+        chip_key()
+            .sign_iso9796_2_ds1(hash, challenge)
+            .expect("RSA test key signs ISO 9796-2 DS1")
     }
 
     // MARK: - Chip-side mock
@@ -389,7 +297,7 @@ b3dbd3288fcb53327ee5a5ebd487e96e8f4e8a41c998494dcf1288a39a9b91";
 
     /// In-memory chip that plays the PICC half of an AA round-trip: it
     /// reads the reader's 8-byte challenge straight out of the APDU
-    /// (offset 5..13) and reacts per its [`ChipBehavior`].
+    /// and reacts per its [`ChipBehavior`].
     struct AaChip {
         behavior: ChipBehavior,
     }
@@ -405,14 +313,16 @@ b3dbd3288fcb53327ee5a5ebd487e96e8f4e8a41c998494dcf1288a39a9b91";
 
         fn transmit_outcome(&mut self, apdu: &CommandApdu) -> Result<TransportOutcome, String> {
             let bytes = apdu.as_bytes();
-            // 00 88 00 00 08 <8-byte challenge> 00  == 14 bytes.
-            assert_eq!(bytes.len(), 14, "AA APDU is 14 bytes");
+            assert_eq!(bytes.len(), AA_APDU_LEN, "AA APDU length mismatch");
             assert_eq!(
-                bytes[1], INS_INTERNAL_AUTHENTICATE,
+                bytes[APDU_INS_INDEX], INS_INTERNAL_AUTHENTICATE,
                 "INS is INTERNAL AUTHENTICATE"
             );
-            assert_eq!(bytes[4], 0x08, "Lc announces an 8-byte challenge");
-            let challenge = &bytes[5..13];
+            assert_eq!(
+                bytes[APDU_LC_INDEX], AA_CHALLENGE_LC,
+                "Lc announces an 8-byte challenge"
+            );
+            let challenge = &bytes[CHALLENGE_START..CHALLENGE_END];
 
             let response = match &self.behavior {
                 ChipBehavior::TransportFail => {
@@ -428,21 +338,23 @@ b3dbd3288fcb53327ee5a5ebd487e96e8f4e8a41c998494dcf1288a39a9b91";
                 }
                 ChipBehavior::MalformedBody(body) => ResponseApdu {
                     body: body.clone(),
-                    sw1: 0x90,
-                    sw2: 0x00,
+                    sw1: SW_OK_1,
+                    sw2: SW_OK_2,
                 },
                 ChipBehavior::Sign(hash) => ResponseApdu {
                     body: ds1_signature(*hash, challenge),
-                    sw1: 0x90,
-                    sw2: 0x00,
+                    sw1: SW_OK_1,
+                    sw2: SW_OK_2,
                 },
                 ChipBehavior::SignWrongChallenge(hash) => {
                     let mut wrong = challenge.to_vec();
-                    wrong[0] ^= 0x01; // guarantee it differs from the real nonce
+                    if let Some(first) = wrong.first_mut() {
+                        *first ^= BIT_FLIP_MASK;
+                    }
                     ResponseApdu {
                         body: ds1_signature(*hash, &wrong),
-                        sw1: 0x90,
-                        sw2: 0x00,
+                        sw1: SW_OK_1,
+                        sw2: SW_OK_2,
                     }
                 }
             };
@@ -463,14 +375,11 @@ b3dbd3288fcb53327ee5a5ebd487e96e8f4e8a41c998494dcf1288a39a9b91";
         let mut transport = AaChip::new(ChipBehavior::Sign(hash));
         let outcome =
             run_active_authentication(&mut transport, &dg15_pubkey()).expect("no transport error");
-        let k = modulus_bytes().len();
-        let (digest_len, trailer) = hash_params(hash);
-        let expected_m1 = k - 1 - digest_len - trailer.len();
         assert_eq!(
             outcome,
             AaOutcome::Verified {
                 hash,
-                m1_len: expected_m1
+                m1_len: expected_m1_len(hash),
             },
             "hash={hash:?}"
         );

@@ -358,7 +358,7 @@ where
         match owned.view().spki.algorithm() {
             PublicKeyAlgorithm::Rsa { .. } => KeyAlgorithm::Rsa,
             PublicKeyAlgorithm::Ec(_) => KeyAlgorithm::Ecdsa,
-            PublicKeyAlgorithm::EcExplicit { .. } | PublicKeyAlgorithm::Other => KeyAlgorithm::Rsa,
+            PublicKeyAlgorithm::Other => KeyAlgorithm::Rsa,
         }
     }
 
@@ -613,10 +613,7 @@ fn sign_with_cert<T: CardTransport>(
             sign_rsa(transport, request, key_ref, scheme, planned, cert)
         }
         PublicKeyAlgorithm::Ec(EcCurve::Secp384r1) => sign_p384(transport, key_ref, planned, cert),
-        PublicKeyAlgorithm::Ec(_) => Err(BackendFailure::SigningUnavailable(
-            "unsupported key".to_owned(),
-        )),
-        PublicKeyAlgorithm::EcExplicit { .. } | PublicKeyAlgorithm::Other => Err(
+        PublicKeyAlgorithm::Ec(_) | PublicKeyAlgorithm::Other => Err(
             BackendFailure::SigningUnavailable("unsupported key".to_owned()),
         ),
     }

@@ -36,6 +36,7 @@ refineid-apdu.workspace = true
 refineid-atr.workspace = true
 refineid-auth.workspace = true
 refineid-ber.workspace = true
+refineid-cms.workspace = true
 refineid-digest.workspace = true
 refineid-pkcs15.workspace = true
 
@@ -45,3 +46,4 @@ refineid-build-number.workspace = true
 [dev-dependencies]
 hex.workspace = true
 proptest.workspace = true
+refineid-cms = { workspace = true, features = ["testkit"] }

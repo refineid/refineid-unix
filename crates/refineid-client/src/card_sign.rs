@@ -543,9 +543,7 @@ fn sign_dispatch_by_alg<T: CardTransport>(
             Ok((signature.into_bytes(), verify))
         }
         PublicKeyAlgorithm::Ec(curve) => Err(SignErrorKind::UnsupportedCurve { slot, curve }),
-        PublicKeyAlgorithm::EcExplicit { .. } | PublicKeyAlgorithm::Other => {
-            Err(SignErrorKind::UnsupportedKeyType(slot))
-        }
+        PublicKeyAlgorithm::Other => Err(SignErrorKind::UnsupportedKeyType(slot)),
     }
 }
 

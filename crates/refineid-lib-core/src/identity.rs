@@ -57,6 +57,12 @@
 use core::fmt;
 use core::ops::Deref;
 
+pub use refineid_cms::identity::{
+    AdditionalName, CommonName, FREE_TEXT_MAX_BYTES, FirstName, FreeTextError, GivenNamesText,
+    NativeName, OrganizationName, PEUIN_LEN, Peuin, PeuinError, SecondName, SplitGivenNames,
+    SubjectIdentity, Surname, holder_line,
+};
+
 /// Full chip-side card identifier.
 ///
 /// Derived from the PKCS#15 EF.TokenInfo `serialNumber` octet
@@ -206,237 +212,13 @@ impl PartialEq<&str> for PrintedSerial {
     }
 }
 
-/// Personal Electronic Unique Identification Number.
-///
-/// Per FINEID S2 v5.2 §6.3.6.1: `SerialNumber` attribute
-/// contains a unique identifier (8 digits + checksum
-/// character) for a person that within Finland identifies the
-/// subject of certification from other persons having exactly
-/// the same name. Also known as SATU in Finnish-language
-/// FINEID material.
-///
-/// Constructor enforces the shape (9 ASCII bytes: 8 digits
-/// followed by one alphanumeric character). Code that consumes
-/// `&Peuin` can rely on those invariants without re-validating
-/// at every use site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Peuin([u8; 9]);
-
-/// Construction errors emitted by `Peuin::new`.
-///
-/// Diagnostic-shaped: each variant carries the offending value
-/// plus the expectation it failed, so the CLI can render a
-/// human-readable error without re-extracting the inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeuinError {
-    /// Input wasn't exactly 9 bytes (8 ASCII digits + 1
-    /// checksum character).
-    WrongLength {
-        /// Number of bytes actually given.
-        got: usize,
-    },
-    /// One of positions 0..8 wasn't an ASCII digit. PEUIN is
-    /// strictly numeric in those slots.
-    NonDigit {
-        /// Byte offset (0-based) where the bad character lives.
-        at: usize,
-        /// The offending byte value at `at`.
-        byte: u8,
-    },
-    /// Position 8 (the checksum) didn't match the computed
-    /// checksum for positions 0..8. The DVV PEUIN spec uses a
-    /// mod-31 weighted sum over the 8 leading digits.
-    BadChecksum {
-        /// The byte value at position 8 that failed the check.
-        byte: u8,
-    },
-}
-
-impl fmt::Display for PeuinError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WrongLength { got } => write!(
-                f,
-                "PEUIN must be exactly 9 characters (8 digits + 1 checksum), got {got}"
-            ),
-            Self::NonDigit { at, byte } => write!(
-                f,
-                "PEUIN positions 0..8 must be ASCII digits; non-digit at offset {at}: {byte:#04x}"
-            ),
-            Self::BadChecksum { byte } => write!(
-                f,
-                "PEUIN checksum (position 8) must be ASCII alphanumeric; got {byte:#04x}"
-            ),
-        }
-    }
-}
-
-impl core::error::Error for PeuinError {}
-
-impl Peuin {
-    /// Parse `s` as a PEUIN. 9 ASCII bytes: positions `0..=7`
-    /// must be digits, position `8` must be alphanumeric (the
-    /// checksum). Anything else is rejected with a specific
-    /// [`PeuinError`].
-    ///
-    /// The checksum value itself is not verified against the
-    /// 8-digit body -- DVV's checksum algorithm is the
-    /// reference, and the cert issuer is the authority; we
-    /// trust the cert's value.
-    ///
-    /// # Errors
-    /// [`PeuinError`] variants for wrong length, non-digit in
-    /// the body, or a bad checksum character.
-    pub(crate) fn new(s: &str) -> Result<Self, PeuinError> {
-        let bytes = s.as_bytes();
-        if bytes.len() != 9 {
-            return Err(PeuinError::WrongLength { got: bytes.len() });
-        }
-        // bytes.len() == 9 verified above; build the 9-byte buf
-        // up front so we can index it as an array (no .get()/
-        // .expect() chain).
-        let mut buf = [0_u8; 9];
-        buf.copy_from_slice(bytes);
-        for (i, &b) in buf.iter().take(8).enumerate() {
-            if !b.is_ascii_digit() {
-                return Err(PeuinError::NonDigit { at: i, byte: b });
-            }
-        }
-        let checksum_byte = buf[8];
-        if !checksum_byte.is_ascii_alphanumeric() {
-            return Err(PeuinError::BadChecksum {
-                byte: checksum_byte,
-            });
-        }
-        Ok(Self(buf))
-    }
-
-    /// String view. Always valid UTF-8 because the constructor
-    /// rejected every byte that wasn't 7-bit ASCII.
-    ///
-    /// # Panics
-    /// Never under correct construction; the constructor only
-    /// accepts ASCII alphanumerics, which are UTF-8 by
-    /// definition.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        #[expect(
-            clippy::expect_used,
-            reason = "Peuin::new accepts only ASCII alphanumerics, which are always valid UTF-8; the expect documents the proven invariant."
-        )]
-        let s = core::str::from_utf8(&self.0).expect("Peuin bytes are ASCII by construction");
-        s
-    }
-
-    /// Borrow the underlying 9-byte array (ICAO 9303 PEUIN: 8
-    /// alphanumeric characters + 1 checksum character).
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 9] {
-        &self.0
-    }
-}
-
-impl Deref for Peuin {
-    type Target = str;
-    fn deref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl AsRef<str> for Peuin {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl fmt::Display for Peuin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl PartialEq<str> for Peuin {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
-impl PartialEq<&str> for Peuin {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
-
-/// Family name as it appears in the cert subject DN
-/// (X.520 `surName`, OID 2.5.4.4).
-///
-/// Validated only as "non-empty" -- FINEID stores the family
-/// name as a `UTF8String` with ISO 8859-1 characters, and
-/// that's the strictest constraint we can apply without
-/// baking in locale-specific rules about hyphens, apostrophes,
-/// etc. Strong typing is for slot identity, not for surname
-/// validation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Surname(String);
-
-/// Construction error shared by every free-text identity
-/// newtype (names, titles, places, free-form DG11 / DG12
-/// fields).
-///
-/// We deliberately validate only **non-empty** and **bounded
-/// byte length**: per FINEID S2 v5.2 §6.3.4 cert subject
-/// strings are UTF-8 with ISO 8859-1 codepoints, and ICAO
-/// 9303-10 DG11/DG12 free-text fields are UTF-8 with no
-/// repertoire constraint. We trust the issuer's encoding and
-/// pass UTF-8 through verbatim -- diacritics (Š, Ž, Õ, Ć, Ł,
-/// ß, ...) preserved as-is. Type construction is the trust
-/// boundary, not the codepoint police.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FreeTextError {
-    /// Input was zero bytes.
-    Empty,
-    /// Input exceeded the per-field byte budget.
-    ///
-    /// Budgets are generous (1024 bytes) but bounded so a
-    /// runaway DG read cannot DOS the renderer with a multi-MB
-    /// "name" field.
-    TooLong {
-        /// Length of the rejected input in UTF-8 bytes. Tier 0
-        /// `usize`; arithmetic count.
-        got: usize,
-        /// The per-field byte cap that was breached (mirrors
-        /// [`FREE_TEXT_MAX_BYTES`] today). Tier 0 `usize`.
-        max: usize,
-    },
-}
-
-impl fmt::Display for FreeTextError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("free-text value cannot be empty"),
-            Self::TooLong { got, max } => {
-                write!(f, "free-text length {got} bytes exceeds maximum {max}")
-            }
-        }
-    }
-}
-
-impl core::error::Error for FreeTextError {}
-
-/// Maximum byte length accepted by every free-text newtype.
-///
-/// 1024 is well above any realistic on-card field size (DG11
-/// `personal_summary` is the largest expected payload at a few
-/// hundred bytes) while still bounding pathological input.
-pub const FREE_TEXT_MAX_BYTES: usize = 1024;
-
 /// Borrowed free-text candidate validated at the identity boundary.
 ///
-/// Private proof type used by the many slot-specific newtypes below: the
+/// Private proof type used by the local DG11/DG12 slot newtypes below: the
 /// wrapped string is non-empty and within [`FREE_TEXT_MAX_BYTES`].
 struct FreeText<'a> {
     /// Validated free-text string.
-    value: &'a str,
+    _value: &'a str,
 }
 
 impl<'a> FreeText<'a> {
@@ -455,223 +237,7 @@ impl<'a> FreeText<'a> {
                 max: FREE_TEXT_MAX_BYTES,
             });
         }
-        Ok(Self { value })
-    }
-}
-
-/// Free-text source being normalized from issuer uppercase to native case.
-struct LegacyUppercaseName<'a> {
-    /// Validated source string.
-    source: FreeText<'a>,
-}
-
-impl<'a> LegacyUppercaseName<'a> {
-    /// Build from a slot value whose constructor already validated
-    /// the free-text invariant.
-    const fn from_validated(source: FreeText<'a>) -> Self {
-        Self { source }
-    }
-
-    /// Validate the source string before case normalization.
-    ///
-    /// # Errors
-    /// [`FreeTextError`] if the source is empty or too long.
-    fn parse(source: &'a str) -> Result<Self, FreeTextError> {
-        Ok(Self {
-            source: FreeText::parse(source)?,
-        })
-    }
-
-    /// Title-case each whitespace- or hyphen-delimited segment using
-    /// Unicode `to_uppercase` / `to_lowercase`.
-    fn title_case_segments(&self) -> String {
-        let s = self.source.value;
-        let mut out = String::with_capacity(s.len());
-        let mut at_segment_start = true;
-        for c in s.chars() {
-            if c.is_whitespace() || c == '-' {
-                out.push(c);
-                at_segment_start = true;
-            } else if at_segment_start {
-                for upper in c.to_uppercase() {
-                    out.push(upper);
-                }
-                at_segment_start = false;
-            } else {
-                for lower in c.to_lowercase() {
-                    out.push(lower);
-                }
-            }
-        }
-        out
-    }
-}
-
-/// Personal name in its "native" form -- the case-normalized
-/// rendering of a name slot that the operator should see in
-/// reports.
-///
-/// FINEID DVV-issued cards publish cert subject DN attributes
-/// (`Surname`, `GivenName`, `CommonName`) in uppercase across
-/// the entire string, mirroring MRZ conventions. The MRZ itself
-/// is uppercase A-Z + `<` by ICAO 9303-3 §6. DG11 `0x5F0E`
-/// `Dg11FullName` is the spec slot that would carry the native
-/// UTF-8 form with proper case and diacritics, but DVV doesn't
-/// currently provision DG11 on citizen ID cards.
-///
-/// `NativeName` is the typed result of running a simple
-/// case-normalization heuristic over an uppercase source:
-///
-/// 1. Split into segments on whitespace (`' '`, `'\t'`, ...) or
-///    hyphen (`'-'`). Hyphenated names like "MARIA-LIISA"
-///    decompose into two segments so each side title-cases
-///    independently.
-/// 2. For each segment, the first character maps to its
-///    Unicode-uppercase form and every subsequent character to
-///    its Unicode-lowercase form. The mapping is locale-
-///    independent (Rust's `char::to_uppercase` /
-///    `char::to_lowercase`).
-/// 3. Separators (whitespace runs, hyphens) are preserved
-///    verbatim.
-///
-/// Result on the Finnish Police's published SPECIMEN identity:
-/// `"VILMA"` -> `"Vilma"`, `"SOFIA"` -> `"Sofia"`,
-/// `"SPECIMEN-TRAVEL"` -> `"Specimen-Travel"` (hyphen segment
-/// boundary). Diacritic-bearing input round-trips through
-/// Unicode case mapping: e.g. `"SÄÄTILA"` -> `"Säätila"`.
-///
-/// Known limitations of the v1 heuristic (acceptable per the
-/// "simple rule for a start" framing):
-///
-/// - No special handling for Irish prefixes (`"MCCABE"` ->
-///   `"Mccabe"` rather than `"McCabe"`).
-/// - No special handling for Dutch/Spanish lowercase particles
-///   ("VAN DER BERG" -> "Van Der Berg" rather than "van der
-///   Berg").
-/// - No special handling for apostrophes ("O'BRIEN" ->
-///   "O'brien" rather than "O'Brien"; apostrophe is not
-///   currently a segment boundary).
-///
-/// When DG11's already-native form becomes available on a card,
-/// callers should use that source directly and skip the
-/// normalization step entirely. `NativeName` is primarily for
-/// the uppercase-source path that today's FINEID cards force.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct NativeName(String);
-
-impl NativeName {
-    /// Normalize an uppercase / mixed-case name slot to its
-    /// native title-case form. Sole constructor; only entry
-    /// point that can build a `NativeName`.
-    ///
-    /// `s` is taken from a typed name newtype's storage (e.g.
-    /// [`Surname::as_str`]) where the free-text validation
-    /// non-empty + bounded-length invariants already hold. The
-    /// constructor preserves the structural validation by
-    /// running `FreeText::parse` again.
-    ///
-    /// # Errors
-    /// [`FreeTextError::Empty`] if `s` is empty,
-    /// [`FreeTextError::TooLong`] if `s` exceeds
-    /// [`FREE_TEXT_MAX_BYTES`].
-    pub(crate) fn from_legacy_uppercase(s: &str) -> Result<Self, FreeTextError> {
-        let source = LegacyUppercaseName::parse(s)?;
-        Ok(Self(source.title_case_segments()))
-    }
-
-    /// Borrow the title-cased native name string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for NativeName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for NativeName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for NativeName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Surname {
-    /// # Errors
-    /// [`FreeTextError::Empty`] if `s` is empty,
-    /// [`FreeTextError::TooLong`] if `s` exceeds
-    /// [`FREE_TEXT_MAX_BYTES`].
-    pub fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying surname string (UTF-8 with
-    /// ISO 8859-1 codepoints as DVV emits).
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Render this `Surname` as its case-normalized
-    /// [`NativeName`].
-    ///
-    /// Equivalent to `NativeName::from_legacy_uppercase(self.as_str())`
-    /// but infallible: `Surname`'s constructor has already
-    /// validated the inner string against
-    /// `FreeText::parse`, so the conversion can't fail
-    /// at this point.
-    #[must_use]
-    pub fn to_native(&self) -> NativeName {
-        NativeName(
-            LegacyUppercaseName::from_validated(FreeText { value: &self.0 }).title_case_segments(),
-        )
-    }
-
-    /// MRZ transliteration source for this surname.
-    #[must_use]
-    pub(crate) fn to_mrz_text(&self) -> NativeMrzText {
-        NativeMrzText(self.0.clone())
-    }
-}
-
-impl Deref for Surname {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for Surname {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Surname {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl PartialEq<str> for Surname {
-    fn eq(&self, other: &str) -> bool {
-        self.0 == other
-    }
-}
-
-impl PartialEq<&str> for Surname {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
+        Ok(Self { _value: value })
     }
 }
 
@@ -897,215 +463,6 @@ impl PartialEq<&str> for EmailAddress {
     }
 }
 
-/// X.509 subject (or issuer) `commonName` attribute value
-/// (OID 2.5.4.3).
-///
-/// In FINEID citizen certs the subject CN is composed of
-/// `surname + givenName + serialNumber(PEUIN)` per S2 v5.2
-/// §6.3.6.1 (example: `"Tormanen Paivi 12345678N"`). Issuer
-/// CN is the issuing sub-CA's name (`"DVV Citizen
-/// Certificates - G4R"` etc.). Strong typing distinguishes
-/// the value from arbitrary strings without imposing the
-/// composition rule on the type -- callers that need to
-/// parse the composed form do so at the rendering boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CommonName(String);
-
-impl CommonName {
-    /// # Errors
-    /// [`FreeTextError::Empty`] if `s` is empty,
-    /// [`FreeTextError::TooLong`] if `s` exceeds
-    /// [`FREE_TEXT_MAX_BYTES`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying common-name string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for CommonName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for CommonName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for CommonName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl PartialEq<str> for CommonName {
-    fn eq(&self, other: &str) -> bool {
-        self.0 == other
-    }
-}
-
-impl PartialEq<&str> for CommonName {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
-    }
-}
-
-/// X.509 subject `organizationName` attribute value (OID 2.5.4.10),
-/// verbatim as the certificate carries it.
-///
-/// An organization card's certificate names the organization here; a
-/// citizen certificate has no such attribute.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct OrganizationName(String);
-
-impl OrganizationName {
-    /// # Errors
-    /// [`FreeTextError::Empty`] if `s` is empty,
-    /// [`FreeTextError::TooLong`] if `s` exceeds
-    /// [`FREE_TEXT_MAX_BYTES`].
-    pub(crate) fn new(s: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&s)?;
-        Ok(Self(s))
-    }
-
-    /// Borrow the underlying organization-name string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for OrganizationName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for OrganizationName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for OrganizationName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// What joins the holder's name to the organization on the
-/// holder line.
-const ORGANIZATION_SEPARATOR: &str = ", ";
-
-/// The holder line a window shows: the holder's name, followed by
-/// the organization when the certificate names one. A name alone
-/// when there is no organization; empty when there is no name.
-#[must_use]
-pub fn holder_line(person: String, organization: Option<&OrganizationName>) -> String {
-    match organization {
-        Some(organization) if !person.is_empty() => {
-            format!("{person}{ORGANIZATION_SEPARATOR}{organization}")
-        }
-        _ => person,
-    }
-}
-
-// =========================================================
-// Per-slot given-name newtypes.
-//
-// FINEID's cert id-at-givenName (2.5.4.42) and ICAO 9303-10
-// DG11 0x5F0E both carry **all** given names joined as one
-// string. Downstream consumers want them split per slot --
-// first name for the "Hi, Yrjö!" greeting, second name and
-// further names available distinctly so the compiler refuses
-// silent role swaps.
-//
-// Splitting is whitespace-based at the parse boundary.
-// Hyphenated or apostrophe-bearing single names (Marie-Claire,
-// O'Brien) stay inside one slot.
-// =========================================================
-
-/// Result of splitting a cert `id-at-givenName` (or DG11 full-
-/// name) attribute into the three per-slot newtypes.
-///
-/// Parse-at-boundary: the raw attribute value enters
-/// `split_given_names` once at the source side (cert parser
-/// or DG11 parser); from there on the typed parts flow through
-/// the rest of the pipeline.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SplitGivenNames {
-    /// First given name; `None` when the source attribute had
-    /// no tokens or every token failed validation.
-    pub first: Option<FirstName>,
-    /// Second given name when the source attribute had at least
-    /// two tokens.
-    pub second: Option<SecondName>,
-    /// Third and subsequent given names, one per token in source
-    /// order.
-    pub additional: Vec<AdditionalName>,
-}
-
-/// Validated source text containing one or more given-name tokens.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct GivenNamesText(String);
-
-impl GivenNamesText {
-    /// Validate a raw cert or DG11 given-name attribute before splitting.
-    ///
-    /// # Errors
-    /// [`FreeTextError`] if the source is empty or too long.
-    pub(crate) fn new(value: String) -> Result<Self, FreeTextError> {
-        FreeText::parse(&value)?;
-        Ok(Self(value))
-    }
-
-    /// Split into the three per-slot given-name types.
-    ///
-    /// Whitespace-tokenises the input; empty tokens are skipped. Tokens
-    /// that fail [`FreeTextError`] validation are dropped.
-    #[must_use]
-    pub(crate) fn split(&self) -> SplitGivenNames {
-        let mut out = SplitGivenNames::default();
-        let mut slot = 0_usize;
-        for tok in self.0.split_whitespace() {
-            if tok.is_empty() {
-                continue;
-            }
-            let owned = tok.to_owned();
-            match slot {
-                0 => {
-                    if let Ok(n) = FirstName::new(owned) {
-                        out.first = Some(n);
-                        slot = 1;
-                    }
-                }
-                1 => {
-                    if let Ok(n) = SecondName::new(owned) {
-                        out.second = Some(n);
-                        slot = 2;
-                    }
-                }
-                _ => {
-                    if let Ok(n) = AdditionalName::new(owned) {
-                        out.additional.push(n);
-                    }
-                }
-            }
-        }
-        out
-    }
-}
-
 /// Declarative generator for `FreeText`-validated holder-identity
 /// newtypes (`String` payload refined through `FreeText::parse`).
 macro_rules! free_text_newtype {
@@ -1162,64 +519,16 @@ macro_rules! free_text_newtype {
     };
 }
 
-/// Inherent case-normalization and MRZ-source conversions shared by
-/// the decomposed given-name slot newtypes.
-macro_rules! impl_given_name_conversions {
-    ($($name:ident),+ $(,)?) => {
-        $(
-            impl $name {
-                /// Render as case-normalized [`NativeName`]. See
-                /// [`Surname::to_native`] for the heuristic.
-                #[must_use]
-                pub fn to_native(&self) -> NativeName {
-                    NativeName(
-                        LegacyUppercaseName::from_validated(FreeText { value: &self.0 })
-                            .title_case_segments(),
-                    )
-                }
-
-                /// MRZ transliteration source for this given-name slot.
-                #[must_use]
-                pub(crate) fn to_mrz_text(&self) -> NativeMrzText {
-                    NativeMrzText(self.0.clone())
-                }
-            }
-        )+
-    };
-}
-
 // =========================================================
-// Decomposed given-name, DG11, and DG12 free-text newtypes.
+// DG11 and DG12 free-text newtypes.
 //
 // Each ICAO 9303-10 holder-identity free-text field has its
-// own type so consumers cannot swap given-name slots, titles,
-// professions, addresses, or document observations. All carry
-// validated UTF-8 verbatim with diacritics preserved.
+// own type so consumers cannot swap titles, professions,
+// addresses, or document observations. All carry validated
+// UTF-8 verbatim with diacritics preserved.
 // =========================================================
 
 free_text_newtype! {
-    /// First given name -- the "Hi, X!" slot.
-    ///
-    /// Conventionally the calling name (Finnish `kutsumanimi`).
-    /// Some Finnish citizens identify by their second given name
-    /// instead; refineid does not encode that preference here.
-    pub struct FirstName(pub new);
-
-    /// Second given name.
-    ///
-    /// Distinct type from [`FirstName`] so the compiler refuses
-    /// to greet someone with their second name where the first
-    /// was intended.
-    pub struct SecondName(pub(crate) new);
-
-    /// Third-or-further given name.
-    ///
-    /// Bag of additional given names beyond first and second. A
-    /// person with names "Anna Maria Helena Sofia" yields
-    /// `FirstName("Anna")`, `SecondName("Maria")`, and a vector
-    /// `[AdditionalName("Helena"), AdditionalName("Sofia")]`.
-    pub struct AdditionalName(pub(crate) new);
-
     /// Personal honorific (DG11 tag `0x5F14`).
     ///
     /// Examples: `"Mr"`, `"Mrs"`, `"Prof."`, `"Dr"`, `"Tri."`.
@@ -1317,8 +626,6 @@ free_text_newtype! {
     /// document (DG12 tag `0x5F56`).
     pub struct PersonalisationDeviceSerial(pub(crate) new);
 }
-
-impl_given_name_conversions!(FirstName, SecondName, AdditionalName);
 
 impl Dg11FullName {
     /// Best-effort decomposition into `(surname, given_names)`.
@@ -1772,7 +1079,7 @@ impl NativeMrzText {
 /// the upstream `FreeTextError` cap effectively prevents.
 #[must_use]
 pub(crate) fn transliterate_surname(surname: &Surname) -> MrzSurname {
-    let raw = surname.to_mrz_text().to_mrz();
+    let raw = NativeMrzText(surname.as_str().to_owned()).to_mrz();
     #[expect(
         clippy::expect_used,
         reason = "transliterate_to_mrz emits only A-Z and `<`; MrzSurname::new accepts that alphabet, so the only failure shape (overlength) is documented in the function's # Panics."
@@ -1791,13 +1098,13 @@ pub(crate) fn transliterate_given_names(
 ) -> Option<MrzGivenName> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(n) = first {
-        parts.push(n.to_mrz_text().to_mrz());
+        parts.push(NativeMrzText(n.as_str().to_owned()).to_mrz());
     }
     if let Some(n) = second {
-        parts.push(n.to_mrz_text().to_mrz());
+        parts.push(NativeMrzText(n.as_str().to_owned()).to_mrz());
     }
     for n in additional {
-        parts.push(n.to_mrz_text().to_mrz());
+        parts.push(NativeMrzText(n.as_str().to_owned()).to_mrz());
     }
     let joined = parts.join("<");
     if joined.is_empty() {

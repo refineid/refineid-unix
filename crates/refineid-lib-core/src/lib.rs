@@ -94,7 +94,7 @@ pub mod hex;
 pub mod identity;
 pub mod iso8601;
 pub mod ocsp;
-pub mod oid;
+pub use refineid_cms::oid;
 pub mod pace;
 pub mod pin;
 pub mod pkcs15;

@@ -54,6 +54,7 @@ impl Hex {
     ///
     /// Panics (= compile error in const context) on anything that
     /// is not `0-9A-Fa-f`.
+    #[cfg(test)]
     #[expect(
         clippy::arithmetic_side_effects,
         clippy::panic,
@@ -77,6 +78,7 @@ impl Hex {
     /// (FIPS 186-4 curve parameters, NIST KAT vectors): a mistyped
     /// digit or a length mismatch fails compilation, so no runtime
     /// path ever sees a malformed constant.
+    #[cfg(test)]
     #[expect(
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects,

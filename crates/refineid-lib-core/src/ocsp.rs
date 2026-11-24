@@ -921,10 +921,10 @@ pub struct BasicOcspResponse<'a> {
     pub tbs_response_data_der: &'a [u8],
     /// `signatureAlgorithm.algorithm` OID body (the value of the
     /// `06 LL` TLV).
-    pub signature_alg_oid: &'a [u8],
+    pub signature_alg_oid: crate::oid::Oid<'a>,
     /// Outer `signature` BIT STRING value with the unused-bits
     /// leading byte stripped.
-    pub signature_bits: &'a [u8],
+    pub signature_bits: crate::x509::SignatureOctets<'a>,
     /// DER bytes of each optional cert in the `[0] EXPLICIT
     /// certs SEQUENCE OF Certificate` field. Empty when the
     /// responder didn't embed any chain certs (it expects the
@@ -945,12 +945,13 @@ impl BasicOcspResponse<'_> {
         &self,
         signer_spki_der: B,
     ) -> Result<(), crate::x509::VerifyError> {
-        let signer_spki_der = signer_spki_der.as_ref();
+        let issuer_spki = crate::x509::SpkiDer::try_from(signer_spki_der.as_ref())
+            .map_err(|_| crate::x509::VerifyError::BadIssuerKey)?;
         crate::x509::verify_tbs_signature(crate::x509::TbsSignature {
             tbs_der: self.tbs_response_data_der,
             signature_alg_oid: self.signature_alg_oid,
             signature_bits: self.signature_bits,
-            issuer_spki_der: signer_spki_der,
+            issuer_spki,
         })
     }
 
@@ -1113,7 +1114,7 @@ impl<'a> VerifiedOcspResponse<'a> {
     /// Find the exact SHA-1 `CertID` for `certificate` under the issuer used
     /// when this response was authenticated.
     pub(crate) fn response_for(&self, certificate: Certificate<'_>) -> Option<&SingleResponse> {
-        let serial = certificate.serial();
+        let serial = crate::x509::cert_serial(&certificate);
         self.single_responses().iter().find(|response| {
             response
                 .cert_id
@@ -1416,7 +1417,8 @@ impl<'a> BasicOcspResponse<'a> {
                 "OCSP signatureAlgorithm OID",
             ));
         }
-        let signature_alg_oid = alg_oid.value();
+        let signature_alg_oid = crate::oid::Oid::new(alg_oid.value())
+            .map_err(|_| X509Error::UnexpectedStructure("OCSP signatureAlgorithm OID"))?;
         if !alg_reader.is_finished() {
             let parameters = AnyRef::from_der(alg_reader.tlv_bytes().map_err(|_ignored| {
                 X509Error::UnexpectedStructure("OCSP signatureAlgorithm parameters")
@@ -1446,16 +1448,8 @@ impl<'a> BasicOcspResponse<'a> {
                 "OCSP signature not BIT STRING",
             ));
         }
-        let Some((&unused_bits, signature_bits)) = sig_bits.value().split_first() else {
-            return Err(X509Error::UnexpectedStructure(
-                "OCSP signature BIT STRING empty",
-            ));
-        };
-        if unused_bits != 0 {
-            return Err(X509Error::UnexpectedStructure(
-                "OCSP signature has unused bits",
-            ));
-        }
+        let signature_bits =
+            crate::x509::SignatureOctets::parse(sig_bits.value(), "OCSP signature")?;
 
         // Optional [0] EXPLICIT certs SEQUENCE OF Certificate.
         let mut embedded_cert_ders: Vec<&[u8]> = Vec::new();

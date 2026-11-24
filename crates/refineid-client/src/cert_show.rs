@@ -161,7 +161,7 @@ pub(crate) fn show_cert(path: &Path) -> Result<CertShowReport, CertShowError> {
 
     let subject_cn = cert.subject.common_name();
     let issuer_cn = cert.issuer.common_name();
-    let serial = cert.serial();
+    let serial = refineid_lib_core::x509::cert_serial(&cert);
     let public_key_summary = parse_subject_public_key_info(cert.spki.as_der()).map_or_else(
         || "unknown public-key encoding".to_owned(),
         refineid_lib_core::x509::PublicKeyAlgorithm::label,

@@ -184,7 +184,7 @@ pub(crate) fn verify_offline(options: &VerifyOptions) -> Result<VerifyReport, Ve
     let signature_len = sig_bytes.len();
     let signature: Signature<RsaPkcs1Sha256> = Signature::new(sig_bytes);
 
-    let (ok, failure_reason) = match pubkey.verify_pkcs1v15_sha256(message, &signature) {
+    let (ok, failure_reason) = match pubkey.verify_pkcs1v15_sha256(&message, &signature) {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e)),
     };
@@ -251,7 +251,10 @@ mod tests {
         let der = decode_cert_pem_or_der(ICAO_CSCA_PEM).ok_or("decode pem")?;
         let cert = OwnedCert::from_der(&der).map_err(|e| format!("parse: {e}"))?;
         let view = cert.view();
-        Ok((view.tbs_der.to_vec(), view.signature_bits.to_vec()))
+        Ok((
+            view.tbs_der.to_vec(),
+            view.signature_bits.as_bytes().to_vec(),
+        ))
     }
 
     #[test]
