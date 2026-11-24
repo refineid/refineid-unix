@@ -1323,7 +1323,15 @@ fn run_ocsp_check(
     // whole check rather than send a replayable, nonce-less request. Same
     // fail-closed posture as the PACE / AA / CA draws in lib-core.
     let nonce = ocsp::OcspNonce::random().map_err(|e| CardCheckError::Rng(e.to_string()))?;
-    let request = ocsp::build_request_with_nonce(name_hash, key_hash, &serial, &nonce);
+    let request = match ocsp::build_request_with_nonce(name_hash, key_hash, &serial, &nonce) {
+        Ok(req) => req,
+        Err(e) => {
+            return Ok(Some(CheckOutcome::Skipped {
+                source: ocsp_url,
+                why: format!("OCSP request encode: {e}"),
+            }));
+        }
+    };
     let body = match http::post(
         first_url,
         "application/ocsp-request",

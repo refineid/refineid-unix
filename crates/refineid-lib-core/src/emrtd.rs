@@ -755,10 +755,10 @@ pub(crate) fn extract_mrz_string(dg1: &Dg1Bytes<'_>) -> Option<String> {
     // but defensively iterate in case a future profile adds siblings.
     // The 5F1F two-byte tag is one-off enough that peek-and-match
     // beats defining a marker for it.
-    let mut iter = BerTlvIter::new(outer.value);
+    let mut iter = BerTlvIter::new(outer.value());
     while let Some(Ok(child)) = iter.next() {
-        if child.tag == dg_tag::MRZ_DATA {
-            return core::str::from_utf8(child.value).ok().map(str::to_owned);
+        if child.tag() == dg_tag::MRZ_DATA {
+            return core::str::from_utf8(child.value()).ok().map(str::to_owned);
         }
     }
     None
@@ -1500,7 +1500,7 @@ impl<'a> Dg11Bytes<'a> {
 
     /// Borrow the DG11 body inside the `[APPLICATION 11]` wrapper.
     const fn body(&self) -> &'a [u8] {
-        self.outer.value
+        self.outer.value()
     }
 }
 
@@ -1623,7 +1623,7 @@ impl EmrtdHelpers {
         let Ok(outer) = BerTlv::<Dg1xContainerA0>::parse(a0_tlv.bytes()) else {
             return;
         };
-        let Ok(body) = BerInput::parse(outer.value) else {
+        let Ok(body) = BerInput::parse(outer.value()) else {
             return;
         };
         let mut cursor = 0_usize;
@@ -1662,7 +1662,7 @@ impl EmrtdHelpers {
         let Ok(outer) = BerTlv::<Dg1xContainerA0>::parse(a0_tlv.bytes()) else {
             return;
         };
-        let Ok(body) = BerInput::parse(outer.value) else {
+        let Ok(body) = BerInput::parse(outer.value()) else {
             return;
         };
         let mut cursor = 0_usize;
@@ -1730,14 +1730,14 @@ impl<'a> TryFrom<&'a [u8]> for Dg15Bytes<'a> {
     fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
         let outer = BerTlv::<Dg15Wrapper>::parse(bytes)?;
         // The inner must be the SPKI SEQUENCE (tag 0x30).
-        if outer.value.first().copied().map(u16::from) != Some(<Sequence as BerTag>::TAG) {
+        if outer.value().first().copied().map(u16::from) != Some(<Sequence as BerTag>::TAG) {
             return Err(BerError::UnexpectedTag {
                 expected: <Sequence as BerTag>::TAG,
-                got: u16::from(outer.value.first().copied().unwrap_or(0)),
+                got: u16::from(outer.value().first().copied().unwrap_or(0)),
             });
         }
         Ok(Self {
-            spki_tlv_bytes: outer.value,
+            spki_tlv_bytes: outer.value(),
         })
     }
 }
@@ -1853,7 +1853,7 @@ impl<'a> TryFrom<&'a [u8]> for Dg14Bytes<'a> {
     #[inline]
     fn try_from(bytes: &'a [u8]) -> Result<Self, Self::Error> {
         let outer = BerTlv::<Dg14Wrapper>::parse(bytes)?;
-        let security_infos_set = BerTlv::<Set>::parse(outer.value)?;
+        let security_infos_set = BerTlv::<Set>::parse(outer.value())?;
         Ok(Self { security_infos_set })
     }
 }
@@ -1870,14 +1870,14 @@ impl<'a> TryFrom<&'a [u8]> for Dg14Bytes<'a> {
 #[inline]
 #[must_use]
 pub fn parse_dg14(dg14: Dg14Bytes<'_>) -> Vec<Dg14SecurityInfo> {
-    let body = dg14.security_infos_set.value;
+    let body = dg14.security_infos_set.value();
     let mut out = Vec::new();
     for tlv in BerTlvIter::new(body) {
         let Ok(any) = tlv else { break };
         let Ok(seq) = any.expect::<Sequence>() else {
             continue;
         };
-        let mut inner = BerTlvIter::new(seq.value);
+        let mut inner = BerTlvIter::new(seq.value());
         let Some(Ok(oid_any)) = inner.next() else {
             continue;
         };
@@ -1907,7 +1907,7 @@ struct Dg14Oid<'a> {
 impl<'a> Dg14Oid<'a> {
     /// Wrap a typed OID TLV as a DG14 classifier input.
     const fn from_tlv(tlv: BerTlv<'a, Oid>) -> Self {
-        Self { bytes: tlv.value }
+        Self { bytes: tlv.value() }
     }
 
     /// Test whether this OID starts with `prefix`.
@@ -2008,7 +2008,7 @@ impl EmrtdHelpers {
     fn read_integer_u32(it: &mut BerTlvIter<'_>) -> Option<u32> {
         let tlv = it.next()?.ok()?.expect::<Integer>().ok()?;
         let mut v: u32 = 0;
-        for &b in tlv.value {
+        for &b in tlv.value() {
             v = v.checked_shl(8)?.checked_add(u32::from(b))?;
         }
         Some(v)
@@ -2040,13 +2040,15 @@ impl EmrtdHelpers {
             "<Sequence as BerTag>::TAG must equal SEQUENCE_TAG"
         );
 
-        let mut iter = BerTlvIter::new(outer.value);
+        const SEQUENCE_HEADER_MAX_BYTES: usize = 4;
+        let mut iter = BerTlvIter::new(outer.value());
         let _oid = iter.next()?.ok()?;
         let spki = iter.next()?.ok()?.expect::<Sequence>().ok()?;
-        let mut out = Vec::with_capacity(spki.value.len().saturating_add(4));
+        let mut out =
+            Vec::with_capacity(spki.value().len().saturating_add(SEQUENCE_HEADER_MAX_BYTES));
         out.push(SEQUENCE_TAG);
-        Self::push_def_length(&mut out, spki.value.len());
-        out.extend_from_slice(spki.value);
+        Self::push_def_length(&mut out, spki.value().len());
+        out.extend_from_slice(spki.value());
         Some(out)
     }
 
@@ -2169,7 +2171,7 @@ impl<'a> Dg12Bytes<'a> {
 
     /// Borrow the DG12 body inside the `[APPLICATION 12]` wrapper.
     const fn body(&self) -> &'a [u8] {
-        self.outer.value
+        self.outer.value()
     }
 }
 
@@ -2197,7 +2199,7 @@ pub(crate) fn parse_dg12(dg12_der: Dg12Bytes<'_>) -> AdditionalDocumentData {
             // `BerTlv::size` is the total TLV byte count
             // (tag + length-of-length + length + value); advancing
             // the cursor by that lands on the next sibling TLV.
-            let Some(next) = cursor.checked_add(outer.size) else {
+            let Some(next) = cursor.checked_add(outer.size()) else {
                 break;
             };
             cursor = next;
@@ -2448,8 +2450,8 @@ ERIKSSON<<ANNA<MARIA<<<<<<<<<<";
 
     /// Build a synthetic EF.DG1: `61 [L] 5F1F [L] <90 MRZ chars>`.
     fn synth_dg1(mrz: &ParsedMrz) -> Vec<u8> {
-        let inner = ber::tlv2(dg_tag::MRZ_DATA, mrz.raw.as_bytes());
-        ber::tlv(DG1_WRAPPER_TAG_BYTE, inner)
+        let inner = ber::tlv2(dg_tag::MRZ_DATA, mrz.raw.as_bytes()).expect("DG1 inner TLV encodes");
+        ber::tlv(DG1_WRAPPER_TAG_BYTE, inner).expect("DG1 outer TLV encodes")
     }
 
     #[test]

@@ -474,9 +474,12 @@ fn set_authentication_template<T: CardTransport>(
     password_ref: u8,
 ) -> Result<(), PaceError<TxError<T>>> {
     let mut enc = ber::BerEncoder::with_capacity(20);
-    enc.push_tlv(tags::MSE_MECHANISM, PACE_MECHANISM_OID.as_bytes());
-    enc.push_tlv(tags::MSE_PASSWORD, [password_ref]);
-    enc.push_tlv(tags::MSE_DOMAIN, [DOMAIN_REF_BRAINPOOL_P384_R1]);
+    enc.push_tlv(tags::MSE_MECHANISM, PACE_MECHANISM_OID.as_bytes())
+        .map_err(|_err| PaceError::UnexpectedResponse("MSE mechanism TLV encode failed"))?;
+    enc.push_tlv(tags::MSE_PASSWORD, [password_ref])
+        .map_err(|_err| PaceError::UnexpectedResponse("MSE password TLV encode failed"))?;
+    enc.push_tlv(tags::MSE_DOMAIN, [DOMAIN_REF_BRAINPOOL_P384_R1])
+        .map_err(|_err| PaceError::UnexpectedResponse("MSE domain TLV encode failed"))?;
 
     let apdu = commands::MseSetAt { data: enc.finish() }.into_apdu();
     let r = transport
@@ -509,15 +512,16 @@ fn get_encrypted_nonce<T: CardTransport>(
     can: crate::can::Can,
 ) -> Result<[u8; NONCE_LEN], PaceError<TxError<T>>> {
     // 7C 00 - empty Dynamic Authentication Data.
-    let request_payload = ber::tlv(tags::DYNAMIC_AUTH, []);
+    let request_payload = ber::tlv(tags::DYNAMIC_AUTH, [])
+        .map_err(|_err| PaceError::UnexpectedResponse("GA-1 request TLV encode failed"))?;
     let apdu = PaceHelpers::wrap_general_authenticate(true, &request_payload);
     let r = transport.transmit(&apdu).map_err(PaceError::Transport)?;
     if !r.is_ok() {
         return Err(PaceError::Sw("GA-1 encrypted nonce", r.sw()));
     }
     let outer = BerTlv::<DynamicAuthData>::parse(&r.body)?;
-    let inner = BerTlv::<EncryptedNonce>::parse(outer.value)?;
-    if inner.value.len() != NONCE_LEN {
+    let inner = BerTlv::<EncryptedNonce>::parse(outer.value())?;
+    if inner.value().len() != NONCE_LEN {
         return Err(PaceError::UnexpectedResponse(
             "encrypted nonce wrong length",
         ));
@@ -529,7 +533,7 @@ fn get_encrypted_nonce<T: CardTransport>(
     // ^ `can.as_bytes()` returns &[u8; 6]; coerces to &[u8] for the KDF.
     // The PACE step-2 encrypted nonce is an AES-CBC ciphertext;
     // wrap into the typed container before decrypt.
-    let cipher = Ciphertext::<AesCbc>::new(inner.value.to_vec());
+    let cipher = Ciphertext::<AesCbc>::new(inner.value().to_vec());
     // NONCE_LEN == AES_BLOCK == 16; the length check above guarantees the
     // ciphertext is exactly one block, so alignment cannot fail -- map it to
     // a typed error anyway (fail-closed; `expect()` is banned workspace-wide).
@@ -581,15 +585,18 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     let our_x_bytes = x_pcd_pub
         .encode_uncompressed()
         .ok_or(PaceError::InvalidPoint)?;
-    let payload = ber::tlv(tags::DYNAMIC_AUTH, ber::tlv(tags::MAP_PCD_PUB, our_x_bytes));
+    let map_inner = ber::tlv(tags::MAP_PCD_PUB, our_x_bytes)
+        .map_err(|_err| PaceError::UnexpectedResponse("GA-2 inner TLV encode failed"))?;
+    let payload = ber::tlv(tags::DYNAMIC_AUTH, &map_inner)
+        .map_err(|_err| PaceError::UnexpectedResponse("GA-2 outer TLV encode failed"))?;
     let apdu = PaceHelpers::wrap_general_authenticate(true, &payload);
     let r = transport.transmit(&apdu).map_err(PaceError::Transport)?;
     if !r.is_ok() {
         return Err(PaceError::Sw("GA-2 map nonce", r.sw()));
     }
     let outer = BerTlv::<DynamicAuthData>::parse(&r.body)?;
-    let card_y = BerTlv::<MappingDataOut>::parse(outer.value)?;
-    let y_picc = AffinePoint::decode_uncompressed(card_y.value).ok_or(PaceError::InvalidPoint)?;
+    let card_y = BerTlv::<MappingDataOut>::parse(outer.value())?;
+    let y_picc = AffinePoint::decode_uncompressed(card_y.value()).ok_or(PaceError::InvalidPoint)?;
 
     // Shared point H = x_pcd * Y_picc. New base point G' = s*G + H.
     let h = y_picc.scalar_mul(&x_pcd);
@@ -605,15 +612,18 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     let pcd_u_bytes = u_pcd_pub
         .encode_uncompressed()
         .ok_or(PaceError::InvalidPoint)?;
-    let payload = ber::tlv(tags::DYNAMIC_AUTH, ber::tlv(tags::KA_PCD_PUB, pcd_u_bytes));
+    let ka_inner = ber::tlv(tags::KA_PCD_PUB, pcd_u_bytes)
+        .map_err(|_err| PaceError::UnexpectedResponse("GA-3 inner TLV encode failed"))?;
+    let payload = ber::tlv(tags::DYNAMIC_AUTH, &ka_inner)
+        .map_err(|_err| PaceError::UnexpectedResponse("GA-3 outer TLV encode failed"))?;
     let apdu = PaceHelpers::wrap_general_authenticate(true, &payload);
     let r = transport.transmit(&apdu).map_err(PaceError::Transport)?;
     if !r.is_ok() {
         return Err(PaceError::Sw("GA-3 key agreement", r.sw()));
     }
     let outer = BerTlv::<DynamicAuthData>::parse(&r.body)?;
-    let card_v = BerTlv::<KeyAgreeOut>::parse(outer.value)?;
-    let v_picc = AffinePoint::decode_uncompressed(card_v.value).ok_or(PaceError::InvalidPoint)?;
+    let card_v = BerTlv::<KeyAgreeOut>::parse(outer.value())?;
+    let v_picc = AffinePoint::decode_uncompressed(card_v.value()).ok_or(PaceError::InvalidPoint)?;
 
     Ok(PaceMidwayState {
         mapped_g,
@@ -683,26 +693,27 @@ pub(crate) fn run_pace_step_5<T: CardTransport>(
         PaceHelpers::encode_auth_token(&state.v_picc).ok_or(PaceError::InvalidPoint)?;
     let t_pcd = aes256_cmac_truncated(k_mac.as_bytes(), &token_for_card);
 
-    let payload = ber::tlv(
-        tags::DYNAMIC_AUTH,
-        ber::tlv(tags::AUTH_TOKEN_PCD, t_pcd.as_bytes()),
-    );
+    let token_inner = ber::tlv(tags::AUTH_TOKEN_PCD, t_pcd.as_bytes())
+        .map_err(|_err| PaceError::UnexpectedResponse("GA-4 inner TLV encode failed"))?;
+    let payload = ber::tlv(tags::DYNAMIC_AUTH, &token_inner)
+        .map_err(|_err| PaceError::UnexpectedResponse("GA-4 outer TLV encode failed"))?;
     let apdu = PaceHelpers::wrap_general_authenticate(false, &payload);
     let r = transport.transmit(&apdu).map_err(PaceError::Transport)?;
     if !r.is_ok() {
         return Err(PaceError::Sw("GA-4 mutual auth", r.sw()));
     }
 
+    const AUTH_TOKEN_LEN: usize = 8;
     let outer = BerTlv::<DynamicAuthData>::parse(&r.body)?;
-    let card_tag = BerTlv::<AuthTokenOut>::parse(outer.value)?;
-    if card_tag.value.len() != 8 {
+    let card_tag = BerTlv::<AuthTokenOut>::parse(outer.value())?;
+    if card_tag.value().len() != AUTH_TOKEN_LEN {
         return Err(PaceError::UnexpectedResponse("card auth tag wrong length"));
     }
 
     let token_for_us =
         PaceHelpers::encode_auth_token(&state.u_pcd_pub).ok_or(PaceError::InvalidPoint)?;
     let expected = aes256_cmac_truncated(k_mac.as_bytes(), &token_for_us);
-    if expected.as_bytes().ct_eq(card_tag.value).unwrap_u8() != 1 {
+    if expected.as_bytes().ct_eq(card_tag.value()).unwrap_u8() != 1 {
         return Err(PaceError::AuthMismatch);
     }
 
@@ -750,9 +761,11 @@ impl PaceHelpers {
             .saturating_add(2)
             .saturating_add(pt_bytes.as_ref().len());
         let mut inner = ber::BerEncoder::with_capacity(cap);
-        inner.push_tlv(tags::ASN1_OID, PACE_MECHANISM_OID.as_bytes());
-        inner.push_tlv(tags::PK_EC_POINT, pt_bytes);
-        Some(ber::tlv2(tags::PK_DATA_OBJECT, inner.finish()))
+        inner
+            .push_tlv(tags::ASN1_OID, PACE_MECHANISM_OID.as_bytes())
+            .ok()?;
+        inner.push_tlv(tags::PK_EC_POINT, pt_bytes).ok()?;
+        ber::tlv2(tags::PK_DATA_OBJECT, inner.finish()).ok()
     }
 
     /// Wrap GENERAL AUTHENTICATE: APDU header `00/10 86 00 00`,
@@ -860,9 +873,12 @@ mod tests {
     #[test]
     fn mse_set_at_payload_layout() {
         let mut enc = ber::BerEncoder::default();
-        enc.push_tlv(tags::MSE_MECHANISM, PACE_MECHANISM_OID.as_bytes());
-        enc.push_tlv(tags::MSE_PASSWORD, [PASSWORD_REF_CAN]);
-        enc.push_tlv(tags::MSE_DOMAIN, [DOMAIN_REF_BRAINPOOL_P384_R1]);
+        enc.push_tlv(tags::MSE_MECHANISM, PACE_MECHANISM_OID.as_bytes())
+            .expect("MSE mechanism TLV encodes");
+        enc.push_tlv(tags::MSE_PASSWORD, [PASSWORD_REF_CAN])
+            .expect("MSE password TLV encodes");
+        enc.push_tlv(tags::MSE_DOMAIN, [DOMAIN_REF_BRAINPOOL_P384_R1])
+            .expect("MSE domain TLV encodes");
         let data = enc.finish();
         assert_eq!(
             hex::encode(&data),
@@ -988,15 +1004,15 @@ mod tests {
         );
 
         // Build the script: one 7C-wrapped step-5 round.
-        let request_payload = ber::tlv(
-            tags::DYNAMIC_AUTH,
-            ber::tlv(tags::AUTH_TOKEN_PCD, t_pcd_expected.as_bytes()),
-        );
+        let req_inner =
+            ber::tlv(tags::AUTH_TOKEN_PCD, t_pcd_expected.as_bytes()).expect("PCD token encodes");
+        let request_payload =
+            ber::tlv(tags::DYNAMIC_AUTH, &req_inner).expect("GA-4 request encodes");
         let request_apdu = PaceHelpers::wrap_general_authenticate(false, &request_payload);
-        let response_body = ber::tlv(
-            tags::DYNAMIC_AUTH,
-            ber::tlv(tags::AUTH_TOKEN_PICC, t_picc.as_bytes()),
-        );
+        let resp_inner =
+            ber::tlv(tags::AUTH_TOKEN_PICC, t_picc.as_bytes()).expect("PICC token encodes");
+        let response_body =
+            ber::tlv(tags::DYNAMIC_AUTH, &resp_inner).expect("GA-4 response encodes");
 
         let state = PaceMidwayState {
             mapped_g: g,
@@ -1053,18 +1069,17 @@ mod tests {
         let token_card =
             PaceHelpers::encode_auth_token(&v_picc).expect("card public point encodes");
         let t_pcd = aes256_cmac_truncated(k_mac.as_bytes(), &token_card);
-        let request = PaceHelpers::wrap_general_authenticate(
-            false,
-            &ber::tlv(
-                tags::DYNAMIC_AUTH,
-                ber::tlv(tags::AUTH_TOKEN_PCD, t_pcd.as_bytes()),
-            ),
-        );
+        let req_inner =
+            ber::tlv(tags::AUTH_TOKEN_PCD, t_pcd.as_bytes()).expect("PCD token encodes");
+        let req_outer = ber::tlv(tags::DYNAMIC_AUTH, &req_inner).expect("GA-4 request encodes");
+        let request = PaceHelpers::wrap_general_authenticate(false, &req_outer);
 
         // Wrong T_PICC: flip a bit.
         let mut bad_tag = [0_u8; 8];
         bad_tag[0] = 0xFF;
-        let response_body = ber::tlv(tags::DYNAMIC_AUTH, ber::tlv(tags::AUTH_TOKEN_PICC, bad_tag));
+        let bad_inner = ber::tlv(tags::AUTH_TOKEN_PICC, bad_tag).expect("bad PICC token encodes");
+        let response_body =
+            ber::tlv(tags::DYNAMIC_AUTH, &bad_inner).expect("GA-4 bad response encodes");
 
         let state = PaceMidwayState {
             mapped_g: g,

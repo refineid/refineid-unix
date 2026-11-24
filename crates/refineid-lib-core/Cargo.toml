@@ -34,6 +34,7 @@ x509-cert = { version = "0.3", default-features = false }
 
 refineid-apdu.workspace = true
 refineid-auth.workspace = true
+refineid-ber.workspace = true
 refineid-pkcs15.workspace = true
 
 [build-dependencies]

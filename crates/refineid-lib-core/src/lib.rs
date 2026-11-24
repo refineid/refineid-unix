@@ -67,7 +67,7 @@ pub mod atr;
 pub mod auth;
 pub mod backend;
 pub mod base64;
-pub(crate) mod ber;
+pub(crate) use refineid_ber as ber;
 pub mod ca;
 pub mod can;
 pub mod card_access;

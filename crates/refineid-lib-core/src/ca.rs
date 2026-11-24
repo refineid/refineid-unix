@@ -73,6 +73,10 @@ use crate::x509::SpkiDer;
 /// (BSI TR-03110-3 B.11.1). PACE's MSE:Set AT uses 0xC1
 /// ("set + restore") instead -- see [`MseSetAt::P1`].
 const CA_MSE_SET_AT_P1: u8 = 0x41;
+/// ISO/IEC 7816-4 / BSI TR-03110-3 cryptographic mechanism reference / ephemeral public key tag.
+const TAG_CA_MECHANISM_OR_KEY: u8 = 0x80;
+/// ISO/IEC 7816-4 Dynamic Authentication Data wrapper tag.
+const TAG_DYNAMIC_AUTH_DATA: u8 = 0x7C;
 
 /// Outcome of a CA round-trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,7 +212,10 @@ pub(crate) fn run_chip_authentication<T: CardTransport>(
     // ("set + restore"), so the typed command lives inline here
     // rather than reusing pace::commands::MseSetAt wholesale --
     // only its CLA/INS/P2 bytes are shared.
-    let mse_data = ber::tlv(0x80, proto_oid);
+    let mse_data =
+        ber::tlv(TAG_CA_MECHANISM_OR_KEY, proto_oid).map_err(|_err| CaError::MseBodyTooLong {
+            got: proto_oid.len(),
+        })?;
     // Capacity hint: 5-byte ISO 7816 APDU header + the BER TLV body.
     // mse_data is TLV(0x80, CA OID) with the OID at most 12 bytes
     // (BSI TR-03110-3 §A.6.2), so the sum is well under usize::MAX;
@@ -243,8 +250,14 @@ pub(crate) fn run_chip_authentication<T: CardTransport>(
         return Ok(CaOutcome::UnsupportedCurve);
     };
     // GA data: 7C { 80 <len> <q_pcd_bytes> }
-    let inner_80 = ber::tlv(0x80, q_pcd_bytes);
-    let ga_data = ber::tlv(0x7C, &inner_80);
+    let inner_80 =
+        ber::tlv(TAG_CA_MECHANISM_OR_KEY, q_pcd_bytes).map_err(|_err| CaError::MseBodyTooLong {
+            got: q_pcd_bytes.as_bytes().len(),
+        })?;
+    let ga_data =
+        ber::tlv(TAG_DYNAMIC_AUTH_DATA, &inner_80).map_err(|_err| CaError::MseBodyTooLong {
+            got: inner_80.len(),
+        })?;
     let ga_apdu = GeneralAuthenticate {
         chain: false,
         payload: ga_data,
@@ -467,18 +480,21 @@ mod tests {
         let mut alg = Vec::new();
         alg.extend_from_slice(&OID_EC_PUBLIC_KEY);
         alg.extend_from_slice(&OID_BRAINPOOL_P384R1);
-        let alg_id = ber::tlv(0x30, &alg);
+        const TAG_SEQUENCE: u8 = 0x30;
+        const TAG_BIT_STRING: u8 = 0x03;
+        let alg_id = ber::tlv(TAG_SEQUENCE, &alg).expect("test alg_id encodes");
         // BIT STRING value: leading 0x00 = "no unused bits", then the
         // 97-byte uncompressed point. `subject_public_key.raw_bytes()`
         // hands the decoder back exactly the 97 point bytes.
         let mut bit_string_value = Vec::with_capacity(98);
         bit_string_value.push(0x00);
         bit_string_value.extend_from_slice(encoded.as_bytes());
-        let bit_string = ber::tlv(0x03, &bit_string_value);
+        let bit_string =
+            ber::tlv(TAG_BIT_STRING, &bit_string_value).expect("test bit_string encodes");
         let mut spki = Vec::new();
         spki.extend_from_slice(&alg_id);
         spki.extend_from_slice(&bit_string);
-        ber::tlv(0x30, &spki)
+        ber::tlv(TAG_SEQUENCE, &spki).expect("test spki encodes")
     }
 
     /// DG14 entries advertising CA over `brainpoolP384r1` with the
@@ -577,6 +593,9 @@ mod tests {
         /// the chip's *current* keys -- the inverse of the driver's
         /// `SmTransport::unwrap`.
         fn sm_response(&mut self, body: &[u8], sw: u16) -> ResponseApdu {
+            const TAG_SM_DO87: u8 = 0x87;
+            const TAG_SM_DO99: u8 = 0x99;
+            const TAG_SM_DO8E: u8 = 0x8E;
             self.ssc.increment();
             let do_cipher = if body.is_empty() {
                 Vec::new()
@@ -588,16 +607,16 @@ mod tests {
                 let mut value = Vec::with_capacity(1 + cipher.as_bytes().len());
                 value.push(0x01);
                 value.extend_from_slice(cipher.as_bytes());
-                ber::tlv(0x87, &value)
+                ber::tlv(TAG_SM_DO87, &value).expect("test DO87 encodes")
             };
-            let do_status = ber::tlv(0x99, sw.to_be_bytes());
+            let do_status = ber::tlv(TAG_SM_DO99, sw.to_be_bytes()).expect("test DO99 encodes");
             let mut mac_input = Vec::new();
             mac_input.extend_from_slice(self.ssc.as_bytes());
             mac_input.extend_from_slice(&do_cipher);
             mac_input.extend_from_slice(&do_status);
             let mac_input = iso7816_pad(&mac_input);
             let tag = aes256_cmac_truncated(&self.k_mac, &mac_input);
-            let do_mac = ber::tlv(0x8E, tag.as_bytes());
+            let do_mac = ber::tlv(TAG_SM_DO8E, tag.as_bytes()).expect("test DO8E encodes");
             let mut resp = Vec::new();
             resp.extend_from_slice(&do_cipher);
             resp.extend_from_slice(&do_status);
@@ -618,10 +637,11 @@ mod tests {
             let lc = usize::from(wrapped[4]);
             let body = &wrapped[5..5 + lc];
             let mut cipher_do: Option<&[u8]> = None;
+            const TAG_SM_DO87: u8 = 0x87;
             for parsed in BerTlvIter::new(body) {
                 let tlv = parsed.expect("SM command body is well-formed BER");
-                if tlv.tag == u16::from(0x87_u8) {
-                    cipher_do = Some(tlv.value);
+                if tlv.tag() == u16::from(TAG_SM_DO87) {
+                    cipher_do = Some(tlv.value());
                 }
             }
             let cipher_do = cipher_do.expect("GA command carries an encrypted DO87");
@@ -637,13 +657,21 @@ mod tests {
                 .next()
                 .expect("GA payload present")
                 .expect("GA payload is valid BER");
-            assert_eq!(outer.tag, u16::from(0x7C_u8), "GA payload wrapper is 0x7C");
-            let inner = BerTlvIter::new(outer.value)
+            assert_eq!(
+                outer.tag(),
+                u16::from(super::TAG_DYNAMIC_AUTH_DATA),
+                "GA payload wrapper carries Dynamic Authentication Data tag"
+            );
+            let inner = BerTlvIter::new(outer.value())
                 .next()
                 .expect("public-key DO present")
                 .expect("public-key DO is valid BER");
-            assert_eq!(inner.tag, u16::from(0x80_u8), "public-key DO is 0x80");
-            AffinePoint::decode_uncompressed(inner.value).expect("Q_PCD is a valid curve point")
+            assert_eq!(
+                inner.tag(),
+                u16::from(super::TAG_CA_MECHANISM_OR_KEY),
+                "public-key DO carries mechanism/key tag"
+            );
+            AffinePoint::decode_uncompressed(inner.value()).expect("Q_PCD is a valid curve point")
         }
     }
 
