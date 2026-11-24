@@ -35,8 +35,8 @@
 //!   above: SELECT PKCS#15, SELECT EF.4331, read the X.509 DER blob.
 //!
 use crate::apdu::iso7816::{
-    ApduClass, FileId, ReadBinaryByOffset, SelectByAidNoFci, SelectEfNoFci, SelectFile,
-    SelectFileResponseMode, SelectFileTarget,
+    ApduClass, DirectOffset15, FileId, ReadBinary, ReadBinaryOffset, SelectByAidNoFci,
+    SelectEfNoFci, SelectFile, SelectFileResponseMode, SelectFileTarget,
 };
 use crate::apdu::primitives::{Aid, AidError};
 use crate::apdu::status_word::StatusWord;
@@ -382,7 +382,7 @@ pub trait Pkcs15Ops: CardTransport {
             .transmit(apdu.as_bytes())
             .map_err(Pkcs15Error::Transport)?;
         if !r.is_ok() {
-            return Err(Pkcs15Error::Sw(r.sw()));
+            return Err(Pkcs15Error::Sw(r.status_word().as_u16()));
         }
         Ok(())
     }
@@ -403,7 +403,7 @@ pub trait Pkcs15Ops: CardTransport {
     {
         let file_id = FileId::new(fid);
         let attempts = [
-            SelectEfNoFci { fid }.into_apdu(),
+            SelectEfNoFci { fid: file_id }.into_apdu(),
             SelectFile {
                 class: ApduClass::Plain,
                 target: SelectFileTarget::AnyByFileId(Some(file_id)),
@@ -419,7 +419,7 @@ pub trait Pkcs15Ops: CardTransport {
             if response.is_ok() {
                 return Ok(());
             }
-            last_sw = response.sw();
+            last_sw = response.status_word().as_u16();
         }
         Err(Pkcs15Error::Sw(last_sw))
     }
@@ -522,7 +522,7 @@ pub trait Pkcs15Ops: CardTransport {
             let r = read_binary_chunk_with_eof_retry(self, offset_u16, want)?;
             let eof = matches!(r.status_word(), StatusWord::EndOfFile);
             if !r.is_ok() && !eof {
-                return Err(Pkcs15Error::Sw(r.sw()));
+                return Err(Pkcs15Error::Sw(r.status_word().as_u16()));
             }
             let body_len = r.body.len();
             collected.extend_from_slice(&r.body);
@@ -578,7 +578,7 @@ pub trait Pkcs15Ops: CardTransport {
             let response = read_binary_chunk_with_eof_retry(self, offset, want)?;
             let eof = matches!(response.status_word(), StatusWord::EndOfFile);
             if !response.is_ok() && !eof {
-                return Err(Pkcs15Error::Sw(response.sw()));
+                return Err(Pkcs15Error::Sw(response.status_word().as_u16()));
             }
             if response.body.len() > usize::from(want) {
                 return Err(Pkcs15Error::InvalidData(what));
@@ -682,10 +682,7 @@ pub trait Pkcs15Ops: CardTransport {
     /// # Errors
     /// Transport or card status failure.
     #[inline]
-    fn select_core_application(
-        &mut self,
-        aid: &refineid_apdu::Aid,
-    ) -> Result<(), Pkcs15Error<TxError<Self>>>
+    fn select_core_application(&mut self, aid: &Aid) -> Result<(), Pkcs15Error<TxError<Self>>>
     where
         Self: Sized,
     {
@@ -802,13 +799,19 @@ impl<T: CardTransport + ?Sized> Pkcs15Ops for T {}
 const READ_LE_256: u8 = 0x00;
 
 /// Issue one `READ BINARY` at `offset` for `want` bytes, retrying once with
-/// `Le = 0x00` if a non-zero `Le` returns an empty-body `6282` (`EndOfFile`).
+/// `Le = 0` if a non-zero `Le` returns an empty-body end-of-file status.
 fn read_binary_chunk_with_eof_retry<T: CardTransport>(
     transport: &mut T,
     offset: u16,
     want: u8,
 ) -> Result<crate::transport::ResponseApdu, Pkcs15Error<TxError<T>>> {
-    let apdu = ReadBinaryByOffset { offset, le: want }.into_apdu();
+    let direct = DirectOffset15::try_new(offset).or(Err(Pkcs15Error::TooLarge))?;
+    let apdu = ReadBinary {
+        class: ApduClass::Plain,
+        offset: ReadBinaryOffset::Direct(direct),
+        le: want,
+    }
+    .into_apdu();
     let response = transport
         .transmit(apdu.as_bytes())
         .map_err(Pkcs15Error::Transport)?;
@@ -816,8 +819,9 @@ fn read_binary_chunk_with_eof_retry<T: CardTransport>(
         && response.body.is_empty()
         && matches!(response.status_word(), StatusWord::EndOfFile)
     {
-        let retry = ReadBinaryByOffset {
-            offset,
+        let retry = ReadBinary {
+            class: ApduClass::Plain,
+            offset: ReadBinaryOffset::Direct(direct),
             le: READ_LE_256,
         }
         .into_apdu();
@@ -838,26 +842,7 @@ fn map_core_pkcs15_error<E>(
             Pkcs15Error::Transport(TransportDispatchError::Error(inner))
         }
         refineid_pkcs15::Pkcs15Error::Outcome(outcome) => {
-            #[expect(
-                clippy::wildcard_enum_match_arm,
-                reason = "refineid_apdu::TransportOutcome is #[non_exhaustive]; unmodeled future transitions map to ProtocolDesync"
-            )]
-            let local_outcome = match outcome {
-                refineid_apdu::TransportOutcome::NoCard => {
-                    crate::transport::TransportOutcome::NoCard
-                }
-                refineid_apdu::TransportOutcome::TimeoutUnknownState => {
-                    crate::transport::TransportOutcome::TimeoutUnknownState
-                }
-                refineid_apdu::TransportOutcome::CardReset => {
-                    crate::transport::TransportOutcome::CardReset
-                }
-                refineid_apdu::TransportOutcome::ReaderRemoved => {
-                    crate::transport::TransportOutcome::ReaderRemoved
-                }
-                _ => crate::transport::TransportOutcome::ProtocolDesync,
-            };
-            Pkcs15Error::Transport(TransportDispatchError::Outcome(local_outcome))
+            Pkcs15Error::Transport(TransportDispatchError::Outcome(outcome))
         }
         refineid_pkcs15::Pkcs15Error::Transport(crate::auth::CoreReadError::CredentialCommand) => {
             Pkcs15Error::InvalidData("transport")
@@ -1648,6 +1633,7 @@ pub(crate) mod esign_wire {
             response_mode: SelectFileResponseMode::None,
         }
         .into_apdu()
+        .into()
     }
 
     /// SELECT MF, the walk's first command.
@@ -1658,7 +1644,7 @@ pub(crate) mod esign_wire {
     /// SELECT DF.ESIGN by its published name.
     pub fn select_esign_by_name() -> CommandApdu {
         let aid = Aid::from_slice(ESIGN_AID).expect("published E.SIGN AID length is valid");
-        SelectByAidNoFci { aid }.into_apdu()
+        SelectByAidNoFci { aid }.into_apdu().into()
     }
 
     /// SELECT DF.ESIGN as any file by its identifier, the walk's last
@@ -1933,8 +1919,8 @@ mod tests {
     #[test]
     fn read_authentication_certificate_discovers_estonian_profile_via_iso7816_15() {
         use super::{
-            Aid, ApduClass, FileId, ReadBinaryByOffset, SelectByAidNoFci, SelectEfNoFci,
-            SelectFile, SelectFileResponseMode, SelectFileTarget, StatusWord,
+            Aid, ApduClass, DirectOffset15, FileId, ReadBinary, ReadBinaryOffset, SelectByAidNoFci,
+            SelectEfNoFci, SelectFile, SelectFileResponseMode, SelectFileTarget, StatusWord,
         };
         use crate::apdu::iso7816::AbsolutePath;
 
@@ -1992,7 +1978,12 @@ mod tests {
         }
 
         fn select_ef_wire(fid: [u8; 2]) -> Vec<u8> {
-            SelectEfNoFci { fid }.into_apdu().as_bytes().to_vec()
+            SelectEfNoFci {
+                fid: FileId::new(fid),
+            }
+            .into_apdu()
+            .as_bytes()
+            .to_vec()
         }
 
         fn select_any_wire(fid: FileId) -> Vec<u8> {
@@ -2007,8 +1998,11 @@ mod tests {
         }
 
         fn read_core_chunk_wire() -> Vec<u8> {
-            ReadBinaryByOffset {
-                offset: READ_OFFSET_START,
+            let direct =
+                DirectOffset15::try_new(READ_OFFSET_START).expect("start offset fits direct form");
+            ReadBinary {
+                class: ApduClass::Plain,
+                offset: ReadBinaryOffset::Direct(direct),
                 le: CORE_READ_CHUNK,
             }
             .into_apdu()
@@ -2176,7 +2170,10 @@ mod tests {
 
     #[test]
     fn read_binary_retries_with_le_zero_on_empty_body_6282() {
-        use super::{READ_CHUNK, READ_LE_256, ReadBinaryByOffset, StatusWord};
+        use super::{
+            ApduClass, DirectOffset15, READ_CHUNK, READ_LE_256, ReadBinary, ReadBinaryOffset,
+            StatusWord,
+        };
 
         const FIRST_CHUNK_LEN: usize = READ_CHUNK as usize;
         const TAIL_LEN: usize = 4;
@@ -2195,22 +2192,28 @@ mod tests {
             sw1: eof_sw1,
             sw2: eof_sw2,
         };
-        let read_first = ReadBinaryByOffset {
-            offset: OFFSET_ZERO,
+        let offset_zero = DirectOffset15::try_new(OFFSET_ZERO).expect("zero offset fits");
+        let offset_second =
+            DirectOffset15::try_new(OFFSET_SECOND_CHUNK).expect("second chunk offset fits");
+        let read_first = ReadBinary {
+            class: ApduClass::Plain,
+            offset: ReadBinaryOffset::Direct(offset_zero),
             le: READ_CHUNK,
         }
         .into_apdu()
         .as_bytes()
         .to_vec();
-        let read_second_fixed = ReadBinaryByOffset {
-            offset: OFFSET_SECOND_CHUNK,
+        let read_second_fixed = ReadBinary {
+            class: ApduClass::Plain,
+            offset: ReadBinaryOffset::Direct(offset_second),
             le: READ_CHUNK,
         }
         .into_apdu()
         .as_bytes()
         .to_vec();
-        let read_second_retry = ReadBinaryByOffset {
-            offset: OFFSET_SECOND_CHUNK,
+        let read_second_retry = ReadBinary {
+            class: ApduClass::Plain,
+            offset: ReadBinaryOffset::Direct(offset_second),
             le: READ_LE_256,
         }
         .into_apdu()

@@ -486,7 +486,7 @@ fn set_authentication_template<T: CardTransport>(
         .transmit(apdu.as_bytes())
         .map_err(PaceError::Transport)?;
     if !r.is_ok() {
-        return Err(PaceError::Sw("MSE:Set AT", r.sw()));
+        return Err(PaceError::Sw("MSE:Set AT", r.status_word().as_u16()));
     }
     Ok(())
 }
@@ -517,7 +517,10 @@ fn get_encrypted_nonce<T: CardTransport>(
     let apdu = PaceHelpers::wrap_general_authenticate(true, &request_payload);
     let r = transport.transmit(&apdu).map_err(PaceError::Transport)?;
     if !r.is_ok() {
-        return Err(PaceError::Sw("GA-1 encrypted nonce", r.sw()));
+        return Err(PaceError::Sw(
+            "GA-1 encrypted nonce",
+            r.status_word().as_u16(),
+        ));
     }
     let outer = BerTlv::<DynamicAuthData>::parse(&r.body)?;
     let inner = BerTlv::<EncryptedNonce>::parse(outer.value())?;
@@ -592,7 +595,7 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     let apdu = PaceHelpers::wrap_general_authenticate(true, &payload);
     let r = transport.transmit(&apdu).map_err(PaceError::Transport)?;
     if !r.is_ok() {
-        return Err(PaceError::Sw("GA-2 map nonce", r.sw()));
+        return Err(PaceError::Sw("GA-2 map nonce", r.status_word().as_u16()));
     }
     let outer = BerTlv::<DynamicAuthData>::parse(&r.body)?;
     let card_y = BerTlv::<MappingDataOut>::parse(outer.value())?;
@@ -619,7 +622,10 @@ fn map_nonce_and_key_agreement<T: CardTransport>(
     let apdu = PaceHelpers::wrap_general_authenticate(true, &payload);
     let r = transport.transmit(&apdu).map_err(PaceError::Transport)?;
     if !r.is_ok() {
-        return Err(PaceError::Sw("GA-3 key agreement", r.sw()));
+        return Err(PaceError::Sw(
+            "GA-3 key agreement",
+            r.status_word().as_u16(),
+        ));
     }
     let outer = BerTlv::<DynamicAuthData>::parse(&r.body)?;
     let card_v = BerTlv::<KeyAgreeOut>::parse(outer.value())?;
@@ -700,7 +706,7 @@ pub(crate) fn run_pace_step_5<T: CardTransport>(
     let apdu = PaceHelpers::wrap_general_authenticate(false, &payload);
     let r = transport.transmit(&apdu).map_err(PaceError::Transport)?;
     if !r.is_ok() {
-        return Err(PaceError::Sw("GA-4 mutual auth", r.sw()));
+        return Err(PaceError::Sw("GA-4 mutual auth", r.status_word().as_u16()));
     }
 
     const AUTH_TOKEN_LEN: usize = 8;

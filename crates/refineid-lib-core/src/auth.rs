@@ -396,11 +396,10 @@ impl From<PinStatus> for refineid_auth::PinStatus {
     fn from(status: PinStatus) -> Self {
         match status {
             PinStatus::Verified => Self::Verified,
-            PinStatus::Remaining(retries) => refineid_apdu::PinRetries::from_nibble(retries.get())
-                .map_or(Self::NoInfo, Self::Remaining),
+            PinStatus::Remaining(retries) => Self::Remaining(retries),
             PinStatus::NoInfo => Self::NoInfo,
             PinStatus::Locked => Self::Locked,
-            PinStatus::Other(sw) => Self::Other(refineid_apdu::StatusWord::from_u16(sw)),
+            PinStatus::Other(sw) => Self::Other(StatusWord::from_u16(sw)),
         }
     }
 }
@@ -465,11 +464,10 @@ pub enum PukStatus {
 impl From<PukStatus> for refineid_auth::PinStatus {
     fn from(status: PukStatus) -> Self {
         match status {
-            PukStatus::Remaining(retries) => refineid_apdu::PinRetries::from_nibble(retries.get())
-                .map_or(Self::NoInfo, Self::Remaining),
+            PukStatus::Remaining(retries) => Self::Remaining(retries),
             PukStatus::NoInfo => Self::NoInfo,
             PukStatus::Locked | PukStatus::Invalidated => Self::Locked,
-            PukStatus::Other(sw) => Self::Other(refineid_apdu::StatusWord::from_u16(sw)),
+            PukStatus::Other(sw) => Self::Other(StatusWord::from_u16(sw)),
         }
     }
 }
@@ -1325,58 +1323,21 @@ impl<E: core::fmt::Display> core::fmt::Display for CoreReadError<E> {
     }
 }
 
-impl<E: TransportErrorExt> refineid_apdu::TransportErrorExt for CoreReadError<E> {
-    fn kind(&self) -> refineid_apdu::TransportErrorKind {
+impl<E: TransportErrorExt> TransportErrorExt for CoreReadError<E> {
+    fn kind(&self) -> TransportErrorKind {
         match self {
-            Self::Transport(error) => match error.kind() {
-                TransportErrorKind::Backend => refineid_apdu::TransportErrorKind::Backend,
-                TransportErrorKind::NoCard => refineid_apdu::TransportErrorKind::NoCard,
-                TransportErrorKind::TimeoutUnknownState => {
-                    refineid_apdu::TransportErrorKind::TimeoutUnknownState
-                }
-                TransportErrorKind::CardReset => refineid_apdu::TransportErrorKind::CardReset,
-                TransportErrorKind::ProtocolDesync => {
-                    refineid_apdu::TransportErrorKind::ProtocolDesync
-                }
-                TransportErrorKind::ReaderRemoved => {
-                    refineid_apdu::TransportErrorKind::ReaderRemoved
-                }
-            },
-            Self::CredentialCommand => refineid_apdu::TransportErrorKind::Backend,
+            Self::Transport(error) => error.kind(),
+            Self::CredentialCommand => TransportErrorKind::Backend,
         }
     }
 }
 
 impl<T: CardTransport> CoreReads<'_, T> {
-    /// Send `bytes` and lift this crate's outcome into refineid-core's.
-    fn send(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<refineid_apdu::TransportOutcome, CoreReadError<T::Error>> {
-        let outcome = self
-            .0
+    /// Send `bytes` and lift this crate's error into `CoreReadError`.
+    fn send(&mut self, bytes: &[u8]) -> Result<TransportOutcome, CoreReadError<T::Error>> {
+        self.0
             .transmit_outcome(&CommandApdu::from(bytes))
-            .map_err(CoreReadError::Transport)?;
-        #[expect(
-            clippy::wildcard_enum_match_arm,
-            reason = "TransportOutcome is #[non_exhaustive]; a future state transition reads as a lost protocol state, which refineid-core treats as a failed read."
-        )]
-        Ok(match outcome {
-            TransportOutcome::Response(response) => {
-                refineid_apdu::TransportOutcome::Response(refineid_apdu::ResponseApdu {
-                    body: response.body,
-                    sw1: response.sw1,
-                    sw2: response.sw2,
-                })
-            }
-            TransportOutcome::NoCard => refineid_apdu::TransportOutcome::NoCard,
-            TransportOutcome::TimeoutUnknownState => {
-                refineid_apdu::TransportOutcome::TimeoutUnknownState
-            }
-            TransportOutcome::CardReset => refineid_apdu::TransportOutcome::CardReset,
-            TransportOutcome::ReaderRemoved => refineid_apdu::TransportOutcome::ReaderRemoved,
-            _ => refineid_apdu::TransportOutcome::ProtocolDesync,
-        })
+            .map_err(CoreReadError::Transport)
     }
 }
 
@@ -1386,11 +1347,11 @@ impl<T: CardTransport> refineid_apdu::CardTransport for CoreReads<'_, T> {
     fn transmit(
         &mut self,
         command: &refineid_apdu::CommandApdu,
-    ) -> Result<refineid_apdu::TransportOutcome, Self::Error> {
+    ) -> Result<TransportOutcome, Self::Error> {
         let outcome = self.send(command.as_bytes())?;
         // ISO 7816-4 §5.3.4: `6Cxx` names the exact `Le`; a read-only
         // case-2 command is sent once more with it.
-        if let refineid_apdu::TransportOutcome::Response(response) = &outcome
+        if let TransportOutcome::Response(response) = &outcome
             && response.sw1 == WRONG_LE_SW1
             && let Some(corrected) = command.corrected_wrong_le(response.sw2)
         {
@@ -1402,7 +1363,7 @@ impl<T: CardTransport> refineid_apdu::CardTransport for CoreReads<'_, T> {
     fn transmit_credential(
         &mut self,
         _command: refineid_apdu::CredentialCommand,
-    ) -> Result<refineid_apdu::TransportOutcome, Self::Error> {
+    ) -> Result<TransportOutcome, Self::Error> {
         Err(CoreReadError::CredentialCommand)
     }
 }

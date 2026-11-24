@@ -18,7 +18,7 @@
 //! flow test states the card's state (PIN counter, certificate) and
 //! not the exact APDU sequence the flow sends.
 
-use refineid_lib_core::apdu::iso7816::{ReadBinaryByOffset, SelectByAidNoFci};
+use refineid_lib_core::apdu::iso7816::{ReadBinary, SelectByAidNoFci};
 use refineid_lib_core::apdu::status_word::{PinRetries, StatusWord};
 use refineid_lib_core::atr::{Atr, AtrError, MINIMAL_DIRECT_ATR};
 use refineid_lib_core::auth::commands::Verify;
@@ -191,7 +191,7 @@ impl SyntheticCard {
                 respond(Vec::new(), StatusWord::Success)
             };
         }
-        if ins == Some(ReadBinaryByOffset::INS) {
+        if ins == Some(ReadBinary::INS) {
             return self.read_binary(apdu);
         }
         if ins == Some(PsoComputeDigitalSignature::INS) {
