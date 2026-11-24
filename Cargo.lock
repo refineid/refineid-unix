@@ -2133,6 +2133,7 @@ dependencies = [
  "refineid-digest",
  "refineid-pace",
  "refineid-pkcs15",
+ "refineid-sign",
  "sha1",
  "sha2 0.11.1",
  "spki",

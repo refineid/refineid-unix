@@ -12,84 +12,69 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-//! Card-side signing primitives for FINEID.
+//! Card-side signing and RSA decipher primitives, delegated to `refineid-sign`.
 //!
-//! Minimal sign-chain for the SHA-256 + RSA-PKCS1v15 path against
-//! the auth key (key reference `0x01`). The flow is the spec-
-//! mandated three-APDU choreography:
-//!
-//! 1. **MSE:Set DST** `00 22 41 B6` -- pin the security environment
-//!    to (algRef = 0x42, key ref = 0x01). On every catalogued
-//!    FINEID variant the wire byte for SHA-256+RSA-PKCS1v15 is
-//!    `0x42` (FINEID S1 v4.2 §3.6.4).
-//! 2. **PSO:HASH** `00 2A 90 A0` with the pre-computed 32-byte
-//!    SHA-256 digest in the `90 20 ...` "external hash" DO. The
-//!    card adds the SHA-256 `DigestInfo` prefix internally before
-//!    `PKCS1v15` padding -- caller ships the raw hash, not the
-//!    `DigestInfo`.
-//! 3. **PSO:CDS** `00 2A 9E 9A` with empty Lc -- the card signs the
-//!    previously stored hash and returns the raw RSA-3072
-//!    signature (384 B).
-//!
-//! VERIFY PIN1 (see [`crate::auth`]) must succeed before
-//! `sign_pre_hashed_sha256_rsa_auth` is called; the card returns
-//! `SW=6982` (security status not satisfied) otherwise. The PIN
-//! state stays valid for the rest of the card session.
-//!
-//! The organization card's qualified-signature key lives in
-//! DF.ESIGN under [`ORG_QUALIFIED_KEY_REF`] and takes the digest
-//! inside PSO:CDS: `SELECT DF.ESIGN -> VERIFY PIN2 -> MSE:Set DST
-//! -> PSO:CDS <digest>`. The VERIFY of that PIN 2
-//! ([`crate::auth::PinOps::verify_pin_with_scheme`]) makes DF.ESIGN
-//! current, and [`KeyRef::Sign`] carries the numbering that picks the
-//! reference and the chain.
+//! Authentication-key signatures and RSA-3072 decipher operations delegate
+//! directly to [`refineid_sign::SignOps`] through the internal `CoreReads`
+//! transport bridge. Qualified-signature calls (where the caller already
+//! verified PIN 2 — and entered `DF.ESIGN` on organizational cards — on the
+//! transport) reuse [`refineid_sign::commands`] over `CoreReads`. Only
+//! `SHA-512 + ECDSA` constructs its `MSE:SET DST` command locally with
+//! `refineid_apdu::CommandApdu::case_3` until `refineid-sign` exposes that
+//! algorithm reference.
 
-use crate::apdu::iso7816::ApduClass;
-use crate::auth::PinReferenceScheme;
-use crate::crypto::container::{
-    Ciphertext, EcdsaP256, EcdsaP384, Plaintext, RsaPkcs1, RsaPkcs1Sha256, Signature,
+pub use refineid_sign::commands;
+pub use refineid_sign::commands::{
+    SHA256_LEN as SHA256_DIGEST_LEN, SHA384_LEN as SHA384_DIGEST_LEN,
+    SHA512_LEN as SHA512_DIGEST_LEN,
 };
-use crate::crypto::digest::{Sha1, Sha224, Sha256, Sha384, Sha512};
+pub use refineid_sign::{
+    ECDSA_P256_SIG_BYTES, ECDSA_P384_SIG_BYTES, KEY_REF_AUTH, KEY_REF_SIGN, ORG_QUALIFIED_KEY_REF,
+    RSA_3072_MODULUS_BYTES, RSA_3072_SIG_BYTES, RecoveredPlaintext, SignScheme,
+};
+
+use refineid_apdu::{ApduClass, CommandHeader, StatusWord};
+use refineid_sign::SignOps as _;
+use refineid_sign::commands::{
+    DecipherAlgRef, ExternalHashValue, MSE_INS, MseSet, PsoComputeDigitalSignature,
+    PsoHashExternal, SignatureAlgRef, expected_length_le,
+};
+
+use crate::auth::{CoreReadError, CoreReads, PinReferenceScheme};
+use crate::crypto::container::{
+    Ciphertext, EcdsaP256, EcdsaP384, RsaPkcs1, RsaPkcs1Sha256, Signature,
+};
+use crate::crypto::digest::{Sha256, Sha384, Sha512};
 use crate::transport::{CardTransport, TransportDispatchError};
 
 /// Shortened transport-error alias for sign-path dispatchers.
-/// Same pattern as the auth-flow and PACE aliases; saves
-/// repeating the nested generic in every `Result` return type
-/// across the sign module.
 type TxError<T> = TransportDispatchError<<T as CardTransport>::Error>;
 
-pub mod commands;
-
-/// PKCS#15 key reference for the FINEID **auth key** -- the one
-/// used for TLS client cert / SSH / agent identity. FINEID S1
-/// v4.2 §3.5.
-pub const KEY_REF_AUTH: u8 = 0x01;
-
-/// PKCS#15 key reference for the FINEID **qualified-signature
-/// key** -- non-repudiation, PIN2-gated -- under the citizen
-/// numbering.
-pub const KEY_REF_SIGN: u8 = 0x02;
-
-/// The organizational card's qualified-signature key reference.
-///
-/// That key is local to DF.ESIGN, and a local security-data-object
-/// reference sets bit 8 over the object number (IAS-ECC v1.0.1
-/// section 4.4); the global form names no key and the signature
-/// answers `6A88`.
-pub const ORG_QUALIFIED_KEY_REF: u8 = 0x82;
+/// MSE:SET P1 selecting computation and decipherment (FINEID S1 v4.2 §3.6.2).
+const MSE_P1_SET: u8 = 0x41;
+/// MSE:SET P2 for the digital-signature template (FINEID S1 v4.2 §3.6.2).
+const MSE_P2_DST: u8 = 0xB6;
+/// Control-reference-object tag for the algorithm reference.
+const CRDO_ALG_REF: u8 = 0x80;
+/// Control-reference-object tag for the key reference.
+const CRDO_KEY_REF: u8 = 0x84;
+/// Single-byte control-reference-object value length.
+const CRDO_VALUE_LEN: u8 = 0x01;
+/// Algorithm reference for SHA-512 + ECDSA (high nibble 6 = SHA-512,
+/// low nibble 4 = ECDSA; FINEID S1 v4.2 §3.6.3 Table 6).
+const ALG_SHA512_ECDSA: u8 = 0x64;
+/// ISO 7816-4 status word: conditions of use not satisfied.
+const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
+/// ISO 7816-4 status word: incorrect parameters in the command data field.
+const SW_INCORRECT_DATA: u16 = 0x6A80;
 
 /// Credential numbering families that support qualified signing in
 /// `refineid-lib-core`.
-///
-/// Estonian eID qualified signing lives in the separate QSCD
-/// application with a card-specific EF.PrKDF key reference and a
-/// first-use PIN2 guard, so [`PinReferenceScheme::Estonian`] cannot be
-/// converted into this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QualifiedSignScheme {
-    /// FINEID S1 citizen card (`KEY_REF_SIGN`).
+    /// FINEID S1 citizen card ([`KEY_REF_SIGN`]).
     Citizen,
-    /// FINEID S4 organizational card (`ORG_QUALIFIED_KEY_REF` in DF.ESIGN).
+    /// FINEID S4 organizational card ([`ORG_QUALIFIED_KEY_REF`] in `DF.ESIGN`).
     Organizational,
 }
 
@@ -119,26 +104,15 @@ impl TryFrom<PinReferenceScheme> for QualifiedSignScheme {
 }
 
 /// Private-key reference, typed at the sign-API boundary.
-///
-/// The card publishes two private keys: authentication and qualified
-/// signature. `KeyRef` captures the dispatch at the type level so the
-/// sign / decrypt chain refuses arbitrary `u8` values and refuses
-/// unsupported qualified-signing families at compile time. The
-/// qualified key carries a [`QualifiedSignScheme`], which decides both
-/// its reference byte and the shape of its signing chain; the runtime
-/// byte is emitted at the MSE:Set DST/CT APDU build site via
-/// [`KeyRef::as_u8`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRef {
-    /// Authentication key, PIN1-gated. Wire byte `0x01`.
+    /// Authentication key, PIN1-gated ([`KEY_REF_AUTH`]).
     Auth,
-    /// Authentication key whose wire reference byte was discovered from
-    /// an ISO/IEC 7816-15 `EF.PrKDF` entry (e.g. Estonian eID).
-    DiscoveredAuth(u8),
+    /// Authentication key whose reference was discovered from an ISO/IEC
+    /// 7816-15 `EF.PrKDF` entry (e.g. Estonian eID).
+    DiscoveredAuth(refineid_pkcs15::KeyReference),
     /// Qualified-signature key, PIN2-gated, under a supported
-    /// qualified-signing family: [`KEY_REF_SIGN`] on citizen cards
-    /// (FINEID S1 v4.2 §3.5), [`ORG_QUALIFIED_KEY_REF`] in DF.ESIGN
-    /// on organization cards.
+    /// qualified-signing family.
     Sign(QualifiedSignScheme),
 }
 
@@ -147,15 +121,15 @@ impl KeyRef {
     /// reference resolved by ISO/IEC 7816-15 directory discovery.
     #[must_use]
     pub const fn discovered_auth(reference: refineid_pkcs15::KeyReference) -> Self {
-        Self::DiscoveredAuth(reference.as_u8())
+        Self::DiscoveredAuth(reference)
     }
 
-    /// The card-side reference byte for MSE:Set DST/CT.
+    /// The card-side reference byte for MSE:SET DST/CT.
     #[must_use]
     pub const fn as_u8(self) -> u8 {
         match self {
             Self::Auth => KEY_REF_AUTH,
-            Self::DiscoveredAuth(reference) => reference,
+            Self::DiscoveredAuth(reference) => reference.as_u8(),
             Self::Sign(QualifiedSignScheme::Citizen) => KEY_REF_SIGN,
             Self::Sign(QualifiedSignScheme::Organizational) => ORG_QUALIFIED_KEY_REF,
         }
@@ -163,40 +137,12 @@ impl KeyRef {
 
     /// `true` when the card takes the host digest inside PSO:CDS for
     /// this key instead of a preceding PSO:HASH: the organizational
-    /// qualified key (organizational cards specification §6.6.2.3).
+    /// qualified key.
     #[must_use]
     pub const fn signs_digest_inline(self) -> bool {
         matches!(self, Self::Sign(QualifiedSignScheme::Organizational))
     }
 }
-
-/// Expected signature length for RSA-3072: 384 bytes. Every
-/// catalogued FINEID auth-key returns exactly this many bytes
-/// from PSO:CDS under algRef = 0x42.
-pub const RSA_3072_SIG_BYTES: usize = 384;
-
-/// Expected signature length for ECDSA over secp384r1 (NIST
-/// P-384) in raw `r || s` form: 48 + 48 = 96 bytes.
-///
-/// FINEID S1 v4.2 §3.8.3 specifies the response as "r || s,
-/// where r and s are integers and are the co-ordinates of the
-/// point on the elliptic curve". No DER wrapper, no length
-/// prefixes.
-pub const ECDSA_P384_SIG_BYTES: usize = 96;
-
-/// Expected signature length for ECDSA over secp256r1 (NIST
-/// P-256) in raw `r || s` form: 32 + 32 = 64 bytes. Same
-/// no-DER-wrapper convention as [`ECDSA_P384_SIG_BYTES`].
-pub const ECDSA_P256_SIG_BYTES: usize = 64;
-
-/// SHA-256 digest size: 32 bytes.
-pub const SHA256_DIGEST_LEN: usize = 32;
-
-/// SHA-384 digest size: 48 bytes.
-pub const SHA384_DIGEST_LEN: usize = 48;
-
-/// SHA-512 digest size: 64 bytes.
-pub const SHA512_DIGEST_LEN: usize = 64;
 
 /// Sign-path errors.
 #[derive(Debug)]
@@ -205,14 +151,10 @@ pub enum SignError<TE> {
     Transport(TE),
     /// Card returned a non-success SW at the labelled stage.
     Sw(&'static str, u16),
-    /// Card returned a signature of an unexpected length. Expected
-    /// `RSA_3072_SIG_BYTES` for the algRef-0x42 auth-key path; any
-    /// other length surfaces hardware misconfiguration or a key
-    /// that isn't RSA-3072 (e.g. an ECC v4.0 card on a code path
-    /// that hard-codes RSA).
+    /// Card returned a signature of an unexpected length, or a decipher
+    /// ciphertext was not modulus-wide.
     UnexpectedSignatureLength(usize),
-    /// Host input cannot be represented by the ISO 7816 APDU
-    /// length field used by the signing command.
+    /// Host input cannot be represented by the ISO 7816 APDU length field.
     InputTooLong(usize),
 }
 
@@ -222,10 +164,7 @@ impl<TE: core::fmt::Display> core::fmt::Display for SignError<TE> {
             Self::Transport(e) => write!(f, "sign transport: {e}"),
             Self::Sw(stage, sw) => write!(f, "sign {stage}: card returned SW={sw:#06X}"),
             Self::UnexpectedSignatureLength(n) => {
-                write!(
-                    f,
-                    "sign: card returned {n}-byte signature; expected {RSA_3072_SIG_BYTES} (RSA-3072)"
-                )
+                write!(f, "sign: card returned unexpected {n}-byte length")
             }
             Self::InputTooLong(n) => write!(
                 f,
@@ -237,477 +176,122 @@ impl<TE: core::fmt::Display> core::fmt::Display for SignError<TE> {
 
 impl<TE: core::fmt::Debug + core::fmt::Display + 'static> core::error::Error for SignError<TE> {}
 
-/// FINEID sign / decrypt chain layered as default-impl methods on
-/// every [`CardTransport`].
+/// Map a `refineid-sign` error over [`CoreReads`] into [`SignError`].
+fn map_core_sign_error<E>(
+    error: refineid_sign::SignError<CoreReadError<E>>,
+) -> SignError<TransportDispatchError<E>> {
+    match error {
+        refineid_sign::SignError::Transport(CoreReadError::Transport(err)) => {
+            SignError::Transport(TransportDispatchError::Error(err))
+        }
+        refineid_sign::SignError::Transport(CoreReadError::CredentialCommand) => {
+            SignError::Sw("sign", SW_CONDITIONS_NOT_SATISFIED)
+        }
+        refineid_sign::SignError::Outcome(outcome) => {
+            SignError::Transport(TransportDispatchError::Outcome(outcome))
+        }
+        refineid_sign::SignError::Status(stage, sw) => SignError::Sw(stage, sw.as_u16()),
+        refineid_sign::SignError::Command(_) => SignError::InputTooLong(0),
+        refineid_sign::SignError::UnsupportedKey { .. } => {
+            SignError::Sw("MSE:Set", StatusWord::ReferenceDataNotFound.as_u16())
+        }
+        refineid_sign::SignError::UnexpectedSignatureLength { got, .. } => {
+            SignError::UnexpectedSignatureLength(got)
+        }
+    }
+}
+
+/// Send one `refineid-apdu` command over [`CoreReads`] (preserving `6Cxx`
+/// wrong-`Le` correction) and require `9000`.
+fn exchange_core_apdu<T: CardTransport>(
+    transport: &mut T,
+    apdu: &refineid_apdu::CommandApdu,
+    stage: &'static str,
+) -> Result<Vec<u8>, SignError<TxError<T>>> {
+    let response = refineid_apdu::CardTransport::transmit(&mut CoreReads(transport), apdu)
+        .map_err(|err| match err {
+            CoreReadError::Transport(inner) => {
+                SignError::Transport(TransportDispatchError::Error(inner))
+            }
+            CoreReadError::CredentialCommand => SignError::Sw(stage, SW_CONDITIONS_NOT_SATISFIED),
+        })?
+        .into_response()
+        .map_err(|outcome| SignError::Transport(TransportDispatchError::Outcome(outcome)))?;
+    if !response.is_ok() {
+        return Err(SignError::Sw(stage, response.status_word().as_u16()));
+    }
+    Ok(response.body)
+}
+
+/// Drive the `MSE:SET DST` -> (`PSO:HASH` + empty `PSO:CDS` | inline `PSO:CDS`)
+/// chain using `refineid_sign::commands`, for keys whose PIN 2 was already
+/// verified by the caller.
+fn drive_prehashed_chain<T: CardTransport>(
+    transport: &mut T,
+    alg_ref: SignatureAlgRef,
+    key_ref: KeyRef,
+    hash: ExternalHashValue,
+    inline_digest: bool,
+    expected_bytes: usize,
+) -> Result<Vec<u8>, SignError<TxError<T>>> {
+    let mse = MseSet {
+        alg_ref,
+        key_ref: key_ref.as_u8(),
+    }
+    .into_apdu()
+    .map_err(|_| SignError::InputTooLong(0))?;
+    exchange_core_apdu(transport, &mse, "MSE:Set DST")?;
+
+    let le = expected_length_le(expected_bytes);
+    let cds = if inline_digest {
+        PsoComputeDigitalSignature
+            .into_apdu_with_digest(hash, le)
+            .map_err(|_| SignError::InputTooLong(hash.as_bytes().len()))?
+    } else {
+        let pso_hash = PsoHashExternal { hash }
+            .into_apdu()
+            .map_err(|_| SignError::InputTooLong(hash.as_bytes().len()))?;
+        exchange_core_apdu(transport, &pso_hash, "PSO:HASH")?;
+        PsoComputeDigitalSignature.into_apdu(le)
+    };
+    let sig = exchange_core_apdu(transport, &cds, "PSO:CDS")?;
+    if sig.len() != expected_bytes {
+        return Err(SignError::UnexpectedSignatureLength(sig.len()));
+    }
+    Ok(sig)
+}
+
+/// Construct a `refineid_sign::SigningKey` for an authentication [`KeyRef`]
+/// under `scheme`, or return `None` for qualified [`KeyRef::Sign`].
 ///
-/// The trait keeps these APIs out of the "`pub fn` with borrowed
-/// parameters" category and groups the wire helpers
-/// (`mse_set_dst`, `pso_hash_external_sha256`, etc.) as trait
-/// methods on `&mut self`. Import via
-/// `use refineid_lib_core::sign::SignOps;` -- the blanket impl
-/// below applies to every transport. Helper methods are public-by-
-/// trait but expected to be invoked only through the high-level
-/// `sign_pre_hashed_sha256_rsa*` / `decrypt_rsa_pkcs1_auth` entry
-/// points; their wire shapes are documented for callers that need
-/// to compose a non-canonical chain.
+/// Discovered `EF.PrKDF` keys use [`SignScheme::Estonian`] when no explicit
+/// organizational inline-digest scheme was requested.
+fn core_auth_key<'r, 't, T: CardTransport>(
+    reads: &'r mut CoreReads<'t, T>,
+    key_ref: KeyRef,
+    scheme: SignScheme,
+) -> Option<refineid_sign::SigningKey<'r, CoreReads<'t, T>>> {
+    match key_ref {
+        KeyRef::Auth => Some(reads.authentication_key(scheme)),
+        KeyRef::DiscoveredAuth(reference) => {
+            let effective = if scheme == SignScheme::Organizational {
+                SignScheme::Organizational
+            } else {
+                SignScheme::Estonian
+            };
+            Some(reads.authentication_key_with_reference(effective, reference))
+        }
+        KeyRef::Sign(_) => None,
+    }
+}
+
+/// FINEID sign / decrypt chain layered as default-impl methods on
+/// every [`CardTransport`], delegated to `refineid-sign`.
 pub trait SignOps: CardTransport {
-    /// `MSE:Set DST` -- pin the security environment for the next
-    /// signing PSO chain. Wire: `00 22 41 B6 06 80 01 <algRef>
-    /// 84 01 <keyRef>`. Helper for [`SignOps::sign_pre_hashed_sha256_rsa`].
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW from the card.
-    fn mse_set_dst(
-        &mut self,
-        alg_ref: commands::SignatureAlgRef,
-        key_ref: KeyRef,
-    ) -> Result<(), SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::MseSet {
-            class: ApduClass::Plain,
-            template: commands::MseSetTemplate::DigitalSignature { alg_ref, key_ref },
-        }
-        .into_apdu();
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("MSE:Set DST", r.status_word().as_u16()));
-        }
-        Ok(())
-    }
-
-    /// `MSE:Set CT` -- pin the security environment for a
-    /// subsequent PSO:DECIPHER. Wire: `00 22 41 B8 06 80 01
-    /// <algRef> 84 01 <keyRef>`.
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW from the card.
-    fn mse_set_ct(
-        &mut self,
-        alg_ref: commands::DecipherAlgRef,
-        key_ref: KeyRef,
-    ) -> Result<(), SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::MseSet {
-            class: ApduClass::Plain,
-            template: commands::MseSetTemplate::DeciphermentRsa { alg_ref, key_ref },
-        }
-        .into_apdu();
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("MSE:Set CT", r.status_word().as_u16()));
-        }
-        Ok(())
-    }
-
-    /// `MSE:Set AT` -- same body shape as `MSE:Set DST` but the
-    /// Authentication Template (P2 = `A4h`). FINEID cards gate the
-    /// raw-PKCS signing primitive on the auth key behind the AT.
-    /// Wire: `00 22 41 A4 06 80 01 <algRef> 84 01 <keyRef>`.
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW from the card.
-    fn mse_set_at(
-        &mut self,
-        alg_ref: commands::SignatureAlgRef,
-        key_ref: KeyRef,
-    ) -> Result<(), SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::MseSet {
-            class: ApduClass::Plain,
-            template: commands::MseSetTemplate::Authentication { alg_ref, key_ref },
-        }
-        .into_apdu();
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("MSE:Set AT", r.status_word().as_u16()));
-        }
-        Ok(())
-    }
-
-    /// `PSO:CDS` with a host-supplied data field -- the card signs
-    /// the given bytes directly under the raw security environment
-    /// previously selected via `MSE:Set AT` / `MSE:Set DST`.
-    ///
-    /// Blocks longer than 255 bytes (every RSA-3072 encoded
-    /// message: 384 B) are shipped with ISO 7816-4 command
-    /// chaining: a first chunk under CLA `10h`, the final chunk
-    /// under CLA `00h` with Le = 0 so the transport GET-RESPONSE
-    /// chain fetches the full signature.
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW at either chunk.
-    fn pso_cds_with_data<Alg>(
-        &mut self,
-        data: &[u8],
-    ) -> Result<Signature<Alg>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        const PSO_CDS_HEADER: [u8; 4] = [
-            0x00,
-            commands::PsoComputeDigitalSignature::INS,
-            commands::PsoComputeDigitalSignature::P1,
-            commands::PsoComputeDigitalSignature::P2,
-        ];
-        const PSO_CDS_CHAINED_HEADER: [u8; 4] = [
-            0x10,
-            commands::PsoComputeDigitalSignature::INS,
-            commands::PsoComputeDigitalSignature::P1,
-            commands::PsoComputeDigitalSignature::P2,
-        ];
-        if data.len() <= 255 {
-            let data_len =
-                u8::try_from(data.len()).map_err(|_| SignError::InputTooLong(data.len()))?;
-            let mut apdu = Vec::with_capacity(5 + data.len() + 1);
-            apdu.extend_from_slice(&PSO_CDS_HEADER);
-            apdu.push(data_len);
-            apdu.extend_from_slice(data);
-            apdu.push(0x00);
-            let r = self.transmit(&apdu).map_err(SignError::Transport)?;
-            if !r.is_ok() {
-                return Err(SignError::Sw("PSO:CDS data", r.status_word().as_u16()));
-            }
-            return Ok(Signature::new(r.body));
-        }
-        // Extended-length form first: FINEID cards accept the whole
-        // RSA-3072 block (384 B) in one extended APDU and reject the
-        // chained form with 6985 (hardware-proven). Chaining below
-        // stays as the fallback for readers that cannot ship
-        // extended APDUs.
-        let mut ext = Vec::with_capacity(7 + data.len() + 2);
-        let data_len =
-            u16::try_from(data.len()).map_err(|_| SignError::InputTooLong(data.len()))?;
-        ext.extend_from_slice(&PSO_CDS_HEADER);
-        ext.push(0x00);
-        ext.extend_from_slice(&data_len.to_be_bytes());
-        ext.extend_from_slice(data);
-        ext.extend_from_slice(&0_u16.to_be_bytes());
-        let ext_sw = if let Ok(r) = self.transmit(&ext) {
-            if r.is_ok() {
-                return Ok(Signature::new(r.body));
-            }
-            r.status_word().as_u16()
-        } else {
-            0
-        };
-        // Command chaining keeps RSA-3072 raw blocks (384 B) inside
-        // short-form APDUs.
-        let half = data.len() / 2;
-        let (first, second) = data.split_at(half);
-        let first_len =
-            u8::try_from(first.len()).map_err(|_| SignError::InputTooLong(data.len()))?;
-        let second_len =
-            u8::try_from(second.len()).map_err(|_| SignError::InputTooLong(data.len()))?;
-
-        let mut apdu1 = Vec::with_capacity(5 + first.len());
-        apdu1.extend_from_slice(&PSO_CDS_CHAINED_HEADER);
-        apdu1.push(first_len);
-        apdu1.extend_from_slice(first);
-        let r1 = self.transmit(&apdu1).map_err(SignError::Transport)?;
-        if !r1.is_ok() {
-            // Surface the extended-form SW when it also failed --
-            // the chained SW alone hides the primary rejection.
-            if ext_sw != 0 {
-                return Err(SignError::Sw("PSO:CDS extended", ext_sw));
-            }
-            return Err(SignError::Sw(
-                "PSO:CDS chunk 1/2",
-                r1.status_word().as_u16(),
-            ));
-        }
-
-        let mut apdu2 = Vec::with_capacity(5 + second.len() + 1);
-        apdu2.extend_from_slice(&PSO_CDS_HEADER);
-        apdu2.push(second_len);
-        apdu2.extend_from_slice(second);
-        apdu2.push(0x00);
-        let r2 = self.transmit(&apdu2).map_err(SignError::Transport)?;
-        if !r2.is_ok() {
-            return Err(SignError::Sw(
-                "PSO:CDS chunk 2/2",
-                r2.status_word().as_u16(),
-            ));
-        }
-        Ok(Signature::new(r2.body))
-    }
-
-    /// Raw RSA private-key operation over a host-encoded block
-    /// (EMSA-PSS or any other RFC 8017 encoding) against `key_ref`.
-    ///
-    /// The auth key selects the security environment via `MSE:Set
-    /// AT` (FINEID gates raw-PKCS client-auth signing behind the
-    /// Authentication Template); the qualified-signature key uses
-    /// the regular DST. Both use algRef `40h` (RSA-PKCS, no hash
-    /// indicated) and ship `encoded` through `PSO:CDS` with
-    /// command chaining.
-    ///
-    /// Used by RSA-PSS consumers: TLS 1.3
-    /// `CertificateVerify` requires RSASSA-PSS, the card only pads
-    /// PKCS#1 v1.5 internally, so the host performs EMSA-PSS
-    /// encoding and the card does the private-key operation only.
-    ///
-    /// # Errors
-    /// Transport failure or a non-9000 SW at any stage.
-    fn sign_rsa_raw(
-        &mut self,
-        key_ref: KeyRef,
-        encoded: &[u8],
-    ) -> Result<Signature<RsaPkcs1>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        match key_ref {
-            KeyRef::Auth | KeyRef::DiscoveredAuth(_) => {
-                self.mse_set_at(commands::SignatureAlgRef::RSA_PKCS1_RAW, key_ref)?;
-            }
-            KeyRef::Sign(_) => {
-                self.mse_set_dst(commands::SignatureAlgRef::RSA_PKCS1_RAW, key_ref)?;
-            }
-        }
-        self.pso_cds_with_data::<RsaPkcs1>(encoded)
-    }
-
-    /// `PSO:HASH` external hash form: ship the pre-computed
-    /// SHA-256 digest in the `90 20 <hash>` DO. Wire: `00 2A 90
-    /// A0 22 90 20 <32-byte-hash>`. Helper for
-    /// [`SignOps::sign_pre_hashed_sha256_rsa`].
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW from the card.
-    fn pso_hash_external_sha256(&mut self, hash: Sha256) -> Result<(), SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::PsoHash {
-            class: ApduClass::Plain,
-            mode: commands::PsoHashMode::External {
-                hash: commands::ExternalHashValue::Sha256(*hash.as_bytes()),
-            },
-        }
-        .into_apdu();
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
-        }
-        Ok(())
-    }
-
-    /// `PSO:HASH` external hash form for SHA-1: ship the pre-computed
-    /// digest in the `90 10 <hash>` DO. Wire: `00 2A 90 A0 16 90 10
-    /// <20-byte-hash>`. Helper for the ECDSA-P384 sign chain when a
-    /// relying party still requests SHA-1.
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW from the card.
-    fn pso_hash_external_sha1(&mut self, hash: Sha1) -> Result<(), SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::PsoHash {
-            class: ApduClass::Plain,
-            mode: commands::PsoHashMode::External {
-                hash: commands::ExternalHashValue::Sha1(*hash.as_bytes()),
-            },
-        }
-        .into_apdu();
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
-        }
-        Ok(())
-    }
-
-    /// `PSO:HASH` external hash form for SHA-384: ship the pre-
-    /// computed digest in the `90 30 <hash>` DO. Wire: `00 2A 90
-    /// A0 32 90 30 <48-byte-hash>`. Helper for the ECDSA-P384
-    /// sign chain (FINEID S4-1 v4.2 §4.2 Newer-scheme ECC P-384).
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW from the card.
-    fn pso_hash_external_sha384(&mut self, hash: Sha384) -> Result<(), SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::PsoHash {
-            class: ApduClass::Plain,
-            mode: commands::PsoHashMode::External {
-                hash: commands::ExternalHashValue::Sha384(*hash.as_bytes()),
-            },
-        }
-        .into_apdu();
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
-        }
-        Ok(())
-    }
-
-    /// `PSO:HASH` external hash form for SHA-512: ship the pre-computed
-    /// digest in the `90 60 <hash>` DO. Wire: `00 2A 90 A0 42 90 60
-    /// <64-byte-hash>`. Helper for the ECDSA-P384 sign chain when a
-    /// relying party requests SHA-512.
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW from the card.
-    fn pso_hash_external_sha512(&mut self, hash: Sha512) -> Result<(), SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::PsoHash {
-            class: ApduClass::Plain,
-            mode: commands::PsoHashMode::External {
-                hash: commands::ExternalHashValue::Sha512(*hash.as_bytes()),
-            },
-        }
-        .into_apdu();
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
-        }
-        Ok(())
-    }
-
-    /// `PSO:HASH` external hash form for SHA-224: ship the pre-
-    /// computed digest in the `90 20 <hash>` DO. Wire: `00 2A 90
-    /// A0 22 90 20 <28-byte-hash>`. Helper for the ECDSA-P384
-    /// sign chain where the trust-service profile requests
-    /// SHA-224.
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW from the card.
-    fn pso_hash_external_sha224(&mut self, hash: Sha224) -> Result<(), SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::PsoHash {
-            class: ApduClass::Plain,
-            mode: commands::PsoHashMode::External {
-                hash: commands::ExternalHashValue::Sha224(*hash.as_bytes()),
-            },
-        }
-        .into_apdu();
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
-        }
-        Ok(())
-    }
-
-    /// `PSO:CDS` with an explicit `Le` -- the card signs the previously
-    /// stored hash. Wire: `00 2A 9E 9A <le>`.
-    ///
-    /// The algorithm marker is a type parameter so the returned
-    /// [`Signature<Alg>`] reflects what `MSE:Set DST` selected.
-    /// Length is **not** validated here; the caller decides what
-    /// length is correct for the algorithm (RSA-3072 = 384,
-    /// ECDSA P-384 raw r||s = 96, etc.) and surfaces the
-    /// mismatch as [`SignError::UnexpectedSignatureLength`].
-    ///
-    /// [`Signature<Alg>`]: Signature
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW.
-    fn pso_cds_empty<Alg>(&mut self, le: u8) -> Result<Signature<Alg>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::PsoComputeDigitalSignature {
-            class: ApduClass::Plain,
-        }
-        .into_apdu_with_le(le);
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("PSO:CDS", r.status_word().as_u16()));
-        }
-        Ok(Signature::new(r.body))
-    }
-
-    /// `PSO:CDS` carrying the host digest in its data field -- the
-    /// organizational card's signing form. Wire: `00 2A 9E 9A <Lc>
-    /// <digest> <le>`.
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW.
-    fn pso_cds_over_digest<Alg>(
-        &mut self,
-        digest: &commands::ExternalHashValue,
-        le: u8,
-    ) -> Result<Signature<Alg>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::PsoComputeDigitalSignature {
-            class: ApduClass::Plain,
-        }
-        .into_apdu_with_hash(digest.as_bytes(), le);
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("PSO:CDS", r.status_word().as_u16()));
-        }
-        Ok(Signature::new(r.body))
-    }
-
-    /// The signing chain over a host digest that every pre-hashed
-    /// entry point drives: MSE:Set DST under `(alg_ref, key_ref)`,
-    /// then the digest in the form the key takes -- PSO:HASH and an
-    /// empty PSO:CDS, or one PSO:CDS carrying it inline
-    /// ([`KeyRef::signs_digest_inline`]).
-    ///
-    /// # Errors
-    /// Transport failure or non-9000 SW at any stage.
-    fn hash_then_sign<Alg>(
-        &mut self,
-        alg_ref: commands::SignatureAlgRef,
-        key_ref: KeyRef,
-        hash: commands::ExternalHashValue,
-        le: u8,
-    ) -> Result<Signature<Alg>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        self.mse_set_dst(alg_ref, key_ref)?;
-        if key_ref.signs_digest_inline() {
-            return self.pso_cds_over_digest(&hash, le);
-        }
-        self.pso_hash_external(hash)?;
-        self.pso_cds_empty(le)
-    }
-
     /// SHA-256 + RSA-PKCS1v15 sign chain for any FINEID RSA key.
-    /// Drives MSE:Set DST + PSO:HASH + PSO:CDS against `key_ref`.
-    ///
-    /// `hash` is consumed by value (`Sha256` is `Copy`).
     ///
     /// # Errors
-    /// Transport failure, a card SW other than `0x9000` at any
-    /// stage, or a signature length other than
-    /// [`RSA_3072_SIG_BYTES`].
+    /// Transport failure, non-9000 SW, or signature length mismatch.
     fn sign_pre_hashed_sha256_rsa(
         &mut self,
         key_ref: KeyRef,
@@ -716,23 +300,26 @@ pub trait SignOps: CardTransport {
     where
         Self: Sized,
     {
-        let sig = self.hash_then_sign::<RsaPkcs1Sha256>(
-            commands::SignatureAlgRef::SHA256_RSA_PKCS1_V1_5,
-            key_ref,
-            commands::ExternalHashValue::Sha256(*hash.as_bytes()),
-            commands::PsoComputeDigitalSignature::LE_MAX_SHORT,
-        )?;
-        if sig.len() != RSA_3072_SIG_BYTES {
-            return Err(SignError::UnexpectedSignatureLength(sig.len()));
+        let mut reads = CoreReads(self);
+        if let Some(key) = core_auth_key(&mut reads, key_ref, SignScheme::Citizen) {
+            let sig = key
+                .sign_prehashed_sha256_rsa(*hash.as_bytes())
+                .map_err(map_core_sign_error)?;
+            return Ok(Signature::new(sig.into_bytes()));
         }
-        Ok(sig)
+        let bytes = drive_prehashed_chain(
+            self,
+            SignatureAlgRef::SHA256_RSA_PKCS1,
+            key_ref,
+            ExternalHashValue::Sha256(*hash.as_bytes()),
+            key_ref.signs_digest_inline(),
+            RSA_3072_SIG_BYTES,
+        )?;
+        Ok(Signature::new(bytes))
     }
 
-    /// [`Self::sign_pre_hashed_sha256_rsa`] in the organizational
-    /// card's form: no PSO:HASH, the off-card digest rides in the
-    /// PSO:CDS data field (organizational cards specification
-    /// §6.6.2.3). The `MultiApp` external-hash DO answers `6A80` on
-    /// that platform, which is how the two forms tell apart.
+    /// [`Self::sign_pre_hashed_sha256_rsa`] in the organizational card's
+    /// inline-digest form (no `PSO:HASH`).
     ///
     /// # Errors
     /// As [`Self::sign_pre_hashed_sha256_rsa`].
@@ -744,148 +331,82 @@ pub trait SignOps: CardTransport {
     where
         Self: Sized,
     {
-        self.mse_set_dst(commands::SignatureAlgRef::SHA256_RSA_PKCS1_V1_5, key_ref)?;
-        let sig = self.pso_cds_over_digest::<RsaPkcs1Sha256>(
-            &commands::ExternalHashValue::Sha256(*hash.as_bytes()),
-            commands::PsoComputeDigitalSignature::LE_MAX_SHORT,
-        )?;
-        if sig.len() != RSA_3072_SIG_BYTES {
-            return Err(SignError::UnexpectedSignatureLength(sig.len()));
+        let mut reads = CoreReads(self);
+        if let Some(key) = core_auth_key(&mut reads, key_ref, SignScheme::Organizational) {
+            let sig = key
+                .sign_prehashed_sha256_rsa(*hash.as_bytes())
+                .map_err(map_core_sign_error)?;
+            return Ok(Signature::new(sig.into_bytes()));
         }
-        Ok(sig)
+        let bytes = drive_prehashed_chain(
+            self,
+            SignatureAlgRef::SHA256_RSA_PKCS1,
+            key_ref,
+            ExternalHashValue::Sha256(*hash.as_bytes()),
+            true,
+            RSA_3072_SIG_BYTES,
+        )?;
+        Ok(Signature::new(bytes))
     }
 
-    /// SHA-384 + ECDSA P-384 sign chain for FINEID Newer-scheme
-    /// ECC keys (S4-1 v4.2 §4.2 auth key / qualified-signature
-    /// ECC key, both `secp384r1`).
-    ///
-    /// Drives MSE:Set DST (algRef `54h`) + PSO:HASH (SHA-384
-    /// external) + PSO:CDS against `key_ref`. The returned
-    /// signature is the raw `r || s` form per S1 v4.2 §3.8.3,
-    /// 96 bytes total (48 + 48). Caller is responsible for
-    /// converting to DER if a downstream verifier needs that
-    /// encoding.
+    /// Pre-hashed RSA-PKCS#1 v1.5 sign over SHA-256, SHA-384, or SHA-512
+    /// against `key_ref`.
     ///
     /// # Errors
-    /// Transport failure, a card SW other than `0x9000` at any
-    /// stage, or a signature length other than
-    /// [`ECDSA_P384_SIG_BYTES`].
-    fn sign_pre_hashed_sha384_ecdsa_p384(
+    /// Transport failure, non-9000 SW, unsupported weak digest, or signature
+    /// length mismatch.
+    fn sign_pre_hashed_rsa_pkcs1(
         &mut self,
         key_ref: KeyRef,
-        hash: Sha384,
-    ) -> Result<Signature<EcdsaP384>, SignError<TxError<Self>>>
+        hash: ExternalHashValue,
+    ) -> Result<Signature<RsaPkcs1>, SignError<TxError<Self>>>
     where
         Self: Sized,
     {
-        let sig = self.hash_then_sign::<EcdsaP384>(
-            commands::SignatureAlgRef::SHA384_ECDSA,
-            key_ref,
-            commands::ExternalHashValue::Sha384(*hash.as_bytes()),
-            commands::PsoComputeDigitalSignature::LE_ECDSA_P384,
-        )?;
-        if sig.len() != ECDSA_P384_SIG_BYTES {
-            return Err(SignError::UnexpectedSignatureLength(sig.len()));
+        let mut reads = CoreReads(self);
+        if let Some(key) = core_auth_key(&mut reads, key_ref, SignScheme::Citizen) {
+            let bytes = match hash {
+                ExternalHashValue::Sha256(digest) => key
+                    .sign_prehashed_sha256_rsa(digest)
+                    .map_err(map_core_sign_error)?
+                    .into_bytes(),
+                ExternalHashValue::Sha384(digest) => key
+                    .sign_prehashed_sha384_rsa(digest)
+                    .map_err(map_core_sign_error)?
+                    .into_bytes(),
+                ExternalHashValue::Sha512(digest) => key
+                    .sign_prehashed_sha512_rsa(digest)
+                    .map_err(map_core_sign_error)?
+                    .into_bytes(),
+                ExternalHashValue::Sha1(_) | ExternalHashValue::Sha224(_) => {
+                    return Err(SignError::Sw("MSE:Set DST", SW_INCORRECT_DATA));
+                }
+            };
+            return Ok(Signature::new(bytes));
         }
-        Ok(sig)
+        let alg_ref = match hash {
+            ExternalHashValue::Sha256(_) => SignatureAlgRef::SHA256_RSA_PKCS1,
+            ExternalHashValue::Sha384(_) => SignatureAlgRef::SHA384_RSA_PKCS1,
+            ExternalHashValue::Sha512(_) => SignatureAlgRef::SHA512_RSA_PKCS1,
+            ExternalHashValue::Sha1(_) | ExternalHashValue::Sha224(_) => {
+                return Err(SignError::Sw("MSE:Set DST", SW_INCORRECT_DATA));
+            }
+        };
+        let bytes = drive_prehashed_chain(
+            self,
+            alg_ref,
+            key_ref,
+            hash,
+            key_ref.signs_digest_inline(),
+            RSA_3072_SIG_BYTES,
+        )?;
+        Ok(Signature::new(bytes))
     }
 
-    /// ECDSA P-384 over a pre-computed SHA-1 digest. Same key and curve
-    /// as the SHA-384 path; only the algRef and digest length differ.
+    /// SHA-256 + ECDSA P-384 sign chain returning raw `r || s` (96 bytes).
     ///
     /// # Errors
-    /// Transport failure, a card SW other than `0x9000` at any stage,
-    /// or a signature length other than [`ECDSA_P384_SIG_BYTES`].
-    fn sign_pre_hashed_sha1_ecdsa_p384(
-        &mut self,
-        key_ref: KeyRef,
-        hash: Sha1,
-    ) -> Result<Signature<EcdsaP384>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let sig = self.hash_then_sign::<EcdsaP384>(
-            commands::SignatureAlgRef::from_parts(
-                commands::HashAlgorithm::Sha1,
-                commands::SignatureAlgorithm::Ecdsa,
-            ),
-            key_ref,
-            commands::ExternalHashValue::Sha1(*hash.as_bytes()),
-            commands::PsoComputeDigitalSignature::LE_ECDSA_P384,
-        )?;
-        if sig.len() != ECDSA_P384_SIG_BYTES {
-            return Err(SignError::UnexpectedSignatureLength(sig.len()));
-        }
-        Ok(sig)
-    }
-
-    /// ECDSA P-384 over a pre-computed SHA-224 digest. Same key and
-    /// curve as [`Self::sign_pre_hashed_sha384_ecdsa_p384`]; only the
-    /// algRef (`34h`) and the external-hash length (28 bytes) differ.
-    /// Some trust-service profiles request this shape alongside
-    /// ECDSA+SHA-256 for P-384 keys.
-    ///
-    /// # Errors
-    /// Transport failure, a card SW other than `0x9000` at any stage,
-    /// or a signature length other than [`ECDSA_P384_SIG_BYTES`].
-    fn sign_pre_hashed_sha224_ecdsa_p384(
-        &mut self,
-        key_ref: KeyRef,
-        hash: Sha224,
-    ) -> Result<Signature<EcdsaP384>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let sig = self.hash_then_sign::<EcdsaP384>(
-            commands::SignatureAlgRef::SHA224_ECDSA,
-            key_ref,
-            commands::ExternalHashValue::Sha224(*hash.as_bytes()),
-            commands::PsoComputeDigitalSignature::LE_ECDSA_P384,
-        )?;
-        if sig.len() != ECDSA_P384_SIG_BYTES {
-            return Err(SignError::UnexpectedSignatureLength(sig.len()));
-        }
-        Ok(sig)
-    }
-
-    /// ECDSA P-384 over a pre-computed SHA-512 digest.
-    ///
-    /// # Errors
-    /// Transport failure, a card SW other than `0x9000` at any stage,
-    /// or a signature length other than [`ECDSA_P384_SIG_BYTES`].
-    fn sign_pre_hashed_sha512_ecdsa_p384(
-        &mut self,
-        key_ref: KeyRef,
-        hash: Sha512,
-    ) -> Result<Signature<EcdsaP384>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let sig = self.hash_then_sign::<EcdsaP384>(
-            commands::SignatureAlgRef::from_parts(
-                commands::HashAlgorithm::Sha512,
-                commands::SignatureAlgorithm::Ecdsa,
-            ),
-            key_ref,
-            commands::ExternalHashValue::Sha512(*hash.as_bytes()),
-            commands::PsoComputeDigitalSignature::LE_ECDSA_P384,
-        )?;
-        if sig.len() != ECDSA_P384_SIG_BYTES {
-            return Err(SignError::UnexpectedSignatureLength(sig.len()));
-        }
-        Ok(sig)
-    }
-
-    /// ECDSA P-384 over a pre-computed SHA-256 digest. Same key and
-    /// curve as [`Self::sign_pre_hashed_sha384_ecdsa_p384`]; only the
-    /// algRef (`44h`) and the external-hash length (32 bytes) differ.
-    /// macOS `SecureTransport` requests ECDSA+SHA-256 for the suomi.fi
-    /// kortti TLS-1.2 `CertificateVerify` even with a P-384 key. Returns
-    /// the raw `r || s` (96 bytes).
-    ///
-    /// # Errors
-    /// Transport failure, a card SW other than `0x9000` at any stage,
-    /// or a signature length other than [`ECDSA_P384_SIG_BYTES`].
+    /// Transport failure, non-9000 SW, or signature length mismatch.
     fn sign_pre_hashed_sha256_ecdsa_p384(
         &mut self,
         key_ref: KeyRef,
@@ -894,20 +415,137 @@ pub trait SignOps: CardTransport {
     where
         Self: Sized,
     {
-        let sig = self.hash_then_sign::<EcdsaP384>(
-            commands::SignatureAlgRef::SHA256_ECDSA,
+        let mut reads = CoreReads(self);
+        if let Some(key) = core_auth_key(&mut reads, key_ref, SignScheme::Citizen) {
+            let sig = key
+                .sign_prehashed_sha256_ecdsa(*hash.as_bytes())
+                .map_err(map_core_sign_error)?;
+            return Ok(Signature::new(sig.into_bytes()));
+        }
+        let bytes = drive_prehashed_chain(
+            self,
+            SignatureAlgRef::SHA256_ECDSA,
             key_ref,
-            commands::ExternalHashValue::Sha256(*hash.as_bytes()),
-            commands::PsoComputeDigitalSignature::LE_ECDSA_P384,
+            ExternalHashValue::Sha256(*hash.as_bytes()),
+            key_ref.signs_digest_inline(),
+            ECDSA_P384_SIG_BYTES,
         )?;
+        Ok(Signature::new(bytes))
+    }
+
+    /// SHA-384 + ECDSA P-384 sign chain returning raw `r || s` (96 bytes).
+    ///
+    /// # Errors
+    /// Transport failure, non-9000 SW, or signature length mismatch.
+    fn sign_pre_hashed_sha384_ecdsa_p384(
+        &mut self,
+        key_ref: KeyRef,
+        hash: Sha384,
+    ) -> Result<Signature<EcdsaP384>, SignError<TxError<Self>>>
+    where
+        Self: Sized,
+    {
+        let mut reads = CoreReads(self);
+        if let Some(key) = core_auth_key(&mut reads, key_ref, SignScheme::Citizen) {
+            let sig = key
+                .sign_prehashed_sha384_ecdsa(*hash.as_bytes())
+                .map_err(map_core_sign_error)?;
+            return Ok(Signature::new(sig.into_bytes()));
+        }
+        let bytes = drive_prehashed_chain(
+            self,
+            SignatureAlgRef::SHA384_ECDSA,
+            key_ref,
+            ExternalHashValue::Sha384(*hash.as_bytes()),
+            key_ref.signs_digest_inline(),
+            ECDSA_P384_SIG_BYTES,
+        )?;
+        Ok(Signature::new(bytes))
+    }
+
+    /// SHA-512 + ECDSA P-384 sign chain returning raw `r || s` (96 bytes).
+    ///
+    /// # Errors
+    /// Transport failure, non-9000 SW, or signature length mismatch.
+    fn sign_pre_hashed_sha512_ecdsa_p384(
+        &mut self,
+        key_ref: KeyRef,
+        hash: Sha512,
+    ) -> Result<Signature<EcdsaP384>, SignError<TxError<Self>>>
+    where
+        Self: Sized,
+    {
+        let mse_data = [
+            CRDO_ALG_REF,
+            CRDO_VALUE_LEN,
+            ALG_SHA512_ECDSA,
+            CRDO_KEY_REF,
+            CRDO_VALUE_LEN,
+            key_ref.as_u8(),
+        ];
+        let mse = refineid_apdu::CommandApdu::case_3(
+            CommandHeader {
+                class: ApduClass::Plain,
+                instruction: MSE_INS,
+                p1: MSE_P1_SET,
+                p2: MSE_P2_DST,
+            },
+            &mse_data,
+        )
+        .map_err(|_| SignError::InputTooLong(mse_data.len()))?;
+        exchange_core_apdu(self, &mse, "MSE:Set DST")?;
+
+        let ext_hash = ExternalHashValue::Sha512(*hash.as_bytes());
+        let le = expected_length_le(ECDSA_P384_SIG_BYTES);
+        let cds = if key_ref.signs_digest_inline() {
+            PsoComputeDigitalSignature
+                .into_apdu_with_digest(ext_hash, le)
+                .map_err(|_| SignError::InputTooLong(ext_hash.as_bytes().len()))?
+        } else {
+            let pso_hash = PsoHashExternal { hash: ext_hash }
+                .into_apdu()
+                .map_err(|_| SignError::InputTooLong(ext_hash.as_bytes().len()))?;
+            exchange_core_apdu(self, &pso_hash, "PSO:HASH")?;
+            PsoComputeDigitalSignature.into_apdu(le)
+        };
+        let sig = exchange_core_apdu(self, &cds, "PSO:CDS")?;
         if sig.len() != ECDSA_P384_SIG_BYTES {
             return Err(SignError::UnexpectedSignatureLength(sig.len()));
         }
-        Ok(sig)
+        Ok(Signature::new(sig))
     }
 
-    /// Auth-slot convenience wrapper for
-    /// [`SignOps::sign_pre_hashed_sha256_rsa`].
+    /// SHA-256 + ECDSA P-256 sign chain returning raw `r || s` (64 bytes).
+    ///
+    /// # Errors
+    /// Transport failure, non-9000 SW, or signature length mismatch.
+    fn sign_pre_hashed_sha256_ecdsa_p256(
+        &mut self,
+        key_ref: KeyRef,
+        hash: Sha256,
+    ) -> Result<Signature<EcdsaP256>, SignError<TxError<Self>>>
+    where
+        Self: Sized,
+    {
+        let mut reads = CoreReads(self);
+        if let Some(key) = core_auth_key(&mut reads, key_ref, SignScheme::Citizen) {
+            let sig = key
+                .sign_prehashed_sha256_ecdsa_p256(*hash.as_bytes())
+                .map_err(map_core_sign_error)?;
+            return Ok(Signature::new(sig.into_bytes()));
+        }
+        let bytes = drive_prehashed_chain(
+            self,
+            SignatureAlgRef::SHA256_ECDSA,
+            key_ref,
+            ExternalHashValue::Sha256(*hash.as_bytes()),
+            key_ref.signs_digest_inline(),
+            ECDSA_P256_SIG_BYTES,
+        )?;
+        Ok(Signature::new(bytes))
+    }
+
+    /// Auth-slot convenience wrapper for [`SignOps::sign_pre_hashed_sha256_rsa`].
     ///
     /// # Errors
     /// See [`SignOps::sign_pre_hashed_sha256_rsa`].
@@ -922,10 +560,7 @@ pub trait SignOps: CardTransport {
     }
 
     /// Qualified-signature-slot convenience wrapper for
-    /// [`SignOps::sign_pre_hashed_sha256_rsa`] under a supported
-    /// qualified-signing family. **Caller must have verified PIN2** in
-    /// this session, and nothing may SELECT between that VERIFY and this
-    /// call.
+    /// [`SignOps::sign_pre_hashed_sha256_rsa`].
     ///
     /// # Errors
     /// See [`SignOps::sign_pre_hashed_sha256_rsa`].
@@ -940,285 +575,59 @@ pub trait SignOps: CardTransport {
         self.sign_pre_hashed_sha256_rsa(KeyRef::Sign(scheme), hash)
     }
 
-    /// `PSO:DECIPHER` -- RSA decrypt the ciphertext under the
-    /// key pinned by [`SignOps::mse_set_ct`]. For RSA-3072 the
-    /// body is `1 + 384 = 385` B (exceeds short-form Lc=255), so
-    /// chaining splits at the halfway point.
-    ///
-    /// Caller is responsible for VERIFY PIN1 + MSE:Set CT before
-    /// invoking this method.
+    /// RSA-PKCS1v1.5 decrypt against the auth key ([`KEY_REF_AUTH`]), delegated
+    /// to [`refineid_sign::SignOps::decipher_rsa`].
     ///
     /// # Errors
-    /// Transport failure or non-9000 SW from any chunk.
-    fn pso_decipher(
-        &mut self,
-        ciphertext: Ciphertext<RsaPkcs1>,
-    ) -> Result<Plaintext<RsaPkcs1>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let ct_bytes = ciphertext.as_bytes();
-        let mut body = Vec::with_capacity(ct_bytes.len().saturating_add(1));
-        body.push(0x81);
-        body.extend_from_slice(ct_bytes);
-
-        if body.len() <= 255 {
-            let apdu = commands::PsoDecipher { body, chain: false }.into_apdu();
-            let r = self
-                .transmit(apdu.as_bytes())
-                .map_err(SignError::Transport)?;
-            if !r.is_ok() {
-                return Err(SignError::Sw("PSO:DECIPHER", r.status_word().as_u16()));
-            }
-            return Ok(Plaintext::new(r.body));
-        }
-
-        // Chaining: split at halfway. RSA-3072 body = 385 B;
-        // halves are 192 + 193, both well under short-form
-        // Lc=255. `div_euclid` is the typed-quotient form (no
-        // `integer_division` lint to silence).
-        let half = body.len().div_euclid(2);
-        let (first, second) = body.split_at(half);
-
-        let apdu1 = commands::PsoDecipher {
-            body: first.to_vec(),
-            chain: true,
-        }
-        .into_apdu();
-        let r1 = self
-            .transmit(apdu1.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r1.is_ok() {
-            return Err(SignError::Sw(
-                "PSO:DECIPHER chunk 1/2",
-                r1.status_word().as_u16(),
-            ));
-        }
-
-        let apdu2 = commands::PsoDecipher {
-            body: second.to_vec(),
-            chain: false,
-        }
-        .into_apdu();
-        let r2 = self
-            .transmit(apdu2.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r2.is_ok() {
-            return Err(SignError::Sw(
-                "PSO:DECIPHER chunk 2/2",
-                r2.status_word().as_u16(),
-            ));
-        }
-        Ok(Plaintext::new(r2.body))
-    }
-
-    /// RSA-PKCS1v1.5 decrypt against the **auth key** (key ref
-    /// `0x01`).
-    ///
-    /// Pre-conditions:
-    /// - VERIFY PIN1 has succeeded earlier in this card session.
-    /// - `ciphertext.len() == RSA_3072_SIG_BYTES`; otherwise the
-    ///   call fails with
-    ///   [`SignError::UnexpectedSignatureLength`].
-    ///
-    /// Returns the PKCS#1 v1.5-unpadded plaintext. Length is
-    /// determined by the card.
-    ///
-    /// # Errors
-    /// Transport failure, a card SW other than `0x9000` at MSE
-    /// or either DECIPHER chunk, or a wrong-length ciphertext.
+    /// Transport failure, non-9000 SW, or a ciphertext length other than
+    /// [`RSA_3072_SIG_BYTES`].
     fn decrypt_rsa_pkcs1_auth(
         &mut self,
         ciphertext: Ciphertext<RsaPkcs1>,
-    ) -> Result<Plaintext<RsaPkcs1>, SignError<TxError<Self>>>
+    ) -> Result<RecoveredPlaintext, SignError<TxError<Self>>>
     where
         Self: Sized,
     {
-        self.decrypt_rsa_pkcs1(KeyRef::Auth, ciphertext)
-    }
-
-    /// `PSO:HASH` external-hash form for any catalogued digest
-    /// size. Generalises [`pso_hash_external_sha256`] /
-    /// [`pso_hash_external_sha384`] across the digest set the card
-    /// accepts (FINEID S1 v4.2 §3.7.2.3 Algorithm-ID table); the
-    /// active SE algorithm (set by the preceding MSE:Set DST)
-    /// selects which length the card expects.
-    ///
-    /// [`pso_hash_external_sha256`]: SignOps::pso_hash_external_sha256
-    /// [`pso_hash_external_sha384`]: SignOps::pso_hash_external_sha384
-    ///
-    /// # Errors
-    /// Transport failure or a non-9000 SW.
-    fn pso_hash_external(
-        &mut self,
-        hash: commands::ExternalHashValue,
-    ) -> Result<(), SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let apdu = commands::PsoHash {
-            class: ApduClass::Plain,
-            mode: commands::PsoHashMode::External { hash },
-        }
-        .into_apdu();
-        let r = self
-            .transmit(apdu.as_bytes())
-            .map_err(SignError::Transport)?;
-        if !r.is_ok() {
-            return Err(SignError::Sw("PSO:HASH", r.status_word().as_u16()));
-        }
-        Ok(())
-    }
-
-    /// Pre-hashed RSA-PKCS#1 v1.5 sign over any catalogued digest
-    /// (SHA-1/224/256/384/512) against `key_ref`. Drives MSE:Set
-    /// DST (algRef = digest x RSA-PKCS1) + PSO:HASH external +
-    /// PSO:CDS; the card builds the `DigestInfo` internally, exactly
-    /// as on the proven SHA-256 auth path.
-    ///
-    /// Unlike [`sign_pre_hashed_sha256_rsa`] the signature length
-    /// is **not** pinned here -- the RSA modulus size is key-
-    /// dependent, so the caller validates the returned
-    /// [`Signature<RsaPkcs1>`] length against the key it selected.
-    ///
-    /// Only SHA-256 is hardware-proven today (the suomi.fi TLS
-    /// path); the other digests follow the same spec choreography
-    /// but are pending FINEID hardware re-validation.
-    ///
-    /// [`sign_pre_hashed_sha256_rsa`]: SignOps::sign_pre_hashed_sha256_rsa
-    ///
-    /// # Errors
-    /// Transport failure or a non-9000 SW at any stage.
-    fn sign_pre_hashed_rsa_pkcs1(
-        &mut self,
-        key_ref: KeyRef,
-        hash: commands::ExternalHashValue,
-    ) -> Result<Signature<RsaPkcs1>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let alg_ref = commands::SignatureAlgRef::from_parts(
-            hash.hash_algorithm(),
-            commands::SignatureAlgorithm::RsaPkcs1V1_5,
-        );
-        self.hash_then_sign::<RsaPkcs1>(
-            alg_ref,
-            key_ref,
-            hash,
-            commands::PsoComputeDigitalSignature::LE_MAX_SHORT,
-        )
-    }
-
-    /// Pre-hashed native RSA-PSS sign against `key_ref`. FINEID S1
-    /// v4.2 Table 6 assigns low nibble `5h` to RSA-PSS, so the card
-    /// performs PSS encoding internally after `PSO:HASH` receives the
-    /// caller's digest. This avoids the unsupported 384-byte raw-RSA
-    /// `PSO:CDS` operation.
-    ///
-    /// The card profile does not expose a salt-length parameter. Callers
-    /// must request the TLS-standard salt length equal to the digest size.
-    ///
-    /// # Errors
-    /// Transport failure or a non-9000 SW at any stage.
-    fn sign_pre_hashed_rsa_pss(
-        &mut self,
-        key_ref: KeyRef,
-        hash: commands::ExternalHashValue,
-    ) -> Result<Signature<RsaPkcs1>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let alg_ref = commands::SignatureAlgRef::from_parts(
-            hash.hash_algorithm(),
-            commands::SignatureAlgorithm::RsaPss,
-        );
-        let signature = self.hash_then_sign::<RsaPkcs1>(
-            alg_ref,
-            key_ref,
-            hash,
-            commands::PsoComputeDigitalSignature::LE_MAX_SHORT,
-        )?;
-        if signature.len() != RSA_3072_SIG_BYTES {
-            return Err(SignError::UnexpectedSignatureLength(signature.len()));
-        }
-        Ok(signature)
-    }
-
-    /// SHA-256 + ECDSA P-256 sign chain (algRef `44h` = SHA256 x
-    /// ECDSA) against `key_ref`: MSE:Set DST + PSO:HASH SHA-256
-    /// external + PSO:CDS. Returns the raw `r || s`, 64 bytes
-    /// ([`ECDSA_P256_SIG_BYTES`]) per FINEID S1 v4.2 §3.8.3.
-    ///
-    /// Pending FINEID hardware re-validation (only the P-384 ECDSA
-    /// path is proven today).
-    ///
-    /// # Errors
-    /// Transport failure, a card SW other than `0x9000` at any
-    /// stage, or a signature length other than
-    /// [`ECDSA_P256_SIG_BYTES`].
-    fn sign_pre_hashed_sha256_ecdsa_p256(
-        &mut self,
-        key_ref: KeyRef,
-        hash: Sha256,
-    ) -> Result<Signature<EcdsaP256>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        let sig = self.hash_then_sign::<EcdsaP256>(
-            commands::SignatureAlgRef::SHA256_ECDSA,
-            key_ref,
-            commands::ExternalHashValue::Sha256(*hash.as_bytes()),
-            commands::PsoComputeDigitalSignature::LE_ECDSA_P256,
-        )?;
-        if sig.len() != ECDSA_P256_SIG_BYTES {
-            return Err(SignError::UnexpectedSignatureLength(sig.len()));
-        }
-        Ok(sig)
-    }
-
-    /// RSA-PKCS#1 v1.5 decrypt against `key_ref`. Generalises
-    /// [`decrypt_rsa_pkcs1_auth`] to either key slot: MSE:Set CT
-    /// (`RsassaPkcs1V1_5`) + PSO:DECIPHER. Requires the matching
-    /// PIN verified earlier in this card session.
-    ///
-    /// [`decrypt_rsa_pkcs1_auth`]: SignOps::decrypt_rsa_pkcs1_auth
-    ///
-    /// # Errors
-    /// Transport failure, a card SW other than `0x9000`, or a
-    /// ciphertext length other than [`RSA_3072_SIG_BYTES`].
-    fn decrypt_rsa_pkcs1(
-        &mut self,
-        key_ref: KeyRef,
-        ciphertext: Ciphertext<RsaPkcs1>,
-    ) -> Result<Plaintext<RsaPkcs1>, SignError<TxError<Self>>>
-    where
-        Self: Sized,
-    {
-        if ciphertext.len() != RSA_3072_SIG_BYTES {
-            return Err(SignError::UnexpectedSignatureLength(ciphertext.len()));
-        }
-        self.mse_set_ct(commands::DecipherAlgRef::RsassaPkcs1V1_5, key_ref)?;
-        self.pso_decipher(ciphertext)
+        let cryptogram = refineid_sign::RsaCryptogram::from_bytes(ciphertext.into_bytes())
+            .map_err(|err| SignError::UnexpectedSignatureLength(err.got))?;
+        CoreReads(self)
+            .decipher_rsa(
+                SignScheme::Citizen,
+                refineid_sign::KeyRef::Auth,
+                DecipherAlgRef::RSA_PKCS1,
+                &cryptogram,
+            )
+            .map_err(map_core_sign_error)
     }
 }
 
 impl<T: CardTransport + ?Sized> SignOps for T {}
 
-// All sign / decrypt fns are methods on [`SignOps`]. See the trait
-// definition above.
-
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use crate::atr::{Atr, AtrError, MINIMAL_DIRECT_ATR};
+    use crate::auth::{PIN_PAD_BYTE, PIN2_STORED_LENGTH, PinOps as _, PinSlot, VERIFY_INS};
+    use crate::pkcs15::esign_wire;
     use crate::transport::{CommandApdu, ResponseApdu, TransportOutcome};
+    use refineid_sign::commands::PsoDecipher;
 
-    /// Scripted transport that asserts each APDU matches an
-    /// expected sequence and returns canned responses.
+    const SW1_SUCCESS: u8 = 0x90;
+    const SW2_SUCCESS: u8 = 0x00;
+    const SW1_SECURITY: u8 = 0x69;
+    const SW2_SECURITY_NOT_SATISFIED: u8 = 0x82;
+    const SW_SECURITY_NOT_SATISFIED: u16 = 0x6982;
+    const VERIFY_P1_MODE: u8 = 0x00;
+    const FILL_BYTE: u8 = 0xAA;
+    const SIG_FILL_BYTE: u8 = 0x55;
+    const TEST_PIN2_LEN: usize = 6;
+    const TEST_PIN2: &[u8; TEST_PIN2_LEN] = b"123456";
+    const SHORT_SIG_LEN: usize = 16;
+
     struct Scripted {
         steps: std::collections::VecDeque<(Vec<u8>, ResponseApdu)>,
     }
+
     impl Scripted {
         fn new(steps: Vec<(Vec<u8>, ResponseApdu)>) -> Self {
             Self {
@@ -1226,420 +635,100 @@ mod tests {
             }
         }
     }
+
     impl CardTransport for Scripted {
         type Error = String;
+
         fn transmit_outcome(
             &mut self,
             apdu: &CommandApdu,
         ) -> Result<TransportOutcome, Self::Error> {
-            let (expected, response) = self
-                .steps
-                .pop_front()
-                .expect("Scripted: unexpected extra APDU");
+            let Some((expected, response)) = self.steps.pop_front() else {
+                return Err("script exhausted".to_owned());
+            };
             assert_eq!(apdu.as_bytes(), expected.as_slice(), "APDU mismatch");
             Ok(TransportOutcome::Response(response))
         }
+
         fn atr(&self) -> Result<Atr, AtrError> {
             Atr::new(MINIMAL_DIRECT_ATR)
         }
     }
 
-    use crate::apdu::status_word::StatusWord;
-
-    /// Build a typed `ResponseApdu` carrying `sw` and `body`.
-    /// Bytes are decomposed from the typed `StatusWord` value so
-    /// the test fixtures don't carry raw `0x9000` / `0x6982`
-    /// hex literals.
-    fn response(sw: StatusWord, body: Vec<u8>) -> ResponseApdu {
-        // Decompose the typed status word to its big-endian wire
-        // pair. `to_be_bytes` is the lossless typed decomposition;
-        // it sidesteps `as u8` truncation casts entirely.
-        let [sw1, sw2] = sw.as_u16().to_be_bytes();
-        ResponseApdu { body, sw1, sw2 }
-    }
-
     fn ok(body: &[u8]) -> ResponseApdu {
-        response(StatusWord::Success, body.to_vec())
-    }
-    fn sw_err(sw: StatusWord) -> ResponseApdu {
-        response(sw, vec![])
+        ResponseApdu {
+            body: body.to_vec(),
+            sw1: SW1_SUCCESS,
+            sw2: SW2_SUCCESS,
+        }
     }
 
-    // Expected-APDU builders for `Scripted` -- each one
-    // constructs the wire bytes via the same typed command
-    // struct the production code uses. This way the higher-
-    // level sign-chain tests below check WHICH command + WHICH
-    // typed parameters refineid dispatches (the test fails if
-    // sign_pre_hashed_sha384_ecdsa_p384 accidentally uses
-    // SHA256_RSA_PKCS1_V1_5 or KeyRef::Sign, etc.), while the
-    // raw byte-shape of each individual command is locked by
-    // the dedicated wire-format tests in `sign::commands`.
-    //
-    // Per typing-discipline.md "Allowed Boundary Shapes": typed
-    // values cross every boundary -- KeyRef, SignatureAlgRef,
-    // ExternalHashValue, ApduClass -- no raw hex constants
-    // here.
-    use crate::apdu::iso7816::ApduClass;
-    use commands::{
-        ExternalHashValue, MseSet, MseSetTemplate, PsoComputeDigitalSignature, PsoHash,
-        PsoHashMode, SignatureAlgRef,
-    };
+    fn sw(sw1: u8, sw2: u8) -> ResponseApdu {
+        ResponseApdu {
+            body: vec![],
+            sw1,
+            sw2,
+        }
+    }
 
-    fn expected_mse_set_dst(alg_ref: SignatureAlgRef, key_ref: KeyRef) -> Vec<u8> {
+    fn expected_mse_dst(alg_ref: SignatureAlgRef, key_ref: KeyRef) -> Vec<u8> {
         MseSet {
-            class: ApduClass::Plain,
-            template: MseSetTemplate::DigitalSignature { alg_ref, key_ref },
+            alg_ref,
+            key_ref: key_ref.as_u8(),
         }
         .into_apdu()
-        .into_bytes()
+        .expect("mse builds")
+        .as_bytes()
+        .to_vec()
     }
 
     fn expected_pso_hash(hash: ExternalHashValue) -> Vec<u8> {
-        PsoHash {
-            class: ApduClass::Plain,
-            mode: PsoHashMode::External { hash },
-        }
-        .into_apdu()
-        .into_bytes()
-    }
-
-    fn expected_pso_cds(le: u8) -> Vec<u8> {
-        PsoComputeDigitalSignature {
-            class: ApduClass::Plain,
-        }
-        .into_apdu_with_le(le)
-        .into_bytes()
-    }
-
-    fn expected_mse_set_ct(alg_ref: commands::DecipherAlgRef, key_ref: KeyRef) -> Vec<u8> {
-        MseSet {
-            class: ApduClass::Plain,
-            template: MseSetTemplate::DeciphermentRsa { alg_ref, key_ref },
-        }
-        .into_apdu()
-        .into_bytes()
-    }
-
-    fn expected_pso_decipher(body: Vec<u8>, chain: bool) -> Vec<u8> {
-        commands::PsoDecipher { body, chain }
+        PsoHashExternal { hash }
             .into_apdu()
-            .into_bytes()
+            .expect("pso hash builds")
+            .as_bytes()
+            .to_vec()
     }
 
-    /// Deterministic fixture-fill byte for placeholder buffers.
-    /// One value reused across every placeholder helper -- the
-    /// tests care about length + structure, not content.
-    const FIXTURE_FILL: u8 = 0xAA;
-
-    /// RSA PKCS#1 v1.5 padding-indicator key per FINEID S1 v4.2
-    /// §3.9 -- prepended by [`SignOps::pso_decipher`] before the
-    /// ciphertext when wrapping the body for the card.
-    const RSA_PKCS1_PADDING_INDICATOR_KEY: u8 = 0x81;
-
-    fn placeholder_sha256_digest() -> Sha256 {
-        Sha256::from_bytes([FIXTURE_FILL; SHA256_DIGEST_LEN])
+    fn expected_pso_cds(expected_bytes: usize) -> Vec<u8> {
+        PsoComputeDigitalSignature
+            .into_apdu(expected_length_le(expected_bytes))
+            .as_bytes()
+            .to_vec()
     }
 
-    fn placeholder_sha1_digest() -> Sha1 {
-        Sha1::from_bytes([FIXTURE_FILL; 20])
+    fn expected_pso_cds_inline(hash: ExternalHashValue, expected_bytes: usize) -> Vec<u8> {
+        PsoComputeDigitalSignature
+            .into_apdu_with_digest(hash, expected_length_le(expected_bytes))
+            .expect("inline cds builds")
+            .as_bytes()
+            .to_vec()
     }
-
-    fn placeholder_sha224_digest() -> Sha224 {
-        Sha224::from_bytes([FIXTURE_FILL; 28])
-    }
-
-    fn placeholder_sha384_digest() -> Sha384 {
-        Sha384::from_bytes([FIXTURE_FILL; SHA384_DIGEST_LEN])
-    }
-
-    fn placeholder_sha512_digest() -> Sha512 {
-        Sha512::from_bytes([FIXTURE_FILL; 64])
-    }
-
-    fn placeholder_sig_bytes(len: usize) -> Vec<u8> {
-        vec![FIXTURE_FILL; len]
-    }
-
-    fn placeholder_ciphertext_rsa_3072() -> Ciphertext<RsaPkcs1> {
-        Ciphertext::new(placeholder_sig_bytes(RSA_3072_SIG_BYTES))
-    }
-
-    fn placeholder_ciphertext_short() -> Ciphertext<RsaPkcs1> {
-        // Any non-RSA-3072 length triggers the length gate. 128
-        // is the AES-128 block-times-8 size that historical
-        // crypto-tooling shorthand uses for "not RSA".
-        const SHORT_CT_LEN: usize = 128;
-        Ciphertext::new(placeholder_sig_bytes(SHORT_CT_LEN))
-    }
-
-    #[test]
-    fn full_chain_yields_signature() {
-        let hash = placeholder_sha256_digest();
-        let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(SignatureAlgRef::SHA256_RSA_PKCS1_V1_5, KeyRef::Auth),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha256(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_MAX_SHORT),
-                ok(&sig),
-            ),
-        ]);
-        let out = tx.sign_pre_hashed_sha256_rsa_auth(hash).expect("ok");
-        assert_eq!(out.as_bytes(), sig.as_slice());
-    }
-
-    #[test]
-    fn rsa_pss_sha256_composes_algref_45() {
-        let digest = ExternalHashValue::Sha256([FIXTURE_FILL; 32]);
-        let alg_ref = SignatureAlgRef::from_parts(
-            commands::HashAlgorithm::Sha256,
-            commands::SignatureAlgorithm::RsaPss,
-        );
-        let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (expected_mse_set_dst(alg_ref, KeyRef::Auth), ok(&[])),
-            (expected_pso_hash(digest), ok(&[])),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_MAX_SHORT),
-                ok(&sig),
-            ),
-        ]);
-        let out = tx
-            .sign_pre_hashed_rsa_pss(KeyRef::Auth, digest)
-            .expect("ok");
-        assert_eq!(out.as_bytes(), sig.as_slice());
-    }
-
-    #[test]
-    fn ecdsa_p384_sha1_chain_yields_96_byte_signature() {
-        let hash = placeholder_sha1_digest();
-        let sig = placeholder_sig_bytes(ECDSA_P384_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(
-                    SignatureAlgRef::from_parts(
-                        commands::HashAlgorithm::Sha1,
-                        commands::SignatureAlgorithm::Ecdsa,
-                    ),
-                    KeyRef::Auth,
-                ),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha1(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_ECDSA_P384),
-                ok(&sig),
-            ),
-        ]);
-        let out = tx
-            .sign_pre_hashed_sha1_ecdsa_p384(KeyRef::Auth, hash)
-            .expect("ok");
-        assert_eq!(out.as_bytes(), sig.as_slice());
-    }
-
-    #[test]
-    fn rsa_pkcs1_sha512_composes_algref_62() {
-        // Generalised multi-digest RSA-PKCS1: a SHA-512 digest must
-        // drive MSE:Set DST with algRef = (Sha512 x RsaPkcs1) and
-        // ship the 64-byte external hash. The chain is identical in
-        // shape to the proven SHA-256 path; only the algRef byte and
-        // the hash length differ.
-        let digest = ExternalHashValue::Sha512([FIXTURE_FILL; 64]);
-        let alg_ref = SignatureAlgRef::from_parts(
-            commands::HashAlgorithm::Sha512,
-            commands::SignatureAlgorithm::RsaPkcs1V1_5,
-        );
-        let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (expected_mse_set_dst(alg_ref, KeyRef::Auth), ok(&[])),
-            (expected_pso_hash(digest), ok(&[])),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_MAX_SHORT),
-                ok(&sig),
-            ),
-        ]);
-        let out = tx
-            .sign_pre_hashed_rsa_pkcs1(KeyRef::Auth, digest)
-            .expect("ok");
-        assert_eq!(out.as_bytes(), sig.as_slice());
-    }
-
-    #[test]
-    fn ecdsa_p256_chain_yields_64_byte_sig() {
-        let hash = placeholder_sha256_digest();
-        let sig = placeholder_sig_bytes(ECDSA_P256_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(SignatureAlgRef::SHA256_ECDSA, KeyRef::Auth),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha256(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_ECDSA_P256),
-                ok(&sig),
-            ),
-        ]);
-        let out = tx
-            .sign_pre_hashed_sha256_ecdsa_p256(KeyRef::Auth, hash)
-            .expect("ok");
-        assert_eq!(out.as_bytes(), sig.as_slice());
-    }
-
-    #[test]
-    fn ecdsa_p384_sha512_chain_yields_96_byte_signature() {
-        let hash = placeholder_sha512_digest();
-        let sig = placeholder_sig_bytes(ECDSA_P384_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(
-                    SignatureAlgRef::from_parts(
-                        commands::HashAlgorithm::Sha512,
-                        commands::SignatureAlgorithm::Ecdsa,
-                    ),
-                    KeyRef::Auth,
-                ),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha512(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_ECDSA_P384),
-                ok(&sig),
-            ),
-        ]);
-        let out = tx
-            .sign_pre_hashed_sha512_ecdsa_p384(KeyRef::Auth, hash)
-            .expect("ok");
-        assert_eq!(out.as_bytes(), sig.as_slice());
-    }
-
-    #[test]
-    fn decrypt_rsa_pkcs1_targets_requested_key_ref() {
-        // decrypt_rsa_pkcs1 must pin MSE:Set CT to the caller's
-        // key_ref (here the qualified-signature slot, 0x02), then
-        // chain the 385-byte (0x81 || 384-byte CT) body.
-        let ct = placeholder_ciphertext_rsa_3072();
-        let mut body = vec![RSA_PKCS1_PADDING_INDICATOR_KEY];
-        body.extend_from_slice(ct.as_bytes());
-        let half = body.len().div_euclid(2);
-        let (first, second) = body.split_at(half);
-        let plaintext = placeholder_sig_bytes(48);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_ct(
-                    commands::DecipherAlgRef::RsassaPkcs1V1_5,
-                    KeyRef::Sign(QualifiedSignScheme::Citizen),
-                ),
-                ok(&[]),
-            ),
-            (expected_pso_decipher(first.to_vec(), true), ok(&[])),
-            (
-                expected_pso_decipher(second.to_vec(), false),
-                ok(&plaintext),
-            ),
-        ]);
-        let out = tx
-            .decrypt_rsa_pkcs1(KeyRef::Sign(QualifiedSignScheme::Citizen), ct)
-            .expect("ok");
-        assert_eq!(out.as_bytes(), plaintext.as_slice());
-    }
-
-    #[test]
-    fn qualified_slot_uses_key_ref_02() {
-        let hash = placeholder_sha256_digest();
-        let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(
-                    SignatureAlgRef::SHA256_RSA_PKCS1_V1_5,
-                    KeyRef::Sign(QualifiedSignScheme::Citizen),
-                ),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha256(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_MAX_SHORT),
-                ok(&sig),
-            ),
-        ]);
-        let out = tx
-            .sign_pre_hashed_sha256_rsa_qualified(QualifiedSignScheme::Citizen, hash)
-            .expect("ok");
-        assert_eq!(out.as_bytes(), sig.as_slice());
-    }
-
-    /// A synthetic PIN 2 the scripted card accepts.
-    const TEST_PIN2: &[u8; 6] = b"123456";
-    /// VERIFY P1 byte: verify mode.
-    const VERIFY_P1_MODE: u8 = 0x00;
 
     fn expected_verify_pin2_probe(scheme: PinReferenceScheme) -> Vec<u8> {
         vec![
             ApduClass::Plain.as_byte(),
-            crate::auth::VERIFY_INS,
+            VERIFY_INS,
             VERIFY_P1_MODE,
-            scheme.reference(crate::auth::PinSlot::Pin2),
+            scheme.reference(PinSlot::Pin2),
         ]
     }
 
-    fn expected_verify_pin2(scheme: PinReferenceScheme) -> CommandApdu {
+    fn expected_verify_pin2(scheme: PinReferenceScheme) -> Vec<u8> {
         let mut block = TEST_PIN2.to_vec();
         if scheme == PinReferenceScheme::Citizen {
-            block.resize(crate::auth::PIN2_STORED_LENGTH, crate::auth::PIN_PAD_BYTE);
+            block.resize(PIN2_STORED_LENGTH, PIN_PAD_BYTE);
         }
         let lc = u8::try_from(block.len()).expect("short-form Lc");
         let mut apdu = vec![
             ApduClass::Plain.as_byte(),
-            crate::auth::VERIFY_INS,
+            VERIFY_INS,
             VERIFY_P1_MODE,
-            scheme.reference(crate::auth::PinSlot::Pin2),
+            scheme.reference(PinSlot::Pin2),
             lc,
         ];
         apdu.extend_from_slice(&block);
-        CommandApdu::new(apdu)
-    }
-
-    fn expected_pso_cds_over_digest(digest: &[u8], le: u8) -> CommandApdu {
-        PsoComputeDigitalSignature {
-            class: ApduClass::Plain,
-        }
-        .into_apdu_with_hash(digest, le)
-    }
-
-    /// Verify PIN 2 under `scheme` and sign `hash` with the
-    /// qualified key, the way every qualified-signature caller does.
-    fn verify_and_sign_qualified(
-        tx: &mut Scripted,
-        scheme: PinReferenceScheme,
-        hash: Sha256,
-    ) -> Signature<RsaPkcs1Sha256> {
-        use crate::auth::PinOps as _;
-        let qualified =
-            QualifiedSignScheme::try_from(scheme).expect("supported qualified signing scheme");
-        let pin = crate::pin::PinBytes::try_from(*TEST_PIN2).expect("valid test PIN");
-        let outcome = tx
-            .verify_pin_with_scheme(crate::auth::PinSlot::Pin2, scheme, pin)
-            .expect("VERIFY PIN2");
-        assert_eq!(outcome, crate::auth::VerifyOutcome::Ok);
-        tx.sign_pre_hashed_sha256_rsa(KeyRef::Sign(qualified), hash)
-            .expect("qualified signature")
+        apdu
     }
 
     #[test]
@@ -1651,144 +740,167 @@ mod tests {
     }
 
     #[test]
-    fn organizational_qualified_signature_runs_inside_esign() {
-        // SELECT MF -> SELECT DF.ESIGN by name -> VERIFY PIN2 (S4-2
-        // numbering) -> MSE:Set DST with the DF.ESIGN-local key ->
-        // one PSO:CDS carrying the digest.
-        use crate::pkcs15::esign_wire;
+    fn citizen_auth_rsa_and_ecdsa_delegate_to_refineid_sign() {
+        let sha256 = Sha256::from_bytes([FILL_BYTE; SHA256_DIGEST_LEN]);
+        let rsa_sig = vec![SIG_FILL_BYTE; RSA_3072_SIG_BYTES];
+        let mut rsa_tx = Scripted::new(vec![
+            (
+                expected_mse_dst(SignatureAlgRef::SHA256_RSA_PKCS1, KeyRef::Auth),
+                ok(&[]),
+            ),
+            (
+                expected_pso_hash(ExternalHashValue::Sha256(*sha256.as_bytes())),
+                ok(&[]),
+            ),
+            (expected_pso_cds(RSA_3072_SIG_BYTES), ok(&rsa_sig)),
+        ]);
+        let out = rsa_tx
+            .sign_pre_hashed_sha256_rsa_auth(sha256)
+            .expect("auth rsa signs");
+        assert_eq!(out.as_bytes(), rsa_sig.as_slice());
+        assert!(rsa_tx.steps.is_empty());
+
+        let sha384 = Sha384::from_bytes([FILL_BYTE; SHA384_DIGEST_LEN]);
+        let ecdsa_sig = vec![SIG_FILL_BYTE; ECDSA_P384_SIG_BYTES];
+        let mut ecdsa_tx = Scripted::new(vec![
+            (
+                expected_mse_dst(SignatureAlgRef::SHA384_ECDSA, KeyRef::Auth),
+                ok(&[]),
+            ),
+            (
+                expected_pso_hash(ExternalHashValue::Sha384(*sha384.as_bytes())),
+                ok(&[]),
+            ),
+            (expected_pso_cds(ECDSA_P384_SIG_BYTES), ok(&ecdsa_sig)),
+        ]);
+        let out_ec = ecdsa_tx
+            .sign_pre_hashed_sha384_ecdsa_p384(KeyRef::Auth, sha384)
+            .expect("auth ecdsa p384 signs");
+        assert_eq!(out_ec.as_bytes(), ecdsa_sig.as_slice());
+        assert!(ecdsa_tx.steps.is_empty());
+    }
+
+    #[test]
+    fn organizational_qualified_signature_runs_inside_esign_inline() {
         let scheme = PinReferenceScheme::Organizational;
         let qualified = QualifiedSignScheme::Organizational;
-        let hash = placeholder_sha256_digest();
-        let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
+        let hash = Sha256::from_bytes([FILL_BYTE; SHA256_DIGEST_LEN]);
+        let sig = vec![SIG_FILL_BYTE; RSA_3072_SIG_BYTES];
         let mut tx = Scripted::new(vec![
             (esign_wire::select_mf().into_bytes(), ok(&[])),
             (esign_wire::select_esign_by_name().into_bytes(), ok(&[])),
             (expected_verify_pin2_probe(scheme), ok(&[])),
-            (expected_verify_pin2(scheme).into_bytes(), ok(&[])),
+            (expected_verify_pin2(scheme), ok(&[])),
             (
-                expected_mse_set_dst(
-                    SignatureAlgRef::SHA256_RSA_PKCS1_V1_5,
-                    KeyRef::Sign(qualified),
+                expected_mse_dst(SignatureAlgRef::SHA256_RSA_PKCS1, KeyRef::Sign(qualified)),
+                ok(&[]),
+            ),
+            (
+                expected_pso_cds_inline(
+                    ExternalHashValue::Sha256(*hash.as_bytes()),
+                    RSA_3072_SIG_BYTES,
                 ),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds_over_digest(
-                    hash.as_bytes(),
-                    PsoComputeDigitalSignature::LE_MAX_SHORT,
-                )
-                .into_bytes(),
                 ok(&sig),
             ),
         ]);
-        let out = verify_and_sign_qualified(&mut tx, scheme, hash);
+        let pin = crate::pin::PinBytes::try_from(*TEST_PIN2).expect("valid pin");
+        assert_eq!(
+            tx.verify_pin_with_scheme(PinSlot::Pin2, scheme, pin)
+                .expect("verify pin2"),
+            crate::auth::VerifyOutcome::Ok
+        );
+        let out = tx
+            .sign_pre_hashed_sha256_rsa_qualified(qualified, hash)
+            .expect("qualified org signs");
         assert_eq!(out.as_bytes(), sig.as_slice());
-        assert!(tx.steps.is_empty(), "every scripted APDU was sent");
-        assert_eq!(KeyRef::Sign(qualified).as_u8(), ORG_QUALIFIED_KEY_REF);
+        assert!(tx.steps.is_empty());
     }
 
     #[test]
-    fn citizen_qualified_signature_is_unchanged() {
-        // VERIFY PIN2 (S1 numbering) -> MSE:Set DST key 02 ->
-        // PSO:HASH -> empty PSO:CDS; no SELECT.
-        let scheme = PinReferenceScheme::Citizen;
-        let qualified = QualifiedSignScheme::Citizen;
-        let hash = placeholder_sha256_digest();
-        let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
+    fn sha512_ecdsa_p384_drives_mse_pso_hash_and_cds() {
+        let hash = Sha512::from_bytes([FILL_BYTE; SHA512_DIGEST_LEN]);
+        let sig = vec![SIG_FILL_BYTE; ECDSA_P384_SIG_BYTES];
+        let mse = refineid_apdu::CommandApdu::case_3(
+            CommandHeader {
+                class: ApduClass::Plain,
+                instruction: MSE_INS,
+                p1: MSE_P1_SET,
+                p2: MSE_P2_DST,
+            },
+            &[
+                CRDO_ALG_REF,
+                CRDO_VALUE_LEN,
+                ALG_SHA512_ECDSA,
+                CRDO_KEY_REF,
+                CRDO_VALUE_LEN,
+                KEY_REF_AUTH,
+            ],
+        )
+        .expect("mse builds")
+        .as_bytes()
+        .to_vec();
         let mut tx = Scripted::new(vec![
-            (expected_verify_pin2_probe(scheme), ok(&[])),
-            (expected_verify_pin2(scheme).into_bytes(), ok(&[])),
+            (mse, ok(&[])),
             (
-                expected_mse_set_dst(
-                    SignatureAlgRef::SHA256_RSA_PKCS1_V1_5,
-                    KeyRef::Sign(qualified),
-                ),
+                expected_pso_hash(ExternalHashValue::Sha512(*hash.as_bytes())),
                 ok(&[]),
             ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha256(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_MAX_SHORT),
-                ok(&sig),
-            ),
-        ]);
-        let out = verify_and_sign_qualified(&mut tx, scheme, hash);
-        assert_eq!(out.as_bytes(), sig.as_slice());
-        assert!(tx.steps.is_empty(), "every scripted APDU was sent");
-        assert_eq!(KeyRef::Sign(qualified).as_u8(), KEY_REF_SIGN);
-    }
-
-    #[test]
-    fn organizational_qualified_ecdsa_carries_the_digest_inline() {
-        let qualified = QualifiedSignScheme::Organizational;
-        let hash = placeholder_sha384_digest();
-        let sig = placeholder_sig_bytes(ECDSA_P384_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(SignatureAlgRef::SHA384_ECDSA, KeyRef::Sign(qualified)),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds_over_digest(
-                    hash.as_bytes(),
-                    PsoComputeDigitalSignature::LE_ECDSA_P384,
-                )
-                .into_bytes(),
-                ok(&sig),
-            ),
+            (expected_pso_cds(ECDSA_P384_SIG_BYTES), ok(&sig)),
         ]);
         let out = tx
-            .sign_pre_hashed_sha384_ecdsa_p384(KeyRef::Sign(qualified), hash)
-            .expect("ok");
+            .sign_pre_hashed_sha512_ecdsa_p384(KeyRef::Auth, hash)
+            .expect("sha512 ecdsa signs");
         assert_eq!(out.as_bytes(), sig.as_slice());
+        assert!(tx.steps.is_empty());
     }
 
     #[test]
-    fn mse_failure_surfaces_sw() {
-        let hash = placeholder_sha256_digest();
-        let mut tx = Scripted::new(vec![(
-            expected_mse_set_dst(SignatureAlgRef::SHA256_RSA_PKCS1_V1_5, KeyRef::Auth),
-            sw_err(StatusWord::ReferenceDataNotFound),
+    fn decrypt_rsa_pkcs1_auth_delegates_to_refineid_sign() {
+        let ct_bytes = vec![FILL_BYTE; RSA_3072_MODULUS_BYTES];
+        let cryptogram = refineid_sign::RsaCryptogram::from_bytes(ct_bytes.clone())
+            .expect("modulus-wide cryptogram");
+        let mse_ct = commands::MseSetCt {
+            alg_ref: DecipherAlgRef::RSA_PKCS1,
+            key_ref: KEY_REF_AUTH,
+        }
+        .into_apdu()
+        .expect("mse ct builds")
+        .as_bytes()
+        .to_vec();
+        let chain = PsoDecipher {
+            cryptogram: &cryptogram,
+        }
+        .into_chain()
+        .expect("decipher chains");
+        let mut steps = vec![(mse_ct, ok(&[]))];
+        let (last, leading) = chain.split_last().expect("non-empty chain");
+        for chunk in leading {
+            steps.push((chunk.as_bytes().to_vec(), ok(&[])));
+        }
+        steps.push((last.as_bytes().to_vec(), ok(b"recovered-secret")));
+        let mut tx = Scripted::new(steps);
+        let recovered = tx
+            .decrypt_rsa_pkcs1_auth(Ciphertext::new(ct_bytes))
+            .expect("decipher succeeds");
+        assert_eq!(recovered.as_bytes(), b"recovered-secret");
+        assert!(tx.steps.is_empty());
+    }
+
+    #[test]
+    fn non_success_status_and_wrong_length_surface_as_sign_errors() {
+        let hash = Sha256::from_bytes([FILL_BYTE; SHA256_DIGEST_LEN]);
+        let mut sw_tx = Scripted::new(vec![(
+            expected_mse_dst(SignatureAlgRef::SHA256_RSA_PKCS1, KeyRef::Auth),
+            sw(SW1_SECURITY, SW2_SECURITY_NOT_SATISFIED),
         )]);
-        let err = tx
-            .sign_pre_hashed_sha256_rsa_auth(hash)
-            .expect_err("MSE:Set DST error status aborts the chain");
         assert!(matches!(
-            err,
-            SignError::Sw("MSE:Set DST", sw) if sw == StatusWord::ReferenceDataNotFound.as_u16()
+            sw_tx.sign_pre_hashed_sha256_rsa_auth(hash),
+            Err(SignError::Sw(_, SW_SECURITY_NOT_SATISFIED))
         ));
-    }
 
-    #[test]
-    fn pso_hash_failure_surfaces_sw() {
-        let hash = placeholder_sha256_digest();
-        let mut tx = Scripted::new(vec![
+        let mut short_tx = Scripted::new(vec![
             (
-                expected_mse_set_dst(SignatureAlgRef::SHA256_RSA_PKCS1_V1_5, KeyRef::Auth),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha256(*hash.as_bytes())),
-                sw_err(StatusWord::SecurityNotSatisfied),
-            ),
-        ]);
-        let err = tx
-            .sign_pre_hashed_sha256_rsa_auth(hash)
-            .expect_err("PSO:HASH error status aborts the chain");
-        assert!(matches!(
-            err,
-            SignError::Sw("PSO:HASH", sw) if sw == StatusWord::SecurityNotSatisfied.as_u16()
-        ));
-    }
-
-    #[test]
-    fn pso_cds_security_status_surfaces_sw() {
-        let hash = placeholder_sha256_digest();
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(SignatureAlgRef::SHA256_RSA_PKCS1_V1_5, KeyRef::Auth),
+                expected_mse_dst(SignatureAlgRef::SHA256_RSA_PKCS1, KeyRef::Auth),
                 ok(&[]),
             ),
             (
@@ -1796,177 +908,13 @@ mod tests {
                 ok(&[]),
             ),
             (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_MAX_SHORT),
-                sw_err(StatusWord::SecurityNotSatisfied),
+                expected_pso_cds(RSA_3072_SIG_BYTES),
+                ok(&[SIG_FILL_BYTE; SHORT_SIG_LEN]),
             ),
         ]);
-        let err = tx
-            .sign_pre_hashed_sha256_rsa_auth(hash)
-            .expect_err("PSO:CDS error status aborts the chain");
         assert!(matches!(
-            err,
-            SignError::Sw("PSO:CDS", sw) if sw == StatusWord::SecurityNotSatisfied.as_u16()
-        ));
-    }
-
-    #[test]
-    fn decrypt_chain_rsa_3072_uses_chained_pso_decipher() {
-        // RSA-3072 ciphertext = RSA_3072_SIG_BYTES; body =
-        // <PI byte> || ciphertext = RSA_3072_SIG_BYTES + 1; the
-        // production code splits at the body midpoint so each
-        // chunk fits in short-form Lc.
-        let ciphertext = placeholder_ciphertext_rsa_3072();
-        let ct_bytes_for_chunks = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
-        let mut body = vec![RSA_PKCS1_PADDING_INDICATOR_KEY];
-        body.extend_from_slice(&ct_bytes_for_chunks);
-        let (first, second) = body.split_at(body.len() / 2);
-        let chunk1 = expected_pso_decipher(first.to_vec(), true);
-        let chunk2 = expected_pso_decipher(second.to_vec(), false);
-
-        let plaintext = b"the answer is 42".to_vec();
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_ct(commands::DecipherAlgRef::RsassaPkcs1V1_5, KeyRef::Auth),
-                ok(&[]),
-            ),
-            (chunk1, ok(&[])),
-            (chunk2, ok(&plaintext)),
-        ]);
-        let out = tx.decrypt_rsa_pkcs1_auth(ciphertext).expect("ok");
-        assert_eq!(out.as_bytes(), plaintext.as_slice());
-    }
-
-    #[test]
-    fn decrypt_rejects_wrong_ciphertext_length() {
-        let mut tx = Scripted::new(vec![]);
-        let short = placeholder_ciphertext_short();
-        let short_len = short.len();
-        let err = tx
-            .decrypt_rsa_pkcs1_auth(short)
-            .expect_err("non-RSA-3072-size ciphertext is rejected");
-        assert!(matches!(
-            err,
-            SignError::UnexpectedSignatureLength(n) if n == short_len
-        ));
-    }
-
-    #[test]
-    fn decrypt_mse_failure_surfaces_sw() {
-        let ciphertext = placeholder_ciphertext_rsa_3072();
-        let mut tx = Scripted::new(vec![(
-            expected_mse_set_ct(commands::DecipherAlgRef::RsassaPkcs1V1_5, KeyRef::Auth),
-            sw_err(StatusWord::ReferenceDataNotFound),
-        )]);
-        let err = tx
-            .decrypt_rsa_pkcs1_auth(ciphertext)
-            .expect_err("MSE:Set CT error status aborts the chain");
-        assert!(matches!(
-            err,
-            SignError::Sw("MSE:Set CT", sw) if sw == StatusWord::ReferenceDataNotFound.as_u16()
-        ));
-    }
-
-    #[test]
-    fn pso_cds_wrong_signature_length_surfaces_unexpected_length() {
-        let hash = placeholder_sha256_digest();
-        // Wrong length: ECDSA-shape signature on an RSA chain.
-        let sig = placeholder_sig_bytes(ECDSA_P384_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(SignatureAlgRef::SHA256_RSA_PKCS1_V1_5, KeyRef::Auth),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha256(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_MAX_SHORT),
-                ok(&sig),
-            ),
-        ]);
-        let err = tx
-            .sign_pre_hashed_sha256_rsa_auth(hash)
-            .expect_err("ECDSA-size signature on an RSA chain is rejected");
-        assert!(matches!(
-            err,
-            SignError::UnexpectedSignatureLength(n) if n == ECDSA_P384_SIG_BYTES
-        ));
-    }
-
-    #[test]
-    fn ecdsa_p384_chain_yields_96_byte_signature() {
-        let hash = placeholder_sha384_digest();
-        let sig = placeholder_sig_bytes(ECDSA_P384_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(SignatureAlgRef::SHA384_ECDSA, KeyRef::Auth),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha384(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_ECDSA_P384),
-                ok(&sig),
-            ),
-        ]);
-        let out = tx
-            .sign_pre_hashed_sha384_ecdsa_p384(KeyRef::Auth, hash)
-            .expect("ok");
-        assert_eq!(out.as_bytes(), sig.as_slice());
-    }
-
-    #[test]
-    fn ecdsa_p384_sha224_chain_yields_96_byte_signature() {
-        let hash = placeholder_sha224_digest();
-        let sig = placeholder_sig_bytes(ECDSA_P384_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(SignatureAlgRef::SHA224_ECDSA, KeyRef::Auth),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha224(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_ECDSA_P384),
-                ok(&sig),
-            ),
-        ]);
-        let out = tx
-            .sign_pre_hashed_sha224_ecdsa_p384(KeyRef::Auth, hash)
-            .expect("ok");
-        assert_eq!(out.as_bytes(), sig.as_slice());
-    }
-
-    #[test]
-    fn ecdsa_p384_chain_wrong_length_surfaces_unexpected_length() {
-        let hash = placeholder_sha384_digest();
-        // Wrong length: RSA-shape signature on an ECDSA chain.
-        let sig = placeholder_sig_bytes(RSA_3072_SIG_BYTES);
-        let mut tx = Scripted::new(vec![
-            (
-                expected_mse_set_dst(SignatureAlgRef::SHA384_ECDSA, KeyRef::Auth),
-                ok(&[]),
-            ),
-            (
-                expected_pso_hash(ExternalHashValue::Sha384(*hash.as_bytes())),
-                ok(&[]),
-            ),
-            (
-                expected_pso_cds(PsoComputeDigitalSignature::LE_ECDSA_P384),
-                ok(&sig),
-            ),
-        ]);
-        let err = tx
-            .sign_pre_hashed_sha384_ecdsa_p384(KeyRef::Auth, hash)
-            .expect_err("RSA-size signature on an ECDSA chain is rejected");
-        assert!(matches!(
-            err,
-            SignError::UnexpectedSignatureLength(n) if n == RSA_3072_SIG_BYTES
+            short_tx.sign_pre_hashed_sha256_rsa_auth(hash),
+            Err(SignError::UnexpectedSignatureLength(SHORT_SIG_LEN))
         ));
     }
 }
