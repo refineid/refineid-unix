@@ -247,19 +247,23 @@ impl OcspRequest {
 /// the writer imposes no length ceiling. It returned a `Result`
 /// while a typed encoder was doing the work, and the error was
 /// unreachable then too.
+/// Build a DER-encoded `OCSPRequest` without a nonce extension.
+///
+/// # Errors
+/// Returns [`crate::ber::BerEncodeError`] if any TLV length exceeds the
+/// BER encoder's 4-byte long-form limit.
 #[inline]
-#[must_use]
 pub fn build_request(
     issuer_name_sha1: IssuerNameHash,
     issuer_key_sha1: IssuerKeyHash,
     serial: &CertSerial,
-) -> OcspRequest {
-    OcspRequest(OcspHelpers::encode_request(
+) -> Result<OcspRequest, crate::ber::BerEncodeError> {
+    Ok(OcspRequest(OcspHelpers::encode_request(
         &issuer_name_sha1,
         &issuer_key_sha1,
         serial,
         None,
-    ))
+    )?))
 }
 
 /// `build_request` plus an OCSP nonce extension (RFC 8954).
@@ -269,21 +273,22 @@ pub fn build_request(
 /// responder echoes it back, defeating replay of an old signed
 /// response.
 ///
-/// Infallible, as [`build_request`].
+/// # Errors
+/// Returns [`crate::ber::BerEncodeError`] if any TLV length exceeds the
+/// BER encoder's 4-byte long-form limit.
 #[inline]
-#[must_use]
 pub fn build_request_with_nonce(
     issuer_name_sha1: IssuerNameHash,
     issuer_key_sha1: IssuerKeyHash,
     serial: &CertSerial,
     nonce: &OcspNonce,
-) -> OcspRequest {
-    OcspRequest(OcspHelpers::encode_request(
+) -> Result<OcspRequest, crate::ber::BerEncodeError> {
+    Ok(OcspRequest(OcspHelpers::encode_request(
         &issuer_name_sha1,
         &issuer_key_sha1,
         serial,
         Some(nonce),
-    ))
+    )?))
 }
 
 /// Helpers hosted on a unit struct (typing-discipline: no
@@ -316,40 +321,40 @@ impl OcspHelpers {
         issuer_key_sha1: &IssuerKeyHash,
         serial: &CertSerial,
         nonce: Option<&OcspNonce>,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, crate::ber::BerEncodeError> {
         // CertID ::= SEQUENCE { hashAlgorithm AlgorithmIdentifier,
         //   issuerNameHash OCTET STRING, issuerKeyHash OCTET STRING,
         //   serialNumber CertificateSerialNumber }
-        let mut algorithm = tlv(TAG_OID, OID_SHA1.as_bytes());
+        let mut algorithm = tlv(TAG_OID, OID_SHA1.as_bytes())?;
         // Explicit NULL parameters: a responder in the field is
         // likelier to match a CertID carrying them than one that
         // leaves the field absent.
-        algorithm.extend_from_slice(&tlv(TAG_NULL, []));
-        let mut cert_id = tlv(TAG_SEQUENCE, algorithm);
-        cert_id.extend_from_slice(&tlv(TAG_OCTET_STRING, issuer_name_sha1.as_bytes()));
-        cert_id.extend_from_slice(&tlv(TAG_OCTET_STRING, issuer_key_sha1.as_bytes()));
-        cert_id.extend_from_slice(&tlv(TAG_INTEGER, serial.as_bytes()));
+        algorithm.extend_from_slice(&tlv(TAG_NULL, [])?);
+        let mut cert_id = tlv(TAG_SEQUENCE, algorithm)?;
+        cert_id.extend_from_slice(&tlv(TAG_OCTET_STRING, issuer_name_sha1.as_bytes())?);
+        cert_id.extend_from_slice(&tlv(TAG_OCTET_STRING, issuer_key_sha1.as_bytes())?);
+        cert_id.extend_from_slice(&tlv(TAG_INTEGER, serial.as_bytes())?);
 
         // Request ::= SEQUENCE { reqCert CertID, ... } and
         // requestList ::= SEQUENCE OF Request -- one of each here.
-        let request = tlv(TAG_SEQUENCE, tlv(TAG_SEQUENCE, cert_id));
-        let mut tbs_request = tlv(TAG_SEQUENCE, request);
+        let request = tlv(TAG_SEQUENCE, tlv(TAG_SEQUENCE, cert_id)?)?;
+        let mut tbs_request = tlv(TAG_SEQUENCE, request)?;
 
         if let Some(nonce) = nonce {
             // RFC 8954: extnValue is an OCTET STRING whose content is
             // itself the DER OCTET STRING holding the nonce.
-            let mut extension = tlv(TAG_OID, OID_OCSP_NONCE.as_bytes());
+            let mut extension = tlv(TAG_OID, OID_OCSP_NONCE.as_bytes())?;
             extension.extend_from_slice(&tlv(
                 TAG_OCTET_STRING,
-                tlv(TAG_OCTET_STRING, nonce.as_bytes()),
-            ));
-            let extensions = tlv(TAG_SEQUENCE, tlv(TAG_SEQUENCE, extension));
+                tlv(TAG_OCTET_STRING, nonce.as_bytes())?,
+            )?);
+            let extensions = tlv(TAG_SEQUENCE, tlv(TAG_SEQUENCE, extension)?)?;
             // requestExtensions [2] EXPLICIT.
-            tbs_request.extend_from_slice(&tlv(TAG_CONTEXT_2, extensions));
+            tbs_request.extend_from_slice(&tlv(TAG_CONTEXT_2, extensions)?);
         }
 
         // OCSPRequest ::= SEQUENCE { tbsRequest TBSRequest, ... }
-        tlv(TAG_SEQUENCE, tlv(TAG_SEQUENCE, tbs_request))
+        tlv(TAG_SEQUENCE, tlv(TAG_SEQUENCE, tbs_request)?)
     }
 
     /// Decode `ResponseData` (RFC 6960 sec.4.2.1) into the four
@@ -1513,7 +1518,10 @@ mod tests {
     const TAG_BIT_STRING: u8 = 0x03;
     /// `ENUMERATED` -- `responseStatus` and `CRLReason`, likewise.
     const TAG_ENUMERATED: u8 = 0x0A;
-    use crate::ber::tlv;
+
+    fn tlv(tag: u8, value: impl AsRef<[u8]>) -> Vec<u8> {
+        crate::ber::tlv(tag, value).expect("test TLV encodes")
+    }
     use crate::identity::CertSerial;
     use crate::x509::OwnedCert;
     use sha1::Digest as _;
@@ -1661,7 +1669,8 @@ mod tests {
             IssuerNameHash::new(FILL_NAME_HASH),
             IssuerKeyHash::new(FILL_KEY_HASH),
             &serial,
-        );
+        )
+        .expect("OCSP request encodes");
         let parsed = OcspHelpers::parse_cert_id(&cert_id_of(request.as_der()))
             .expect("the encoder's CertID parses");
         assert_eq!(parsed.hash_algorithm_oid, OID_SHA1.as_bytes());
@@ -1699,7 +1708,8 @@ mod tests {
             IssuerKeyHash::new(FILL_KEY_HASH),
             &CertSerial::from_bytes(ROUNDTRIP_SERIAL.to_vec()),
             &nonce,
-        );
+        )
+        .expect("OCSP request with nonce encodes");
         let mut outer = OcspHelpers::sequence_reader(request.as_der(), "OCSPRequest")
             .expect("OCSPRequest is a SEQUENCE");
         let tbs = outer.tlv_bytes().expect("tbsRequest");
@@ -1727,7 +1737,8 @@ mod tests {
             IssuerNameHash::new(FILL_NAME_HASH),
             IssuerKeyHash::new(FILL_KEY_HASH),
             &CertSerial::from_bytes(ROUNDTRIP_SERIAL.to_vec()),
-        );
+        )
+        .expect("OCSP request encodes");
         let needle = OID_OCSP_NONCE.as_bytes();
         assert!(
             !request.as_der().windows(needle.len()).any(|w| w == needle),

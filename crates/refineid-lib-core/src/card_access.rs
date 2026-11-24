@@ -269,10 +269,10 @@ impl CardAccess {
         // Accept either: try SET first, then SEQUENCE. The child
         // value bytes are identical in both shapes.
         let (outer_size, outer_value) = if let Ok(t) = BerTlv::<Set>::parse(der) {
-            (t.size, t.value)
+            (t.size(), t.value())
         } else {
             let t = BerTlv::<Sequence>::parse(der).map_err(CardAccessError::NotSetOrSequence)?;
-            (t.size, t.value)
+            (t.size(), t.value())
         };
         if outer_size != der.len() {
             return Err(CardAccessError::TrailingBytes);
@@ -297,7 +297,7 @@ impl CardAccess {
             let entry = entry
                 .expect::<Sequence>()
                 .map_err(CardAccessError::MalformedSecurityInfo)?;
-            match PaceSecurityInfo::parse(entry.value) {
+            match PaceSecurityInfo::parse(entry.value()) {
                 Ok(info) => out.security_infos.push(info),
                 Err(CardAccessError::UnsupportedProtocol) => {}
                 Err(e) => return Err(e),
@@ -344,7 +344,7 @@ impl PaceSecurityInfo {
             .expect::<Oid>()
             .map_err(CardAccessError::MalformedSecurityInfo)?;
         let protocol =
-            PaceProtocol::from_oid(oid_tlv.value).ok_or(CardAccessError::UnsupportedProtocol)?;
+            PaceProtocol::from_oid(oid_tlv.value()).ok_or(CardAccessError::UnsupportedProtocol)?;
         // version INTEGER -- required.
         let version_tlv = it
             .next()
@@ -352,13 +352,13 @@ impl PaceSecurityInfo {
             .map_err(CardAccessError::MalformedSecurityInfo)?
             .expect::<Integer>()
             .map_err(CardAccessError::MalformedSecurityInfo)?;
-        let version = CardAccessHelpers::u32_be(version_tlv.value);
+        let version = CardAccessHelpers::u32_be(version_tlv.value());
         // parameterId INTEGER -- OPTIONAL; absent is legal.
         let parameter_id = it
             .next()
             .and_then(Result::ok)
             .and_then(|any: BerTlvAny<'_>| any.expect::<Integer>().ok())
-            .map(|t| CardAccessHelpers::u32_be(t.value));
+            .map(|t| CardAccessHelpers::u32_be(t.value()));
         Ok(Self {
             protocol,
             version,

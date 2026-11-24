@@ -224,17 +224,19 @@ impl<'a> SignedData<'a> {
                     input,
                     "trailing bytes after EF.SOD wrapper",
                 )?;
-                CmsHelpers::decode_content_info(&ContentInfoDer { input: outer.value })?
+                CmsHelpers::decode_content_info(&ContentInfoDer {
+                    input: outer.value(),
+                })?
             }
             <Sequence as BerTag>::TAG => {
                 let outer =
                     CmsHelpers::parse_exact::<Sequence>(input, "trailing bytes after CMS value")?;
-                let mut it = BerTlvIter::new(outer.value);
+                let mut it = BerTlvIter::new(outer.value());
                 let first_any = it.next().ok_or(CmsError::UnexpectedStructure("empty"))??;
-                if first_any.tag == <Oid as BerTag>::TAG {
+                if first_any.tag() == <Oid as BerTag>::TAG {
                     CmsHelpers::decode_content_info(&ContentInfoDer { input })?
                 } else {
-                    outer.value
+                    outer.value()
                 }
             }
             _ => return Err(CmsError::UnexpectedStructure("unknown wrapper tag")),
@@ -273,7 +275,7 @@ impl CmsHelpers {
         trailing: &'static str,
     ) -> Result<BerTlv<'a, T>, CmsError> {
         let tlv = BerTlv::<T>::parse(input)?;
-        if tlv.size != input.len() {
+        if tlv.size() != input.len() {
             return Err(CmsError::UnexpectedStructure(trailing));
         }
         Ok(tlv)
@@ -283,7 +285,7 @@ impl CmsHelpers {
     fn decode_content_info<'a>(content_info: &ContentInfoDer<'a>) -> Result<&'a [u8], CmsError> {
         let outer =
             Self::parse_exact::<Sequence>(content_info.input, "trailing bytes after ContentInfo")?;
-        let mut it = BerTlvIter::new(outer.value);
+        let mut it = BerTlvIter::new(outer.value());
         let oid = it
             .next()
             .ok_or(CmsError::UnexpectedStructure("ContentInfo missing OID"))??
@@ -291,10 +293,10 @@ impl CmsHelpers {
             .or(Err(CmsError::UnexpectedStructure(
                 "ContentInfo OID malformed",
             )))?;
-        crate::oid::Oid::new(oid.value).or(Err(CmsError::UnexpectedStructure(
+        crate::oid::Oid::new(oid.value()).or(Err(CmsError::UnexpectedStructure(
             "ContentInfo OID malformed",
         )))?;
-        if oid.value != known::SIGNED_DATA.as_bytes() {
+        if oid.value() != known::SIGNED_DATA.as_bytes() {
             return Err(CmsError::UnexpectedStructure("ContentInfo not SignedData"));
         }
         let explicit = it
@@ -311,9 +313,11 @@ impl CmsHelpers {
                 "ContentInfo has trailing fields",
             ));
         }
-        let inner_sd =
-            Self::parse_exact::<Sequence>(explicit.value, "trailing bytes in ContentInfo content")?;
-        Ok(inner_sd.value)
+        let inner_sd = Self::parse_exact::<Sequence>(
+            explicit.value(),
+            "trailing bytes in ContentInfo content",
+        )?;
+        Ok(inner_sd.value())
     }
 
     /// Parse and validate a `SignedData` body and its sole `SignerInfo`.
@@ -332,7 +336,7 @@ impl CmsHelpers {
             .or(Err(CmsError::UnexpectedStructure(
                 "SignedData version not INTEGER",
             )))?;
-        if version.value.is_empty() {
+        if version.value().is_empty() {
             return Err(CmsError::UnexpectedStructure("SignedData version is empty"));
         }
 
@@ -345,7 +349,7 @@ impl CmsHelpers {
             .or(Err(CmsError::UnexpectedStructure(
                 "SignedData digestAlgorithms not SET",
             )))?;
-        let digest_algorithm_oids = Self::parse_digest_algorithms(digest_algorithms.value)?;
+        let digest_algorithm_oids = Self::parse_digest_algorithms(digest_algorithms.value())?;
 
         let encap = it
             .next()
@@ -356,13 +360,13 @@ impl CmsHelpers {
             .or(Err(CmsError::UnexpectedStructure(
                 "encapContentInfo not SEQUENCE",
             )))?;
-        let mut e_it = BerTlvIter::new(encap.value);
+        let mut e_it = BerTlvIter::new(encap.value());
         let econtent_type = e_it
             .next()
             .ok_or(CmsError::UnexpectedStructure("encap missing eContentType"))??
             .expect::<Oid>()
             .or(Err(CmsError::UnexpectedStructure("eContentType not OID")))?;
-        let econtent_type_oid = crate::oid::Oid::new(econtent_type.value).or(Err(
+        let econtent_type_oid = crate::oid::Oid::new(econtent_type.value()).or(Err(
             CmsError::UnexpectedStructure("eContentType OID malformed"),
         ))?;
         let econtent_der = match e_it.next() {
@@ -371,9 +375,11 @@ impl CmsHelpers {
                 let explicit = explicit?.expect::<Asn1ContentExplicit0>().or(Err(
                     CmsError::UnexpectedStructure("eContent tag not [0] EXPLICIT"),
                 ))?;
-                let octet =
-                    Self::parse_exact::<OctetString>(explicit.value, "trailing bytes in eContent")?;
-                Some(octet.value)
+                let octet = Self::parse_exact::<OctetString>(
+                    explicit.value(),
+                    "trailing bytes in eContent",
+                )?;
+                Some(octet.value())
             }
         };
         if e_it.next().is_some() {
@@ -391,22 +397,22 @@ impl CmsHelpers {
         let mut certificates_der = Vec::new();
         if remaining
             .get(field_index)
-            .is_some_and(|field| field.tag == <Asn1ContentExplicit0 as BerTag>::TAG)
+            .is_some_and(|field| field.tag() == <Asn1ContentExplicit0 as BerTag>::TAG)
         {
             let certificates = remaining
                 .get(field_index)
                 .ok_or(CmsError::UnexpectedStructure("certificates missing"))?;
-            certificates_der = Self::parse_certificates(certificates.value)?;
+            certificates_der = Self::parse_certificates(certificates.value())?;
             field_index = field_index.saturating_add(1);
         }
         if remaining
             .get(field_index)
-            .is_some_and(|field| field.tag == <Asn1ContentImplicit1 as BerTag>::TAG)
+            .is_some_and(|field| field.tag() == <Asn1ContentImplicit1 as BerTag>::TAG)
         {
             let crls = remaining
                 .get(field_index)
                 .ok_or(CmsError::UnexpectedStructure("crls missing"))?;
-            Self::validate_nonempty_tlv_stream(crls.value, "empty crls field")?;
+            Self::validate_nonempty_tlv_stream(crls.value(), "empty crls field")?;
             field_index = field_index.saturating_add(1);
         }
 
@@ -426,7 +432,7 @@ impl CmsHelpers {
             ));
         }
 
-        let mut signers = BerTlvIter::new(signer_infos.value);
+        let mut signers = BerTlvIter::new(signer_infos.value());
         let signer_tlv = signers
             .next()
             .ok_or(CmsError::UnexpectedStructure("signerInfos is empty"))??
@@ -445,7 +451,7 @@ impl CmsHelpers {
         }
         let signer_digest_oid = Self::validate_signer_info(
             &SignerInfoBody {
-                body: signer_tlv.value,
+                body: signer_tlv.value(),
             },
             econtent_type_oid,
         )?;
@@ -500,7 +506,7 @@ impl CmsHelpers {
             .or(Err(CmsError::UnexpectedStructure(
                 "AlgorithmIdentifier algorithm not OID",
             )))?;
-        let oid = crate::oid::Oid::new(oid.value).or(Err(CmsError::UnexpectedStructure(
+        let oid = crate::oid::Oid::new(oid.value()).or(Err(CmsError::UnexpectedStructure(
             "AlgorithmIdentifier OID malformed",
         )))?;
         if let Some(parameters) = it.next() {
@@ -528,12 +534,12 @@ impl CmsHelpers {
                 .get(cursor..)
                 .ok_or(CmsError::UnexpectedStructure("certificate cursor invalid"))?;
             let certificate = BerTlvAny::parse(tail)?;
-            if certificate.tag != <Sequence as BerTag>::TAG {
+            if certificate.tag() != <Sequence as BerTag>::TAG {
                 return Err(CmsError::UnexpectedStructure(
                     "unsupported CMS CertificateChoices entry",
                 ));
             }
-            let end = cursor.saturating_add(certificate.size);
+            let end = cursor.saturating_add(certificate.size());
             let certificate_der = certificates
                 .get(cursor..end)
                 .ok_or(CmsError::UnexpectedStructure("certificate truncated"))?;
@@ -574,7 +580,7 @@ impl CmsHelpers {
         let sid = children
             .next()
             .ok_or(CmsError::UnexpectedStructure("signerInfo missing sid"))??;
-        Self::validate_signer_identifier(sid, version.value)?;
+        Self::validate_signer_identifier(sid, version.value())?;
 
         let digest_alg_seq = children
             .next()
@@ -591,11 +597,11 @@ impl CmsHelpers {
             "signerInfo missing signature material",
         ))??;
         let (signed_attrs_value, signature_algorithm) =
-            if after_digest.tag == <Asn1ContentExplicit0 as BerTag>::TAG {
+            if after_digest.tag() == <Asn1ContentExplicit0 as BerTag>::TAG {
                 let signature_algorithm = children.next().ok_or(
                     CmsError::UnexpectedStructure("signerInfo missing signatureAlgorithm"),
                 )??;
-                (Some(after_digest.value), signature_algorithm)
+                (Some(after_digest.value()), signature_algorithm)
             } else {
                 (None, after_digest)
             };
@@ -618,12 +624,12 @@ impl CmsHelpers {
 
         if let Some(unsigned_attrs) = children.next() {
             let unsigned_attrs = unsigned_attrs?;
-            if unsigned_attrs.tag != <Asn1ContentImplicit1 as BerTag>::TAG {
+            if unsigned_attrs.tag() != <Asn1ContentImplicit1 as BerTag>::TAG {
                 return Err(CmsError::UnexpectedStructure(
                     "signerInfo trailing field is not unsignedAttrs",
                 ));
             }
-            let _discarded = Self::parse_attributes(unsigned_attrs.value, false)?;
+            let _discarded = Self::parse_attributes(unsigned_attrs.value(), false)?;
         }
         if children.next().is_some() {
             return Err(CmsError::UnexpectedStructure(
@@ -647,7 +653,7 @@ impl CmsHelpers {
         const VERSION_ISSUER_AND_SERIAL: u8 = 1;
         const VERSION_SUBJECT_KEY_IDENTIFIER: u8 = 3;
 
-        if sid.tag == <Sequence as BerTag>::TAG {
+        if sid.tag() == <Sequence as BerTag>::TAG {
             if version != [VERSION_ISSUER_AND_SERIAL] {
                 return Err(CmsError::UnexpectedStructure(
                     "issuerAndSerialNumber signerInfo version is not 1",
@@ -669,24 +675,24 @@ impl CmsHelpers {
                 .or(Err(CmsError::UnexpectedStructure(
                     "sid serialNumber not INTEGER",
                 )))?;
-            if serial.value.is_empty() || it.next().is_some() {
+            if serial.value().is_empty() || it.next().is_some() {
                 return Err(CmsError::UnexpectedStructure(
                     "issuerAndSerialNumber malformed",
                 ));
             }
             let _issuer_der = sid
-                .value
-                .get(..issuer.size)
+                .value()
+                .get(..issuer.size())
                 .ok_or(CmsError::UnexpectedStructure("sid issuer truncated"))?;
             Ok(())
-        } else if sid.tag == <SignerSubjectKeyIdentifier as BerTag>::TAG {
+        } else if sid.tag() == <SignerSubjectKeyIdentifier as BerTag>::TAG {
             if version != [VERSION_SUBJECT_KEY_IDENTIFIER] {
                 return Err(CmsError::UnexpectedStructure(
                     "subjectKeyIdentifier signerInfo version is not 3",
                 ));
             }
             let sid = sid.expect::<SignerSubjectKeyIdentifier>()?;
-            if sid.value.is_empty() {
+            if sid.value().is_empty() {
                 return Err(CmsError::UnexpectedStructure(
                     "subjectKeyIdentifier is empty",
                 ));
@@ -719,7 +725,7 @@ impl CmsHelpers {
                 .ok_or(CmsError::UnexpectedStructure("attribute missing OID"))??
                 .expect::<Oid>()
                 .or(Err(CmsError::UnexpectedStructure("attribute type not OID")))?;
-            let oid = crate::oid::Oid::new(oid.value).or(Err(CmsError::UnexpectedStructure(
+            let oid = crate::oid::Oid::new(oid.value()).or(Err(CmsError::UnexpectedStructure(
                 "attribute OID malformed",
             )))?;
             let values = it
@@ -734,7 +740,7 @@ impl CmsHelpers {
                     "attribute has trailing fields",
                 ));
             }
-            Self::validate_nonempty_tlv_stream(values.value, "attribute value set is empty")?;
+            Self::validate_nonempty_tlv_stream(values.value(), "attribute value set is empty")?;
 
             if require_mandatory_signed && oid == known::CONTENT_TYPE {
                 if content_type.is_some() {
@@ -743,10 +749,10 @@ impl CmsHelpers {
                     ));
                 }
                 let value = Self::parse_exact::<Oid>(
-                    values.value,
+                    values.value(),
                     "contentType attribute has multiple values",
                 )?;
-                content_type = Some(crate::oid::Oid::new(value.value).or(Err(
+                content_type = Some(crate::oid::Oid::new(value.value()).or(Err(
                     CmsError::UnexpectedStructure("contentType attribute OID malformed"),
                 ))?);
             } else if require_mandatory_signed && oid == known::MESSAGE_DIGEST {
@@ -756,7 +762,7 @@ impl CmsHelpers {
                     ));
                 }
                 let _value = Self::parse_exact::<OctetString>(
-                    values.value,
+                    values.value(),
                     "messageDigest attribute has multiple values",
                 )?;
                 has_message_digest = true;
@@ -800,7 +806,7 @@ impl<'a> LdsSecurityObject<'a> {
         const BITS_PER_BYTE: u32 = 8;
 
         let outer = BerTlv::<Sequence>::parse(der)?;
-        let mut it = BerTlvIter::new(outer.value);
+        let mut it = BerTlvIter::new(outer.value());
         let _version = it.next().ok_or(CmsError::UnexpectedStructure(
             "LDSSecurityObject missing version",
         ))??;
@@ -813,10 +819,10 @@ impl<'a> LdsSecurityObject<'a> {
             .or(Err(CmsError::UnexpectedStructure(
                 "hashAlgorithm not SEQUENCE",
             )))?;
-        let hash_oid_tlv = BerTlv::<Oid>::parse(hash_alg_seq.value).or(Err(
+        let hash_oid_tlv = BerTlv::<Oid>::parse(hash_alg_seq.value()).or(Err(
             CmsError::UnexpectedStructure("hashAlgorithm OID missing"),
         ))?;
-        let hash_algorithm = HashAlgorithm::from_oid(hash_oid_tlv.value)
+        let hash_algorithm = HashAlgorithm::from_oid(hash_oid_tlv.value())
             .ok_or(CmsError::UnsupportedDigestAlgorithm)?;
         let dgh_seq = it
             .next()
@@ -828,11 +834,11 @@ impl<'a> LdsSecurityObject<'a> {
                 "dataGroupHashValues not SEQUENCE",
             )))?;
         let mut data_group_hashes: Vec<(u32, &[u8])> = Vec::new();
-        for dg in BerTlvIter::new(dgh_seq.value) {
+        for dg in BerTlvIter::new(dgh_seq.value()) {
             let Ok(dg) = dg?.expect::<Sequence>() else {
                 continue;
             };
-            let mut dit = BerTlvIter::new(dg.value);
+            let mut dit = BerTlvIter::new(dg.value());
             let num_tlv = dit
                 .next()
                 .ok_or(CmsError::UnexpectedStructure("DG hash missing number"))??;
@@ -840,7 +846,7 @@ impl<'a> LdsSecurityObject<'a> {
                 continue;
             };
             let mut num: u32 = 0;
-            for &b in num_tlv.value {
+            for &b in num_tlv.value() {
                 num = num.wrapping_shl(BITS_PER_BYTE) | u32::from(b);
             }
             let hash_tlv = dit.next().ok_or(CmsError::UnexpectedStructure(
@@ -849,7 +855,7 @@ impl<'a> LdsSecurityObject<'a> {
             let Ok(hash_tlv) = hash_tlv.expect::<OctetString>() else {
                 continue;
             };
-            data_group_hashes.push((num, hash_tlv.value));
+            data_group_hashes.push((num, hash_tlv.value()));
         }
         Ok(LdsSecurityObject {
             hash_algorithm,
@@ -863,9 +869,13 @@ mod tests {
     use super::{
         CmsError, CmsHelpers, HashAlgorithm, LdsSecurityObject, OwnedSignedData, SignedData,
     };
-    use crate::ber::{BerTlv, BerTlvIter, Sequence, tlv};
+    use crate::ber::{BerTlv, BerTlvIter, Sequence};
     use crate::oid::{Oid, known};
     use crate::x509::Certificate;
+
+    fn tlv(tag: u8, value: impl AsRef<[u8]>) -> Vec<u8> {
+        crate::ber::tlv(tag, value).expect("test TLV encodes")
+    }
 
     const TAG_INTEGER: u8 = 0x02;
     const TAG_OCTET_STRING: u8 = 0x04;
@@ -1121,7 +1131,7 @@ mod tests {
 
     fn inner_signed_data_seq(content_info: ContentInfoFixture<'_>) -> Vec<u8> {
         let ci = BerTlv::<Sequence>::parse(content_info.der).expect("ContentInfo SEQUENCE");
-        let mut it = BerTlvIter::new(ci.value);
+        let mut it = BerTlvIter::new(ci.value());
         let _oid = it
             .next()
             .expect("contentType present")
@@ -1130,7 +1140,7 @@ mod tests {
             .next()
             .expect("[0] EXPLICIT present")
             .expect("[0] EXPLICIT TLV");
-        explicit.value.to_vec()
+        explicit.value().to_vec()
     }
 
     // ----- HashAlgorithm OID mapping -----

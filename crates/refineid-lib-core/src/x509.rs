@@ -937,33 +937,33 @@ pub fn extract_crl_distribution_urls<B: AsRef<[u8]>>(extensions: B) -> Vec<crate
         return Vec::new();
     };
     let mut urls = Vec::new();
-    for dp in BerTlvIter::new(outer.value) {
+    for dp in BerTlvIter::new(outer.value()) {
         let Ok(dp) = dp.and_then(BerTlvAny::expect::<Sequence>) else {
             continue;
         };
         // Walk the inner fields, looking for [0] distributionPoint.
-        for field in BerTlvIter::new(dp.value) {
+        for field in BerTlvIter::new(dp.value()) {
             let Ok(field) = field else { continue };
-            if field.tag != TAG_DP_DISTRIBUTION_POINT_NAME {
+            if field.tag() != TAG_DP_DISTRIBUTION_POINT_NAME {
                 continue;
             }
             // Inside the EXPLICIT [0] we expect the CHOICE
             // DistributionPointName encoded with its IMPLICIT tag
             // [0] GeneralNames -> 0xA0 (constructed) holding
             // GeneralName entries with their own context tags.
-            for gn_wrap in BerTlvIter::new(field.value) {
+            for gn_wrap in BerTlvIter::new(field.value()) {
                 let Ok(gn_wrap) = gn_wrap else { continue };
-                if gn_wrap.tag != TAG_DP_FULL_NAME {
+                if gn_wrap.tag() != TAG_DP_FULL_NAME {
                     continue;
                 }
-                for gn in BerTlvIter::new(gn_wrap.value) {
+                for gn in BerTlvIter::new(gn_wrap.value()) {
                     let Ok(gn) = gn else { continue };
                     // Filter URI GeneralNames to http(s) at parse
                     // time -- S2 §6.3.8.5 deprecates LDAP CDP and
                     // refineid's HTTP client doesn't speak other
                     // schemes anyway. Uri::parse rejects.
-                    if gn.tag == TAG_GN_URI
-                        && let Ok(s) = core::str::from_utf8(gn.value)
+                    if gn.tag() == TAG_GN_URI
+                        && let Ok(s) = core::str::from_utf8(gn.value())
                         && let Ok(url) = crate::text::Uri::parse(s.to_owned())
                     {
                         urls.push(url);
@@ -1036,10 +1036,10 @@ pub fn extract_subject_alt_emails<B: AsRef<[u8]>>(
         return Vec::new();
     };
     let mut emails = Vec::new();
-    for gn in BerTlvIter::new(outer.value) {
+    for gn in BerTlvIter::new(outer.value()) {
         let Ok(gn) = gn else { continue };
-        if gn.tag == TAG_GN_RFC822_NAME
-            && let Ok(s) = core::str::from_utf8(gn.value)
+        if gn.tag() == TAG_GN_RFC822_NAME
+            && let Ok(s) = core::str::from_utf8(gn.value())
             && let Ok(email) = crate::identity::EmailAddress::new(s)
         {
             emails.push(email);
@@ -1718,16 +1718,16 @@ impl X509Helpers {
         let mut it = BerTlvIter::new(params.seq_value);
         let _version = it.next()?.ok()?;
         let field_id = it.next()?.ok()?;
-        if field_id.tag != <Sequence as BerTag>::TAG {
+        if field_id.tag() != <Sequence as BerTag>::TAG {
             return None;
         }
-        let mut fit = BerTlvIter::new(field_id.value);
+        let mut fit = BerTlvIter::new(field_id.value());
         let _field_type_oid = fit.next()?.ok()?;
         let prime = fit.next()?.ok()?;
-        if prime.tag != <Integer as BerTag>::TAG {
+        if prime.tag() != <Integer as BerTag>::TAG {
             return None;
         }
-        let bytes = prime.value.strip_prefix(&[0_u8]).unwrap_or(prime.value);
+        let bytes = prime.value().strip_prefix(&[0_u8]).unwrap_or(prime.value());
         let first = *bytes.first()?;
         // `u8::leading_zeros` is in 0..=8; widens to usize losslessly.
         let leading_zeros = usize::try_from(first.leading_zeros()).ok()?;
@@ -1908,7 +1908,7 @@ pub fn extract_key_usage<B: AsRef<[u8]>>(extensions: B) -> Option<KeyUsage> {
     let bit_string = BerTlv::<BitString>::parse(extn_value).ok()?;
     // First byte = unused-bits count; we don't need it. `.get(1..)?`
     // is `None` exactly when the BIT STRING value is empty.
-    let bytes = bit_string.value.get(1..)?;
+    let bytes = bit_string.value().get(1..)?;
     let b0 = bytes.first().copied().unwrap_or(0);
     let b1 = bytes.get(1).copied().unwrap_or(0);
     // BIT STRING bits are numbered from MSB (named bit 0 = bit 7 of
@@ -1942,12 +1942,12 @@ pub fn extract_extended_key_usage<B: AsRef<[u8]>>(extensions: B) -> Vec<String> 
         return Vec::new();
     };
     let mut out = Vec::new();
-    for entry in BerTlvIter::new(outer.value) {
+    for entry in BerTlvIter::new(outer.value()) {
         let Ok(entry) = entry else { continue };
-        if entry.tag != <BerOid as BerTag>::TAG {
+        if entry.tag() != <BerOid as BerTag>::TAG {
             continue;
         }
-        if let Ok(oid) = Oid::new(entry.value) {
+        if let Ok(oid) = Oid::new(entry.value()) {
             out.push(X509Helpers::eku_label(oid));
         }
     }
@@ -2008,14 +2008,14 @@ pub fn extract_extended_key_usage_meta<B: AsRef<[u8]>>(
     let meta = find_extension_with_meta(extensions, OID_EXT_KEY_USAGE)?;
     let outer = BerTlv::<Sequence>::parse(meta.value).ok()?;
     let mut oids: Vec<Vec<u8>> = Vec::new();
-    for entry in BerTlvIter::new(outer.value) {
+    for entry in BerTlvIter::new(outer.value()) {
         let Ok(entry) = entry else { continue };
-        if entry.tag != <BerOid as BerTag>::TAG {
+        if entry.tag() != <BerOid as BerTag>::TAG {
             continue;
         }
         // Tag already checked == 0x06; entry.value is the OID
         // content bytes.
-        oids.push(entry.value.to_vec());
+        oids.push(entry.value().to_vec());
     }
     Some(ExtendedKeyUsageOwned {
         oids,
@@ -2045,7 +2045,7 @@ pub fn extract_key_usage_meta<B: AsRef<[u8]>>(extensions: B) -> Option<KeyUsageM
     let bit_string = BerTlv::<BitString>::parse(meta.value).ok()?;
     // First byte = unused-bits count; we don't need it. `.get(1..)?`
     // is `None` exactly when the BIT STRING value is empty.
-    let bytes = bit_string.value.get(1..)?;
+    let bytes = bit_string.value().get(1..)?;
     let b0 = bytes.first().copied().unwrap_or(0);
     let b1 = bytes.get(1).copied().unwrap_or(0);
     Some(KeyUsageMeta {
@@ -2184,7 +2184,7 @@ pub fn path_extension_profile(
             .map_err(|_ignored| PathExtensionError::Malformed("Extension OID encoding"))?
             .expect::<BerOid>()
             .map_err(|_ignored| PathExtensionError::Malformed("Extension OID tag"))?;
-        let oid = Oid::new(oid.value)
+        let oid = Oid::new(oid.value())
             .map_err(|_ignored| PathExtensionError::Malformed("Extension OID value"))?;
         if seen.contains(&oid) {
             return if oid == known::OCSP_NO_CHECK {
@@ -2199,8 +2199,8 @@ pub fn path_extension_profile(
             .next()
             .ok_or(PathExtensionError::Malformed("Extension has no value"))?
             .map_err(|_ignored| PathExtensionError::Malformed("Extension value encoding"))?;
-        let (critical, value) = if next.tag == <Boolean as BerTag>::TAG {
-            if next.value != [u8::MAX] {
+        let (critical, value) = if next.tag() == <Boolean as BerTag>::TAG {
+            if next.value() != [u8::MAX] {
                 return Err(PathExtensionError::Malformed(
                     "critical BOOLEAN is not canonical TRUE",
                 ));
@@ -2225,16 +2225,16 @@ pub fn path_extension_profile(
         }
 
         if oid == known::BASIC_CONSTRAINTS {
-            profile.basic_constraints = parse_path_basic_constraints(value.value, critical)?;
+            profile.basic_constraints = parse_path_basic_constraints(value.value(), critical)?;
         } else if oid == known::KEY_USAGE {
-            profile.key_usage = Some(parse_path_key_usage(value.value, critical)?);
+            profile.key_usage = Some(parse_path_key_usage(value.value(), critical)?);
         } else if oid == known::EXT_KEY_USAGE {
-            profile.ocsp_signing_extended_key_usage = parse_path_extended_key_usage(value.value)?;
+            profile.ocsp_signing_extended_key_usage = parse_path_extended_key_usage(value.value())?;
             profile.extended_key_usage_present = true;
         } else if oid == known::NAME_CONSTRAINTS {
             profile.name_constraints_present = true;
         } else if oid == known::OCSP_NO_CHECK {
-            parse_path_ocsp_no_check(value.value, critical)?;
+            parse_path_ocsp_no_check(value.value(), critical)?;
             profile.ocsp_no_check_present = true;
         } else if critical {
             return Err(PathExtensionError::UnsupportedCritical);
@@ -2255,11 +2255,11 @@ fn parse_path_basic_constraints(
         .next()
         .transpose()
         .map_err(|_ignored| PathExtensionError::Malformed("Basic Constraints child encoding"))?;
-    if next.is_some_and(|field| field.tag == <Boolean as BerTag>::TAG) {
+    if next.is_some_and(|field| field.tag() == <Boolean as BerTag>::TAG) {
         let flag = next.ok_or(PathExtensionError::Malformed(
             "Basic Constraints cA is absent",
         ))?;
-        match flag.value {
+        match flag.value() {
             [0] => {
                 // DVV cardholder certificates explicitly encode the DEFAULT
                 // FALSE value. DER would omit it, but accepting the exact
@@ -2285,7 +2285,7 @@ fn parse_path_basic_constraints(
                 "Basic Constraints pathLen without cA",
             ));
         }
-        Some(parse_path_length(path_len.value)?)
+        Some(parse_path_length(path_len.value())?)
     } else {
         None
     };
@@ -2362,7 +2362,7 @@ fn parse_path_key_usage(value: &[u8], critical: bool) -> Result<KeyUsageMeta, Pa
     const DECIPHER_ONLY: u8 = 1_u8 << 7_u32;
 
     let bit_string = exact_path_extension_tlv::<BitString>(value, "Key Usage")?;
-    let Some((&unused, bits)) = bit_string.value.split_first() else {
+    let Some((&unused, bits)) = bit_string.value().split_first() else {
         return Err(PathExtensionError::Malformed("Key Usage is empty"));
     };
     if unused > MAX_UNUSED_BITS || bits.is_empty() || bits.len() > 2 {
@@ -2411,7 +2411,7 @@ fn parse_path_extended_key_usage(value: &[u8]) -> Result<bool, PathExtensionErro
             .map_err(|_ignored| PathExtensionError::Malformed("Extended Key Usage entry"))?
             .expect::<BerOid>()
             .map_err(|_ignored| PathExtensionError::Malformed("Extended Key Usage entry tag"))?;
-        let purpose = Oid::new(purpose.value)
+        let purpose = Oid::new(purpose.value())
             .map_err(|_ignored| PathExtensionError::Malformed("Extended Key Usage OID"))?;
         if seen.contains(&purpose) {
             return Err(PathExtensionError::Malformed(
@@ -2432,7 +2432,7 @@ fn parse_path_ocsp_no_check(value: &[u8], critical: bool) -> Result<(), PathExte
     }
     let null =
         BerTlvAny::parse(value).map_err(|_ignored| PathExtensionError::InvalidOcspNoCheck)?;
-    if null.tag != TAG_NULL || !null.value.is_empty() || null.size != value.len() {
+    if null.tag() != TAG_NULL || !null.value().is_empty() || null.size() != value.len() {
         return Err(PathExtensionError::InvalidOcspNoCheck);
     }
     Ok(())
@@ -2444,7 +2444,7 @@ fn exact_path_extension_tlv<'a, T: BerTag>(
 ) -> Result<BerTlv<'a, T>, PathExtensionError> {
     let parsed =
         BerTlv::<T>::parse(value).map_err(|_ignored| PathExtensionError::Malformed(label))?;
-    if parsed.size != value.len() {
+    if parsed.size() != value.len() {
         return Err(PathExtensionError::Malformed(
             "extension value has trailing bytes",
         ));
@@ -2472,24 +2472,24 @@ pub fn extract_basic_constraints<B: AsRef<[u8]>>(extensions: B) -> BasicConstrai
     let Ok(outer) = BerTlv::<Sequence>::parse(meta.value) else {
         return absent;
     };
-    let it = BerTlvIter::new(outer.value);
+    let it = BerTlvIter::new(outer.value());
     let mut ca = false;
     let mut path_len: Option<u32> = None;
     for child in it {
         let Ok(child) = child else { break };
-        match child.tag {
+        match child.tag() {
             <Boolean as BerTag>::TAG => {
                 // Promote through the typed `Boolean` marker (not just its
                 // TAG const) so the tag type is exercised as a value, the
                 // same idiom the other BER markers use across the crate.
                 // The tag already matched, so `expect` cannot fail here.
                 if let Ok(flag) = child.expect::<Boolean>() {
-                    ca = flag.value.first().is_some_and(|&b| b != 0);
+                    ca = flag.value().first().is_some_and(|&b| b != 0);
                 }
             }
             <Integer as BerTag>::TAG => {
                 let mut acc: u32 = 0;
-                for &b in child.value {
+                for &b in child.value() {
                     // Path-length INTEGERs in BasicConstraints are
                     // bounded by the cert format; 4 bytes (32 bits)
                     // shifted in -- the wrapping form is the intent
