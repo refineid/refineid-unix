@@ -69,17 +69,12 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 # provider of its own; rustls's ring provider verifies.
 rustls-platform-verifier = "0.7.1"
 
-# SHA-256 digests; HMAC; hex encoding for diagnostic output.
+# SHA-256 digests and hex encoding for diagnostic output.
 sha2 = "0.11"
-hmac = "0.13"
 hex = "0.4"
 # Property-based testing (dev-only): falsification harness for the
 # Uri parser -- idempotence and total no-panic over generated inputs.
 proptest = "1"
-# SHA-1 for OCSP CertID hashes (RFC 6960 default + MUST-support
-# digest). Plain hash, no security claim on the algorithm itself
-# -- responders match on the SHA-1 hash and we compare back.
-sha1 = "0.11"
 
 # DNSSEC-first resolution for certificate and timestamp endpoints. Hickory
 # performs local validation against the bundled root trust anchor; Tokio is

@@ -59,27 +59,27 @@ use refineid_lib_core::auth::{
 use refineid_lib_core::backend::{ReaderAccessCap, ReaderBackend as _, ReaderPickError};
 use refineid_lib_core::card_access::{CardAccess, CardAccessOps as _};
 use refineid_lib_core::cert_state::CertDer;
-use refineid_lib_core::crl::OwnedCrl;
 use refineid_lib_core::crypto::digest::Sha256;
 use refineid_lib_core::emrtd::{EmrtdError, EmrtdPersonalData, read_personal_data};
 use refineid_lib_core::identity::CredentialIdentity;
-use refineid_lib_core::ocsp::{self, OcspResponseStatus};
 use refineid_lib_core::pkcs15::{
     CertSlot, FineidReaderPick, FineidReaderPicker as _, Pkcs15Error, Pkcs15Ops as _, TokenInfo,
 };
-use refineid_lib_core::revocation::{
-    RevocationStatus, check_against_crl, check_against_ocsp_response,
-};
 use refineid_lib_core::secure_messaging::SmTransport;
 use refineid_lib_core::x509::{
-    Certificate, DateTime, KeyUsage, Name, OwnedCert, PublicKeyAlgorithm, SignatureAlgorithm,
+    Certificate, DateTime, KeyUsage, OwnedCert, PublicKeyAlgorithm, SignatureAlgorithm,
     extract_ca_issuers_urls, extract_crl_distribution_urls, extract_extended_key_usage,
     extract_key_usage, extract_ocsp_urls, extract_subject_alt_emails,
     parse_subject_public_key_info,
 };
 use refineid_lib_pcsc::{PcscBackend, PcscError};
-use sha1::{Digest as Sha1Digest, Sha1};
 
+use refineid_doc_sign::CertificateExt as _;
+use refineid_doc_sign::crl::{self, OwnedCrl};
+use refineid_doc_sign::ocsp::{self, OcspResponseStatus};
+use refineid_doc_sign::revocation::{
+    RevocationStatus, check_against_crl, check_against_ocsp_response,
+};
 use refineid_doc_sign::verification::AnchorRole;
 use refineid_doc_sign::x509::OwnedCert as AnchorCert;
 
@@ -92,8 +92,6 @@ use crate::user_agent;
 const CRL_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// Issuer certs and OCSP responses are small (<= 8 KiB).
 const SMALL_HTTP_MAX_BYTES: usize = 64 * 1024;
-/// SHA-1 output width in bytes.
-const SHA1_OUTPUT_LEN: usize = 20;
 /// Why a chain check is skipped when no issuing CA certificate is at
 /// hand.
 const NO_INTERMEDIATE: &str =
@@ -1253,17 +1251,17 @@ fn run_crl_check(
 }
 
 /// Verify a CRL's signature against its claimed issuer and return
-/// the [`refineid_lib_core::crl::VerifiedCrl`] -- the only handle
-/// from which a revocation list can be consulted.
+/// the [`crl::VerifiedCrl`] -- the only handle from which a
+/// revocation list can be consulted.
 ///
 /// RFC 5280 §5.1.1.2. Requires DN equality between CRL issuer and
 /// the supplied issuer cert's subject before the cryptographic
 /// verify -- a CRL whose issuer doesn't match the chain's
 /// intermediate is by definition not the right CRL to consult.
 fn verify_crl<'a>(
-    crl: &refineid_lib_core::crl::Crl<'a>,
+    crl: &crl::Crl<'a>,
     issuer_cert: &AiaIssuerCertStatus,
-) -> Result<refineid_lib_core::crl::VerifiedCrl<'a>, String> {
+) -> Result<crl::VerifiedCrl<'a>, String> {
     let issuer_owned = match issuer_cert {
         AiaIssuerCertStatus::Parsed(cert) => cert,
         AiaIssuerCertStatus::Unavailable => {
@@ -1275,7 +1273,7 @@ fn verify_crl<'a>(
     if crl.issuer != issuer.subject {
         return Err("CRL issuer DN does not match AIA intermediate's subject".to_owned());
     }
-    refineid_lib_core::crl::VerifiedCrl::verify(crl, issuer).map_err(|e| format!("{e}"))
+    crl::VerifiedCrl::verify(crl, issuer).map_err(|e| format!("{e}"))
 }
 
 /// Issue an OCSP query for `cert` against its responder URL.
@@ -1319,21 +1317,13 @@ fn run_ocsp_check(
     // here, and there is no "did not parse" branch: the SpkiDer in
     // `issuer_cert.spki` was validated when the issuer cert parsed).
     let key_hash = ocsp::IssuerKeyHash::from_subject_public_key(&issuer_cert.spki);
-    let name_hash = CardCheckHelpers::issuer_name_hash(&cert.issuer);
-    let serial = refineid_lib_core::x509::cert_serial(cert);
+    let name_hash = ocsp::IssuerNameHash::from_name(cert.issuer);
+    let serial = cert.serial();
     // A dead OS RNG means nothing on this host can be trusted: abort the
     // whole check rather than send a replayable, nonce-less request. Same
     // fail-closed posture as the PACE / AA / CA draws in lib-core.
     let nonce = ocsp::OcspNonce::random().map_err(|e| CardCheckError::Rng(e.to_string()))?;
-    let request = match ocsp::build_request_with_nonce(name_hash, key_hash, &serial, &nonce) {
-        Ok(req) => req,
-        Err(e) => {
-            return Ok(Some(CheckOutcome::Skipped {
-                source: ocsp_url,
-                why: format!("OCSP request encode: {e}"),
-            }));
-        }
-    };
+    let request = ocsp::build_request_with_nonce(name_hash, key_hash, &serial, &nonce);
     let body = match http::post(
         first_url,
         "application/ocsp-request",
@@ -1398,7 +1388,7 @@ fn ocsp_nonce_check(
     nonce: &ocsp::OcspNonce,
     basic: &ocsp::BasicOcspResponse<'_>,
 ) -> SignatureCheck {
-    let echoed = basic.nonce.as_deref();
+    let echoed = basic.nonce.as_ref().map(ocsp::ResponseNonce::as_bytes);
     match echoed {
         Some(returned) if returned == nonce.as_bytes() => SignatureCheck::Ok,
         Some(returned) => SignatureCheck::Failed(format!(
@@ -1438,18 +1428,6 @@ fn verify_ocsp_response<'a>(
         }
     }
     Err("response signature did not verify against CA or any embedded responder cert".to_owned())
-}
-
-impl CardCheckHelpers {
-    /// SHA-1 of a certificate issuer name as an OCSP `IssuerNameHash`.
-    fn issuer_name_hash(issuer: &Name<'_>) -> ocsp::IssuerNameHash {
-        let mut h = <Sha1 as Sha1Digest>::new();
-        h.update(issuer.as_der());
-        let out = h.finalize();
-        let mut buf = [0_u8; SHA1_OUTPUT_LEN];
-        buf.copy_from_slice(&out);
-        ocsp::IssuerNameHash::new(buf)
-    }
 }
 
 /// Days from `a` to `b` (positive when `b` is in the future).
@@ -2006,6 +1984,7 @@ impl CardCheckHelpers {
             RevocationStatus::Unknown => "unknown".to_owned(),
             RevocationStatus::Inapplicable(why) => format!("inapplicable ({why})"),
             RevocationStatus::Stale => "stale (past nextUpdate)".to_owned(),
+            RevocationStatus::NotYetValid => "not yet valid (thisUpdate in future)".to_owned(),
         }
     }
 }
@@ -2296,6 +2275,8 @@ mod tests {
     use crate::test_util::{TestResult, check, check_true};
     use crate::trusted_lists::{AnchorSource, FinnishListGap, RunAnchors};
     use alloc::fmt;
+    use refineid_doc_sign::crl::OwnedCrl;
+    use refineid_doc_sign::revocation::{InapplicableReason, RevocationStatus};
     use refineid_doc_sign::verification::trusted_list::{ListFailure, TrustedListError};
     use refineid_doc_sign::verification::{AnchorRole, GrantedPeriod, TrustAnchor, TrustAnchors};
     use refineid_lib_core::aa::AaOutcome;
@@ -2306,11 +2287,9 @@ mod tests {
     };
     use refineid_lib_core::ca::CaOutcome;
     use refineid_lib_core::card_access::CardAccess;
-    use refineid_lib_core::crl::OwnedCrl;
     use refineid_lib_core::crypto::digest::HashAlg;
     use refineid_lib_core::identity::{CredentialIdentity, MrzDate};
     use refineid_lib_core::pkcs15::{CertSlot, TokenInfo};
-    use refineid_lib_core::revocation::{InapplicableReason, RevocationStatus};
     use refineid_lib_core::x509::{DateTime, OwnedCert};
 
     // ---------- DER construction toolkit ----------
@@ -2863,21 +2842,38 @@ mod tests {
     }
 
     #[test]
-    fn verify_crl_reaches_signature_check_on_dn_match() -> TestResult {
-        // Issuer cert subject DN equals the CRL issuer DN, so the
-        // DN gate passes and the (padding) signature is actually
-        // verified -- which fails. The point is that the
-        // orchestration advanced past the DN gate to the crypto
-        // check rather than short-circuiting.
+    fn verify_crl_rejects_non_ca_issuer() -> TestResult {
+        const FIXTURE_SERIAL: [u8; 1] = [1];
         let crl_der = build_crl(&dn_cn(b"Alice"));
         let owned =
             OwnedCrl::from_der(crl_der.as_slice()).map_err(|e| format!("crl parse: {e}"))?;
         let crl = owned.view();
-        let issuer = build_cert([0x01], &dn_cn(b"Issuer"), &dn_cn(b"Alice"), None);
+        let issuer = build_cert(FIXTURE_SERIAL, &dn_cn(b"Issuer"), &dn_cn(b"Alice"), None);
         let issuer = AiaIssuerCertStatus::Parsed(AiaIssuerCert::from_der(issuer.as_slice())?);
         match verify_crl(&crl, &issuer) {
             Err(why) => check_true(
-                !why.contains("does not match") && !why.contains("no AIA caIssuers"),
+                why.contains("cRLSign"),
+                "rejects issuer without CA basic constraints and cRLSign authorization",
+            ),
+            Ok(_) => Err("non-CA issuer must not verify a CRL".into()),
+        }
+    }
+
+    #[test]
+    fn verify_crl_reaches_signature_check_on_dn_match() -> TestResult {
+        // Real CA issuer with matching subject DN passes both the DN
+        // gate and CA/cRLSign authorization, reaching signature
+        // verification where the padding signature fails.
+        let issuer_owned = parse(DVV_ISSUING_CA_DER)?;
+        let issuer_subject = FixtureDer(issuer_owned.view().subject.as_der().to_vec());
+        let crl_der = build_crl(&issuer_subject);
+        let owned =
+            OwnedCrl::from_der(crl_der.as_slice()).map_err(|e| format!("crl parse: {e}"))?;
+        let crl = owned.view();
+        let issuer = fetched(DVV_ISSUING_CA_DER)?;
+        match verify_crl(&crl, &issuer) {
+            Err(why) => check_true(
+                why.contains("CRL signature"),
                 "reached the signature verify stage (not a precondition error)",
             ),
             Ok(_) => Err("padding-signed CRL must not verify".into()),
@@ -2929,6 +2925,11 @@ mod tests {
         check_true(
             CardCheckHelpers::fmt_revocation(&RevocationStatus::Stale).contains("stale"),
             "Stale",
+        )?;
+        check_true(
+            CardCheckHelpers::fmt_revocation(&RevocationStatus::NotYetValid)
+                .contains("not yet valid"),
+            "NotYetValid",
         )?;
         let at = DateTime::new(2026, 1, 2, 3, 4, 5).map_err(|e| format!("date: {e}"))?;
         check_true(

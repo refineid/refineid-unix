@@ -22,13 +22,9 @@ subtle.workspace = true
 spki.workspace = true
 # Compile-time dotted-decimal OID parser for the `oid::known` table.
 const-oid.workspace = true
-# Typed RSAPublicKey for reading the SPKI key bits' modulus length.
-sha1.workspace = true
 sha2.workspace = true
-hmac.workspace = true
 # Secret-material zeroize-on-drop -- `PinBytes` in `pin`.
 zeroize.workspace = true
-x509-cert = { version = "0.3", default-features = false }
 
 refineid-apdu.workspace = true
 refineid-atr.workspace = true

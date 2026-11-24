@@ -156,9 +156,9 @@ pub struct SignedData<'a> {
 /// Owning wrapper around a validated CMS `SignedData` buffer.
 ///
 /// Follows the same lifetime-anchor pattern as
-/// [`crate::x509::OwnedCert`], [`crate::crl::OwnedCrl`], and
-/// [`crate::ocsp::OwnedOcspResponse`]: validates the DER on
-/// construction and hands out borrowed [`SignedData`] views on demand.
+/// [`crate::x509::OwnedCert`], `OwnedCrl`, and `OwnedOcspResponse`:
+/// validates the DER on construction and hands out borrowed
+/// [`SignedData`] views on demand.
 #[derive(Debug, Clone)]
 pub struct OwnedSignedData {
     /// Validated raw DER bytes.

@@ -1997,7 +1997,6 @@ dependencies = [
  "rpassword",
  "rustix",
  "rustls",
- "sha1",
  "sha2 0.11.1",
  "tokio",
  "zeroize",
@@ -2122,7 +2121,6 @@ dependencies = [
  "const-oid",
  "crypto-bigint",
  "hex",
- "hmac",
  "proptest",
  "refineid-apdu",
  "refineid-atr",
@@ -2134,11 +2132,9 @@ dependencies = [
  "refineid-pace",
  "refineid-pkcs15",
  "refineid-sign",
- "sha1",
  "sha2 0.11.1",
  "spki",
  "subtle",
- "x509-cert",
  "zeroize",
 ]
 
