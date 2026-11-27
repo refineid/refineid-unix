@@ -56,7 +56,7 @@ refineid-doc-sign = { git = "https://github.com/refineid/refineid-core.git", bra
 refineid-pace = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-scs = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
 refineid-sign = { git = "https://github.com/refineid/refineid-core.git", branch = "main" }
-fltk = "1.5.23"
+fltk = "1.5.24"
 gtk4 = "0.11"
 
 # rustls backend for server-authenticated HTTPS (TSA calls, trusted
